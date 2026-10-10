@@ -264,6 +264,163 @@ async fn assert_store_contract(store: Arc<dyn HistoryMarkerStore>) {
     }
 }
 
+// The public resolved marker intentionally omits TTL metadata. These snapshots
+// observe retention/rollback only; marker creation and accessibility use the store API.
+async fn retention_snapshot(
+    store: &SqlHistoryMarkerStore,
+    owner: &Principal,
+) -> Vec<(String, i64, i64, Option<i64>)> {
+    let principal = owner.continuation_key();
+    match store {
+        SqlHistoryMarkerStore::Sqlite(pool) => sqlx::query_as(
+            "SELECT reference, expires_at, updated_at, published_at FROM history_markers \
+             WHERE principal = ? ORDER BY reference",
+        )
+        .bind(&principal)
+        .fetch_all(pool)
+        .await
+        .unwrap(),
+        SqlHistoryMarkerStore::Postgres(pool) => sqlx::query_as(
+            "SELECT reference, expires_at, updated_at, published_at FROM history_markers \
+             WHERE principal = $1 ORDER BY reference",
+        )
+        .bind(&principal)
+        .fetch_all(pool)
+        .await
+        .unwrap(),
+    }
+}
+
+async fn assert_batch_retention_contract(store: &SqlHistoryMarkerStore) {
+    let owner = principal("marker-batch-owner");
+    let foreign_owner = principal("marker-batch-foreign");
+    // Reserve and sort first so every unavailable reference sorts after more
+    // than one chunk of valid owner references, independent of random IDs.
+    let mut markers: Vec<_> = (0..407).map(|_| reserve_thinking_marker()).collect();
+    markers.sort_unstable_by(|left, right| left.reference.cmp(&right.reference));
+    for (index, marker) in markers.iter().enumerate() {
+        store
+            .create_reserved_thinking(
+                if index == 406 { &foreign_owner } else { &owner },
+                marker,
+                ThinkingMarkerInput {
+                    block: ContentBlock::RedactedThinking {
+                        data: "opaque-retention".into(),
+                    },
+                    source: None,
+                    activity: marker.activity.clone(),
+                    pending_retention: Duration::from_secs(3600),
+                },
+            )
+            .await
+            .unwrap();
+    }
+    let references: Vec<_> = markers[..405]
+        .iter()
+        .map(|marker| marker.reference.clone())
+        .collect();
+    store
+        .publish(&owner, &references[..1], Duration::from_secs(3600))
+        .await
+        .unwrap();
+    let expired = &markers[405].reference;
+    match store {
+        SqlHistoryMarkerStore::Sqlite(pool) => {
+            sqlx::query("UPDATE history_markers SET expires_at = 0 WHERE reference = ?")
+                .bind(expired)
+                .execute(pool)
+                .await
+                .unwrap();
+        }
+        SqlHistoryMarkerStore::Postgres(pool) => {
+            sqlx::query("UPDATE history_markers SET expires_at = 0 WHERE reference = $1")
+                .bind(expired)
+                .execute(pool)
+                .await
+                .unwrap();
+        }
+    }
+    let initial = retention_snapshot(store, &owner).await;
+    let foreign_initial = retention_snapshot(store, &foreign_owner).await;
+    let long = Duration::from_secs(30 * 24 * 60 * 60);
+    let missing = format!("{}-missing", markers[406].reference);
+    for unavailable in [
+        missing.as_str(),
+        expired.as_str(),
+        markers[406].reference.as_str(),
+    ] {
+        let mut requested = references.clone();
+        requested.extend_from_within(..);
+        requested.push(unavailable.into());
+        let error = store
+            .extend_retention(&owner, &requested, long)
+            .await
+            .unwrap_err();
+        assert!(matches!(&error, HistoryMarkerError::Storage(message)
+            if message == "trusted Generation Chain references an unavailable history marker"));
+        assert_eq!(
+            retention_snapshot(store, &owner).await,
+            initial,
+            "a later unavailable reference must roll back earlier chunks"
+        );
+        assert_eq!(
+            retention_snapshot(store, &foreign_owner).await,
+            foreign_initial
+        );
+        assert!(store.resolve(&owner, unavailable).await.unwrap().is_none());
+    }
+    let mut repeated = references.clone();
+    repeated.extend_from_within(..);
+    let before = chrono::Utc::now().timestamp_millis();
+    store
+        .extend_retention(&owner, &repeated, long)
+        .await
+        .unwrap();
+    let retained = retention_snapshot(store, &owner).await;
+    for row in retained.iter().filter(|row| row.0 != *expired) {
+        assert!(row.1 >= before + 30 * 24 * 60 * 60 * 1000);
+    }
+    for (index, reference) in references.iter().enumerate() {
+        let resolved = store.resolve(&owner, reference).await.unwrap().unwrap();
+        assert_eq!(
+            resolved.published,
+            index == 0,
+            "renewal does not publish pending markers"
+        );
+    }
+    store
+        .extend_retention(&owner, &repeated, Duration::ZERO)
+        .await
+        .unwrap();
+    let shorter = retention_snapshot(store, &owner).await;
+    assert_eq!(
+        shorter
+            .iter()
+            .map(|row| (&row.0, row.1, row.3))
+            .collect::<Vec<_>>(),
+        retained
+            .iter()
+            .map(|row| (&row.0, row.1, row.3))
+            .collect::<Vec<_>>(),
+        "renewal cannot shorten TTL or change publication"
+    );
+    assert!(store.resolve(&owner, expired).await.unwrap().is_none());
+    store.extend_retention(&owner, &[], long).await.unwrap();
+}
+
+#[tokio::test]
+async fn sqlite_history_marker_batch_retention_is_atomic_and_monotonic() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    crate::migrations::migrate_sqlite(&pool, None)
+        .await
+        .unwrap();
+    assert_batch_retention_contract(&SqlHistoryMarkerStore::sqlite(pool)).await;
+}
+
 #[tokio::test]
 async fn sqlite_history_marker_store_contract() {
     assert_store_contract(sqlite_store().await).await;
@@ -299,6 +456,7 @@ async fn postgres_history_marker_store_contract_when_configured() {
         .await
         .expect("PostgreSQL migrations");
     assert_store_contract(Arc::new(SqlHistoryMarkerStore::postgres(pool.clone()))).await;
+    assert_batch_retention_contract(&SqlHistoryMarkerStore::postgres(pool.clone())).await;
     pool.close().await;
     sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
         .execute(&admin)

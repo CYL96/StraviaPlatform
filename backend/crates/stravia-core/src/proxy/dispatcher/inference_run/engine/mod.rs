@@ -418,7 +418,7 @@ pub(super) async fn orchestrate(
     });
     let compact = ctx.extensions.get::<crate::model_turn::ModelTurnPurpose>()
         == Some(crate::model_turn::ModelTurnPurpose::Compact);
-    let generation_chain_write = if !compact
+    let mut generation_chain_write = if !compact
         && matches!(
             request_kind,
             stravia_runtime_contract::hook::RequestKind::Generation
@@ -479,50 +479,67 @@ pub(super) async fn orchestrate(
     } else {
         None
     };
-    let (compact_parent_id, compact_root_id, compact_has_new_user, compact_pending_tool_result) =
-        if compact {
-            let prepare = tokio::select! {
-                prepare = gw
-                    .generation_chains
-                    .prepare_compaction(principal.clone(), request) => prepare,
-                _ = ctx.cancellation.cancelled() => {
-                    let deadline = ctx.deadline.is_exceeded();
-                    let code = if deadline { "deadline_exceeded" } else { "cancelled" };
-                    let response = if deadline {
-                        error_response(504, "request deadline exceeded")
-                    } else {
-                        error_response(499, "request cancelled")
-                    };
-                    return reject_before_admission(
-                        &mut Some(ingress_observer),
-                        "generation_chain",
-                        code,
-                        response,
-                    );
-                }
-            };
-            let prepared = match prepare {
-                Ok(prepared) => prepared,
-                Err(error) => {
-                    let code = error.to_string();
-                    return reject_before_admission(
-                        &mut Some(ingress_observer),
-                        "protocol",
-                        &code,
-                        coded_error_response(StatusCode::BAD_REQUEST, &code, &code),
-                    );
-                }
-            };
-            request = prepared.request;
-            (
-                prepared.parent_id,
-                prepared.root_id,
-                Some(prepared.has_new_user),
-                prepared.has_matching_pending_tool_result,
-            )
-        } else {
-            (None, None, None, false)
+    let (
+        compact_parent_id,
+        compact_root_id,
+        compact_has_new_user,
+        compact_pending_tool_result,
+        compact_parent_target,
+        mut discovery_workspace,
+    ) = if compact {
+        let prepare = tokio::select! {
+            prepare = gw
+                .generation_chains
+                .prepare_compaction(principal.clone(), request) => prepare,
+            _ = ctx.cancellation.cancelled() => {
+                let deadline = ctx.deadline.is_exceeded();
+                let code = if deadline { "deadline_exceeded" } else { "cancelled" };
+                let response = if deadline {
+                    error_response(504, "request deadline exceeded")
+                } else {
+                    error_response(499, "request cancelled")
+                };
+                return reject_before_admission(
+                    &mut Some(ingress_observer),
+                    "generation_chain",
+                    code,
+                    response,
+                );
+            }
         };
+        let prepared = match prepare {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let code = error.to_string();
+                return reject_before_admission(
+                    &mut Some(ingress_observer),
+                    "protocol",
+                    &code,
+                    coded_error_response(StatusCode::BAD_REQUEST, &code, &code),
+                );
+            }
+        };
+        request = prepared.request;
+        (
+            prepared.parent_id,
+            prepared.root_id,
+            Some(prepared.has_new_user),
+            prepared.has_matching_pending_tool_result,
+            prepared.parent_target,
+            prepared.discovery_workspace,
+        )
+    } else {
+        (
+            None,
+            None,
+            None,
+            false,
+            crate::router::GenerationParentTarget::Unresolved,
+            generation_chain_write
+                .as_mut()
+                .and_then(|write| write.take_discovery_workspace()),
+        )
+    };
     let compaction_source_generation_id = if compact && compact_parent_id.is_some() {
         compact_parent_id.clone()
     } else if !compact
@@ -544,7 +561,7 @@ pub(super) async fn orchestrate(
     {
         match gw
             .generation_chains
-            .compaction_source(&principal, &client_request)
+            .compaction_source(&principal, &client_request, discovery_workspace.as_mut())
             .await
         {
             Ok(source) => source,
@@ -561,6 +578,9 @@ pub(super) async fn orchestrate(
     } else {
         None
     };
+    // Discovery materials belong only to admission preparation, not the
+    // Generation write's later model legs or upstream stream lifetime.
+    drop(discovery_workspace);
     let execution_window = ctx.deadline.remaining();
     if crate::history_marker::request_needs_marker_resolution(&request) {
         match crate::history_marker::resolve_request_markers(
@@ -761,6 +781,7 @@ pub(super) async fn orchestrate(
         turn_input.compaction_records = compaction_records.clone();
         turn_input.compaction_source_generation_id = compaction_source_generation_id;
         turn_input.generation_root_id = generation_root_id;
+        turn_input.generation_parent_target = compact_parent_target;
         let mut turn = match executor.execute(turn_input).await {
             Ok(turn) => turn,
             Err(error) => {
@@ -1100,6 +1121,14 @@ async fn acquire_turn(
             .get::<crate::rpm::RootRequest>()
             .expect("admitted root RPM context");
         input.compaction_source_generation_id = generation.compaction_source_generation_id.clone();
+        input.generation_parent_target = generation.write.as_ref().map_or(
+            crate::router::GenerationParentTarget::Resolved {
+                parent_id: None,
+                target: None,
+                expires_at: None,
+            },
+            |write| write.parent_target(),
+        );
         input.generation_root_id = generation
             .write
             .as_ref()

@@ -1,5 +1,204 @@
 use super::*;
 
+pub(super) const DISCOVERY_WORKSPACE_BYTES: usize = 16 * 1024 * 1024;
+
+pub(super) struct DecodedDiscoveryNode {
+    pub(super) id: TurnNodeId,
+    pub(super) parent_id: Option<TurnNodeId>,
+    pub(super) payload_version: u32,
+    pub(super) persisted: PersistedResponseNode<'static>,
+}
+
+struct RetainedDiscoveryNode {
+    node: Arc<DecodedDiscoveryNode>,
+    expires_at: std::time::Instant,
+}
+
+/// A request-local logical budget, not a process/RSS limit. Each immutable delta
+/// is retained once; no candidate's accumulated prefix is kept here.
+pub(super) struct DiscoveryWorkspace {
+    // Lazy binding keeps first-winner ordinary discovery allocation-free.
+    principal: Option<Principal>,
+    admitting: bool,
+    budget: usize,
+    bytes: usize,
+    nodes: HashMap<TurnNodeId, RetainedDiscoveryNode>,
+    // Exact complete-chain deadlines, never complete materialized prefixes.
+    heads: HashMap<TurnNodeId, std::time::Instant>,
+}
+
+/// Owned, preparation-only reuse. Consumers may move it but cannot inspect nodes.
+pub(crate) struct GenerationDiscoveryWorkspace(DiscoveryWorkspace);
+
+impl GenerationDiscoveryWorkspace {
+    pub(super) fn workspace(&mut self) -> &mut DiscoveryWorkspace {
+        &mut self.0
+    }
+}
+
+impl DiscoveryWorkspace {
+    pub(super) fn new(principal: &Principal, enabled: bool) -> Self {
+        Self {
+            principal: enabled.then(|| principal.clone()),
+            admitting: true,
+            budget: DISCOVERY_WORKSPACE_BYTES,
+            bytes: 0,
+            nodes: HashMap::new(),
+            heads: HashMap::new(),
+        }
+    }
+
+    pub(super) fn into_request(self) -> Option<GenerationDiscoveryWorkspace> {
+        (!self.nodes.is_empty()).then_some(GenerationDiscoveryWorkspace(self))
+    }
+
+    fn enable(&mut self, principal: &Principal) {
+        if self.principal.is_none() {
+            self.principal = Some(principal.clone());
+        }
+    }
+
+    fn is_enabled_for(&self, principal: &Principal) -> bool {
+        self.budget > 0 && self.principal.as_ref() == Some(principal)
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_budget(principal: &Principal, budget: usize) -> Self {
+        Self {
+            budget,
+            ..Self::new(principal, true)
+        }
+    }
+
+    pub(super) fn chain(
+        &mut self,
+        principal: &Principal,
+        id: &TurnNodeId,
+        now: std::time::Instant,
+    ) -> Option<(Vec<Arc<DecodedDiscoveryNode>>, std::time::Instant)> {
+        if !self.is_enabled_for(principal) {
+            return None;
+        }
+        let expires_at = *self.heads.get(id)?;
+        if expires_at <= now {
+            return None;
+        }
+        let mut nodes = Vec::new();
+        let mut current = id;
+        loop {
+            let entry = self.nodes.get(current)?;
+            if entry.expires_at <= now
+                || entry.node.payload_version != RESPONSE_PAYLOAD_VERSION
+                || nodes.len() >= self.nodes.len()
+            {
+                return None;
+            }
+            nodes.push(Arc::clone(&entry.node));
+            match entry.node.parent_id.as_ref() {
+                Some(parent) => current = parent,
+                None => break,
+            }
+        }
+        nodes.reverse();
+        Some((nodes, expires_at))
+    }
+
+    pub(super) fn decode_chain(
+        &mut self,
+        principal: &Principal,
+        nodes: Vec<stravia_runtime_contract::turn_chain::TurnNode>,
+    ) -> Result<Vec<Arc<DecodedDiscoveryNode>>, String> {
+        let mut decoded = Vec::with_capacity(nodes.len());
+        for mut node in nodes {
+            let known = if self.is_enabled_for(principal)
+                && node.payload_version == RESPONSE_PAYLOAD_VERSION
+            {
+                self.nodes.get(&node.id).filter(|entry| {
+                    entry.expires_at > std::time::Instant::now()
+                        && entry.node.parent_id == node.parent_id
+                        && entry.node.payload_version == node.payload_version
+                })
+            } else {
+                None
+            };
+            if let Some(known) = known {
+                decoded.push(Arc::clone(&known.node));
+            } else {
+                let parent_id = node.parent_id.take();
+                let payload_version = node.payload_version;
+                let (id, persisted) = decode_response_node(node)?;
+                decoded.push(Arc::new(DecodedDiscoveryNode {
+                    id,
+                    parent_id,
+                    payload_version,
+                    persisted,
+                }));
+            }
+        }
+        // Admission is deliberately separate: the caller must successfully fold
+        // the complete chain before any newly decoded node becomes reusable.
+        Ok(decoded)
+    }
+
+    fn retain(
+        &mut self,
+        principal: &Principal,
+        nodes: &[Arc<DecodedDiscoveryNode>],
+        expires_at: std::time::Instant,
+    ) {
+        if !self.is_enabled_for(principal)
+            || !self.admitting
+            || expires_at <= std::time::Instant::now()
+        {
+            return;
+        }
+        let Some(head) = nodes.last() else {
+            return;
+        };
+        let mut additional = if self.heads.contains_key(&head.id) {
+            0
+        } else {
+            head.id.as_str().len().saturating_add(64)
+        };
+        for node in nodes {
+            if !self.nodes.contains_key(&node.id) {
+                additional = additional
+                    .saturating_add(serialized_size_bytes(&node.persisted))
+                    .saturating_add(node.id.as_str().len())
+                    .saturating_add(node.parent_id.as_ref().map_or(0, |id| id.as_str().len()))
+                    .saturating_add(128);
+            }
+            if additional > self.budget.saturating_sub(self.bytes) {
+                // Keep existing hits, but do not repeatedly measure rejected deltas.
+                self.admitting = false;
+                return;
+            }
+        }
+        for node in nodes {
+            if let Some(entry) = self.nodes.get_mut(&node.id) {
+                // A complete chain proves every ancestor valid through its
+                // deadline. A shorter head must not weaken earlier proof; each
+                // head certificate still independently caps its own reuse.
+                entry.expires_at = entry.expires_at.max(expires_at);
+            } else {
+                self.nodes.insert(
+                    node.id.clone(),
+                    RetainedDiscoveryNode {
+                        node: Arc::clone(node),
+                        expires_at,
+                    },
+                );
+            }
+        }
+        if let Some(expiry) = self.heads.get_mut(&head.id) {
+            *expiry = expires_at;
+        } else {
+            self.heads.insert(head.id.clone(), expires_at);
+        }
+        self.bytes += additional;
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct GenerationChainStore {
     pub(super) turn_chain: Arc<dyn TurnChainStore>,
@@ -320,8 +519,10 @@ impl GenerationChainStore {
         &self,
         principal: &Principal,
         request: &mut Arc<AiRequest>,
+        workspace: &mut DiscoveryWorkspace,
     ) -> Result<Option<DiscoveredGenerationPrefix>, String> {
-        self.discover_prefix(principal, request, false).await
+        self.discover_prefix(principal, request, false, workspace)
+            .await
     }
 
     #[tracing::instrument(
@@ -335,6 +536,7 @@ impl GenerationChainStore {
         principal: &Principal,
         request: &mut Arc<AiRequest>,
         allow_complete_window: bool,
+        workspace: &mut DiscoveryWorkspace,
     ) -> Result<Option<DiscoveredGenerationPrefix>, String> {
         let snapshot = Arc::clone(request);
         let client_request = canonical_client_history_request(&snapshot);
@@ -405,7 +607,7 @@ impl GenerationChainStore {
             candidate_count += candidates.len() as u64;
             tracing::Span::current().record("candidate_count", candidate_count);
             if let Some(prefix) = self
-                .verify_prefix_candidates(principal, &context, candidates, request)
+                .verify_prefix_candidates(principal, &context, candidates, request, workspace)
                 .await?
             {
                 return Ok(Some(prefix));
@@ -426,7 +628,7 @@ impl GenerationChainStore {
             .map_err(|error| error.to_string())?;
         candidate_count += candidates.len() as u64;
         tracing::Span::current().record("candidate_count", candidate_count);
-        self.verify_prefix_candidates(principal, &context, candidates, request)
+        self.verify_prefix_candidates(principal, &context, candidates, request, workspace)
             .await
     }
 
@@ -438,6 +640,7 @@ impl GenerationChainStore {
         context: &PrefixVerifyContext<'_>,
         candidates: Vec<stravia_runtime_contract::turn_chain::ReusablePrefixCandidate>,
         request: &mut Arc<AiRequest>,
+        workspace: &mut DiscoveryWorkspace,
     ) -> Result<Option<DiscoveredGenerationPrefix>, String> {
         for candidate in candidates {
             let matched_units = usize::try_from(candidate.item_count).unwrap_or(usize::MAX);
@@ -454,7 +657,7 @@ impl GenerationChainStore {
                 continue;
             };
             let materialized = self
-                .materialize_generation(principal, &candidate.node_id)
+                .materialize_discovery_generation(principal, &candidate.node_id, workspace)
                 .await?;
             // 便宜的标量比较先短路：fingerprint 相等只是索引命中，units 与
             // controls 相同才值得对两侧前缀做完整 canonical 投影比较。
@@ -466,6 +669,9 @@ impl GenerationChainStore {
                     &context.client_request.items[..matched_items],
                 );
             if !history_matches {
+                // Ordinary discovery pays no admission cost when its first actual
+                // candidate wins. Native multi-stage discovery is already enabled.
+                workspace.enable(principal);
                 continue;
             }
             let mut delta = request.as_ref().clone();
@@ -517,6 +723,7 @@ impl GenerationChainStore {
         &self,
         principal: &Principal,
         request: &AiRequest,
+        workspace: &mut DiscoveryWorkspace,
     ) -> Result<Option<(usize, String)>, BeginError> {
         let request = canonical_client_history_request(request);
         let mut seen = std::collections::HashSet::new();
@@ -530,19 +737,37 @@ impl GenerationChainStore {
             if !seen.insert(id.clone()) {
                 continue;
             }
-            let chain = match self
-                .turn_chain
-                .materialize_with_expiry(principal, TurnNodeKind::Response, &TurnNodeId::new(&id))
-                .await
+            let node_id = TurnNodeId::new(&id);
+            let materialized = if let Some((nodes, expires_at)) =
+                workspace.chain(principal, &node_id, std::time::Instant::now())
             {
-                Ok(chain) => chain,
-                Err(stravia_runtime_contract::turn_chain::TurnUnavailable::Unavailable) => continue,
-                Err(stravia_runtime_contract::turn_chain::TurnUnavailable::Storage(_)) => {
-                    return Err(BeginError::CompactionStorageFailed);
+                materialize_discovery_nodes(&nodes, expires_at)
+                    .map_err(|_| BeginError::CompactionUnavailable)?
+            } else {
+                let chain = match self
+                    .turn_chain
+                    .materialize_with_expiry(principal, TurnNodeKind::Response, &node_id)
+                    .await
+                {
+                    Ok(chain) => chain,
+                    Err(TurnUnavailable::Unavailable) => continue,
+                    Err(TurnUnavailable::Storage(_)) => {
+                        return Err(BeginError::CompactionStorageFailed);
+                    }
+                };
+                if workspace.is_enabled_for(principal) {
+                    let nodes = workspace
+                        .decode_chain(principal, chain.nodes)
+                        .map_err(|_| BeginError::CompactionUnavailable)?;
+                    let materialized = materialize_discovery_nodes(&nodes, chain.expires_at)
+                        .map_err(|_| BeginError::CompactionUnavailable)?;
+                    workspace.retain(principal, &nodes, chain.expires_at);
+                    materialized
+                } else {
+                    materialize_generation_nodes(chain.nodes, chain.expires_at)
+                        .map_err(|_| BeginError::CompactionUnavailable)?
                 }
             };
-            let materialized = materialize_generation_nodes(chain.nodes, chain.expires_at)
-                .map_err(|_| BeginError::CompactionUnavailable)?;
             let count = materialized.client_items.len();
             // Compact instructions govern a new operation. A gateway-owned output identity
             // plus its complete client prefix proves the source without reusing its controls.
@@ -575,26 +800,39 @@ impl GenerationChainStore {
         &self,
         principal: &Principal,
         parent_id: &str,
+        workspace: &mut DiscoveryWorkspace,
     ) -> Result<ActiveGenerationChain, String> {
-        let nodes = self
-            .turn_chain
-            .materialize(
-                principal,
-                TurnNodeKind::Response,
-                &TurnNodeId::new(parent_id),
-            )
-            .await
-            .map_err(|error| error.to_string())?;
+        let id = TurnNodeId::new(parent_id);
+        let (nodes, expires_at) = match workspace.chain(principal, &id, std::time::Instant::now()) {
+            Some(chain) => chain,
+            None => {
+                let chain = self
+                    .turn_chain
+                    .materialize_with_expiry(principal, TurnNodeKind::Response, &id)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let nodes = workspace.decode_chain(principal, chain.nodes)?;
+                workspace.retain(principal, &nodes, chain.expires_at);
+                (nodes, chain.expires_at)
+            }
+        };
         let root_id = nodes.first().map(|node| node.id.to_string());
         let mut compaction_record_ids = Vec::new();
-        for node in nodes {
-            compaction_record_ids.extend(decode_response_node(node)?.1.compaction_record_ids);
+        for node in &nodes {
+            compaction_record_ids.extend_from_slice(&node.persisted.compaction_record_ids);
         }
         compaction_record_ids.sort();
         compaction_record_ids.dedup();
+        let parent_target_key = nodes
+            .last()
+            .map(|node| &node.persisted.effective_state.selected_target_key)
+            .filter(|key| !key.is_empty())
+            .cloned();
         Ok(ActiveGenerationChain {
             root_id,
             parent_id: Some(parent_id.to_owned()),
+            parent_target_key,
+            parent_expires_at: (expires_at > std::time::Instant::now()).then_some(expires_at),
             compaction_record_ids,
             ..ActiveGenerationChain::default()
         })
@@ -670,6 +908,9 @@ impl GenerationChainStore {
             parent_id: Some(parent_id.to_owned()),
             parent_upstream_response_id: materialized.upstream_response_id.clone(),
             parent_state: Some(materialized.effective_state.clone()),
+            parent_target_key: None,
+            parent_expires_at: (materialized.expires_at > std::time::Instant::now())
+                .then_some(materialized.expires_at),
             media_turn_messages: materialized.media_turn_messages.clone(),
             parent_effective_items: materialized.effective_items.clone(),
             parent_client_items: materialized.client_items.clone(),
@@ -756,6 +997,34 @@ impl GenerationChainStore {
         )
         .await;
         Ok((materialized, catalog))
+    }
+
+    pub(super) async fn materialize_discovery_generation(
+        &self,
+        principal: &Principal,
+        id: &TurnNodeId,
+        workspace: &mut DiscoveryWorkspace,
+    ) -> Result<Arc<MaterializedGeneration>, String> {
+        if !workspace.is_enabled_for(principal) {
+            return self.materialize_generation(principal, id).await;
+        }
+        if let Some((nodes, expires_at)) = workspace.chain(principal, id, std::time::Instant::now())
+        {
+            return materialize_discovery_nodes(&nodes, expires_at).map(Arc::new);
+        }
+        let principal_key = principal.continuation_key();
+        if let Some(materialized) = self.materialization_cache_get(&principal_key, id).await {
+            crate::performance::record_generation_cache_access(true);
+            return Ok(materialized);
+        }
+        crate::performance::record_generation_cache_access(false);
+        let chain = self.load_generation_chain(principal, id).await?;
+        let nodes = workspace.decode_chain(principal, chain.nodes)?;
+        let materialized = Arc::new(materialize_discovery_nodes(&nodes, chain.expires_at)?);
+        workspace.retain(principal, &nodes, chain.expires_at);
+        self.materialization_cache_insert(principal_key, id.clone(), Arc::clone(&materialized))
+            .await;
+        Ok(materialized)
     }
 
     pub(super) async fn materialize_generation(

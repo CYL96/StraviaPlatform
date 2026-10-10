@@ -11,24 +11,76 @@ pub(super) fn decode_response_node(
     Ok((node.id, persisted))
 }
 
-fn fold_client_history(
-    client_items: &mut Vec<AiItem>,
-    persisted: &mut PersistedResponseNode<'static>,
-) -> usize {
-    match persisted.client_history_mutation.take() {
-        Some(EffectiveHistoryMutation::Append { items }) => client_items.extend(items.into_owned()),
-        Some(EffectiveHistoryMutation::Replace { items }) => *client_items = items.into_owned(),
-        None => {
-            client_items.extend(std::mem::take(&mut persisted.client_delta.messages).into_owned())
+fn apply_history_input(
+    items: &mut Vec<AiItem>,
+    mutation: Option<(bool, Cow<'_, [AiItem]>)>,
+    fallback: Cow<'_, [AiItem]>,
+) {
+    let (replace, input) = mutation.unwrap_or((false, fallback));
+    if replace {
+        *items = input.into_owned();
+    } else {
+        match input {
+            Cow::Owned(input) => items.extend(input),
+            Cow::Borrowed(input) => items.extend_from_slice(input),
         }
     }
+}
+
+fn borrowed_mutation<'a>(
+    mutation: &'a Option<EffectiveHistoryMutation<'static>>,
+) -> Option<(bool, Cow<'a, [AiItem]>)> {
+    mutation.as_ref().map(|mutation| match mutation {
+        EffectiveHistoryMutation::Append { items } => (false, Cow::Borrowed(items.as_ref())),
+        EffectiveHistoryMutation::Replace { items } => (true, Cow::Borrowed(items.as_ref())),
+    })
+}
+
+fn owned_mutation<'a>(
+    mutation: Option<EffectiveHistoryMutation<'static>>,
+) -> Option<(bool, Cow<'a, [AiItem]>)> {
+    mutation.map(|mutation| match mutation {
+        EffectiveHistoryMutation::Append { items } => (false, items),
+        EffectiveHistoryMutation::Replace { items } => (true, items),
+    })
+}
+
+// Common fold: owned nodes move content; workspace nodes lend exactly the same input.
+fn fold_client_history_view(
+    client_items: &mut Vec<AiItem>,
+    persisted: &mut Cow<'_, PersistedResponseNode<'static>>,
+) -> usize {
+    let (mutation, fallback, output) = match persisted {
+        Cow::Owned(node) => {
+            let mutation = owned_mutation(node.client_history_mutation.take());
+            let fallback = Cow::Owned(std::mem::take(&mut node.client_delta.messages).into_owned());
+            let output = node
+                .client_output
+                .take()
+                .map(Cow::Owned)
+                .unwrap_or_else(|| {
+                    Cow::Owned(generic_client_history_output(&node.effective_output))
+                });
+            (mutation, fallback, output)
+        }
+        Cow::Borrowed(node) => {
+            let output = node
+                .client_output
+                .as_ref()
+                .map(|items| Cow::Borrowed(items.as_slice()))
+                .unwrap_or_else(|| {
+                    Cow::Owned(generic_client_history_output(&node.effective_output))
+                });
+            (
+                borrowed_mutation(&node.client_history_mutation),
+                Cow::Borrowed(node.client_delta.messages.as_ref()),
+                output,
+            )
+        }
+    };
+    apply_history_input(client_items, mutation, fallback);
     let input_end = client_items.len();
-    client_items.extend(
-        persisted
-            .client_output
-            .take()
-            .unwrap_or_else(|| generic_client_history_output(&persisted.effective_output)),
-    );
+    apply_history_input(client_items, None, output);
     input_end
 }
 
@@ -60,67 +112,113 @@ pub(super) fn materialize_generation_nodes_with_catalog(
 fn materialize_generation_nodes_inner(
     nodes: Vec<stravia_runtime_contract::turn_chain::TurnNode>,
     expires_at: std::time::Instant,
+    visit_node: impl FnMut(&PersistedResponseNode<'static>),
+) -> Result<MaterializedGeneration, String> {
+    materialize_generation_replay(
+        nodes.into_iter().map(|node| {
+            decode_response_node(node).map(|(id, node)| (Cow::Owned(id), Cow::Owned(node)))
+        }),
+        expires_at,
+        visit_node,
+    )
+}
+
+fn materialize_generation_replay<'a>(
+    nodes: impl IntoIterator<
+        Item = Result<(Cow<'a, TurnNodeId>, Cow<'a, PersistedResponseNode<'static>>), String>,
+    >,
+    expires_at: std::time::Instant,
     mut visit_node: impl FnMut(&PersistedResponseNode<'static>),
 ) -> Result<MaterializedGeneration, String> {
     let mut root_id = None;
     let mut compaction_record_ids = Vec::new();
     let mut effective_items = Vec::new();
     let mut client_items = Vec::new();
-    let mut effective_request = None;
-    let mut effective_system = None;
-    let mut upstream_response_id = None;
-    let mut effective_state = GenerationChainState::default();
     let mut media_turn_messages = Vec::new();
-    let mut client_history = None;
-    let mut payload_version = 0;
+    let mut last = None;
     for node in nodes {
-        let node_version = node.payload_version;
-        let (id, mut persisted) = decode_response_node(node)?;
+        let (id, mut persisted) = node?;
         if root_id.is_none() {
             root_id = Some(id.to_string());
         }
-        compaction_record_ids.append(&mut persisted.compaction_record_ids);
         visit_node(&persisted);
-        match persisted.effective_history_mutation.take() {
-            Some(EffectiveHistoryMutation::Append { items }) => {
-                effective_items.extend(items.into_owned())
+        let (mutation, fallback) = match &mut persisted {
+            Cow::Owned(node) => (
+                owned_mutation(node.effective_history_mutation.take()),
+                Cow::Borrowed(node.client_delta.messages.as_ref()),
+            ),
+            Cow::Borrowed(node) => (
+                borrowed_mutation(&node.effective_history_mutation),
+                Cow::Borrowed(node.client_delta.messages.as_ref()),
+            ),
+        };
+        apply_history_input(&mut effective_items, mutation, fallback);
+        match &mut persisted {
+            Cow::Owned(node) => {
+                compaction_record_ids.append(&mut node.compaction_record_ids);
+                if !node.trusted_media_turn_ids.is_empty() {
+                    media_turn_messages.push((
+                        effective_items.len(),
+                        std::mem::take(&mut node.trusted_media_turn_ids),
+                    ));
+                }
             }
-            Some(EffectiveHistoryMutation::Replace { items }) => {
-                effective_items = items.into_owned()
+            Cow::Borrowed(node) => {
+                compaction_record_ids.extend_from_slice(&node.compaction_record_ids);
+                if !node.trusted_media_turn_ids.is_empty() {
+                    media_turn_messages
+                        .push((effective_items.len(), node.trusted_media_turn_ids.clone()));
+                }
             }
-            None => effective_items.extend_from_slice(&persisted.client_delta.messages),
         }
-        if !persisted.trusted_media_turn_ids.is_empty() {
-            media_turn_messages.push((
-                effective_items.len(),
-                std::mem::take(&mut persisted.trusted_media_turn_ids),
-            ));
+        fold_client_history_view(&mut client_items, &mut persisted);
+        let output_start = effective_items.len();
+        match &mut persisted {
+            Cow::Owned(node) => effective_items.append(&mut node.effective_output.items),
+            Cow::Borrowed(node) => effective_items.extend_from_slice(&node.effective_output.items),
         }
-        fold_client_history(&mut client_items, &mut persisted);
-        let response = &mut persisted.effective_output;
         crate::model_turn::support::restore_chat_reasoning_field(
-            &mut response.items,
-            0,
-            response
+            &mut effective_items,
+            output_start,
+            persisted
+                .effective_output
                 .vendor
                 .ingress
                 .get(stravia_runtime_contract::protocol::ir::vendor_ext::CHAT_REASONING_FIELD_META),
         );
-        effective_items.append(&mut persisted.effective_output.items);
-        client_history = persisted.client_history;
-        effective_request = persisted.effective_request;
-        effective_system = persisted.effective_system.or(persisted.client_delta.system);
-        upstream_response_id = persisted.upstream_response_id;
-        effective_state = persisted.effective_state;
-        payload_version = node_version;
+        last = Some(persisted);
     }
     let root_id = root_id.ok_or_else(|| "generation chain was empty".to_string())?;
+    let last = last.expect("a nonempty chain has a final node");
+    let (
+        mut client_history,
+        effective_request,
+        effective_system,
+        upstream_response_id,
+        effective_state,
+    ) = match last {
+        Cow::Owned(node) => (
+            node.client_history,
+            node.effective_request,
+            node.effective_system.or(node.client_delta.system),
+            node.upstream_response_id,
+            node.effective_state,
+        ),
+        Cow::Borrowed(node) => (
+            node.client_history.clone(),
+            node.effective_request.clone(),
+            node.effective_system
+                .as_ref()
+                .or(node.client_delta.system.as_ref())
+                .cloned(),
+            node.upstream_response_id.clone(),
+            node.effective_state.clone(),
+        ),
+    };
     compaction_record_ids.sort();
     compaction_record_ids.dedup();
-    // Client identity is derived from retained client history. Do not replace
-    // upstream proofs: they may describe a reversible-redaction Provider view,
-    // not these retained items. An old incompatible proof safely declines
-    // Target Continuation while automatic parent discovery remains available.
+    // Retained client history determines local discovery identity, not the
+    // upstream proof: that proof may describe a reversible-redaction view.
     let mut client_item_units = 0usize;
     if let Some(history) = client_history.as_mut() {
         let mut context =
@@ -152,9 +250,22 @@ fn materialize_generation_nodes_inner(
         effective_state,
         media_turn_messages,
         client_history,
-        payload_version,
+        payload_version: RESPONSE_PAYLOAD_VERSION,
         expires_at,
     })
+}
+
+pub(super) fn materialize_discovery_nodes(
+    nodes: &[Arc<DecodedDiscoveryNode>],
+    expires_at: std::time::Instant,
+) -> Result<MaterializedGeneration, String> {
+    materialize_generation_replay(
+        nodes
+            .iter()
+            .map(|node| Ok((Cow::Borrowed(&node.id), Cow::Borrowed(&node.persisted)))),
+        expires_at,
+        |_| {},
+    )
 }
 
 pub(crate) fn rebuilt_prefix(
@@ -209,8 +320,9 @@ pub(super) fn visit_client_items_from_nodes(
     }
 
     let mut client_items = Vec::new();
-    for (node_id, mut persisted) in decoded {
-        let input_end = fold_client_history(&mut client_items, &mut persisted);
+    for (node_id, persisted) in decoded {
+        let mut persisted = Cow::Owned(persisted);
+        let input_end = fold_client_history_view(&mut client_items, &mut persisted);
         visit(node_id.as_str(), &client_items, input_end);
     }
     Ok(())

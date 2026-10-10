@@ -5,8 +5,8 @@ pub(crate) mod selection;
 pub mod selector;
 
 pub(crate) use continuation::{
-    ContinuationLookup, ContinuationTarget, clear_previous_response_id, parent_id_from_request,
-    stamp_previous_response_id,
+    ContinuationLookup, ContinuationTarget, GenerationParentTarget, clear_previous_response_id,
+    parent_id_from_request, stamp_previous_response_id,
 };
 pub use matcher::RouteCache;
 pub(crate) use selection::{RouteSelector, SelectionError};

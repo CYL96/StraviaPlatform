@@ -1,6 +1,6 @@
 use super::*;
 
-use sqlx::FromRow;
+use sqlx::{Connection, FromRow};
 
 #[derive(Clone)]
 pub enum SqlHistoryMarkerStore {
@@ -766,41 +766,88 @@ impl HistoryMarkerStore for SqlHistoryMarkerStore {
         if references.is_empty() {
             return Ok(());
         }
-        let now = Self::now();
-        let expires_at = Self::after(now, retention);
+        let mut references: Vec<_> = references.iter().map(String::as_str).collect();
+        references.sort_unstable();
+        references.dedup();
         let principal = principal.continuation_key();
-        for reference in references {
-            let updated = match self {
-                Self::Sqlite(pool) => sqlx::query(
-                        "UPDATE history_markers SET expires_at = MAX(expires_at, ?), updated_at = ? \
-                         WHERE principal = ? AND reference = ? AND expires_at > ?",
-                    )
-                    .bind(expires_at)
-                    .bind(now)
-                    .bind(&principal)
-                    .bind(reference)
-                    .bind(now)
-                    .execute(pool)
+        const UNAVAILABLE: &str =
+            "trusted Generation Chain references an unavailable history marker";
+        match self {
+            Self::Sqlite(pool) => {
+                let mut connection = pool.acquire().await.map_err(storage)?;
+                let mut transaction = connection
+                    .begin_with("BEGIN IMMEDIATE")
                     .await
-                    .map_err(storage)?
-                    .rows_affected(),
-                Self::Postgres(pool) => sqlx::query(
-                        "UPDATE history_markers SET expires_at = GREATEST(expires_at, $1), updated_at = $2 \
-                         WHERE principal = $3 AND reference = $4 AND expires_at > $2",
-                    )
-                    .bind(expires_at)
-                    .bind(now)
-                    .bind(&principal)
-                    .bind(reference)
-                    .execute(pool)
-                    .await
-                    .map_err(storage)?
-                    .rows_affected(),
-            };
-            if updated != 1 {
-                return Err(HistoryMarkerError::Storage(
-                    "trusted Generation Chain references an unavailable history marker".into(),
-                ));
+                    .map_err(storage)?;
+                let now = Self::now();
+                let expires_at = Self::after(now, retention);
+                // Keep every chunk in this transaction: an unavailable reference
+                // must not leave earlier markers with an extended lifetime.
+                for references in references.chunks(400) {
+                    let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+                        "UPDATE history_markers SET expires_at = MAX(expires_at, ",
+                    );
+                    query
+                        .push_bind(expires_at)
+                        .push("), updated_at = ")
+                        .push_bind(now)
+                        .push(" WHERE principal = ")
+                        .push_bind(&principal)
+                        .push(" AND expires_at > ")
+                        .push_bind(now)
+                        .push(" AND reference IN (");
+                    let mut list = query.separated(", ");
+                    for reference in references {
+                        list.push_bind(*reference);
+                    }
+                    list.push_unseparated(")");
+                    let updated = query
+                        .build()
+                        .execute(&mut *transaction)
+                        .await
+                        .map_err(storage)?
+                        .rows_affected();
+                    if updated != references.len() as u64 {
+                        transaction.rollback().await.map_err(storage)?;
+                        return Err(HistoryMarkerError::Storage(UNAVAILABLE.into()));
+                    }
+                }
+                transaction.commit().await.map_err(storage)?;
+            }
+            Self::Postgres(pool) => {
+                let mut transaction = pool.begin().await.map_err(storage)?;
+                let now = Self::now();
+                let expires_at = Self::after(now, retention);
+                for references in references.chunks(400) {
+                    let mut query = sqlx::QueryBuilder::<sqlx::Postgres>::new(
+                        "UPDATE history_markers SET expires_at = GREATEST(expires_at, ",
+                    );
+                    query
+                        .push_bind(expires_at)
+                        .push("), updated_at = ")
+                        .push_bind(now)
+                        .push(" WHERE principal = ")
+                        .push_bind(&principal)
+                        .push(" AND expires_at > ")
+                        .push_bind(now)
+                        .push(" AND reference IN (");
+                    let mut list = query.separated(", ");
+                    for reference in references {
+                        list.push_bind(*reference);
+                    }
+                    list.push_unseparated(")");
+                    let updated = query
+                        .build()
+                        .execute(&mut *transaction)
+                        .await
+                        .map_err(storage)?
+                        .rows_affected();
+                    if updated != references.len() as u64 {
+                        transaction.rollback().await.map_err(storage)?;
+                        return Err(HistoryMarkerError::Storage(UNAVAILABLE.into()));
+                    }
+                }
+                transaction.commit().await.map_err(storage)?;
             }
         }
         Ok(())

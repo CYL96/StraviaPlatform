@@ -6,6 +6,19 @@ use stravia_runtime_contract::protocol::ids::ProtocolId;
 use stravia_runtime_contract::protocol::ir::AiRequest;
 use stravia_runtime_contract::protocol::ir::ProtocolExt;
 
+/// Internal evidence from an already validated Generation Chain parent.
+/// A resolved miss must not initiate another history lookup.
+#[derive(Clone, Debug, Default)]
+pub(crate) enum GenerationParentTarget {
+    #[default]
+    Unresolved,
+    Resolved {
+        parent_id: Option<String>,
+        target: Option<String>,
+        expires_at: Option<std::time::Instant>,
+    },
+}
+
 pub struct ContinuationTarget<'a> {
     pub namespace: &'a str,
     pub protocol: Option<ProtocolId>,
@@ -15,6 +28,8 @@ pub struct ContinuationTarget<'a> {
 
 #[async_trait]
 pub trait ContinuationLookup: Send + Sync {
+    /// Resolve affinity when reusable validated parent evidence is unavailable.
+    /// Resolved parents travel separately from client-writable IR.
     async fn preferred_target(
         &self,
         _principal: &Principal,

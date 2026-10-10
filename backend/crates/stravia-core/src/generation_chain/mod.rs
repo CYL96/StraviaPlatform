@@ -49,8 +49,8 @@ pub(crate) use project::{
     set_generation_session_id,
 };
 pub(crate) use store::{
-    hydrate_response_artifact_references, request_has_item_references,
-    request_preserves_upstream_response,
+    GenerationDiscoveryWorkspace, hydrate_response_artifact_references,
+    request_has_item_references, request_preserves_upstream_response,
 };
 
 // Persisted payloads must match this version exactly; older encodings are rejected.
@@ -84,7 +84,6 @@ pub(crate) struct GenerationChain {
     ttl: Duration,
 }
 
-#[derive(Clone)]
 pub(crate) struct GenerationChainWrite {
     chain: GenerationChain,
     principal: Principal,
@@ -94,8 +93,26 @@ pub(crate) struct GenerationChainWrite {
     request_delta: Arc<AiRequest>,
     request: Arc<AiRequest>,
     id: String,
+    discovery_workspace: Option<GenerationDiscoveryWorkspace>,
     staged: Option<StagedGeneration>,
     commit_fence: Option<GenerationCommitFence>,
+}
+
+impl Clone for GenerationChainWrite {
+    fn clone(&self) -> Self {
+        Self {
+            chain: self.chain.clone(),
+            principal: self.principal.clone(),
+            parent: Arc::clone(&self.parent),
+            request_delta: Arc::clone(&self.request_delta),
+            request: Arc::clone(&self.request),
+            id: self.id.clone(),
+            // Execution legs never retain the preparation-only workspace.
+            discovery_workspace: None,
+            staged: self.staged.clone(),
+            commit_fence: self.commit_fence.clone(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -174,6 +191,8 @@ pub(crate) struct PreparedCompactionInput {
     pub root_id: Option<String>,
     pub has_new_user: bool,
     pub has_matching_pending_tool_result: bool,
+    pub parent_target: crate::router::GenerationParentTarget,
+    pub discovery_workspace: Option<GenerationDiscoveryWorkspace>,
 }
 
 impl GenerationChain {
@@ -227,7 +246,7 @@ impl GenerationChain {
         request: impl Into<Arc<AiRequest>>,
     ) -> Result<PreparedCompactionInput, BeginError> {
         // 只复用引用和来源准备，不 stage/persist，也不公开临时 Generation identity。
-        let write = self.begin_native_compaction(principal, request).await?;
+        let mut write = self.begin_native_compaction(principal, request).await?;
         let has_new_user = write
             .request_delta
             .items
@@ -241,12 +260,16 @@ impl GenerationChain {
         } else {
             None
         };
+        let parent_target = write.parent_target();
+        let discovery_workspace = write.take_discovery_workspace();
         Ok(PreparedCompactionInput {
             request: write.request,
             parent_id,
             root_id,
             has_new_user,
             has_matching_pending_tool_result,
+            parent_target,
+            discovery_workspace,
         })
     }
 
@@ -254,11 +277,12 @@ impl GenerationChain {
         &self,
         principal: &Principal,
         request: &AiRequest,
+        workspace: &mut DiscoveryWorkspace,
     ) -> Result<Option<(usize, String)>, BeginError> {
         let canonical = canonical_client_history_request(request);
         let identity = self
             .store
-            .compaction_source_from_items(principal, request)
+            .compaction_source_from_items(principal, request, workspace)
             .await?;
         if identity
             .as_ref()
@@ -270,7 +294,7 @@ impl GenerationChain {
         let mut probe = Arc::new(request.clone());
         let strict = self
             .store
-            .discover_prefix(principal, &mut probe, true)
+            .discover_prefix(principal, &mut probe, true, workspace)
             .await
             .map_err(|_| BeginError::CompactionUnavailable)?
             .and_then(|prefix| {
@@ -290,6 +314,7 @@ impl GenerationChain {
         &self,
         principal: &Principal,
         request: &AiRequest,
+        discovery_workspace: Option<&mut GenerationDiscoveryWorkspace>,
     ) -> Result<Option<String>, BeginError> {
         self.pending_commits
             .wait_for_relevant(principal, request)
@@ -298,7 +323,13 @@ impl GenerationChain {
         request.items.retain(|item| !item.is_compaction_trigger());
         let native = self.resolve_compaction(principal, &request).await?;
         let explicit = crate::router::parent_id_from_request(&request);
-        let source_prefix = self.compaction_source_prefix(principal, &request).await?;
+        let mut owned_workspace = DiscoveryWorkspace::new(principal, discovery_workspace.is_none());
+        let workspace = discovery_workspace
+            .map(|workspace| workspace.workspace())
+            .unwrap_or(&mut owned_workspace);
+        let source_prefix = self
+            .compaction_source_prefix(principal, &request, workspace)
+            .await?;
         let parent = explicit
             .or_else(|| source_prefix.map(|(_, id)| id))
             .or_else(|| {
@@ -308,7 +339,7 @@ impl GenerationChain {
             });
         if let Some(parent) = parent.as_deref() {
             self.store
-                .source_parent(principal, parent)
+                .source_parent(principal, parent, workspace)
                 .await
                 .map_err(|_| BeginError::PreviousResponseNotFound)?;
             if let Some(source) = native
@@ -412,13 +443,17 @@ impl GenerationChain {
         self.pending_commits
             .wait_for_relevant(&principal, &request)
             .await;
-        self.begin_ready(principal, request).await
+        let mut workspace = DiscoveryWorkspace::new(&principal, false);
+        let mut write = self.begin_ready(principal, request, &mut workspace).await?;
+        write.discovery_workspace = workspace.into_request();
+        Ok(write)
     }
 
     async fn begin_ready(
         &self,
         principal: Principal,
         mut request: Arc<AiRequest>,
+        workspace: &mut DiscoveryWorkspace,
     ) -> Result<GenerationChainWrite, BeginError> {
         // The client delta and execution request start as one immutable snapshot.
         // History/control preparation detaches only the side it actually edits.
@@ -468,7 +503,7 @@ impl GenerationChain {
             crate::router::clear_previous_response_id(Arc::make_mut(&mut discovered_request));
             let discovered = self
                 .store
-                .discover_parent(&principal, &mut discovered_request)
+                .discover_parent(&principal, &mut discovered_request, workspace)
                 .await
                 .map_err(|_| BeginError::CompactionUnavailable)?
                 .filter(|prefix| prefix.matched_items >= native_range.end);
@@ -500,7 +535,7 @@ impl GenerationChain {
                 let mut parent = match native.source_generation_id.as_deref() {
                     Some(id) => self
                         .store
-                        .source_parent(&principal, id)
+                        .source_parent(&principal, id, workspace)
                         .await
                         .map_err(|_| BeginError::CompactionUnavailable)?,
                     None => ActiveGenerationChain::default(),
@@ -528,7 +563,11 @@ impl GenerationChain {
         } else if request_has_item_references(&request) {
             return Err(BeginError::ItemReferenceNotFound);
         } else {
-            match self.store.discover_parent(&principal, &mut request).await {
+            match self
+                .store
+                .discover_parent(&principal, &mut request, workspace)
+                .await
+            {
                 Ok(Some(discovered)) => {
                     let delta_items = request_delta.items[discovered.matched_items..].to_vec();
                     Arc::make_mut(&mut request_delta).items = delta_items;
@@ -563,6 +602,7 @@ impl GenerationChain {
             request_delta,
             request,
             id: self.store.allocate_id(),
+            discovery_workspace: None,
             staged: None,
             commit_fence: None,
         })
@@ -577,9 +617,25 @@ impl GenerationChain {
         self.pending_commits
             .wait_for_relevant(&principal, &request)
             .await;
-        let explicit_parent = crate::router::parent_id_from_request(&request).is_some();
-        if explicit_parent {
-            return self.begin_ready(principal, request).await;
+        let mut workspace = DiscoveryWorkspace::new(
+            &principal,
+            crate::router::parent_id_from_request(&request).is_none(),
+        );
+        let mut write = self
+            .begin_native_compaction_ready(principal, request, &mut workspace)
+            .await?;
+        write.discovery_workspace = workspace.into_request();
+        Ok(write)
+    }
+
+    async fn begin_native_compaction_ready(
+        &self,
+        principal: Principal,
+        request: Arc<AiRequest>,
+        workspace: &mut DiscoveryWorkspace,
+    ) -> Result<GenerationChainWrite, BeginError> {
+        if crate::router::parent_id_from_request(&request).is_some() {
+            return self.begin_ready(principal, request, workspace).await;
         }
 
         // Native controls authorize a new operation, not replay of the source's effective
@@ -598,9 +654,9 @@ impl GenerationChain {
         let client_request = canonical_client_history_request(&source_request).into_owned();
         let leading_controls = source_request.items.len() - client_request.items.len();
         let source_prefix = self
-            .compaction_source_prefix(&principal, &source_request)
+            .compaction_source_prefix(&principal, &source_request, workspace)
             .await?;
-        let mut write = self.begin_ready(principal, request).await?;
+        let mut write = self.begin_ready(principal, request, workspace).await?;
         let Some((matched_items, source_id)) = source_prefix else {
             return Ok(write);
         };
@@ -619,7 +675,7 @@ impl GenerationChain {
         write.request = Arc::new(source_request);
         let mut parent = self
             .store
-            .source_parent(&write.principal, &source_id)
+            .source_parent(&write.principal, &source_id, workspace)
             .await
             .map_err(|_| BeginError::CompactionUnavailable)?;
         parent.replace_effective_history = true;
@@ -686,6 +742,33 @@ impl GenerationChain {
         Arc::new(GenerationChainContinuationLookup {
             chain: self.clone(),
         })
+    }
+}
+
+impl GenerationChainWrite {
+    /// Move the preparation workspace out before model execution or leg cloning.
+    pub(crate) fn take_discovery_workspace(&mut self) -> Option<GenerationDiscoveryWorkspace> {
+        self.discovery_workspace.take()
+    }
+
+    pub(crate) fn parent_target(&self) -> crate::router::GenerationParentTarget {
+        if self.parent.parent_id.is_some() && self.parent.parent_expires_at.is_none() {
+            // Adapters without a retainable deadline require the original fresh lookup.
+            return crate::router::GenerationParentTarget::Unresolved;
+        }
+        let target = self
+            .parent
+            .parent_state
+            .as_ref()
+            .map(|state| &state.selected_target_key)
+            .or(self.parent.parent_target_key.as_ref())
+            .filter(|key| !key.is_empty())
+            .cloned();
+        crate::router::GenerationParentTarget::Resolved {
+            parent_id: self.parent.parent_id.clone(),
+            target,
+            expires_at: self.parent.parent_expires_at,
+        }
     }
 }
 
@@ -837,6 +920,9 @@ struct ActiveGenerationChain {
     pub parent_id: Option<String>,
     pub parent_upstream_response_id: Option<String>,
     pub parent_state: Option<GenerationChainState>,
+    // Ancestry-only parents retain affinity without restoring execution state.
+    parent_target_key: Option<String>,
+    parent_expires_at: Option<std::time::Instant>,
     pub media_turn_messages: Vec<(usize, Vec<String>)>,
     parent_effective_items: Vec<AiItem>,
     parent_client_items: Vec<AiItem>,

@@ -33,6 +33,99 @@ async fn expire(store: &SqlMappingStore, reference: &str) {
     }
 }
 
+async fn assert_batch_retention_contract(store: &SqlMappingStore) {
+    let owner = Principal::new("mapping-batch-owner");
+    let other = Principal::new("mapping-batch-other");
+    let secrets: Vec<_> = (0..407)
+        .map(|index| format!("batch-secret-{index}"))
+        .collect();
+    let mappings = store.intern(&owner, &secrets).await.unwrap().mappings;
+    let references: Vec<_> = mappings
+        .iter()
+        .map(|mapping| mapping.reference.clone())
+        .collect();
+    let foreign = store
+        .intern(&other, &["foreign-batch-secret".into()])
+        .await
+        .unwrap()
+        .mappings
+        .remove(0);
+    let long = Duration::from_secs(30 * 24 * 60 * 60);
+    let mut published = references[..405].to_vec();
+    published.extend_from_within(..);
+    published.push("missing-mapping".into());
+    published.push(foreign.reference.clone());
+    store
+        .publish(&owner, &published, Duration::ZERO)
+        .await
+        .unwrap();
+    expire(store, &references[405]).await;
+    let pending_expiry = mappings[406].expires_at;
+    let mut requested = references.clone();
+    requested.extend_from_within(..);
+    requested.push("missing-mapping".into());
+    requested.push(foreign.reference.clone());
+    let before = now();
+    store
+        .extend_retention(&owner, &requested, long)
+        .await
+        .unwrap();
+    let retained = store.active(&owner).await.unwrap();
+    assert_eq!(retained.len(), 406);
+    for mapping in &retained {
+        if mapping.reference == references[406] {
+            assert_eq!(
+                mapping.expires_at, pending_expiry,
+                "unpublished mappings are not renewed"
+            );
+        } else {
+            assert!(mapping.expires_at >= after(before, long));
+        }
+    }
+    assert_eq!(
+        store.active(&other).await.unwrap()[0].expires_at,
+        foreign.expires_at
+    );
+    let expiry: std::collections::BTreeMap<_, _> = retained
+        .into_iter()
+        .map(|mapping| (mapping.reference, mapping.expires_at))
+        .collect();
+    store
+        .extend_retention(&owner, &requested, Duration::ZERO)
+        .await
+        .unwrap();
+    store
+        .publish(&owner, &published, Duration::ZERO)
+        .await
+        .unwrap();
+    let shortened: std::collections::BTreeMap<_, _> = store
+        .active(&owner)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|mapping| (mapping.reference, mapping.expires_at))
+        .collect();
+    assert_eq!(
+        shortened, expiry,
+        "shorter retention cannot shorten an existing TTL"
+    );
+    store
+        .publish(&owner, std::slice::from_ref(&references[405]), long)
+        .await
+        .unwrap();
+    assert!(
+        !store
+            .active(&owner)
+            .await
+            .unwrap()
+            .iter()
+            .any(|mapping| mapping.reference == references[405]),
+        "publication cannot revive expired mappings"
+    );
+    store.extend_retention(&owner, &[], long).await.unwrap();
+    store.publish(&owner, &[], long).await.unwrap();
+}
+
 async fn assert_store_contract(store: &SqlMappingStore) -> (Principal, String, String) {
     let owner = Principal::new("mapping-owner");
     let other = Principal::new("mapping-other");
@@ -157,6 +250,7 @@ async fn sqlite_mapping_concurrency_lifecycle_isolation_and_restart() {
         .unwrap();
     let store = SqlMappingStore::sqlite(pool.clone());
     let (owner, reference, secret) = assert_store_contract(&store).await;
+    assert_batch_retention_contract(&store).await;
     drop(store);
     pool.close().await;
     let reopened = crate::db::init_pool(directory.path()).await.unwrap();
@@ -203,6 +297,7 @@ async fn postgres_mapping_contract_when_configured() {
         .unwrap();
     let store = SqlMappingStore::postgres(pool.clone());
     let (owner, reference, secret) = assert_store_contract(&store).await;
+    assert_batch_retention_contract(&store).await;
     drop(store);
     pool.close().await;
     let reopened = sqlx::postgres::PgPoolOptions::new()

@@ -1,6 +1,823 @@
 use super::*;
 use stravia_runtime_contract::artifact::{ArtifactStore, bytes_stream};
 
+struct ControlledDiscoveryTurnChainStore {
+    inner: crate::turn_chain::SqlTurnChainStore,
+    blocked: parking_lot::Mutex<std::collections::HashSet<String>>,
+    deadlines: parking_lot::Mutex<HashMap<String, std::time::Instant>>,
+}
+
+impl ControlledDiscoveryTurnChainStore {
+    fn new(inner: crate::turn_chain::SqlTurnChainStore) -> Self {
+        Self {
+            inner,
+            blocked: Default::default(),
+            deadlines: Default::default(),
+        }
+    }
+    fn block(&self, id: &str) {
+        self.blocked.lock().insert(id.to_owned());
+    }
+    fn unblock(&self, id: &str) {
+        self.blocked.lock().remove(id);
+    }
+    fn deadline(&self, id: &str, deadline: std::time::Instant) {
+        self.deadlines.lock().insert(id.to_owned(), deadline);
+    }
+}
+
+#[async_trait::async_trait]
+impl TurnChainStore for ControlledDiscoveryTurnChainStore {
+    async fn materialize(
+        &self,
+        principal: &Principal,
+        kind: TurnNodeKind,
+        id: &TurnNodeId,
+    ) -> Result<Vec<stravia_runtime_contract::turn_chain::TurnNode>, TurnUnavailable> {
+        Ok(self
+            .materialize_with_expiry(principal, kind, id)
+            .await?
+            .nodes)
+    }
+    async fn materialize_with_expiry(
+        &self,
+        principal: &Principal,
+        kind: TurnNodeKind,
+        id: &TurnNodeId,
+    ) -> Result<stravia_runtime_contract::turn_chain::MaterializedTurnChain, TurnUnavailable> {
+        if self.blocked.lock().contains(id.as_str()) {
+            return Err(TurnUnavailable::Storage(
+                "injected temporary history read failure".into(),
+            ));
+        }
+        let expiry = self.deadlines.lock().get(id.as_str()).copied();
+        if expiry.is_some_and(|expiry| expiry <= std::time::Instant::now()) {
+            return Err(TurnUnavailable::Unavailable);
+        }
+        let mut chain = self
+            .inner
+            .materialize_with_expiry(principal, kind, id)
+            .await?;
+        if let Some(expiry) = expiry {
+            chain.expires_at = chain.expires_at.min(expiry);
+        }
+        Ok(chain)
+    }
+    async fn commit(&self, commit: TurnCommit) -> Result<TurnNodeId, TurnCommitError> {
+        self.inner.commit(commit).await
+    }
+    async fn find_reusable_prefixes(
+        &self,
+        principal: &Principal,
+        kind: TurnNodeKind,
+        query: &ReusablePrefixQuery,
+    ) -> Result<Vec<stravia_runtime_contract::turn_chain::ReusablePrefixCandidate>, TurnUnavailable>
+    {
+        self.inner
+            .find_reusable_prefixes(principal, kind, query)
+            .await
+    }
+    async fn sweep_expired(&self) -> Result<u64, TurnUnavailable> {
+        self.inner.sweep_expired().await
+    }
+}
+
+#[tokio::test]
+async fn native_preparation_reuses_owned_workspace_for_diagnostic_source() {
+    let owner = principal("workspace-diagnostic-owner");
+    let backend = Arc::new(ControlledDiscoveryTurnChainStore::new(
+        crate::turn_chain::test_store().await,
+    ));
+    let chain = GenerationChain::from_turn_chain(
+        backend.clone(),
+        Duration::from_secs(60),
+        None,
+        crate::runtime_cache::RuntimeCache::tinyufo(1),
+    );
+    let mut root_request = responses_request(vec![user_message("exact question")]);
+    set_generation_session_id(&mut root_request, "diagnostic-session");
+    let mut ids = Vec::new();
+    for (question, answer) in [
+        ("exact question", "exact answer"),
+        ("other question", "other answer"),
+    ] {
+        let mut request = root_request.clone();
+        request.items = vec![user_message(question)];
+        let mut write = chain.begin(owner.clone(), request).await.unwrap();
+        let mut response = AiResponse::new("upstream", "model");
+        response.push_output_text(answer);
+        assert!(write.stage(&mut response, &generation_source(), None));
+        write.persist().await.unwrap();
+        ids.push(write.id().to_owned());
+    }
+    // Delivery IDs are not prefix identity; use client-shaped replay without them.
+    let mut replay = root_request;
+    replay.items.push(AiItem::output_text("exact answer"));
+    let mut write = chain
+        .begin_native_compaction(owner.clone(), replay.clone())
+        .await
+        .unwrap();
+    assert_eq!(write.parent_id(), Some(ids[0].as_str()));
+    let mut workspace = write.take_discovery_workspace();
+    for id in &ids {
+        backend.block(id);
+    }
+    assert_eq!(
+        chain
+            .compaction_source(&owner, &replay, workspace.as_mut())
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(ids[0].as_str())
+    );
+    drop(workspace);
+    assert_eq!(
+        chain.compaction_source(&owner, &replay, None).await.err(),
+        Some(BeginError::CompactionUnavailable)
+    );
+}
+
+#[tokio::test]
+async fn discovery_workspace_recovers_transient_errors_and_does_not_adopt_a_partial_chain() {
+    let owner = principal("workspace-failure-owner");
+    let backend = Arc::new(ControlledDiscoveryTurnChainStore::new(
+        crate::turn_chain::test_store().await,
+    ));
+    let store = GenerationChainStore::from_turn_chain(
+        backend.clone(),
+        Duration::from_secs(60),
+        crate::runtime_cache::RuntimeCache::tinyufo(1),
+    );
+    commit_observation_node(
+        backend.as_ref(),
+        &owner,
+        "recoverable-root",
+        None,
+        observation_payload(vec![user_message("root")], None, None, "answer"),
+        Duration::from_secs(60),
+    )
+    .await;
+    commit_observation_node(
+        backend.as_ref(),
+        &owner,
+        "partial-root",
+        None,
+        observation_payload(vec![user_message("partial")], None, None, "answer"),
+        Duration::from_secs(60),
+    )
+    .await;
+    commit_observation_node(
+        backend.as_ref(),
+        &owner,
+        "invalid-tail",
+        Some("partial-root"),
+        serde_json::json!({"invalid":true}),
+        Duration::from_secs(60),
+    )
+    .await;
+    let mut workspace = DiscoveryWorkspace::new(&owner, true);
+    backend.block("recoverable-root");
+    assert!(
+        store
+            .materialize_discovery_generation(
+                &owner,
+                &TurnNodeId::new("recoverable-root"),
+                &mut workspace
+            )
+            .await
+            .is_err()
+    );
+    backend.unblock("recoverable-root");
+    let recovered = store
+        .materialize_discovery_generation(
+            &owner,
+            &TurnNodeId::new("recoverable-root"),
+            &mut workspace,
+        )
+        .await
+        .unwrap();
+    assert!(items_equal(
+        &recovered.client_items,
+        &[user_message("root"), AiItem::output_text("answer")]
+    ));
+    assert_eq!(
+        store
+            .materialize_discovery_generation(
+                &owner,
+                &TurnNodeId::new("invalid-tail"),
+                &mut workspace
+            )
+            .await
+            .err()
+            .as_deref(),
+        Some("invalid generation payload")
+    );
+    backend.block("partial-root");
+    assert!(
+        store
+            .materialize_discovery_generation(
+                &owner,
+                &TurnNodeId::new("partial-root"),
+                &mut workspace
+            )
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn discovery_workspace_budget_overflow_keeps_prior_evidence_without_partial_admission() {
+    let owner = principal("workspace-budget-owner");
+    let backend = Arc::new(ControlledDiscoveryTurnChainStore::new(
+        crate::turn_chain::test_store().await,
+    ));
+    let store = GenerationChainStore::from_turn_chain(
+        backend.clone(),
+        Duration::from_secs(60),
+        crate::runtime_cache::RuntimeCache::tinyufo(1),
+    );
+    commit_observation_node(
+        backend.as_ref(),
+        &owner,
+        "small-root",
+        None,
+        observation_payload(vec![user_message("root")], None, None, "answer"),
+        Duration::from_secs(60),
+    )
+    .await;
+    commit_observation_node(
+        backend.as_ref(),
+        &owner,
+        "large-child",
+        Some("small-root"),
+        observation_payload(
+            vec![user_message(&"x".repeat(128 * 1024))],
+            None,
+            None,
+            "large answer",
+        ),
+        Duration::from_secs(60),
+    )
+    .await;
+    let mut workspace = DiscoveryWorkspace::with_budget(&owner, 64 * 1024);
+    let small = store
+        .materialize_discovery_generation(&owner, &TurnNodeId::new("small-root"), &mut workspace)
+        .await
+        .unwrap();
+    let large = store
+        .materialize_discovery_generation(&owner, &TurnNodeId::new("large-child"), &mut workspace)
+        .await
+        .unwrap();
+    assert_eq!(large.client_items.len(), 4);
+    backend.block("small-root");
+    backend.block("large-child");
+    let retained = store
+        .materialize_discovery_generation(&owner, &TurnNodeId::new("small-root"), &mut workspace)
+        .await
+        .unwrap();
+    assert!(items_equal(&retained.client_items, &small.client_items));
+    assert!(
+        store
+            .materialize_discovery_generation(
+                &owner,
+                &TurnNodeId::new("large-child"),
+                &mut workspace
+            )
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn discovery_workspace_preserves_each_overlapping_heads_exact_expiry() {
+    let owner = principal("workspace-deadline-owner");
+    let backend = Arc::new(ControlledDiscoveryTurnChainStore::new(
+        crate::turn_chain::test_store().await,
+    ));
+    let store = GenerationChainStore::from_turn_chain(
+        backend.clone(),
+        Duration::from_secs(60),
+        crate::runtime_cache::RuntimeCache::tinyufo(1),
+    );
+    commit_observation_node(
+        backend.as_ref(),
+        &owner,
+        "long-lived-root",
+        None,
+        observation_payload(vec![user_message("root")], None, None, "answer"),
+        Duration::from_secs(60),
+    )
+    .await;
+    commit_observation_node(
+        backend.as_ref(),
+        &owner,
+        "short-lived-child",
+        Some("long-lived-root"),
+        observation_payload(vec![user_message("child")], None, None, "child answer"),
+        Duration::from_secs(60),
+    )
+    .await;
+    let parent_expiry = std::time::Instant::now() + Duration::from_secs(40);
+    let child_expiry = std::time::Instant::now() + Duration::from_secs(20);
+    backend.deadline("long-lived-root", parent_expiry);
+    backend.deadline("short-lived-child", child_expiry);
+    let mut workspace = DiscoveryWorkspace::new(&owner, true);
+    let parent = store
+        .materialize_discovery_generation(
+            &owner,
+            &TurnNodeId::new("long-lived-root"),
+            &mut workspace,
+        )
+        .await
+        .unwrap();
+    let child = store
+        .materialize_discovery_generation(
+            &owner,
+            &TurnNodeId::new("short-lived-child"),
+            &mut workspace,
+        )
+        .await
+        .unwrap();
+    let parent_again = store
+        .materialize_discovery_generation(
+            &owner,
+            &TurnNodeId::new("long-lived-root"),
+            &mut workspace,
+        )
+        .await
+        .unwrap();
+    assert_eq!(parent.expires_at, parent_expiry);
+    assert_eq!(child.expires_at, child_expiry);
+    assert_eq!(parent_again.expires_at, parent_expiry);
+    let after_child_expiry = child_expiry + Duration::from_secs(1);
+    assert!(after_child_expiry < parent_expiry);
+    assert!(
+        workspace
+            .chain(
+                &owner,
+                &TurnNodeId::new("short-lived-child"),
+                after_child_expiry
+            )
+            .is_none()
+    );
+    let (nodes, expires_at) = workspace
+        .chain(
+            &owner,
+            &TurnNodeId::new("long-lived-root"),
+            after_child_expiry,
+        )
+        .expect("the longer root certificate still permits cached ancestry replay");
+    let cached_parent = materialize_discovery_nodes(&nodes, expires_at).unwrap();
+    assert_eq!(cached_parent.expires_at, parent_expiry);
+    assert_eq!(
+        serde_json::to_value(&cached_parent).unwrap(),
+        serde_json::to_value(parent.as_ref()).unwrap()
+    );
+}
+
+#[tokio::test]
+async fn discovery_workspace_preserves_candidate_order_and_distinct_complete_windows() {
+    for budget in [0, 256, DISCOVERY_WORKSPACE_BYTES] {
+        let owner = principal("workspace-owner");
+        let store = GenerationChainStore::from_turn_chain(
+            Arc::new(crate::turn_chain::test_store().await),
+            Duration::from_secs(60),
+            crate::runtime_cache::RuntimeCache::tinyufo(1),
+        );
+        let mut root = responses_request(vec![user_message("exact question")]);
+        set_generation_session_id(&mut root, "workspace-session");
+        for (id, question, answer) in [
+            ("workspace-good", "exact question", "exact answer"),
+            ("workspace-bad", "other question", "other answer"),
+        ] {
+            let mut request = root.clone();
+            request.items = vec![user_message(question)];
+            let mut response = AiResponse::new(id, "model");
+            response.push_output_text(answer);
+            store
+                .save(GenerationChainCommit {
+                    principal: owner.clone(),
+                    id: id.into(),
+                    parent: &ActiveGenerationChain::default(),
+                    request_delta: &request,
+                    effective_request: None,
+                    response,
+                    upstream_response_id: None,
+                    effective_state: GenerationChainState::from_request(
+                        &request,
+                        "target",
+                        OPEN_RESPONSES_2026_04_24,
+                    ),
+                })
+                .await
+                .unwrap();
+        }
+        let mut complete = root.clone();
+        complete.items.push(AiItem::output_text("exact answer"));
+        let mut workspace = DiscoveryWorkspace::with_budget(&owner, budget);
+        let mut strict = Arc::new(complete.clone());
+        let found = store
+            .discover_prefix(&owner, &mut strict, true, &mut workspace)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.active.parent_id.as_deref(), Some("workspace-good"));
+        assert_eq!(found.matched_items, 2);
+        let mut ordinary = Arc::new(complete.clone());
+        assert!(
+            store
+                .discover_parent(&owner, &mut ordinary, &mut workspace)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let mut continuation = complete.clone();
+        continuation.items.push(user_message("next"));
+        let mut continuation = Arc::new(continuation);
+        let found = store
+            .discover_parent(&owner, &mut continuation, &mut workspace)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.active.parent_id.as_deref(), Some("workspace-good"));
+        assert!(items_equal(
+            &continuation.items,
+            &[
+                user_message("exact question"),
+                AiItem::output_text("exact answer"),
+                user_message("next")
+            ]
+        ));
+        let mut mismatch = complete.clone();
+        mismatch.items[1] = AiItem::output_text("changed semantic answer");
+        mismatch.items.push(user_message("next"));
+        assert!(
+            store
+                .discover_parent(&owner, &mut Arc::new(mismatch), &mut workspace)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .discover_prefix(
+                    &principal("different-owner"),
+                    &mut Arc::new(complete),
+                    true,
+                    &mut workspace
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
+#[tokio::test]
+async fn discovery_workspace_replays_shared_ancestry_across_multiple_candidates() {
+    let owner = principal("workspace-shared-owner");
+    let store = GenerationChainStore::from_turn_chain(
+        Arc::new(crate::turn_chain::test_store().await),
+        Duration::from_secs(60),
+        crate::runtime_cache::RuntimeCache::tinyufo(1),
+    );
+    let mut root_request = responses_request(vec![user_message("root question")]);
+    set_generation_session_id(&mut root_request, "shared-session");
+    let mut root_response = AiResponse::new("shared-root", "model");
+    root_response.push_output_text("root answer");
+    store
+        .save(GenerationChainCommit {
+            principal: owner.clone(),
+            id: "shared-root".into(),
+            parent: &ActiveGenerationChain::default(),
+            request_delta: &root_request,
+            effective_request: None,
+            response: root_response,
+            upstream_response_id: None,
+            effective_state: GenerationChainState::from_request(
+                &root_request,
+                "target",
+                OPEN_RESPONSES_2026_04_24,
+            ),
+        })
+        .await
+        .unwrap();
+    let mut child_request = root_request.clone();
+    child_request.items = vec![user_message("old extension")];
+    crate::router::stamp_previous_response_id(&mut child_request, "shared-root");
+    let parent = store
+        .materialize_parent(&owner, &mut child_request)
+        .await
+        .unwrap();
+    let mut child_delta = root_request.clone();
+    child_delta.items = vec![user_message("old extension")];
+    let mut child_response = AiResponse::new("shared-child", "model");
+    child_response.push_output_text("old extension answer");
+    store
+        .save(GenerationChainCommit {
+            principal: owner.clone(),
+            id: "shared-child".into(),
+            parent: &parent,
+            request_delta: &child_delta,
+            effective_request: None,
+            response: child_response,
+            upstream_response_id: None,
+            effective_state: GenerationChainState::from_request(
+                &child_request,
+                "target",
+                OPEN_RESPONSES_2026_04_24,
+            ),
+        })
+        .await
+        .unwrap();
+    let mut replay = root_request;
+    replay.items.extend([
+        AiItem::output_text("root answer"),
+        user_message("different extension"),
+        AiItem::output_text("different extension answer"),
+        user_message("next"),
+    ]);
+    let mut workspace = DiscoveryWorkspace::new(&owner, true);
+    for complete_window in [true, false, true] {
+        let mut request = Arc::new(replay.clone());
+        let found = store
+            .discover_prefix(&owner, &mut request, complete_window, &mut workspace)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.active.parent_id.as_deref(), Some("shared-root"));
+        assert_eq!(found.matched_items, 2);
+        assert!(items_equal(&request.items, &replay.items));
+    }
+}
+
+#[tokio::test]
+async fn discovery_workspace_rechecks_candidate_priority_after_a_previous_match() {
+    let owner = principal("workspace-priority-owner");
+    let durable = Arc::new(crate::turn_chain::test_store().await);
+    let store = GenerationChainStore::from_turn_chain(
+        durable.clone(),
+        Duration::from_secs(60),
+        crate::runtime_cache::RuntimeCache::tinyufo(1),
+    );
+    let mut root = responses_request(vec![user_message("question")]);
+    set_generation_session_id(&mut root, "priority-session");
+    let mut response = AiResponse::new("good-priority", "model");
+    response.push_output_text("answer");
+    store
+        .save(GenerationChainCommit {
+            principal: owner.clone(),
+            id: "good-priority".into(),
+            parent: &ActiveGenerationChain::default(),
+            request_delta: &root,
+            effective_request: None,
+            response,
+            upstream_response_id: None,
+            effective_state: GenerationChainState::from_request(
+                &root,
+                "target",
+                OPEN_RESPONSES_2026_04_24,
+            ),
+        })
+        .await
+        .unwrap();
+    let mut replay = root.clone();
+    replay
+        .items
+        .extend([AiItem::output_text("answer"), user_message("next")]);
+    let mut workspace = DiscoveryWorkspace::new(&owner, true);
+    assert_eq!(
+        store
+            .discover_parent(&owner, &mut Arc::new(replay.clone()), &mut workspace)
+            .await
+            .unwrap()
+            .unwrap()
+            .active
+            .parent_id
+            .as_deref(),
+        Some("good-priority")
+    );
+    durable
+        .commit(TurnCommit {
+            id: TurnNodeId::new("bad-priority"),
+            kind: TurnNodeKind::Response,
+            parent_id: None,
+            principal: owner.clone(),
+            payload_version: RESPONSE_PAYLOAD_VERSION,
+            payload: serde_json::json!({"invalid":true}),
+            idle_ttl: Duration::from_secs(60),
+            reusable_prefix: Some(ReusablePrefixMetadata {
+                namespace: format!("{GENERATION_PREFIX_NAMESPACE}session"),
+                fingerprint: generation_session_fingerprint(&root).unwrap(),
+                item_count: 2,
+                completed_at: i64::MAX,
+            }),
+        })
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        assert_eq!(
+            store
+                .discover_parent(&owner, &mut Arc::new(replay.clone()), &mut workspace)
+                .await
+                .err()
+                .as_deref(),
+            Some("invalid generation payload")
+        );
+    }
+}
+
+#[tokio::test]
+async fn discovery_workspace_does_not_retain_expired_or_invalid_ancestor_evidence() {
+    let owner = principal("workspace-expiry-owner");
+    let durable = Arc::new(crate::turn_chain::test_store().await);
+    let store = GenerationChainStore::from_turn_chain(
+        durable.clone(),
+        Duration::from_secs(60),
+        crate::runtime_cache::RuntimeCache::tinyufo(1),
+    );
+    commit_observation_node(
+        durable.as_ref(),
+        &owner,
+        "expired-workspace-root",
+        None,
+        observation_payload(
+            vec![user_message("old")],
+            None,
+            Some(vec![AiItem::output_text("old answer")]),
+            "old answer",
+        ),
+        Duration::from_millis(500),
+    )
+    .await;
+    let mut workspace = DiscoveryWorkspace::new(&owner, true);
+    let initial = store
+        .materialize_discovery_generation(
+            &owner,
+            &TurnNodeId::new("expired-workspace-root"),
+            &mut workspace,
+        )
+        .await
+        .unwrap();
+    assert_eq!(initial.client_items.len(), 2);
+    tokio::time::sleep(
+        initial
+            .expires_at
+            .saturating_duration_since(std::time::Instant::now())
+            + Duration::from_millis(25),
+    )
+    .await;
+    assert!(
+        store
+            .materialize_discovery_generation(
+                &owner,
+                &TurnNodeId::new("expired-workspace-root"),
+                &mut workspace
+            )
+            .await
+            .is_err()
+    );
+    commit_observation_node(
+        durable.as_ref(),
+        &owner,
+        "valid-workspace-root",
+        None,
+        observation_payload(vec![user_message("kept")], None, None, "root answer"),
+        Duration::from_secs(60),
+    )
+    .await;
+    commit_observation_node(
+        durable.as_ref(),
+        &owner,
+        "invalid-workspace-tail",
+        Some("valid-workspace-root"),
+        serde_json::json!({"invalid":true}),
+        Duration::from_secs(60),
+    )
+    .await;
+    for _ in 0..2 {
+        assert_eq!(
+            store
+                .materialize_discovery_generation(
+                    &owner,
+                    &TurnNodeId::new("invalid-workspace-tail"),
+                    &mut workspace
+                )
+                .await
+                .err()
+                .as_deref(),
+            Some("invalid generation payload")
+        );
+    }
+    let valid = store
+        .materialize_discovery_generation(
+            &owner,
+            &TurnNodeId::new("valid-workspace-root"),
+            &mut workspace,
+        )
+        .await
+        .unwrap();
+    assert_eq!(valid.client_items.len(), 2);
+    assert!(
+        store
+            .materialize_discovery_generation(
+                &principal("other-owner"),
+                &TurnNodeId::new("valid-workspace-root"),
+                &mut workspace
+            )
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn shared_discovery_replay_preserves_mutations_reasoning_and_media_boundaries() {
+    let owner = principal("workspace-replay-owner");
+    for (replace, reasoning_field) in [
+        (false, serde_json::Value::Null),
+        (true, serde_json::Value::Null),
+        (false, serde_json::json!("")),
+        (true, serde_json::json!("")),
+    ] {
+        let input = vec![user_message("boundary input")];
+        let mutation = if replace {
+            EffectiveHistoryMutation::Replace {
+                items: Cow::Owned(input.clone()),
+            }
+        } else {
+            EffectiveHistoryMutation::Append {
+                items: Cow::Owned(input.clone()),
+            }
+        };
+        let mut root = observation_payload(vec![user_message("root")], None, None, "root answer");
+        root["compaction_record_ids"] = serde_json::json!(["root-record", "duplicate"]);
+        root["trusted_media_turn_ids"] = serde_json::json!(["root-media"]);
+        let mut child = observation_payload(
+            vec![user_message("unused delta")],
+            Some(mutation.clone()),
+            Some(vec![AiItem::output_text("client answer")]),
+            "effective answer",
+        );
+        child["effective_history_mutation"] = serde_json::to_value(mutation).unwrap();
+        child["compaction_record_ids"] = serde_json::json!(["child-record", "duplicate"]);
+        child["trusted_media_turn_ids"] = serde_json::json!(["child-media"]);
+        let request = responses_request(input.clone());
+        child["client_history"] =
+            serde_json::to_value(ClientHistoryState::from_request(&request, &input)).unwrap();
+        child["effective_state"]["selected_target_key"] = serde_json::json!("selected-target");
+        child["upstream_response_id"] = serde_json::json!("upstream-child");
+        child["effective_system"] = serde_json::json!("effective child system");
+        child["effective_request"] =
+            serde_json::to_value(EffectiveRequestConfig::from_request(&request)).unwrap();
+        let mut persisted: PersistedResponseNode<'static> = serde_json::from_value(child).unwrap();
+        persisted.effective_output.vendor.ingress.insert(
+            stravia_runtime_contract::protocol::ir::vendor_ext::CHAT_REASONING_FIELD_META.into(),
+            reasoning_field,
+        );
+        let child = serde_json::to_value(persisted).unwrap();
+        let nodes = vec![
+            stravia_runtime_contract::turn_chain::TurnNode {
+                id: TurnNodeId::new("shared-root"),
+                kind: TurnNodeKind::Response,
+                parent_id: None,
+                payload_version: RESPONSE_PAYLOAD_VERSION,
+                payload: root,
+            },
+            stravia_runtime_contract::turn_chain::TurnNode {
+                id: TurnNodeId::new("shared-child"),
+                kind: TurnNodeKind::Response,
+                parent_id: Some(TurnNodeId::new("shared-root")),
+                payload_version: RESPONSE_PAYLOAD_VERSION,
+                payload: child,
+            },
+        ];
+        let expires_at = std::time::Instant::now() + Duration::from_secs(60);
+        let owned = materialize_generation_nodes(nodes.clone(), expires_at).unwrap();
+        let mut workspace = DiscoveryWorkspace::new(&owner, true);
+        let decoded = workspace.decode_chain(&owner, nodes).unwrap();
+        let borrowed = materialize_discovery_nodes(&decoded, expires_at).unwrap();
+        assert_eq!(
+            serde_json::to_value(&owned).unwrap(),
+            serde_json::to_value(&borrowed).unwrap()
+        );
+        assert_eq!(
+            borrowed.compaction_record_ids,
+            ["child-record", "duplicate", "root-record"]
+        );
+        assert_eq!(borrowed.media_turn_messages.len(), 2);
+        assert_eq!(
+            borrowed.upstream_response_id.as_deref(),
+            Some("upstream-child")
+        );
+        assert!(
+            !borrowed
+                .effective_items
+                .iter()
+                .any(|item| replace && item.content.to_text() == "root")
+        );
+    }
+}
+
 type PendingPersist = tokio::task::JoinHandle<Result<(), PersistError>>;
 
 struct CountingParentTurnChainStore {
@@ -2312,7 +3129,11 @@ async fn automatic_prefix_selects_exact_completed_context_and_leaves_new_items()
     next.items.push(user_message("m2"));
     let mut next = Arc::new(next);
     let discovered = store
-        .discover_parent(&owner, &mut next)
+        .discover_parent(
+            &owner,
+            &mut next,
+            &mut DiscoveryWorkspace::new(&owner, false),
+        )
         .await
         .expect("discover prefix")
         .expect("generation parent");
@@ -2403,7 +3224,11 @@ async fn automatic_prefix_preserves_parallel_tool_result_ids_after_duplicate_eff
     }
     let mut next = Arc::new(next);
     store
-        .discover_parent(&owner, &mut next)
+        .discover_parent(
+            &owner,
+            &mut next,
+            &mut DiscoveryWorkspace::new(&owner, false),
+        )
         .await
         .expect("discover prefix")
         .expect("generation parent");
@@ -2499,7 +3324,11 @@ async fn automatic_prefix_never_turns_an_identical_full_request_into_an_empty_de
     let mut identical = Arc::new(identical);
     assert!(
         store
-            .discover_parent(&owner, &mut identical)
+            .discover_parent(
+                &owner,
+                &mut identical,
+                &mut DiscoveryWorkspace::new(&owner, false)
+            )
             .await
             .expect("discover generation parent")
             .is_none()

@@ -872,6 +872,7 @@ async fn select_with_rpm(
                 input.observer.as_ref(),
                 routing_estimate,
                 &input.root_request.cooldown,
+                &input.generation_parent_target,
             )
             .await
             .map_err(|error| match error {

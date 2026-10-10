@@ -84,16 +84,27 @@ impl RouteSelector {
         observer: Option<&RunObserver>,
         estimated_input_tokens: u64,
         cooldown: &CooldownAttempts,
+        parent_target: &crate::router::GenerationParentTarget,
     ) -> Result<RouteAttemptPolicy, SelectionError> {
         let conversation = conversation_identity(request);
-        // Continuation evidence only exists for generation-parent conversations.
-        let conversation_affinity_target = if matches!(
-            conversation,
-            Some(ConversationIdentity::GenerationParent(_))
-        ) {
-            self.continuation.preferred_target(principal, request).await
-        } else {
-            None
+        let conversation_affinity_target = match (&conversation, parent_target) {
+            (
+                Some(ConversationIdentity::GenerationParent(_)),
+                crate::router::GenerationParentTarget::Unresolved,
+            ) => self.continuation.preferred_target(principal, request).await,
+            (
+                Some(ConversationIdentity::GenerationParent(id)),
+                crate::router::GenerationParentTarget::Resolved {
+                    parent_id,
+                    target,
+                    expires_at,
+                },
+            ) if parent_id.as_ref() == Some(id)
+                && expires_at.is_some_and(|expiry| expiry > std::time::Instant::now()) =>
+            {
+                target.clone()
+            }
+            _ => None,
         };
         let snapshot = self
             .scheduling_snapshot(&route.targets, observer)
@@ -332,8 +343,6 @@ pub(crate) fn estimate_uncached_input_tokens(request: &AiRequest) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
     use async_trait::async_trait;
     use rust_decimal::Decimal;
 
@@ -428,31 +437,6 @@ mod tests {
             _request: &AiRequest,
         ) -> Option<String> {
             self.0.clone()
-        }
-
-        async fn prepare(
-            &self,
-            _principal: &Principal,
-            _target: ContinuationTarget<'_>,
-            _request: &mut Arc<AiRequest>,
-            _full_fallback: &mut Option<Arc<AiRequest>>,
-        ) -> Option<String> {
-            None
-        }
-    }
-
-    /// Continuation lookup counting `preferred_target` consultations.
-    struct CountingContinuation(Arc<AtomicUsize>);
-
-    #[async_trait]
-    impl ContinuationLookup for CountingContinuation {
-        async fn preferred_target(
-            &self,
-            _principal: &Principal,
-            _request: &AiRequest,
-        ) -> Option<String> {
-            self.0.fetch_add(1, Ordering::SeqCst);
-            None
         }
 
         async fn prepare(
@@ -770,6 +754,7 @@ mod tests {
                 None,
                 estimate_uncached_input_tokens(&request()),
                 &CooldownAttempts::default(),
+                &crate::router::GenerationParentTarget::Unresolved,
             )
             .await
             .expect("select");
@@ -795,6 +780,7 @@ mod tests {
                 None,
                 estimate_uncached_input_tokens(&request()),
                 &CooldownAttempts::default(),
+                &crate::router::GenerationParentTarget::Unresolved,
             )
             .await
             .expect("first select");
@@ -825,6 +811,7 @@ mod tests {
                 None,
                 estimate_uncached_input_tokens(&request()),
                 &CooldownAttempts::default(),
+                &crate::router::GenerationParentTarget::Unresolved,
             )
             .await
             .expect("second select");
@@ -866,6 +853,7 @@ mod tests {
                 None,
                 estimate_uncached_input_tokens(&request),
                 &CooldownAttempts::default(),
+                &crate::router::GenerationParentTarget::Unresolved,
             )
             .await
             .expect("select");
@@ -898,6 +886,7 @@ mod tests {
                 None,
                 estimate_uncached_input_tokens(&seeded),
                 &CooldownAttempts::default(),
+                &crate::router::GenerationParentTarget::Unresolved,
             )
             .await
             .expect("select");
@@ -919,6 +908,7 @@ mod tests {
                 None,
                 estimate_uncached_input_tokens(&identified),
                 &CooldownAttempts::default(),
+                &crate::router::GenerationParentTarget::Unresolved,
             )
             .await
             .expect("select with conversation");
@@ -929,60 +919,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn continuation_lookup_runs_only_for_generation_parents() {
-        let consultations = Arc::new(AtomicUsize::new(0));
+    async fn parent_target_preference_does_not_apply_to_prompt_cache_identity() {
         let fixture = fixture(
             memory(),
-            Arc::new(CountingContinuation(Arc::clone(&consultations))),
+            Arc::new(StaticContinuation(Some("continued:model".into()))),
         );
-        let route = route(vec![target("a", 0)]);
-
-        let mut cache_key_only = request();
-        cache_key_only.ext = Some(ProtocolExt::OpenResponses(OpenResponsesExt {
+        let route = route(vec![target("primary", 10), target("continued", 0)]);
+        let mut request = request();
+        request.ext = Some(ProtocolExt::OpenResponses(OpenResponsesExt {
             prompt_cache_key: Some("chat-c".into()),
             ..Default::default()
         }));
-        fixture
+        let mut policy = fixture
             .selector
             .select(
                 &principal(),
                 &route,
-                &cache_key_only,
+                &request,
                 None,
                 None,
-                estimate_uncached_input_tokens(&cache_key_only),
+                estimate_uncached_input_tokens(&request),
                 &CooldownAttempts::default(),
+                &crate::router::GenerationParentTarget::Unresolved,
             )
             .await
-            .expect("select");
-        assert_eq!(consultations.load(Ordering::SeqCst), 0);
-
-        let mut parent = request();
-        crate::router::stamp_previous_response_id(&mut parent, "parent-1");
-        fixture
-            .selector
-            .select(
-                &principal(),
-                &route,
-                &parent,
-                None,
-                None,
-                estimate_uncached_input_tokens(&parent),
-                &CooldownAttempts::default(),
-            )
-            .await
-            .expect("select with parent");
-        assert_eq!(consultations.load(Ordering::SeqCst), 1);
+            .expect("select prompt-cache conversation");
+        assert_eq!(next_provider(&mut policy).as_deref(), Some("primary"));
     }
 
     #[tokio::test]
     async fn independent_selection_carries_model_target_without_generation_hints() {
-        let consultations = Arc::new(AtomicUsize::new(0));
         let fixture = fixture(
             memory(),
-            Arc::new(CountingContinuation(Arc::clone(&consultations))),
+            Arc::new(StaticContinuation(Some("continued:model".into()))),
         );
-        let route = route(vec![target("research", 0)]);
+        let route = route(vec![target("research", 10), target("continued", 0)]);
 
         let mut policy = fixture
             .selector
@@ -997,9 +968,316 @@ mod tests {
             .expect("independent selection");
         let selected = policy.next_healthy().expect("Model Target");
 
-        assert_eq!(consultations.load(Ordering::SeqCst), 0);
         assert_eq!(selected.provider_id().as_str(), "research");
         assert_eq!(selected.model().as_str(), "model");
+    }
+
+    fn responses_request(items: Vec<AiItem>) -> AiRequest {
+        let mut request = AiRequest::new("route", items);
+        request.ext = Some(ProtocolExt::OpenResponses(OpenResponsesExt::default()));
+        request
+    }
+
+    fn source(provider: &str) -> crate::generation_chain::GenerationSource {
+        crate::generation_chain::GenerationSource::Target(crate::history_marker::ThinkingSource {
+            namespace: format!("{provider}:model"),
+            protocol: Some(
+                stravia_runtime_contract::protocol::ids::OPEN_RESPONSES_2026_04_24.into(),
+            ),
+            actual_model: "model".into(),
+            target_id: format!("{provider}:model"),
+            authority: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn resolved_explicit_discovered_and_native_parents_prefer_the_actual_final_target() {
+        let chain = crate::generation_chain::test_chain().await;
+        let owner = principal();
+        let mut root = chain
+            .begin(
+                owner.clone(),
+                responses_request(vec![user_item("question")]),
+            )
+            .await
+            .expect("root");
+        let mut intermediate =
+            stravia_runtime_contract::protocol::ir::AiResponse::new("hidden", "model");
+        intermediate.push_output_text("hidden answer");
+        assert!(root.stage(&mut intermediate, &source("earlier"), None));
+        let mut response =
+            stravia_runtime_contract::protocol::ir::AiResponse::new("final", "model");
+        response.push_output_text("answer");
+        assert!(root.stage(&mut response, &source("continued"), None));
+        root.persist().await.expect("delivered root");
+
+        for mode in ["explicit", "discovered", "native"] {
+            let mut request = if mode == "explicit" {
+                responses_request(vec![user_item("follow-up")])
+            } else {
+                let mut items = vec![user_item("question")];
+                items.extend(response.items.clone());
+                if mode == "discovered" {
+                    items.push(user_item("follow-up"));
+                }
+                responses_request(items)
+            };
+            if mode == "explicit" {
+                crate::router::stamp_previous_response_id(&mut request, root.id());
+            }
+            let child = if mode == "native" {
+                chain.begin_native_compaction(owner.clone(), request).await
+            } else {
+                chain.begin(owner.clone(), request).await
+            }
+            .expect("resolved parent");
+            assert_eq!(child.parent_id(), Some(root.id()), "{mode}");
+            let fixture = fixture(memory(), chain.continuation_lookup());
+            let route = route(vec![
+                target("primary", 10),
+                target("earlier", 5),
+                target("continued", 0),
+            ]);
+            let mut policy = fixture
+                .selector
+                .select(
+                    &owner,
+                    &route,
+                    child.request(),
+                    None,
+                    None,
+                    estimate_uncached_input_tokens(child.request()),
+                    &CooldownAttempts::default(),
+                    &child.parent_target(),
+                )
+                .await
+                .expect("select resolved parent");
+            assert_eq!(
+                next_provider(&mut policy).as_deref(),
+                Some("continued"),
+                "{mode}"
+            );
+        }
+
+        let mut foreign = responses_request(vec![user_item("follow-up")]);
+        crate::router::stamp_previous_response_id(&mut foreign, root.id());
+        assert!(matches!(
+            chain.begin(Principal::new("another-owner"), foreign).await,
+            Err(crate::generation_chain::BeginError::PreviousResponseNotFound),
+        ));
+        let mut full_history = vec![user_item("question")];
+        full_history.extend(response.items);
+        full_history.push(user_item("follow-up"));
+        let foreign = chain
+            .begin(
+                Principal::new("another-owner"),
+                responses_request(full_history),
+            )
+            .await
+            .expect("foreign history becomes a new root");
+        assert_eq!(foreign.parent_id(), None);
+        let fixture = fixture(memory(), chain.continuation_lookup());
+        let route = route(vec![target("primary", 10), target("continued", 0)]);
+        let mut policy = fixture
+            .selector
+            .select(
+                &Principal::new("another-owner"),
+                &route,
+                foreign.request(),
+                None,
+                None,
+                estimate_uncached_input_tokens(foreign.request()),
+                &CooldownAttempts::default(),
+                &foreign.parent_target(),
+            )
+            .await
+            .expect("select isolated principal");
+        assert_eq!(next_provider(&mut policy).as_deref(), Some("primary"));
+    }
+
+    #[tokio::test]
+    async fn parent_from_unknown_expiry_adapter_still_prefers_its_actual_target() {
+        use stravia_runtime_contract::turn_chain::{
+            TurnChainStore, TurnCommit, TurnCommitError, TurnNode, TurnNodeId, TurnNodeKind,
+            TurnUnavailable,
+        };
+
+        // A supported custom store may use the trait's default unknown expiry
+        // while its durable materialization still enforces real node validity.
+        struct UnknownExpiryStore(crate::turn_chain::SqlTurnChainStore);
+
+        #[async_trait]
+        impl TurnChainStore for UnknownExpiryStore {
+            async fn materialize(
+                &self,
+                principal: &Principal,
+                kind: TurnNodeKind,
+                id: &TurnNodeId,
+            ) -> Result<Vec<TurnNode>, TurnUnavailable> {
+                self.0.materialize(principal, kind, id).await
+            }
+
+            async fn commit(&self, commit: TurnCommit) -> Result<TurnNodeId, TurnCommitError> {
+                self.0.commit(commit).await
+            }
+
+            async fn sweep_expired(&self) -> Result<u64, TurnUnavailable> {
+                self.0.sweep_expired().await
+            }
+        }
+
+        let chain = crate::generation_chain::GenerationChain::from_turn_chain(
+            Arc::new(UnknownExpiryStore(crate::turn_chain::test_store().await)),
+            std::time::Duration::from_secs(7 * 24 * 60 * 60),
+            None,
+            crate::runtime_cache::RuntimeCache::tinyufo(16 * 1024 * 1024),
+        );
+        let owner = principal();
+        let mut root = chain
+            .begin(
+                owner.clone(),
+                responses_request(vec![user_item("question")]),
+            )
+            .await
+            .expect("root on custom store");
+        let mut response =
+            stravia_runtime_contract::protocol::ir::AiResponse::new("answer", "model");
+        response.push_output_text("answer");
+        assert!(root.stage(&mut response, &source("continued"), None));
+        root.persist().await.expect("persist custom-store root");
+        let mut request = responses_request(vec![user_item("follow-up")]);
+        crate::router::stamp_previous_response_id(&mut request, root.id());
+        let child = chain
+            .begin(owner.clone(), request)
+            .await
+            .expect("custom-store parent");
+        let fixture = fixture(memory(), chain.continuation_lookup());
+        let route = route(vec![target("primary", 10), target("continued", 0)]);
+        let mut policy = fixture
+            .selector
+            .select(
+                &owner,
+                &route,
+                child.request(),
+                None,
+                None,
+                estimate_uncached_input_tokens(child.request()),
+                &CooldownAttempts::default(),
+                &child.parent_target(),
+            )
+            .await
+            .expect("select custom-store continuation");
+        assert_eq!(next_provider(&mut policy).as_deref(), Some("continued"));
+    }
+
+    #[tokio::test]
+    async fn resolved_hook_parent_without_target_uses_normal_route_priority() {
+        let chain = crate::generation_chain::test_chain().await;
+        let owner = principal();
+        let mut root = chain
+            .begin(
+                owner.clone(),
+                responses_request(vec![user_item("question")]),
+            )
+            .await
+            .expect("root");
+        let mut response = stravia_runtime_contract::protocol::ir::AiResponse::new("hook", "model");
+        response.push_output_text("Hook answer");
+        assert!(root.stage(
+            &mut response,
+            &crate::generation_chain::GenerationSource::Hook {
+                protocol: stravia_runtime_contract::protocol::ids::OPEN_RESPONSES_2026_04_24,
+            },
+            None
+        ));
+        root.persist().await.expect("Hook root");
+        let mut request = responses_request(vec![user_item("follow-up")]);
+        crate::router::stamp_previous_response_id(&mut request, root.id());
+        let child = chain
+            .begin(owner.clone(), request)
+            .await
+            .expect("Hook parent");
+        // The resolved absence is authoritative even if an independent resolver
+        // would provide a Target.
+        let fixture = fixture(
+            memory(),
+            Arc::new(StaticContinuation(Some("continued:model".into()))),
+        );
+        let route = route(vec![target("primary", 10), target("continued", 0)]);
+        let mut policy = fixture
+            .selector
+            .select(
+                &owner,
+                &route,
+                child.request(),
+                None,
+                None,
+                estimate_uncached_input_tokens(child.request()),
+                &CooldownAttempts::default(),
+                &child.parent_target(),
+            )
+            .await
+            .expect("select Hook continuation");
+        assert_eq!(next_provider(&mut policy).as_deref(), Some("primary"));
+    }
+
+    #[tokio::test]
+    async fn resolved_parent_evidence_cannot_revive_expired_mismatched_or_disabled_targets() {
+        let mut request = request();
+        crate::router::stamp_previous_response_id(&mut request, "actual-parent");
+        for (parent_id, expires_at, enabled, present) in [
+            ("actual-parent", std::time::Instant::now(), true, true),
+            (
+                "other-parent",
+                std::time::Instant::now() + std::time::Duration::from_secs(60),
+                true,
+                true,
+            ),
+            (
+                "actual-parent",
+                std::time::Instant::now() + std::time::Duration::from_secs(60),
+                false,
+                true,
+            ),
+            (
+                "actual-parent",
+                std::time::Instant::now() + std::time::Duration::from_secs(60),
+                true,
+                false,
+            ),
+        ] {
+            let fixture = fixture(
+                memory(),
+                Arc::new(StaticContinuation(Some("continued:model".into()))),
+            );
+            let mut targets = vec![target("primary", 10)];
+            if present {
+                let mut continued = target("continued", 0);
+                continued.enabled = enabled;
+                targets.push(continued);
+            }
+            let route = route(targets);
+            let evidence = crate::router::GenerationParentTarget::Resolved {
+                parent_id: Some(parent_id.into()),
+                target: Some("continued:model".into()),
+                expires_at: Some(expires_at),
+            };
+            let mut policy = fixture
+                .selector
+                .select(
+                    &principal(),
+                    &route,
+                    &request,
+                    None,
+                    None,
+                    estimate_uncached_input_tokens(&request),
+                    &CooldownAttempts::default(),
+                    &evidence,
+                )
+                .await
+                .expect("select without invalid preference");
+            assert_eq!(next_provider(&mut policy).as_deref(), Some("primary"));
+        }
     }
 
     #[tokio::test]
@@ -1022,6 +1300,7 @@ mod tests {
                 None,
                 estimate_uncached_input_tokens(&request),
                 &CooldownAttempts::default(),
+                &crate::router::GenerationParentTarget::Unresolved,
             )
             .await
             .expect("select");
@@ -1048,6 +1327,7 @@ mod tests {
                 None,
                 estimate_uncached_input_tokens(&request()),
                 &CooldownAttempts::default(),
+                &crate::router::GenerationParentTarget::Unresolved,
             )
             .await
             .expect("select");
@@ -1069,6 +1349,7 @@ mod tests {
                 None,
                 estimate_uncached_input_tokens(&request()),
                 &CooldownAttempts::default(),
+                &crate::router::GenerationParentTarget::Unresolved,
             )
             .await
             .err()
@@ -1093,6 +1374,7 @@ mod tests {
                 None,
                 estimate_uncached_input_tokens(&request()),
                 &CooldownAttempts::default(),
+                &crate::router::GenerationParentTarget::Unresolved,
             )
             .await
             .err()
@@ -1116,6 +1398,7 @@ mod tests {
                 None,
                 estimate_uncached_input_tokens(&request()),
                 &CooldownAttempts::default(),
+                &crate::router::GenerationParentTarget::Unresolved,
             )
             .await
             .err()
@@ -1146,6 +1429,7 @@ mod tests {
                 None,
                 estimate_uncached_input_tokens(&request()),
                 &CooldownAttempts::default(),
+                &crate::router::GenerationParentTarget::Unresolved,
             )
             .await
             .expect("stale snapshot still selects");
@@ -1219,6 +1503,7 @@ mod tests {
                 None,
                 estimate_uncached_input_tokens(&request()),
                 &CooldownAttempts::default(),
+                &crate::router::GenerationParentTarget::Unresolved,
             )
             .await
             .expect("select");

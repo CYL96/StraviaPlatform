@@ -83,6 +83,9 @@ impl SqlMappingStore {
         if references.is_empty() {
             return Ok(());
         }
+        let mut references: Vec<_> = references.iter().map(String::as_str).collect();
+        references.sort_unstable();
+        references.dedup();
         let principal = principal.continuation_key();
         let retention = if publish {
             retention.max(PUBLISHED_RETENTION)
@@ -98,17 +101,36 @@ impl SqlMappingStore {
                     .map_err(storage)?;
                 let now = now();
                 let expires_at = after(now, retention);
-                for reference in references {
-                    sqlx::query(
-                        "UPDATE reversible_redaction_mappings SET \
-                         published_at = CASE WHEN ? THEN COALESCE(published_at, ?) ELSE published_at END, \
-                         expires_at = MAX(expires_at, ?), updated_at = ? \
-                         WHERE principal = ? AND reference = ? AND expires_at > ? \
-                         AND (? OR published_at IS NOT NULL)",
-                    )
-                    .bind(publish).bind(now).bind(expires_at).bind(now)
-                    .bind(&principal).bind(reference).bind(now).bind(publish)
-                    .execute(&mut *transaction).await.map_err(storage)?;
+                // Match the 400-key IN batches used by durable history storage.
+                for references in references.chunks(400) {
+                    let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+                        "UPDATE reversible_redaction_mappings SET published_at = CASE WHEN ",
+                    );
+                    query
+                        .push_bind(publish)
+                        .push(" THEN COALESCE(published_at, ")
+                        .push_bind(now)
+                        .push(") ELSE published_at END, expires_at = MAX(expires_at, ")
+                        .push_bind(expires_at)
+                        .push("), updated_at = ")
+                        .push_bind(now)
+                        .push(" WHERE principal = ")
+                        .push_bind(&principal)
+                        .push(" AND expires_at > ")
+                        .push_bind(now)
+                        .push(" AND (")
+                        .push_bind(publish)
+                        .push(" OR published_at IS NOT NULL) AND reference IN (");
+                    let mut list = query.separated(", ");
+                    for reference in references {
+                        list.push_bind(*reference);
+                    }
+                    list.push_unseparated(")");
+                    query
+                        .build()
+                        .execute(&mut *transaction)
+                        .await
+                        .map_err(storage)?;
                 }
                 transaction.commit().await.map_err(storage)?;
             }
@@ -122,16 +144,35 @@ impl SqlMappingStore {
                     .map_err(storage)?;
                 let now = now();
                 let expires_at = after(now, retention);
-                for reference in references {
-                    sqlx::query(
-                        "UPDATE reversible_redaction_mappings SET \
-                         published_at = CASE WHEN $1 THEN COALESCE(published_at, $2) ELSE published_at END, \
-                         expires_at = GREATEST(expires_at, $3), updated_at = $2 \
-                         WHERE principal = $4 AND reference = $5 AND expires_at > $2 \
-                         AND ($1 OR published_at IS NOT NULL)",
-                    )
-                    .bind(publish).bind(now).bind(expires_at).bind(&principal).bind(reference)
-                    .execute(&mut *transaction).await.map_err(storage)?;
+                for references in references.chunks(400) {
+                    let mut query = sqlx::QueryBuilder::<sqlx::Postgres>::new(
+                        "UPDATE reversible_redaction_mappings SET published_at = CASE WHEN ",
+                    );
+                    query
+                        .push_bind(publish)
+                        .push(" THEN COALESCE(published_at, ")
+                        .push_bind(now)
+                        .push(") ELSE published_at END, expires_at = GREATEST(expires_at, ")
+                        .push_bind(expires_at)
+                        .push("), updated_at = ")
+                        .push_bind(now)
+                        .push(" WHERE principal = ")
+                        .push_bind(&principal)
+                        .push(" AND expires_at > ")
+                        .push_bind(now)
+                        .push(" AND (")
+                        .push_bind(publish)
+                        .push(" OR published_at IS NOT NULL) AND reference IN (");
+                    let mut list = query.separated(", ");
+                    for reference in references {
+                        list.push_bind(*reference);
+                    }
+                    list.push_unseparated(")");
+                    query
+                        .build()
+                        .execute(&mut *transaction)
+                        .await
+                        .map_err(storage)?;
                 }
                 transaction.commit().await.map_err(storage)?;
             }

@@ -126,6 +126,8 @@ pub struct TurnInput {
     /// 派生 `session_affinity` 交给插件，同一链路各轮与压缩共享上游会话键；
     /// 与客户端自报的 session 无关。
     pub(crate) generation_root_id: Option<String>,
+    /// Trusted parent resolution; never populated from client request metadata.
+    pub(crate) generation_parent_target: crate::router::GenerationParentTarget,
     pub(crate) root_request: crate::rpm::RootRequest,
 }
 
@@ -145,6 +147,7 @@ impl TurnInput {
             compaction_records: Arc::default(),
             compaction_source_generation_id: None,
             generation_root_id: None,
+            generation_parent_target: crate::router::GenerationParentTarget::Unresolved,
             root_request: crate::rpm::RootRequest::default(),
         }
     }
