@@ -1442,6 +1442,7 @@ async fn prepare_attempt(
                         && transport_preference != TransportPreference::HttpOnly
                         && require_affinity,
                 },
+                &input.generation_parent_target,
                 &mut provider_request,
                 &mut continuation_fallback,
             )

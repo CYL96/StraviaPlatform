@@ -18,6 +18,110 @@ impl SqlTurnChainStore {
         Self::Postgres(pool)
     }
 
+    /// Complete the SQL suffix against a proof checked after the query await.
+    /// An expired accelerator is not evidence that the durable ancestor vanished.
+    pub(super) async fn finish_context_read(
+        &self,
+        principal: &Principal,
+        kind: TurnNodeKind,
+        context: &mut TurnReadContext,
+        rows: Vec<StoredAncestorRow>,
+        completed_at: std::time::Instant,
+    ) -> Result<SharedMaterializedTurnChain, TurnUnavailable> {
+        let now = chrono::Utc::now().timestamp_millis();
+        if rows.is_empty() || rows.iter().any(|row| row.4 <= now) {
+            return Err(TurnUnavailable::Unavailable);
+        }
+        let mut prefix = match rows[0].1.as_ref() {
+            Some(parent) => match context.get_at(&TurnNodeId::new(parent), completed_at) {
+                Some(prefix) => prefix,
+                None => {
+                    // The query stopped at a proof that expired during its await.
+                    // Re-read the full fact chain once, including current ownership
+                    // and TTL. Missing, expired and corrupt facts still fail normally.
+                    context.begin_read();
+                    let head = TurnNodeId::new(&rows.last().expect("nonempty SQL suffix").0);
+                    drop(rows);
+                    let chain = self.materialize_with_expiry(principal, kind, &head).await?;
+                    return Ok(SharedMaterializedTurnChain {
+                        expires_at: chain.expires_at,
+                        nodes: chain
+                            .nodes
+                            .into_iter()
+                            .map(|node| SharedTurnNode {
+                                id: node.id.clone(),
+                                kind: node.kind,
+                                parent_id: node.parent_id.clone(),
+                                payload_version: node.payload_version,
+                                expires_at: chain.expires_at,
+                                raw: Some(Arc::new(node)),
+                                decoded: None,
+                            })
+                            .collect(),
+                    });
+                }
+            },
+            None => SharedMaterializedTurnChain {
+                nodes: Vec::new(),
+                expires_at: deadline_from_unix_millis(rows[0].4, now),
+            },
+        };
+        let principal_key = principal.continuation_key();
+        let deadlines: Vec<_> = rows
+            .iter()
+            .map(|row| deadline_from_unix_millis(row.4, now))
+            .collect();
+        let mut nodes = rows
+            .into_iter()
+            .map(|(id, parent, version, payload, _, _)| {
+                decode_node(TurnNodeId::new(id), kind, parent, version, payload)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let restored = match self {
+            Self::Sqlite(pool, _) => {
+                content::restore_sqlite_context(
+                    &mut *pool
+                        .acquire()
+                        .await
+                        .map_err(|error| TurnUnavailable::Storage(error.to_string()))?,
+                    &principal_key,
+                    &mut nodes,
+                    Some(context),
+                )
+                .await
+            }
+            Self::Postgres(pool) => {
+                content::restore_postgres_context(
+                    &mut *pool
+                        .acquire()
+                        .await
+                        .map_err(|error| TurnUnavailable::Storage(error.to_string()))?,
+                    &principal_key,
+                    &mut nodes,
+                    Some(context),
+                )
+                .await
+            }
+        };
+        if let Err(error) = restored {
+            context.begin_read();
+            return Err(TurnUnavailable::Storage(error.to_string()));
+        }
+        for (node, expires_at) in nodes.into_iter().zip(deadlines) {
+            prefix.expires_at = prefix.expires_at.min(expires_at);
+            prefix.nodes.push(SharedTurnNode {
+                id: node.id.clone(),
+                kind,
+                parent_id: node.parent_id.clone(),
+                payload_version: node.payload_version,
+                expires_at,
+                raw: Some(Arc::new(node)),
+                decoded: None,
+            });
+        }
+        Ok(prefix)
+    }
+
     async fn remove_unreferenced_contents(&self) -> anyhow::Result<()> {
         const DELETE: &str = "DELETE FROM turn_chain_contents WHERE NOT EXISTS \
             (SELECT 1 FROM turn_chain_node_contents r WHERE r.principal = turn_chain_contents.principal \
@@ -49,7 +153,9 @@ fn unix_millis_after(ttl: Duration) -> i64 {
 }
 
 fn deadline_from_unix_millis(expires_at: i64, now: i64) -> std::time::Instant {
-    let remaining = u64::try_from(expires_at.saturating_sub(now)).unwrap_or(0);
+    let remaining =
+        u64::try_from(expires_at.saturating_sub(now.max(chrono::Utc::now().timestamp_millis())))
+            .unwrap_or(0);
     std::time::Instant::now()
         .checked_add(Duration::from_millis(remaining))
         .unwrap_or_else(std::time::Instant::now)
@@ -106,7 +212,7 @@ impl TurnChainStore for SqlTurnChainStore {
         use tracing::Instrument as _;
         let principal = principal.continuation_key();
         let now = chrono::Utc::now().timestamp_millis();
-        let rows: Vec<(String, Option<String>, i64, Vec<u8>, i64, i64)> = async {
+        let rows: Vec<StoredAncestorRow> = async {
             match self {
             Self::Sqlite(pool, _) => {
                 // CROSS JOIN 固定 ancestors 为外层：否则无统计信息的 SQLite 会按
@@ -219,6 +325,59 @@ impl TurnChainStore for SqlTurnChainStore {
 
     #[tracing::instrument(
         target = "stravia::perf",
+        name = "turn_chain.materialize",
+        skip_all,
+        fields(node_count = 0_u64)
+    )]
+    async fn materialize_in_context(
+        &self,
+        principal: &Principal,
+        kind: TurnNodeKind,
+        id: &TurnNodeId,
+        context: &mut TurnReadContext,
+    ) -> Result<SharedMaterializedTurnChain, TurnUnavailable> {
+        use tracing::Instrument as _;
+        context.begin_read();
+        if !context.matches(principal, kind) {
+            return Err(TurnUnavailable::Unavailable);
+        }
+        if let Some(chain) = context.get(id) {
+            return Ok(chain);
+        }
+        let known = serde_json::to_string(&context.validated_ids())
+            .map_err(|error| TurnUnavailable::Storage(error.to_string()))?;
+        let principal_key = principal.continuation_key();
+        macro_rules! select {
+            ($pool:expr, $db:ty, $depth:expr, $join:expr, $known_start:expr, $known_end:expr) => {{
+                let mut query = sqlx::QueryBuilder::<$db>::new(
+                    "WITH RECURSIVE ancestors(id, parent_id, payload_version, payload, expires_at, depth) AS (SELECT id, parent_id, payload_version, payload, expires_at, ");
+                query.push($depth).push(" FROM turn_chain_nodes WHERE id = ").push_bind(id.as_str())
+                    .push(" AND principal = ").push_bind(&principal_key)
+                    .push(" AND kind = ").push_bind(kind.as_str())
+                    .push(" UNION ALL SELECT node.id, node.parent_id, node.payload_version, node.payload, node.expires_at, ancestors.depth + 1 FROM ")
+                    .push($join).push(" WHERE node.id = ancestors.parent_id AND node.principal = ")
+                    .push_bind(&principal_key).push(" AND node.kind = ").push_bind(kind.as_str());
+                query.push($known_start).push_bind(&known).push($known_end);
+                query.push(") SELECT id, parent_id, payload_version, payload, expires_at, depth FROM ancestors ORDER BY depth DESC");
+                query.build_query_as::<StoredAncestorRow>()
+                    .fetch_all($pool).await
+            }};
+        }
+        let rows = async {
+            let rows = match self {
+                Self::Sqlite(pool, _) => select!(pool, sqlx::Sqlite, "0", "ancestors CROSS JOIN turn_chain_nodes node", " AND node.id NOT IN (SELECT value FROM json_each(", "))"),
+                Self::Postgres(pool) => select!(pool, sqlx::Postgres, "0::BIGINT", "ancestors CROSS JOIN turn_chain_nodes node", " AND node.id NOT IN (SELECT jsonb_array_elements_text(", "::jsonb))"),
+            }.map_err(|error| TurnUnavailable::Storage(error.to_string()))?;
+            tracing::Span::current().record("node_count", rows.len() as u64);
+            Ok::<_, TurnUnavailable>(rows)
+        }.instrument(tracing::info_span!(target: "stravia::perf", "turn_chain.ancestor.select", node_count = 0_u64)).await?;
+        tracing::Span::current().record("node_count", rows.len() as u64);
+        self.finish_context_read(principal, kind, context, rows, std::time::Instant::now())
+            .await
+    }
+
+    #[tracing::instrument(
+        target = "stravia::perf",
         name = "turn_chain.commit",
         skip_all,
         fields(reference_count)
@@ -270,6 +429,13 @@ impl TurnChainStore for SqlTurnChainStore {
             .reusable_prefix
             .as_ref()
             .map(|prefix| i64::from(prefix.item_count));
+        let projection = commit
+            .reusable_prefix
+            .as_ref()
+            .and_then(|prefix| prefix.projection.as_ref());
+        let projection_version = projection.map(|proof| i64::from(proof.version));
+        let controls_fingerprint = projection.map(|proof| proof.controls_fingerprint.as_str());
+        let context_fingerprint = projection.map(|proof| proof.context_fingerprint.as_str());
         let prefix_completed_at = commit
             .reusable_prefix
             .as_ref()
@@ -332,8 +498,8 @@ impl TurnChainStore for SqlTurnChainStore {
                     "INSERT INTO turn_chain_nodes \
                      (id, kind, parent_id, principal, payload_version, payload, created_at, expires_at, \
                       prefix_namespace, prefix_fingerprint, prefix_item_count, prefix_completed_at, \
-                      storage_format) \
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 2)",
+                      prefix_projection_version, prefix_controls_fingerprint, prefix_context_fingerprint, storage_format) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 2)",
                 )
                 .bind(commit.id.as_str())
                 .bind(commit.kind.as_str())
@@ -347,6 +513,9 @@ impl TurnChainStore for SqlTurnChainStore {
                 .bind(prefix_fingerprint)
                 .bind(prefix_item_count)
                 .bind(prefix_completed_at)
+                .bind(projection_version)
+                .bind(controls_fingerprint)
+                .bind(context_fingerprint)
                 .execute(&mut *transaction)
                 .await
                 .map_err(|error| TurnCommitError::Storage(error.to_string()))?;
@@ -418,8 +587,8 @@ impl TurnChainStore for SqlTurnChainStore {
                     "INSERT INTO turn_chain_nodes \
                      (id, kind, parent_id, principal, payload_version, payload, created_at, expires_at, \
                       prefix_namespace, prefix_fingerprint, prefix_item_count, prefix_completed_at, \
-                      storage_format) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 2)",
+                      prefix_projection_version, prefix_controls_fingerprint, prefix_context_fingerprint, storage_format) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, 2)",
                 )
                 .bind(commit.id.as_str())
                 .bind(commit.kind.as_str())
@@ -433,6 +602,9 @@ impl TurnChainStore for SqlTurnChainStore {
                 .bind(prefix_fingerprint)
                 .bind(prefix_item_count)
                 .bind(prefix_completed_at)
+                .bind(projection_version)
+                .bind(controls_fingerprint)
+                .bind(context_fingerprint)
                 .execute(&mut *transaction)
                 .await
                 .map_err(|error| TurnCommitError::Storage(error.to_string()))?;
@@ -471,6 +643,31 @@ impl TurnChainStore for SqlTurnChainStore {
         }
         let principal = principal.continuation_key();
         let now = chrono::Utc::now().timestamp_millis();
+        macro_rules! push_projection {
+            ($builder:ident, $values:expr) => {
+                if let Some(proof) = query.projection.as_ref()
+                    .filter(|proof| proof.version == REUSABLE_PREFIX_PROJECTION_VERSION) {
+                    // Only a complete, known-version proof can exclude a row.
+                    // NULL and unknown versions remain authoritative-read candidates.
+                    $builder.push(" AND (prefix_projection_version IS NULL OR prefix_projection_version <> ")
+                        .push_bind(i64::from(REUSABLE_PREFIX_PROJECTION_VERSION))
+                        .push(" OR prefix_controls_fingerprint IS NULL OR prefix_context_fingerprint IS NULL OR (")
+                        .push("prefix_controls_fingerprint = ").push_bind(&proof.controls_fingerprint);
+                    if proof.context_fingerprints.is_empty() {
+                        $builder.push(" AND 1 = 0");
+                    } else {
+                        $builder.push(" AND (prefix_context_fingerprint, prefix_item_count) IN (").push($values);
+                        for (index, (fingerprint, units)) in proof.context_fingerprints.iter().enumerate() {
+                            if index > 0 { $builder.push(", "); }
+                            $builder.push("(").push_bind(fingerprint).push(", ")
+                                .push_bind(i64::from(*units)).push(")");
+                        }
+                        $builder.push(")");
+                    }
+                    $builder.push("))");
+                }
+            };
+        }
         let rows: Vec<(String, i64, i64)> = match self {
             Self::Sqlite(pool, _) => {
                 let mut builder = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
@@ -497,8 +694,9 @@ impl TurnChainStore for SqlTurnChainStore {
                         .push_bind(i64::from(*item_count))
                         .push(")");
                 }
-                builder
-                    .push(") ORDER BY prefix_item_count DESC, prefix_completed_at DESC, id DESC");
+                builder.push(")");
+                push_projection!(builder, "VALUES ");
+                builder.push(" ORDER BY prefix_item_count DESC, prefix_completed_at DESC, id DESC");
                 builder.build_query_as().fetch_all(pool).await
             }
             Self::Postgres(pool) => {
@@ -526,8 +724,9 @@ impl TurnChainStore for SqlTurnChainStore {
                         .push_bind(i64::from(*item_count))
                         .push(")");
                 }
-                builder
-                    .push(") ORDER BY prefix_item_count DESC, prefix_completed_at DESC, id DESC");
+                builder.push(")");
+                push_projection!(builder, "");
+                builder.push(" ORDER BY prefix_item_count DESC, prefix_completed_at DESC, id DESC");
                 builder.build_query_as().fetch_all(pool).await
             }
         }
@@ -584,7 +783,7 @@ impl TurnChainStore for SqlTurnChainStore {
                     ).bind(&id).bind(&principal).fetch_all(&mut *transaction).await
                         .map_err(|error| TurnUnavailable::Storage(error.to_string()))?;
                     if rows.first().is_none_or(|row| row.1.is_some()) || rows.iter().any(|row| row.4 <= now) {
-                        sqlx::query("UPDATE turn_chain_nodes SET prefix_namespace = NULL, prefix_fingerprint = NULL, prefix_item_count = NULL, prefix_completed_at = NULL WHERE id = $1 AND principal = $2")
+                        sqlx::query("UPDATE turn_chain_nodes SET prefix_namespace = NULL, prefix_fingerprint = NULL, prefix_item_count = NULL, prefix_completed_at = NULL, prefix_projection_version = NULL, prefix_controls_fingerprint = NULL, prefix_context_fingerprint = NULL WHERE id = $1 AND principal = $2")
                             .bind(&id).bind(&principal).execute(&mut *transaction).await
                             .map_err(|error| TurnUnavailable::Storage(error.to_string()))?;
                         continue;
@@ -595,9 +794,18 @@ impl TurnChainStore for SqlTurnChainStore {
                     content::$restore(&mut transaction, &principal, &mut nodes).await
                         .map_err(|error| TurnUnavailable::Storage(error.to_string()))?;
                     let Some(prefix) = decode(nodes, completed_at)
-                        .map_err(TurnUnavailable::Storage)? else { continue };
-                    sqlx::query("UPDATE turn_chain_nodes SET prefix_namespace = $1, prefix_fingerprint = $2, prefix_item_count = $3 WHERE id = $4 AND principal = $5")
-                        .bind(prefix.namespace).bind(prefix.fingerprint).bind(i64::from(prefix.item_count)).bind(id).bind(principal)
+                        .map_err(TurnUnavailable::Storage)? else {
+                        sqlx::query("UPDATE turn_chain_nodes SET prefix_namespace = NULL, prefix_fingerprint = NULL, prefix_item_count = NULL, prefix_completed_at = NULL, prefix_projection_version = NULL, prefix_controls_fingerprint = NULL, prefix_context_fingerprint = NULL WHERE id = $1 AND principal = $2")
+                            .bind(&id).bind(&principal).execute(&mut *transaction).await
+                            .map_err(|error| TurnUnavailable::Storage(error.to_string()))?;
+                        continue;
+                    };
+                    let proof = prefix.projection.as_ref();
+                    sqlx::query("UPDATE turn_chain_nodes SET prefix_namespace = $1, prefix_fingerprint = $2, prefix_item_count = $3, prefix_projection_version = $6, prefix_controls_fingerprint = $7, prefix_context_fingerprint = $8 WHERE id = $4 AND principal = $5")
+                        .bind(&prefix.namespace).bind(&prefix.fingerprint).bind(i64::from(prefix.item_count)).bind(id).bind(principal)
+                        .bind(proof.map(|proof| i64::from(proof.version)))
+                        .bind(proof.map(|proof| proof.controls_fingerprint.as_str()))
+                        .bind(proof.map(|proof| proof.context_fingerprint.as_str()))
                         .execute(&mut *transaction).await.map_err(|error| TurnUnavailable::Storage(error.to_string()))?;
                 }
                 transaction.commit().await.map_err(|error| TurnUnavailable::Storage(error.to_string()))?;

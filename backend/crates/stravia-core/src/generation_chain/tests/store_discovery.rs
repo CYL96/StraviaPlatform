@@ -611,6 +611,7 @@ async fn discovery_workspace_rechecks_candidate_priority_after_a_previous_match(
                 fingerprint: generation_session_fingerprint(&root).unwrap(),
                 item_count: 2,
                 completed_at: i64::MAX,
+                projection: None,
             }),
         })
         .await
@@ -624,6 +625,125 @@ async fn discovery_workspace_rechecks_candidate_priority_after_a_previous_match(
                 .as_deref(),
             Some("invalid generation payload")
         );
+    }
+}
+
+#[tokio::test]
+async fn discovery_projection_skips_only_proven_incompatible_corrupt_candidates() {
+    use stravia_runtime_contract::turn_chain::REUSABLE_PREFIX_PROJECTION_VERSION;
+
+    for (case, bad_first, expect_error) in [
+        ("different-controls", true, false),
+        ("different-context", true, false),
+        ("matching", true, true),
+        ("unknown-version", true, true),
+        ("absent", true, true),
+        ("matching", false, false),
+    ] {
+        let owner = principal("projection-corrupt-candidate-owner");
+        let durable = Arc::new(crate::turn_chain::test_store().await);
+        let store = GenerationChainStore::from_turn_chain(
+            durable.clone(),
+            Duration::from_secs(60),
+            crate::runtime_cache::RuntimeCache::tinyufo(1),
+        );
+        let mut root = responses_request(vec![user_message("question")]);
+        set_generation_session_id(&mut root, "corrupt-candidate-session");
+        let mut response = AiResponse::new("good-projection", "model");
+        response.push_output_text("answer");
+        store
+            .save(GenerationChainCommit {
+                principal: owner.clone(),
+                id: "good-projection".into(),
+                parent: &ActiveGenerationChain::default(),
+                request_delta: &root,
+                effective_request: None,
+                response,
+                upstream_response_id: None,
+                effective_state: GenerationChainState::from_request(
+                    &root,
+                    "target",
+                    OPEN_RESPONSES_2026_04_24,
+                ),
+            })
+            .await
+            .unwrap();
+        let mut replay = root.clone();
+        replay.items.push(AiItem::output_text("answer"));
+        let history = ClientHistoryState::from_request(&root, &replay.items);
+        let item_count = u32::try_from(
+            stravia_runtime_contract::protocol::ir::canonical::history_unit_count(&replay.items),
+        )
+        .unwrap();
+        let projection = match case {
+            "absent" => None,
+            _ => {
+                let mut projection = history.reusable_projection();
+                match case {
+                    "different-controls" => {
+                        let mut different = root.clone();
+                        different.instructions = Some("incompatible controls".into());
+                        projection.controls_fingerprint =
+                            ClientHistoryState::from_request(&different, &replay.items)
+                                .controls_fingerprint;
+                    }
+                    "different-context" => {
+                        projection.context_fingerprint = history_context_fingerprint(&[
+                            user_message("different question"),
+                            AiItem::output_text("different answer"),
+                        ]);
+                    }
+                    "unknown-version" => {
+                        projection.version = REUSABLE_PREFIX_PROJECTION_VERSION + 1;
+                        projection.controls_fingerprint = "unknown controls projection".into();
+                        projection.context_fingerprint = "unknown context projection".into();
+                    }
+                    "matching" => {}
+                    _ => unreachable!(),
+                }
+                Some(projection)
+            }
+        };
+        // A real index row whose immutable generation payload cannot be decoded.
+        // Its earlier/later completion time fixes candidate priority independently
+        // of IDs and proves that a successful first hit never reads later payloads.
+        durable
+            .commit(TurnCommit {
+                id: TurnNodeId::new("corrupt-projection"),
+                kind: TurnNodeKind::Response,
+                parent_id: None,
+                principal: owner.clone(),
+                payload_version: RESPONSE_PAYLOAD_VERSION,
+                payload: serde_json::json!({"invalid": true}),
+                idle_ttl: Duration::from_secs(60),
+                reusable_prefix: Some(ReusablePrefixMetadata {
+                    namespace: history.reusable_namespace(),
+                    fingerprint: history.session_fingerprint.clone().unwrap(),
+                    item_count,
+                    completed_at: if bad_first { i64::MAX } else { 0 },
+                    projection,
+                }),
+            })
+            .await
+            .unwrap();
+        replay.items.push(user_message("next"));
+        let mut workspace = DiscoveryWorkspace::new(&owner, true);
+        let result = store
+            .discover_parent(&owner, &mut Arc::new(replay), &mut workspace)
+            .await;
+        if expect_error {
+            assert_eq!(
+                result.err().as_deref(),
+                Some("invalid generation payload"),
+                "case={case}, bad_first={bad_first}",
+            );
+        } else {
+            assert_eq!(
+                result.unwrap().unwrap().active.parent_id.as_deref(),
+                Some("good-projection"),
+                "case={case}, bad_first={bad_first}",
+            );
+        }
     }
 }
 
@@ -1404,7 +1524,7 @@ async fn reasoning_tracking_metadata_does_not_fork_generation_history() {
     };
     {
         let _write_gate = gate.lock().await;
-        sqlx::query("UPDATE turn_chain_nodes SET prefix_namespace = 'old-controls', prefix_fingerprint = 'old-projection', prefix_item_count = 99 WHERE id = ?")
+        sqlx::query("UPDATE turn_chain_nodes SET prefix_namespace = 'old-controls', prefix_fingerprint = 'old-projection', prefix_item_count = 99, prefix_projection_version = 999, prefix_controls_fingerprint = 'stale-controls', prefix_context_fingerprint = 'stale-context' WHERE id = ?")
             .bind(b.id()).execute(pool).await.unwrap();
     }
     backend
@@ -1424,6 +1544,28 @@ async fn reasoning_tracking_metadata_does_not_fork_generation_history() {
         Some("ciphertext".into()),
     ));
     replay.push(user_message("continue"));
+    let projection: (Option<i64>, Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT prefix_projection_version, prefix_controls_fingerprint, prefix_context_fingerprint FROM turn_chain_nodes WHERE id = ?",
+    )
+    .bind(b.id())
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    let expected_history = ClientHistoryState::from_request(
+        &responses_request(replay.clone()),
+        &replay[..replay.len() - 1],
+    );
+    assert_eq!(
+        projection,
+        (
+            Some(i64::from(
+                stravia_runtime_contract::turn_chain::REUSABLE_PREFIX_PROJECTION_VERSION
+            )),
+            Some(expected_history.controls_fingerprint),
+            Some(expected_history.context_fingerprint),
+        ),
+        "namespace invalidation must rebuild the proof from retained client history",
+    );
     let resumed = restarted
         .begin(owner.clone(), responses_request(replay.clone()))
         .await
@@ -2327,6 +2469,7 @@ async fn matching_prefix_prefers_ephemeral_upstream_continuation_when_transport_
                     actual_model: "model",
                     allow_ephemeral_response: false,
                 },
+                &resumed.parent_target(),
                 &mut without_affinity,
                 &mut miss_fallback,
             )
@@ -2346,6 +2489,7 @@ async fn matching_prefix_prefers_ephemeral_upstream_continuation_when_transport_
                     actual_model: "model",
                     allow_ephemeral_response: true,
                 },
+                &crate::router::GenerationParentTarget::Unresolved,
                 &mut root_request,
                 &mut miss_fallback,
             )
@@ -2366,6 +2510,7 @@ async fn matching_prefix_prefers_ephemeral_upstream_continuation_when_transport_
                     actual_model: "model",
                     allow_ephemeral_response: true,
                 },
+                &resumed.parent_target(),
                 &mut with_affinity,
                 &mut None,
             )
@@ -3061,7 +3206,15 @@ async fn compatible_parent_uses_upstream_id_and_only_new_messages() {
     let full_items = next.items.clone();
     let mut next = Arc::new(next);
     let mut fallback = None;
-    assert!(store.prepare_upstream(&active, &mut next, &state, false, &mut fallback));
+    assert!(super::super::continuation::prepare_upstream(
+        active.parent_upstream_response_id.as_ref(),
+        active.parent_state.as_ref(),
+        active.parent_expires_at,
+        &mut next,
+        &state,
+        false,
+        &mut fallback
+    ));
     let fallback = fallback.expect("successful continuation retains full replay");
     assert!(super::super::project::items_equal(
         &fallback.items,
@@ -3075,8 +3228,10 @@ async fn compatible_parent_uses_upstream_id_and_only_new_messages() {
         OPEN_RESPONSES_2026_04_24,
     );
     let mut miss_fallback = None;
-    assert!(!store.prepare_upstream(
-        &active,
+    assert!(!super::super::continuation::prepare_upstream(
+        active.parent_upstream_response_id.as_ref(),
+        active.parent_state.as_ref(),
+        active.parent_expires_at,
         &mut incompatible,
         &incompatible_state,
         false,
@@ -3480,9 +3635,8 @@ fn empty_tools_match_absent_tools_for_native_upstream_reuse() {
     assert!(persisted.compatible_continuation(&candidate));
 }
 
-#[tokio::test]
-async fn native_upstream_reuse_requires_persisted_open_responses_target() {
-    let store = generation_store().await;
+#[test]
+fn native_upstream_reuse_requires_persisted_open_responses_target() {
     for (egress, store_value) in [
         (OPEN_RESPONSES_2026_04_24, Some(false)),
         (ANTHROPIC_MESSAGES_2023_06_01, Some(true)),
@@ -3501,7 +3655,15 @@ async fn native_upstream_reuse_requires_persisted_open_responses_target() {
 
         let mut request = Arc::new(request);
         let mut fallback = None;
-        assert!(!store.prepare_upstream(&active, &mut request, &state, false, &mut fallback));
+        assert!(!super::super::continuation::prepare_upstream(
+            active.parent_upstream_response_id.as_ref(),
+            active.parent_state.as_ref(),
+            active.parent_expires_at,
+            &mut request,
+            &state,
+            false,
+            &mut fallback
+        ));
         assert!(fallback.is_none());
         assert_eq!(request.items.len(), 1);
     }

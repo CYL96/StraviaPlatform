@@ -5,26 +5,14 @@ pub(super) const DISCOVERY_WORKSPACE_BYTES: usize = 16 * 1024 * 1024;
 pub(super) struct DecodedDiscoveryNode {
     pub(super) id: TurnNodeId,
     pub(super) parent_id: Option<TurnNodeId>,
-    pub(super) payload_version: u32,
     pub(super) persisted: PersistedResponseNode<'static>,
 }
 
-struct RetainedDiscoveryNode {
-    node: Arc<DecodedDiscoveryNode>,
-    expires_at: std::time::Instant,
-}
-
-/// A request-local logical budget, not a process/RSS limit. Each immutable delta
-/// is retained once; no candidate's accumulated prefix is kept here.
+/// Request-local storage reads and domain decoding share one logical budget.
+/// Cached entries are immutable deltas, never accumulated history prefixes.
 pub(super) struct DiscoveryWorkspace {
-    // Lazy binding keeps first-winner ordinary discovery allocation-free.
-    principal: Option<Principal>,
-    admitting: bool,
+    context: Option<stravia_runtime_contract::turn_chain::TurnReadContext>,
     budget: usize,
-    bytes: usize,
-    nodes: HashMap<TurnNodeId, RetainedDiscoveryNode>,
-    // Exact complete-chain deadlines, never complete materialized prefixes.
-    heads: HashMap<TurnNodeId, std::time::Instant>,
 }
 
 /// Owned, preparation-only reuse. Consumers may move it but cannot inspect nodes.
@@ -36,37 +24,71 @@ impl GenerationDiscoveryWorkspace {
     }
 }
 
+enum DiscoveryReadError {
+    Storage(TurnUnavailable),
+    Decode(String),
+}
+
+impl std::fmt::Display for DiscoveryReadError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Storage(error) => error.fmt(formatter),
+            Self::Decode(error) => formatter.write_str(error),
+        }
+    }
+}
+
 impl DiscoveryWorkspace {
     pub(super) fn new(principal: &Principal, enabled: bool) -> Self {
         Self {
-            principal: enabled.then(|| principal.clone()),
-            admitting: true,
+            context: enabled.then(|| {
+                stravia_runtime_contract::turn_chain::TurnReadContext::new(
+                    principal,
+                    TurnNodeKind::Response,
+                )
+            }),
             budget: DISCOVERY_WORKSPACE_BYTES,
-            bytes: 0,
-            nodes: HashMap::new(),
-            heads: HashMap::new(),
         }
     }
 
     pub(super) fn into_request(self) -> Option<GenerationDiscoveryWorkspace> {
-        (!self.nodes.is_empty()).then_some(GenerationDiscoveryWorkspace(self))
+        self.context
+            .as_ref()
+            .is_some_and(|context| !context.is_empty())
+            .then_some(GenerationDiscoveryWorkspace(self))
     }
 
     fn enable(&mut self, principal: &Principal) {
-        if self.principal.is_none() {
-            self.principal = Some(principal.clone());
+        if self.context.is_none() {
+            self.context = Some(
+                stravia_runtime_contract::turn_chain::TurnReadContext::with_budget(
+                    principal,
+                    TurnNodeKind::Response,
+                    self.budget,
+                ),
+            );
         }
     }
 
     fn is_enabled_for(&self, principal: &Principal) -> bool {
-        self.budget > 0 && self.principal.as_ref() == Some(principal)
+        self.budget > 0
+            && self
+                .context
+                .as_ref()
+                .is_some_and(|context| context.matches(principal, TurnNodeKind::Response))
     }
 
     #[cfg(test)]
     pub(super) fn with_budget(principal: &Principal, budget: usize) -> Self {
         Self {
+            context: Some(
+                stravia_runtime_contract::turn_chain::TurnReadContext::with_budget(
+                    principal,
+                    TurnNodeKind::Response,
+                    budget,
+                ),
+            ),
             budget,
-            ..Self::new(principal, true)
         }
     }
 
@@ -79,123 +101,147 @@ impl DiscoveryWorkspace {
         if !self.is_enabled_for(principal) {
             return None;
         }
-        let expires_at = *self.heads.get(id)?;
-        if expires_at <= now {
+        let chain = self.context.as_ref()?.get(id)?;
+        if chain.expires_at <= now {
             return None;
         }
-        let mut nodes = Vec::new();
-        let mut current = id;
-        loop {
-            let entry = self.nodes.get(current)?;
-            if entry.expires_at <= now
-                || entry.node.payload_version != RESPONSE_PAYLOAD_VERSION
-                || nodes.len() >= self.nodes.len()
-            {
-                return None;
-            }
-            nodes.push(Arc::clone(&entry.node));
-            match entry.node.parent_id.as_ref() {
-                Some(parent) => current = parent,
-                None => break,
-            }
-        }
-        nodes.reverse();
-        Some((nodes, expires_at))
+        let nodes = chain
+            .nodes
+            .into_iter()
+            .map(|node| node.decoded?.downcast::<DecodedDiscoveryNode>().ok())
+            .collect::<Option<Vec<_>>>()?;
+        Some((nodes, chain.expires_at))
     }
 
+    #[cfg(test)]
     pub(super) fn decode_chain(
         &mut self,
-        principal: &Principal,
+        _principal: &Principal,
         nodes: Vec<stravia_runtime_contract::turn_chain::TurnNode>,
     ) -> Result<Vec<Arc<DecodedDiscoveryNode>>, String> {
-        let mut decoded = Vec::with_capacity(nodes.len());
-        for mut node in nodes {
-            let known = if self.is_enabled_for(principal)
-                && node.payload_version == RESPONSE_PAYLOAD_VERSION
-            {
-                self.nodes.get(&node.id).filter(|entry| {
-                    entry.expires_at > std::time::Instant::now()
-                        && entry.node.parent_id == node.parent_id
-                        && entry.node.payload_version == node.payload_version
-                })
+        nodes.into_iter().map(Self::decode_node).collect()
+    }
+
+    fn decode_node(
+        mut node: stravia_runtime_contract::turn_chain::TurnNode,
+    ) -> Result<Arc<DecodedDiscoveryNode>, String> {
+        let parent_id = node.parent_id.take();
+        let (id, persisted) = decode_response_node(node)?;
+        Ok(Arc::new(DecodedDiscoveryNode {
+            id,
+            parent_id,
+            persisted,
+        }))
+    }
+
+    async fn read(
+        &mut self,
+        store: &dyn TurnChainStore,
+        principal: &Principal,
+        id: &TurnNodeId,
+    ) -> Result<
+        (
+            Vec<Arc<DecodedDiscoveryNode>>,
+            stravia_runtime_contract::turn_chain::SharedMaterializedTurnChain,
+        ),
+        DiscoveryReadError,
+    > {
+        use tracing::Instrument as _;
+        let context = self
+            .context
+            .as_mut()
+            .ok_or(DiscoveryReadError::Storage(TurnUnavailable::Unavailable))?;
+        let span = tracing::info_span!(target: "stravia::perf", "generation_chain.history.load", status = tracing::field::Empty);
+        let chain = store
+            .materialize_in_context(principal, TurnNodeKind::Response, id, context)
+            .instrument(span.clone())
+            .await;
+        span.record("status", if chain.is_ok() { "completed" } else { "error" });
+        let mut chain = chain.map_err(|error| {
+            context.begin_read();
+            DiscoveryReadError::Storage(error)
+        })?;
+        let mut nodes = Vec::with_capacity(chain.nodes.len());
+        for node in &mut chain.nodes {
+            let decoded = if let Some(decoded) = node.decoded.as_ref() {
+                Arc::clone(decoded)
+                    .downcast::<DecodedDiscoveryNode>()
+                    .map_err(|_| {
+                        context.begin_read();
+                        DiscoveryReadError::Decode("invalid request history decode".into())
+                    })?
             } else {
-                None
+                let raw = node.raw.take().ok_or_else(|| {
+                    context.begin_read();
+                    DiscoveryReadError::Decode("missing request history payload".into())
+                })?;
+                Self::decode_node(Arc::try_unwrap(raw).unwrap_or_else(|raw| (*raw).clone()))
+                    .map_err(|error| {
+                        context.begin_read();
+                        DiscoveryReadError::Decode(error)
+                    })?
             };
-            if let Some(known) = known {
-                decoded.push(Arc::clone(&known.node));
-            } else {
-                let parent_id = node.parent_id.take();
-                let payload_version = node.payload_version;
-                let (id, persisted) = decode_response_node(node)?;
-                decoded.push(Arc::new(DecodedDiscoveryNode {
-                    id,
-                    parent_id,
-                    payload_version,
-                    persisted,
-                }));
+            nodes.push(decoded);
+        }
+        Ok((nodes, chain))
+    }
+
+    fn fold(
+        &mut self,
+        principal: &Principal,
+        nodes: &[Arc<DecodedDiscoveryNode>],
+        chain: &stravia_runtime_contract::turn_chain::SharedMaterializedTurnChain,
+    ) -> Result<MaterializedGeneration, String> {
+        match materialize_discovery_nodes(nodes, chain.expires_at) {
+            Ok(materialized) => {
+                self.retain(principal, nodes, chain);
+                Ok(materialized)
+            }
+            Err(error) => {
+                if let Some(context) = self.context.as_mut() {
+                    context.begin_read();
+                }
+                Err(error)
             }
         }
-        // Admission is deliberately separate: the caller must successfully fold
-        // the complete chain before any newly decoded node becomes reusable.
-        Ok(decoded)
     }
 
     fn retain(
         &mut self,
         principal: &Principal,
         nodes: &[Arc<DecodedDiscoveryNode>],
-        expires_at: std::time::Instant,
+        chain: &stravia_runtime_contract::turn_chain::SharedMaterializedTurnChain,
     ) {
         if !self.is_enabled_for(principal)
-            || !self.admitting
-            || expires_at <= std::time::Instant::now()
+            || !self
+                .context
+                .as_ref()
+                .is_some_and(|context| context.admission_open())
         {
             return;
         }
-        let Some(head) = nodes.last() else {
-            return;
-        };
-        let mut additional = if self.heads.contains_key(&head.id) {
-            0
-        } else {
-            head.id.as_str().len().saturating_add(64)
-        };
-        for node in nodes {
-            if !self.nodes.contains_key(&node.id) {
-                additional = additional
-                    .saturating_add(serialized_size_bytes(&node.persisted))
-                    .saturating_add(node.id.as_str().len())
-                    .saturating_add(node.parent_id.as_ref().map_or(0, |id| id.as_str().len()))
-                    .saturating_add(128);
-            }
-            if additional > self.budget.saturating_sub(self.bytes) {
-                // Keep existing hits, but do not repeatedly measure rejected deltas.
-                self.admitting = false;
-                return;
-            }
-        }
-        for node in nodes {
-            if let Some(entry) = self.nodes.get_mut(&node.id) {
-                // A complete chain proves every ancestor valid through its
-                // deadline. A shorter head must not weaken earlier proof; each
-                // head certificate still independently caps its own reuse.
-                entry.expires_at = entry.expires_at.max(expires_at);
-            } else {
-                self.nodes.insert(
-                    node.id.clone(),
-                    RetainedDiscoveryNode {
-                        node: Arc::clone(node),
-                        expires_at,
-                    },
-                );
-            }
-        }
-        if let Some(expiry) = self.heads.get_mut(&head.id) {
-            *expiry = expires_at;
-        } else {
-            self.heads.insert(head.id.clone(), expires_at);
-        }
-        self.bytes += additional;
+        let decoded = nodes
+            .iter()
+            .zip(&chain.nodes)
+            .map(|(node, stored)| {
+                let size = if stored.decoded.is_some() {
+                    0
+                } else {
+                    serialized_size_bytes(&node.persisted)
+                        .saturating_add(node.id.as_str().len())
+                        .saturating_add(node.parent_id.as_ref().map_or(0, |id| id.as_str().len()))
+                        .saturating_add(128)
+                };
+                (
+                    Arc::clone(node) as Arc<dyn std::any::Any + Send + Sync>,
+                    size,
+                )
+            })
+            .collect();
+        self.context
+            .as_mut()
+            .expect("enabled request context")
+            .admit(chain, decoded);
     }
 }
 
@@ -600,6 +646,11 @@ impl GenerationChainStore {
                     &ReusablePrefixQuery {
                         namespace: format!("{GENERATION_PREFIX_NAMESPACE}session"),
                         fingerprints,
+                        projection: Some(stravia_runtime_contract::turn_chain::ReusablePrefixProjectionQuery {
+                            version: stravia_runtime_contract::turn_chain::REUSABLE_PREFIX_PROJECTION_VERSION,
+                            controls_fingerprint: controls_fingerprint.clone(),
+                            context_fingerprints: context_fingerprints.clone(),
+                        }),
                     },
                 )
                 .await
@@ -621,6 +672,11 @@ impl GenerationChainStore {
                 TurnNodeKind::Response,
                 &ReusablePrefixQuery {
                     namespace: format!("{}{}", GENERATION_PREFIX_NAMESPACE, controls_fingerprint),
+                    projection: Some(stravia_runtime_contract::turn_chain::ReusablePrefixProjectionQuery {
+                        version: stravia_runtime_contract::turn_chain::REUSABLE_PREFIX_PROJECTION_VERSION,
+                        controls_fingerprint: controls_fingerprint.clone(),
+                        context_fingerprints: context_fingerprints.clone(),
+                    }),
                     fingerprints: context_fingerprints,
                 },
             )
@@ -744,26 +800,35 @@ impl GenerationChainStore {
                 materialize_discovery_nodes(&nodes, expires_at)
                     .map_err(|_| BeginError::CompactionUnavailable)?
             } else {
-                let chain = match self
-                    .turn_chain
-                    .materialize_with_expiry(principal, TurnNodeKind::Response, &node_id)
-                    .await
-                {
-                    Ok(chain) => chain,
-                    Err(TurnUnavailable::Unavailable) => continue,
-                    Err(TurnUnavailable::Storage(_)) => {
-                        return Err(BeginError::CompactionStorageFailed);
-                    }
-                };
                 if workspace.is_enabled_for(principal) {
-                    let nodes = workspace
-                        .decode_chain(principal, chain.nodes)
-                        .map_err(|_| BeginError::CompactionUnavailable)?;
-                    let materialized = materialize_discovery_nodes(&nodes, chain.expires_at)
-                        .map_err(|_| BeginError::CompactionUnavailable)?;
-                    workspace.retain(principal, &nodes, chain.expires_at);
-                    materialized
+                    let (nodes, chain) = match workspace
+                        .read(self.turn_chain.as_ref(), principal, &node_id)
+                        .await
+                    {
+                        Ok(chain) => chain,
+                        Err(DiscoveryReadError::Storage(TurnUnavailable::Unavailable)) => continue,
+                        Err(DiscoveryReadError::Storage(TurnUnavailable::Storage(_))) => {
+                            return Err(BeginError::CompactionStorageFailed);
+                        }
+                        Err(DiscoveryReadError::Decode(_)) => {
+                            return Err(BeginError::CompactionUnavailable);
+                        }
+                    };
+                    workspace
+                        .fold(principal, &nodes, &chain)
+                        .map_err(|_| BeginError::CompactionUnavailable)?
                 } else {
+                    let chain = match self
+                        .turn_chain
+                        .materialize_with_expiry(principal, TurnNodeKind::Response, &node_id)
+                        .await
+                    {
+                        Ok(chain) => chain,
+                        Err(TurnUnavailable::Unavailable) => continue,
+                        Err(TurnUnavailable::Storage(_)) => {
+                            return Err(BeginError::CompactionStorageFailed);
+                        }
+                    };
                     materialize_generation_nodes(chain.nodes, chain.expires_at)
                         .map_err(|_| BeginError::CompactionUnavailable)?
                 }
@@ -805,14 +870,35 @@ impl GenerationChainStore {
         let id = TurnNodeId::new(parent_id);
         let (nodes, expires_at) = match workspace.chain(principal, &id, std::time::Instant::now()) {
             Some(chain) => chain,
+            None if workspace.is_enabled_for(principal) => {
+                let (nodes, chain) = workspace
+                    .read(self.turn_chain.as_ref(), principal, &id)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                // Source metadata needs no execution replay. Fold only while a
+                // successful result can still admit reusable decoded nodes.
+                if workspace
+                    .context
+                    .as_ref()
+                    .is_some_and(|context| context.admission_open())
+                {
+                    workspace.fold(principal, &nodes, &chain)?;
+                }
+                (nodes, chain.expires_at)
+            }
             None => {
+                // Explicit-parent preparation has no discovery cache. Resolve
+                // source identity freshly without adopting old execution state.
                 let chain = self
                     .turn_chain
                     .materialize_with_expiry(principal, TurnNodeKind::Response, &id)
                     .await
                     .map_err(|error| error.to_string())?;
-                let nodes = workspace.decode_chain(principal, chain.nodes)?;
-                workspace.retain(principal, &nodes, chain.expires_at);
+                let nodes = chain
+                    .nodes
+                    .into_iter()
+                    .map(DiscoveryWorkspace::decode_node)
+                    .collect::<Result<Vec<_>, _>>()?;
                 (nodes, chain.expires_at)
             }
         };
@@ -1018,10 +1104,11 @@ impl GenerationChainStore {
             return Ok(materialized);
         }
         crate::performance::record_generation_cache_access(false);
-        let chain = self.load_generation_chain(principal, id).await?;
-        let nodes = workspace.decode_chain(principal, chain.nodes)?;
-        let materialized = Arc::new(materialize_discovery_nodes(&nodes, chain.expires_at)?);
-        workspace.retain(principal, &nodes, chain.expires_at);
+        let (nodes, chain) = workspace
+            .read(self.turn_chain.as_ref(), principal, id)
+            .await
+            .map_err(|error| error.to_string())?;
+        let materialized = Arc::new(workspace.fold(principal, &nodes, &chain)?);
         self.materialization_cache_insert(principal_key, id.clone(), Arc::clone(&materialized))
             .await;
         Ok(materialized)
@@ -1142,109 +1229,6 @@ impl GenerationChainStore {
         candidate: &AiResponse,
     ) -> bool {
         items_equal(&original.items, &candidate.items)
-    }
-
-    pub(crate) async fn prepare_target_continuation(
-        &self,
-        principal: &Principal,
-        parent_id: &str,
-        request: &mut Arc<AiRequest>,
-        candidate_state: &GenerationChainState,
-        allow_ephemeral_response: bool,
-        full_fallback: &mut Option<Arc<AiRequest>>,
-    ) -> bool {
-        *full_fallback = None;
-        let Ok(materialized) = self
-            .materialize_generation(principal, &TurnNodeId::new(parent_id))
-            .await
-        else {
-            return false;
-        };
-        let active = ActiveGenerationChain {
-            parent_id: Some(parent_id.to_owned()),
-            parent_upstream_response_id: materialized.upstream_response_id.clone(),
-            parent_state: Some(materialized.effective_state.clone()),
-            ..ActiveGenerationChain::default()
-        };
-        self.prepare_upstream(
-            &active,
-            request,
-            candidate_state,
-            allow_ephemeral_response,
-            full_fallback,
-        )
-    }
-
-    pub fn prepare_upstream(
-        &self,
-        active: &ActiveGenerationChain,
-        request: &mut Arc<AiRequest>,
-        candidate_state: &GenerationChainState,
-        allow_ephemeral_response: bool,
-        full_fallback: &mut Option<Arc<AiRequest>>,
-    ) -> bool {
-        *full_fallback = None;
-        if !(request_preserves_upstream_response(request) || allow_ephemeral_response)
-            || !candidate_state.supports_open_responses_continuation()
-        {
-            return false;
-        }
-        let (Some(upstream_id), Some(parent_state)) = (
-            active.parent_upstream_response_id.as_ref(),
-            active.parent_state.as_ref(),
-        ) else {
-            return false;
-        };
-        let verified_history_replay = request
-            .meta
-            .vendor
-            .ingress
-            .get(VERIFIED_HISTORY_REPLAY_META)
-            .and_then(serde_json::Value::as_bool)
-            == Some(true);
-        let compatible = if verified_history_replay {
-            parent_state.same_target(candidate_state)
-        } else {
-            parent_state.compatible_continuation(candidate_state)
-        };
-        if !compatible
-            || request.items.len() < parent_state.context_messages
-            || history_context_fingerprint(&request.items[..parent_state.context_messages])
-                != parent_state.context_fingerprint
-        {
-            return false;
-        }
-        // Snapshot only after every continuation gate succeeds, immediately before
-        // discarding history or replacing protocol controls.
-        let mut fallback = Arc::clone(request);
-        if crate::router::parent_id_from_request(&fallback).is_some()
-            || fallback
-                .meta
-                .vendor
-                .ingress
-                .contains_key("previous_response_id")
-        {
-            crate::router::clear_previous_response_id(Arc::make_mut(&mut fallback));
-        }
-        *full_fallback = Some(fallback);
-        let request = Arc::make_mut(request);
-        request.items = request.items.split_off(parent_state.context_messages);
-        match request.ext.as_mut() {
-            Some(ProtocolExt::OpenResponses(extension)) => {
-                extension.previous_response_id = Some(upstream_id.clone());
-            }
-            _ => {
-                request.ext = Some(ProtocolExt::OpenResponses(OpenResponsesExt {
-                    previous_response_id: Some(upstream_id.clone()),
-                    ..Default::default()
-                }));
-            }
-        }
-        request.meta.vendor.ingress.insert(
-            "previous_response_id".into(),
-            serde_json::Value::String(upstream_id.clone()),
-        );
-        true
     }
 
     #[cfg(test)]
@@ -1371,6 +1355,7 @@ impl GenerationChainStore {
                 .unwrap_or_else(|| client_history.context_fingerprint.clone()),
             item_count,
             completed_at: chrono::Utc::now().timestamp_millis(),
+            projection: Some(client_history.reusable_projection()),
         });
         let effective_system = effective_request.instructions.clone();
         let trusted_media_turn_ids = response.trusted_media_turn_ids.clone();

@@ -227,8 +227,46 @@ pub(super) async fn prepare_missing(
     Ok(())
 }
 
+enum RestoredContent {
+    Owned(Value),
+    Shared(std::sync::Arc<Value>),
+}
+
+impl RestoredContent {
+    fn value(&self) -> &Value {
+        match self {
+            Self::Owned(value) => value,
+            Self::Shared(value) => value,
+        }
+    }
+}
+
+fn content_memory(value: &Value) -> usize {
+    let own = std::mem::size_of::<Value>();
+    own.saturating_add(match value {
+        Value::String(value) => value.capacity(),
+        Value::Array(values) => values
+            .iter()
+            .fold(0usize, |sum, value| {
+                sum.saturating_add(content_memory(value))
+            })
+            .saturating_add(
+                values
+                    .capacity()
+                    .saturating_sub(values.len())
+                    .saturating_mul(own),
+            ),
+        Value::Object(values) => values.iter().fold(0usize, |sum, (key, value)| {
+            sum.saturating_add(key.capacity())
+                .saturating_add(content_memory(value))
+                .saturating_add(std::mem::size_of::<String>() + 4 * std::mem::size_of::<usize>())
+        }),
+        _ => 0,
+    })
+}
+
 macro_rules! backend {
-    ($put:ident, $prepared:ident, $inner:ident, $lookup:ident, $restore:ident, $db:ty, $conn:ty, $lock:literal) => {
+    ($put:ident, $prepared:ident, $inner:ident, $lookup:ident, $restore:ident, $restore_context:ident, $db:ty, $conn:ty, $lock:literal) => {
         /// Links an already-inserted node to its distinct content ids. Callers
         /// hold the contents table lock on PostgreSQL; SQLite serializes on the
         /// commit transaction. Empty contents skip every contents statement.
@@ -414,6 +452,15 @@ macro_rules! backend {
             principal: &str,
             nodes: &mut [TurnNode],
         ) -> anyhow::Result<()> {
+            $restore_context(connection, principal, nodes, None).await
+        }
+
+        pub(super) async fn $restore_context(
+            connection: &mut $conn,
+            principal: &str,
+            nodes: &mut [TurnNode],
+            mut context: Option<&mut stravia_runtime_contract::turn_chain::TurnReadContext>,
+        ) -> anyhow::Result<()> {
             let mut plans: Vec<Vec<(String, String)>> = Vec::with_capacity(nodes.len());
             let mut needed: HashSet<String> = HashSet::new();
             for node in nodes.iter() {
@@ -457,8 +504,15 @@ macro_rules! backend {
             }
             let mut needed: Vec<String> = needed.into_iter().collect();
             needed.sort_unstable();
-            let mut values: HashMap<String, Value> = HashMap::with_capacity(needed.len());
-            for chunk in needed.chunks(400) {
+            let mut values: HashMap<String, RestoredContent> = HashMap::with_capacity(needed.len());
+            if let Some(context) = context.as_deref() {
+                for key in &needed {
+                    if let Some(value) = context.cached_content(key) { values.insert(key.clone(), RestoredContent::Shared(value)); }
+                }
+            }
+            let missing: Vec<_> = needed.iter().filter(|key| !values.contains_key(*key)).collect();
+            let mut content_reads = 0u64;
+            for chunk in missing.chunks(400) {
                 let mut query = sqlx::QueryBuilder::<$db>::new(
                     "SELECT content_key, content FROM turn_chain_contents WHERE principal = ",
                 );
@@ -473,7 +527,17 @@ macro_rules! backend {
                 for (key, encoded) in rows {
                     let raw = crate::storage_codec::decode(&encoded)?;
                     ensure!(content_key(&raw) == key, "damaged history content");
-                    values.insert(key, serde_json::from_slice::<Value>(&raw)?);
+                    let value = serde_json::from_slice::<Value>(&raw)?;
+                    let value = if context.as_deref().is_some_and(|context| context.admission_open()) {
+                        let value = std::sync::Arc::new(value);
+                        let bytes = content_memory(&value).saturating_add(key.capacity());
+                        context.as_deref_mut().expect("open content admission").stage_content(key.clone(), value.clone(), bytes);
+                        RestoredContent::Shared(value)
+                    } else {
+                        RestoredContent::Owned(value)
+                    };
+                    values.insert(key, value);
+                    content_reads += 1;
                 }
             }
             for key in &needed {
@@ -488,10 +552,12 @@ macro_rules! backend {
                 for (pointer, key) in plan {
                     let slot = data.pointer_mut(&pointer).context("invalid history slot")?;
                     ensure!(slot.is_null(), "history slot overwrites data");
-                    *slot = values.get(&key).context("missing history content")?.clone();
+                    *slot = values.get(&key).context("missing history content")?.value().clone();
                 }
                 node.payload = data;
             }
+            tracing::info!(target: "stravia::perf", content_read_count = content_reads,
+                reference_count = content_reads, "turn_chain.content.restore");
             Ok(())
         }
     };
@@ -502,6 +568,7 @@ backend!(
     put_sqlite_inner,
     lookup_sqlite,
     restore_sqlite,
+    restore_sqlite_context,
     sqlx::Sqlite,
     sqlx::SqliteConnection,
     ""
@@ -512,6 +579,7 @@ backend!(
     put_postgres_inner,
     lookup_postgres,
     restore_postgres,
+    restore_postgres_context,
     sqlx::Postgres,
     sqlx::PgConnection,
     " FOR KEY SHARE"

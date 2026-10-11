@@ -786,6 +786,9 @@ CREATE TABLE public.turn_chain_nodes (
     prefix_item_count bigint,
     prefix_completed_at bigint,
     storage_format integer DEFAULT 2 NOT NULL,
+    prefix_projection_version integer,
+    prefix_controls_fingerprint text,
+    prefix_context_fingerprint text,
     CONSTRAINT turn_chain_nodes_kind_check CHECK ((kind = ANY (ARRAY['response'::text, 'agent'::text, 'web_search'::text]))),
     CONSTRAINT turn_chain_nodes_payload_version_check CHECK ((payload_version > 0)),
     CONSTRAINT turn_chain_nodes_storage_format_v2 CHECK ((storage_format = ANY (ARRAY[0, 1, 2])))

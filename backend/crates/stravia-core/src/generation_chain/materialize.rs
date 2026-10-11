@@ -285,6 +285,7 @@ pub(crate) fn rebuilt_prefix(
         item_count: u32::try_from(materialized.client_item_units)
             .map_err(|error| error.to_string())?,
         completed_at,
+        projection: Some(history.reusable_projection()),
     }))
 }
 

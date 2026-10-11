@@ -1,6 +1,62 @@
 use super::*;
 
 #[tokio::test]
+async fn candidate_projection_uses_client_controls_and_retained_items() {
+    let chain = generation_chain().await;
+    let mut request = responses_request(vec![user_message("client input")]);
+    request.instructions = Some("client controls".into());
+    let mut write = chain
+        .begin(principal("projection-owner"), request.clone())
+        .await
+        .unwrap();
+    write.request_mut().instructions = Some("effective-only controls".into());
+    write.request_mut().items = vec![user_message("effective-only history")];
+    let mut response = AiResponse::new("upstream", "model");
+    response.push_output_text("client answer");
+
+    for replacement in [None, Some(vec![user_message("retained replacement")])] {
+        let parent = ActiveGenerationChain {
+            parent_client_items: vec![user_message("old client history")],
+            replacement_client_items: replacement.clone(),
+            ..Default::default()
+        };
+        let projected = project_client_commit(&parent, write.request_delta(), &response).unwrap();
+        let projection = projected.client_history.reusable_projection();
+        let mut expected = replacement.unwrap_or_else(|| {
+            vec![
+                user_message("old client history"),
+                user_message("client input"),
+            ]
+        });
+        expected.extend(projected.client_output.clone());
+        assert_eq!(
+            projection.version,
+            stravia_runtime_contract::turn_chain::REUSABLE_PREFIX_PROJECTION_VERSION,
+        );
+        assert_eq!(
+            projection.context_fingerprint,
+            history_context_fingerprint(&expected)
+        );
+        assert_eq!(
+            projection.context_fingerprint,
+            history_context_fingerprint(&projected.client_items)
+        );
+        assert_eq!(
+            projection.controls_fingerprint,
+            ClientHistoryState::from_request(&request, &expected).controls_fingerprint,
+        );
+        assert_ne!(
+            projection.controls_fingerprint,
+            ClientHistoryState::from_request(write.request(), &expected).controls_fingerprint,
+        );
+        assert_ne!(
+            projection.context_fingerprint,
+            history_context_fingerprint(&write.request().items)
+        );
+    }
+}
+
+#[tokio::test]
 async fn explicit_chat_reasoning_field_survives_persisted_client_history() {
     use stravia_protocol_codec::transform::ProtocolAdapter;
     use stravia_runtime_contract::protocol::ir::vendor_ext::CHAT_REASONING_FIELD_META;
@@ -338,6 +394,7 @@ async fn hook_completion_does_not_reuse_an_earlier_target_or_upstream_response()
                     actual_model: "model",
                     allow_ephemeral_response: true,
                 },
+                &resumed.parent_target(),
                 &mut continued,
                 &mut None,
             )
@@ -418,6 +475,7 @@ async fn chat_reasoning_prefix_restores_encrypted_effective_history() {
                     actual_model: "model",
                     allow_ephemeral_response: true,
                 },
+                &resumed.parent_target(),
                 &mut continued,
                 &mut None,
             )
@@ -439,6 +497,7 @@ async fn chat_reasoning_prefix_restores_encrypted_effective_history() {
                     actual_model: "model",
                     allow_ephemeral_response: true,
                 },
+                &resumed.parent_target(),
                 &mut materialized,
                 &mut None,
             )
@@ -625,6 +684,7 @@ async fn native_responses_replay_uses_whitelisted_provider_context_for_continuat
                     actual_model: "model",
                     allow_ephemeral_response: true,
                 },
+                &resumed.parent_target(),
                 &mut provider_request,
                 &mut None,
             )
@@ -704,6 +764,7 @@ async fn encrypted_reasoning_replay_omits_gateway_projected_item_id() {
                     actual_model: "model",
                     allow_ephemeral_response: true,
                 },
+                &resumed.parent_target(),
                 &mut replay,
                 &mut None,
             )

@@ -371,6 +371,90 @@ async fn recompaction_excludes_source_prefix_and_native_window_from_new_user_del
 }
 
 #[tokio::test]
+async fn explicit_parent_native_compacted_continuation_reads_source_without_discovery_context() {
+    let pool = crate::test_support::migrated_sqlite_pool().await.unwrap();
+    let compaction = crate::compaction::Compaction::sqlite(pool.clone());
+    let chain = GenerationChain::from_turn_chain(
+        Arc::new(crate::turn_chain::SqlTurnChainStore::sqlite(
+            pool,
+            Arc::new(tokio::sync::Mutex::new(())),
+        )),
+        DEFAULT_GENERATION_CHAIN_TTL,
+        None,
+        crate::runtime_cache::RuntimeCache::tinyufo(1),
+    )
+    .with_compaction(compaction.clone());
+    let owner = principal("explicit-native-continuation");
+    let mut original = responses_request(vec![user_message("uncompacted source history")]);
+    original.instructions = Some("original source controls".into());
+    let mut source = chain.begin(owner.clone(), original).await.unwrap();
+    let mut answer = AiResponse::new("source-answer", "model");
+    answer.push_output_text("original delivered answer");
+    assert!(source.stage(&mut answer, &generation_source(), None));
+    source.persist().await.unwrap();
+    let state = stravia_protocol_codec::codec::open_responses::decoder::decode_input_item(
+        &serde_json::json!({"type":"compaction","id":"explicit-source-state","encrypted_content":"opaque"}),
+    ).unwrap().unwrap();
+    compaction
+        .register(
+            &owner,
+            crate::compaction::CompactionRegistration {
+                source_generation_id: Some(source.id().to_owned()),
+                source_record_ids: Vec::new(),
+                operation_id: "explicit-source-boundary".into(),
+                target: crate::compaction::CompactionTarget {
+                    target_key: "local-target".into(),
+                    namespace: "local-account".into(),
+                    model: "model".into(),
+                    protocol: OPEN_RESPONSES_2026_04_24.to_string(),
+                },
+                window: vec![state.clone()],
+                state_items: vec![state.clone()],
+            },
+        )
+        .await
+        .unwrap();
+    let new_user = user_message("continue compacted task");
+    let window_request = vec![state.clone(), new_user.clone()];
+    let mut request = responses_request(window_request.clone());
+    request.instructions = Some("native continuation controls".into());
+    crate::router::stamp_previous_response_id(&mut request, source.id());
+    let mut resumed = chain.begin(owner.clone(), request).await.expect(
+        "explicit-parent native window still resolves source identity with discovery disabled",
+    );
+    assert_eq!(resumed.parent_id(), Some(source.id()));
+    assert!(
+        items_equal(&resumed.request().items, &window_request),
+        "old source execution history must not replace the native window"
+    );
+    assert!(items_equal(
+        &resumed.request_delta().items,
+        std::slice::from_ref(&new_user)
+    ));
+    assert_eq!(
+        resumed.request().instructions.as_deref(),
+        Some("native continuation controls")
+    );
+    let mut continued = AiResponse::new("continued-answer", "model");
+    continued.push_output_text("continued from compacted window");
+    assert!(resumed.stage(&mut continued, &generation_source(), None));
+    resumed.persist().await.unwrap();
+    let mut next_request = responses_request(vec![user_message("next after continuation")]);
+    crate::router::stamp_previous_response_id(&mut next_request, resumed.id());
+    let next = chain.begin(owner, next_request).await.unwrap();
+    let expected = vec![
+        state,
+        new_user,
+        AiItem::output_text("continued from compacted window"),
+        user_message("next after continuation"),
+    ];
+    assert!(
+        items_equal(&next.request().items, &expected),
+        "committed continuation materializes the compacted window, not the original source prefix"
+    );
+}
+
+#[tokio::test]
 async fn native_window_excludes_only_verified_items_from_new_input() {
     let pool = crate::test_support::migrated_sqlite_pool().await.unwrap();
     let compaction = crate::compaction::Compaction::sqlite(pool);

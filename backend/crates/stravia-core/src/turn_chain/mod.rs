@@ -4,6 +4,9 @@ use std::time::Duration;
 use stravia_runtime_contract::Principal;
 use stravia_runtime_contract::turn_chain::*;
 
+// Durable ancestor selection: id, parent, payload version/body, TTL and depth.
+type StoredAncestorRow = (String, Option<String>, i64, Vec<u8>, i64, i64);
+
 mod content;
 mod sql;
 pub(crate) mod upgrade;

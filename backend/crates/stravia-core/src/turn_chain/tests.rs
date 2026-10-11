@@ -441,6 +441,7 @@ async fn assert_reusable_prefix_store_contract(store: Arc<dyn TurnChainStore>) {
                     Duration::from_secs(60)
                 },
                 reusable_prefix: reusable.then(|| ReusablePrefixMetadata {
+                    projection: None,
                     namespace: namespace.into(),
                     fingerprint: fingerprint.into(),
                     item_count,
@@ -451,6 +452,7 @@ async fn assert_reusable_prefix_store_contract(store: Arc<dyn TurnChainStore>) {
             .expect("commit contract node");
     }
     let query = ReusablePrefixQuery {
+        projection: None,
         namespace: "target-a".into(),
         fingerprints: vec![("short".into(), 2), ("long".into(), 4), ("long".into(), 4)],
     };
@@ -486,6 +488,7 @@ async fn assert_reusable_prefix_store_contract(store: Arc<dyn TurnChainStore>) {
                 &principal("owner"),
                 TurnNodeKind::Response,
                 &ReusablePrefixQuery {
+                    projection: None,
                     namespace: "target-a".into(),
                     fingerprints: Vec::new(),
                 },
@@ -507,6 +510,7 @@ async fn assert_reusable_prefix_store_contract(store: Arc<dyn TurnChainStore>) {
                 &principal("owner"),
                 TurnNodeKind::Response,
                 &ReusablePrefixQuery {
+                    projection: None,
                     namespace: "missing-target".into(),
                     fingerprints: query.fingerprints.clone(),
                 },
@@ -567,8 +571,11 @@ async fn postgres_reusable_prefix_store_contract_when_configured() {
     crate::migrations::migrate_postgres(&pool, None)
         .await
         .expect("PostgreSQL migrations");
-    assert_reusable_prefix_store_contract(Arc::new(SqlTurnChainStore::postgres(pool.clone())))
-        .await;
+    let store = SqlTurnChainStore::postgres(pool.clone());
+    assert_reusable_prefix_store_contract(Arc::new(store.clone())).await;
+    assert_request_context_contract(&store).await;
+    assert_expired_query_cutoff_proof_falls_back_to_current_facts(&store).await;
+    assert_projection_proofs_exclude_only_known_mismatches_and_rebuild_old_indexes(&store).await;
     pool.close().await;
     sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
         .execute(&admin)
@@ -594,6 +601,7 @@ async fn reusable_prefix_lookup_is_principal_scoped_and_longest_first() {
                 payload: serde_json::json!({"response": id}),
                 idle_ttl: Duration::from_secs(60),
                 reusable_prefix: Some(ReusablePrefixMetadata {
+                    projection: None,
                     namespace: "target-a".into(),
                     fingerprint: fingerprint.into(),
                     item_count,
@@ -605,6 +613,7 @@ async fn reusable_prefix_lookup_is_principal_scoped_and_longest_first() {
     }
 
     let query = ReusablePrefixQuery {
+        projection: None,
         namespace: "target-a".into(),
         fingerprints: vec![("hash-short".into(), 2), ("hash-long".into(), 4)],
     };
@@ -650,6 +659,7 @@ async fn sqlite_reusable_prefix_metadata_survives_store_reconstruction() {
             payload: serde_json::json!({"response": "persisted"}),
             idle_ttl: Duration::from_secs(60),
             reusable_prefix: Some(ReusablePrefixMetadata {
+                projection: None,
                 namespace: "target-a".into(),
                 fingerprint: "hash-indexed".into(),
                 item_count: 6,
@@ -664,6 +674,7 @@ async fn sqlite_reusable_prefix_metadata_survives_store_reconstruction() {
             &principal("owner"),
             TurnNodeKind::Response,
             &ReusablePrefixQuery {
+                projection: None,
                 namespace: "target-a".into(),
                 fingerprints: vec![("hash-indexed".into(), 6)],
             },
@@ -837,6 +848,7 @@ async fn sqlite_prefix_lookup_does_not_scan_unrelated_namespace_nodes() {
             &owner,
             TurnNodeKind::Response,
             &ReusablePrefixQuery {
+                projection: None,
                 namespace: "budget".into(),
                 fingerprints: (1..=PAIRS)
                     .map(|i| (format!("fingerprint-{i}"), i))
@@ -862,4 +874,1012 @@ async fn sqlite_prefix_lookup_does_not_scan_unrelated_namespace_nodes() {
             .collect::<Vec<_>>()
     );
     assert!(ticks.load(std::sync::atomic::Ordering::Relaxed) <= TICK_BUDGET);
+}
+
+#[tokio::test]
+async fn request_context_reuses_validated_ancestors_before_payload_fetch() {
+    let store = test_store().await;
+    let owner = principal("request-context");
+    let root = TurnNodeId::response();
+    let child = TurnNodeId::response();
+    for (id, parent) in [(root.clone(), None), (child.clone(), Some(root.clone()))] {
+        store
+            .commit(TurnCommit {
+                id,
+                parent_id: parent,
+                principal: owner.clone(),
+                kind: TurnNodeKind::Response,
+                payload_version: 1,
+                payload: serde_json::json!({"items": ["large history ".repeat(100)]}),
+                idle_ttl: Duration::from_secs(60),
+                reusable_prefix: None,
+            })
+            .await
+            .unwrap();
+    }
+    let mut context = TurnReadContext::new(&owner, TurnNodeKind::Response);
+    let chain = store
+        .materialize_in_context(&owner, TurnNodeKind::Response, &root, &mut context)
+        .await
+        .unwrap();
+    assert!(
+        context.is_empty(),
+        "materialization alone must not admit data"
+    );
+    let decoded: Arc<dyn std::any::Any + Send + Sync> = Arc::new("decoded root".to_owned());
+    context.admit(&chain, vec![(decoded.clone(), 256)]);
+    // A validated ancestor must be reused without fetching or decoding its now
+    // damaged persisted payload. Newly read descendants still restore normally.
+    let SqlTurnChainStore::Sqlite(pool, _) = &store else {
+        unreachable!()
+    };
+    sqlx::query("UPDATE turn_chain_nodes SET payload = X'00' WHERE id = ?")
+        .bind(root.as_str())
+        .execute(pool)
+        .await
+        .unwrap();
+    let chain = store
+        .materialize_in_context(&owner, TurnNodeKind::Response, &child, &mut context)
+        .await
+        .unwrap();
+    assert_eq!(chain.nodes.len(), 2);
+    assert!(chain.nodes[0].raw.is_none());
+    assert!(Arc::ptr_eq(
+        chain.nodes[0].decoded.as_ref().unwrap(),
+        &decoded
+    ));
+    assert!(
+        chain.nodes[1].raw.as_ref().unwrap().payload["items"][0]
+            .as_str()
+            .unwrap()
+            .len()
+            > 256
+    );
+    assert!(
+        store
+            .materialize_in_context(
+                &principal("other"),
+                TurnNodeKind::Response,
+                &root,
+                &mut context
+            )
+            .await
+            .is_err()
+    );
+}
+
+#[test]
+fn request_context_budget_and_independent_node_ttl_are_conservative() {
+    use std::time::Instant;
+    let owner = principal("ttl-context");
+    let root = TurnNodeId::response();
+    let child = TurnNodeId::response();
+    let long = Instant::now() + Duration::from_secs(60);
+    let expired = Instant::now();
+    let node = |id, parent_id, expires_at| SharedTurnNode {
+        id,
+        parent_id,
+        expires_at,
+        kind: TurnNodeKind::Response,
+        payload_version: 1,
+        raw: None,
+        decoded: None,
+    };
+    let chain = SharedMaterializedTurnChain {
+        expires_at: long,
+        nodes: vec![
+            node(root.clone(), None, long),
+            node(child.clone(), Some(root.clone()), long),
+        ],
+    };
+    let value: Arc<dyn std::any::Any + Send + Sync> = Arc::new(1usize);
+    let mut small = TurnReadContext::with_budget(&owner, TurnNodeKind::Response, 1);
+    small.admit(&chain, vec![(value.clone(), 1), (value.clone(), 1)]);
+    assert!(
+        small.is_empty(),
+        "oversized chains must not be partially admitted"
+    );
+    let mut context = TurnReadContext::new(&owner, TurnNodeKind::Response);
+    let short = Instant::now() + Duration::from_secs(10);
+    let shorter_child = SharedMaterializedTurnChain {
+        expires_at: short,
+        nodes: vec![
+            node(root.clone(), None, long),
+            node(child.clone(), Some(root.clone()), short),
+        ],
+    };
+    context.admit(&shorter_child, vec![(value.clone(), 1), (value.clone(), 1)]);
+    assert_eq!(context.get(&root).unwrap().expires_at, long);
+    assert_eq!(context.get(&child).unwrap().expires_at, short);
+    let mut fallback = TurnReadContext::new(&owner, TurnNodeKind::Response);
+    let fallback_chain = SharedMaterializedTurnChain {
+        expires_at: short,
+        nodes: vec![
+            node(root.clone(), None, short),
+            node(child.clone(), Some(root.clone()), short),
+        ],
+    };
+    fallback.admit(
+        &fallback_chain,
+        vec![(value.clone(), 1), (value.clone(), 1)],
+    );
+    let independently_read_root = SharedMaterializedTurnChain {
+        expires_at: long,
+        nodes: vec![node(root.clone(), None, long)],
+    };
+    fallback.admit(&independently_read_root, vec![(value.clone(), 1)]);
+    assert_eq!(fallback.get(&root).unwrap().expires_at, long);
+    assert_eq!(fallback.get(&child).unwrap().expires_at, short);
+    let mut context = TurnReadContext::new(&owner, TurnNodeKind::Response);
+    let root_chain = SharedMaterializedTurnChain {
+        expires_at: long,
+        nodes: vec![node(root.clone(), None, long)],
+    };
+    context.admit(&root_chain, vec![(value.clone(), 1)]);
+    let expired_chain = SharedMaterializedTurnChain {
+        expires_at: expired,
+        nodes: vec![node(child.clone(), Some(root.clone()), expired)],
+    };
+    context.admit(&expired_chain, vec![(value, 1)]);
+    assert!(context.get(&root).is_some());
+    assert!(context.get(&child).is_none());
+    let expired_head = SharedMaterializedTurnChain {
+        expires_at: long,
+        nodes: vec![
+            node(root.clone(), None, long),
+            node(child.clone(), Some(root.clone()), expired),
+        ],
+    };
+    let value: Arc<dyn std::any::Any + Send + Sync> = Arc::new(1usize);
+    context.admit(&expired_head, vec![(value.clone(), 0), (value, 1)]);
+    assert!(context.get(&root).is_some());
+    assert!(
+        context.get(&child).is_none(),
+        "each head checks its own node deadline"
+    );
+    assert!(context.validated_ids().contains(&root.as_str().to_owned()));
+    assert!(!context.validated_ids().contains(&child.as_str().to_owned()));
+}
+
+async fn assert_expired_query_cutoff_proof_falls_back_to_current_facts(store: &SqlTurnChainStore) {
+    let owner = principal("query-cutoff-expiry");
+    let root = TurnNodeId::response();
+    let child = TurnNodeId::response();
+    store
+        .commit(TurnCommit {
+            id: root.clone(),
+            parent_id: None,
+            principal: owner.clone(),
+            kind: TurnNodeKind::Response,
+            payload_version: 1,
+            payload: serde_json::json!({"root": true}),
+            idle_ttl: Duration::from_secs(60),
+            reusable_prefix: None,
+        })
+        .await
+        .unwrap();
+    let mut context = TurnReadContext::new(&owner, TurnNodeKind::Response);
+    let mut root_chain = store
+        .materialize_in_context(&owner, TurnNodeKind::Response, &root, &mut context)
+        .await
+        .unwrap();
+    let cutoff_deadline = std::time::Instant::now() + Duration::from_secs(10);
+    root_chain.expires_at = cutoff_deadline;
+    root_chain.nodes[0].expires_at = cutoff_deadline;
+    let decoded: Arc<dyn std::any::Any + Send + Sync> = Arc::new("validated root");
+    context.admit(&root_chain, vec![(decoded, 128)]);
+    assert!(context.validated_ids().contains(&root.as_str().to_owned()));
+    // A normal append renews the durable ancestor, not the old request proof.
+    store
+        .commit(TurnCommit {
+            id: child.clone(),
+            parent_id: Some(root.clone()),
+            principal: owner.clone(),
+            kind: TurnNodeKind::Response,
+            payload_version: 1,
+            payload: serde_json::json!({"child": true}),
+            idle_ttl: Duration::from_secs(3600),
+            reusable_prefix: None,
+        })
+        .await
+        .unwrap();
+    let suffix_query = "SELECT id, parent_id, payload_version, payload, expires_at, CAST(0 AS BIGINT) FROM turn_chain_nodes WHERE id = $1";
+    let rows: Vec<StoredAncestorRow> = match store {
+        SqlTurnChainStore::Sqlite(pool, _) => sqlx::query_as(suffix_query)
+            .bind(child.as_str())
+            .fetch_all(pool)
+            .await
+            .unwrap(),
+        SqlTurnChainStore::Postgres(pool) => sqlx::query_as(suffix_query)
+            .bind(child.as_str())
+            .fetch_all(pool)
+            .await
+            .unwrap(),
+    };
+    assert_eq!(
+        rows.len(),
+        1,
+        "the query stopped at the previously valid root proof"
+    );
+    let completed_at = cutoff_deadline + Duration::from_secs(1);
+    assert!(context.get_at(&root, completed_at).is_none());
+    let chain = store
+        .finish_context_read(
+            &owner,
+            TurnNodeKind::Response,
+            &mut context,
+            rows.clone(),
+            completed_at,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        chain.nodes.iter().map(|node| &node.id).collect::<Vec<_>>(),
+        vec![&root, &child]
+    );
+    assert!(
+        chain.nodes.iter().all(|node| node.raw.is_some()),
+        "lost proof requires complete fresh facts"
+    );
+    assert_eq!(
+        chain.nodes[0].raw.as_ref().unwrap().payload,
+        serde_json::json!({"root": true})
+    );
+    assert!(chain.expires_at > cutoff_deadline);
+    let expire_root = "UPDATE turn_chain_nodes SET expires_at = 0 WHERE id = $1";
+    match store {
+        SqlTurnChainStore::Sqlite(pool, _) => {
+            sqlx::query(expire_root)
+                .bind(root.as_str())
+                .execute(pool)
+                .await
+                .unwrap();
+        }
+        SqlTurnChainStore::Postgres(pool) => {
+            sqlx::query(expire_root)
+                .bind(root.as_str())
+                .execute(pool)
+                .await
+                .unwrap();
+        }
+    }
+    assert!(
+        matches!(
+            store
+                .finish_context_read(
+                    &owner,
+                    TurnNodeKind::Response,
+                    &mut context,
+                    rows,
+                    completed_at
+                )
+                .await,
+            Err(TurnUnavailable::Unavailable)
+        ),
+        "a truly expired durable ancestor cannot be revived by the old proof"
+    );
+}
+
+#[tokio::test]
+async fn expired_query_cutoff_proof_falls_back_to_current_facts() {
+    assert_expired_query_cutoff_proof_falls_back_to_current_facts(&test_store().await).await;
+}
+
+#[test]
+fn pending_external_content_obeys_the_shared_budget_before_admission() {
+    let owner = principal("pending-budget");
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let id = TurnNodeId::response();
+    let chain = SharedMaterializedTurnChain {
+        expires_at: deadline,
+        nodes: vec![SharedTurnNode {
+            id: id.clone(),
+            kind: TurnNodeKind::Response,
+            parent_id: None,
+            payload_version: 1,
+            expires_at: deadline,
+            raw: None,
+            decoded: None,
+        }],
+    };
+    let decoded: Arc<dyn std::any::Any + Send + Sync> = Arc::new("decoded node");
+    let mut context = TurnReadContext::with_budget(&owner, TurnNodeKind::Response, 64);
+    let admitted = Arc::new(serde_json::json!("admitted"));
+    context.stage_content("existing".into(), admitted.clone(), 32);
+    context.admit(&chain, vec![(decoded, 1)]);
+    assert!(context.cached_content("existing").is_some());
+    let boundary = Arc::new(serde_json::json!("pending at boundary"));
+    let boundary_lifetime = Arc::downgrade(&boundary);
+    context.stage_content("boundary".into(), boundary, 31);
+    assert!(
+        boundary_lifetime.upgrade().is_some(),
+        "exact remaining budget may be staged"
+    );
+    let excess = Arc::new(serde_json::json!("one byte beyond boundary"));
+    let excess_lifetime = Arc::downgrade(&excess);
+    context.stage_content("excess".into(), excess, 1);
+    assert!(
+        boundary_lifetime.upgrade().is_none(),
+        "overflow releases optional pending values immediately"
+    );
+    assert!(excess_lifetime.upgrade().is_none());
+    assert!(!context.admission_open());
+    assert!(
+        context.get(&id).is_some(),
+        "already admitted nodes remain reusable"
+    );
+    assert!(
+        context.cached_content("existing").is_some(),
+        "already admitted external content remains reusable"
+    );
+    let mut zero = TurnReadContext::with_budget(&owner, TurnNodeKind::Response, 0);
+    let value = Arc::new(serde_json::json!("zero budget"));
+    let lifetime = Arc::downgrade(&value);
+    zero.stage_content("zero".into(), value, 1);
+    assert!(
+        lifetime.upgrade().is_none(),
+        "zero budget retains no optional content before fold"
+    );
+    let mut large = TurnReadContext::new(&owner, TurnNodeKind::Response);
+    let value = Arc::new(serde_json::Value::String(
+        "x".repeat(TurnReadContext::BYTE_LIMIT + 1),
+    ));
+    let lifetime = Arc::downgrade(&value);
+    large.stage_content("large".into(), value, TurnReadContext::BYTE_LIMIT + 1);
+    assert!(
+        lifetime.upgrade().is_none(),
+        "over-limit restored values are not staged until fold"
+    );
+    assert!(!large.admission_open());
+}
+
+async fn assert_projection_proofs_exclude_only_known_mismatches_and_rebuild_old_indexes(
+    store: &SqlTurnChainStore,
+) {
+    let owner = principal("projection-context");
+    let proof = ReusablePrefixProjection {
+        version: REUSABLE_PREFIX_PROJECTION_VERSION,
+        controls_fingerprint: "controls".into(),
+        context_fingerprint: "context".into(),
+    };
+    for (id, projection) in [
+        ("legacy", None),
+        ("known", Some(proof.clone())),
+        (
+            "unknown",
+            Some(ReusablePrefixProjection {
+                version: 999,
+                ..proof.clone()
+            }),
+        ),
+    ] {
+        store
+            .commit(TurnCommit {
+                id: TurnNodeId::new(id),
+                kind: TurnNodeKind::Response,
+                parent_id: None,
+                principal: owner.clone(),
+                payload_version: 1,
+                payload: serde_json::json!({"items": ["root"]}),
+                idle_ttl: Duration::from_secs(60),
+                reusable_prefix: Some(ReusablePrefixMetadata {
+                    namespace: "old".into(),
+                    fingerprint: "hash".into(),
+                    item_count: 1,
+                    completed_at: 1,
+                    projection,
+                }),
+            })
+            .await
+            .unwrap();
+    }
+    let query = ReusablePrefixQuery {
+        namespace: "old".into(),
+        fingerprints: vec![("hash".into(), 1)],
+        projection: Some(ReusablePrefixProjectionQuery {
+            version: REUSABLE_PREFIX_PROJECTION_VERSION,
+            controls_fingerprint: "different".into(),
+            context_fingerprints: vec![("context".into(), 1)],
+        }),
+    };
+    let candidates = store
+        .find_reusable_prefixes(&owner, TurnNodeKind::Response, &query)
+        .await
+        .unwrap();
+    assert_eq!(
+        candidates
+            .iter()
+            .map(|candidate| candidate.node_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["unknown", "legacy"]
+    );
+    let unknown_query = ReusablePrefixQuery {
+        projection: Some(ReusablePrefixProjectionQuery {
+            version: 999,
+            ..query.projection.clone().unwrap()
+        }),
+        ..query.clone()
+    };
+    assert_eq!(
+        store
+            .find_reusable_prefixes(&owner, TurnNodeKind::Response, &unknown_query)
+            .await
+            .unwrap()
+            .len(),
+        3
+    );
+    let matching_query = ReusablePrefixQuery {
+        projection: Some(ReusablePrefixProjectionQuery {
+            controls_fingerprint: "controls".into(),
+            ..query.projection.clone().unwrap()
+        }),
+        ..query.clone()
+    };
+    assert_eq!(
+        store
+            .find_reusable_prefixes(&owner, TurnNodeKind::Response, &matching_query)
+            .await
+            .unwrap()
+            .len(),
+        3
+    );
+    for contexts in [
+        vec![("different-context".into(), 1)],
+        vec![("context".into(), 2)],
+        Vec::new(),
+    ] {
+        let context_mismatch = ReusablePrefixQuery {
+            projection: Some(ReusablePrefixProjectionQuery {
+                context_fingerprints: contexts,
+                ..matching_query.projection.clone().unwrap()
+            }),
+            ..matching_query.clone()
+        };
+        assert_eq!(
+            store
+                .find_reusable_prefixes(&owner, TurnNodeKind::Response, &context_mismatch)
+                .await
+                .unwrap()
+                .iter()
+                .map(|candidate| candidate.node_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["unknown", "legacy"]
+        );
+    }
+    let partial = "UPDATE turn_chain_nodes SET prefix_context_fingerprint = NULL WHERE id = 'known' AND principal = $1";
+    match store {
+        SqlTurnChainStore::Sqlite(pool, _) => {
+            sqlx::query(partial)
+                .bind(owner.continuation_key())
+                .execute(pool)
+                .await
+                .unwrap();
+        }
+        SqlTurnChainStore::Postgres(pool) => {
+            sqlx::query(partial)
+                .bind(owner.continuation_key())
+                .execute(pool)
+                .await
+                .unwrap();
+        }
+    }
+    assert_eq!(
+        store
+            .find_reusable_prefixes(&owner, TurnNodeKind::Response, &query)
+            .await
+            .unwrap()
+            .len(),
+        3,
+        "incomplete known-version projections cannot exclude rows, even when controls differ"
+    );
+    store
+        .rebuild_prefixes("current", &|_, completed_at| {
+            Ok(Some(ReusablePrefixMetadata {
+                namespace: "current".into(),
+                fingerprint: "hash".into(),
+                item_count: 1,
+                completed_at,
+                projection: Some(proof.clone()),
+            }))
+        })
+        .await
+        .unwrap();
+    let query = ReusablePrefixQuery {
+        namespace: "current".into(),
+        ..query
+    };
+    assert!(
+        store
+            .find_reusable_prefixes(&owner, TurnNodeKind::Response, &query)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    store
+        .rebuild_prefixes("next", &|_, _| Ok(None))
+        .await
+        .unwrap();
+    let query = ReusablePrefixQuery {
+        projection: None,
+        ..query
+    };
+    assert!(
+        store
+            .find_reusable_prefixes(&owner, TurnNodeKind::Response, &query)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn projection_proofs_exclude_only_known_mismatches_and_rebuild_old_indexes() {
+    assert_projection_proofs_exclude_only_known_mismatches_and_rebuild_old_indexes(
+        &test_store().await,
+    )
+    .await;
+}
+
+async fn overwrite_context_content(store: &SqlTurnChainStore, owner: &Principal, bytes: Vec<u8>) {
+    let query = "UPDATE turn_chain_contents SET content = $1 WHERE principal = $2";
+    match store {
+        SqlTurnChainStore::Sqlite(pool, _) => {
+            sqlx::query(query)
+                .bind(bytes)
+                .bind(owner.continuation_key())
+                .execute(pool)
+                .await
+                .unwrap();
+        }
+        SqlTurnChainStore::Postgres(pool) => {
+            sqlx::query(query)
+                .bind(bytes)
+                .bind(owner.continuation_key())
+                .execute(pool)
+                .await
+                .unwrap();
+        }
+    }
+}
+
+async fn assert_request_context_contract(store: &SqlTurnChainStore) {
+    let owner = principal("external-context");
+    let root = TurnNodeId::response();
+    let first = TurnNodeId::response();
+    let second = TurnNodeId::response();
+    let expired = TurnNodeId::response();
+    let item = serde_json::json!({"text": "shared external history ".repeat(100)});
+    let key = content::content_key(&serde_json::to_vec(&item).unwrap());
+    for (id, parent_id, payload, ttl) in [
+        (root.clone(), None, serde_json::json!({"root": true}), 60),
+        (
+            first.clone(),
+            Some(root.clone()),
+            serde_json::json!({"items": [item.clone()]}),
+            10,
+        ),
+        (
+            second.clone(),
+            Some(root.clone()),
+            serde_json::json!({"items": [item.clone()]}),
+            60,
+        ),
+        (
+            expired.clone(),
+            Some(root.clone()),
+            serde_json::json!({"items": [item.clone()]}),
+            0,
+        ),
+    ] {
+        store
+            .commit(TurnCommit {
+                id,
+                parent_id,
+                payload,
+                principal: owner.clone(),
+                kind: TurnNodeKind::Response,
+                payload_version: 1,
+                idle_ttl: Duration::from_secs(ttl),
+                reusable_prefix: None,
+            })
+            .await
+            .unwrap();
+    }
+    let mut context = TurnReadContext::new(&owner, TurnNodeKind::Response);
+    let chain = store
+        .materialize_in_context(&owner, TurnNodeKind::Response, &first, &mut context)
+        .await
+        .unwrap();
+    assert!(
+        context.cached_content(&key).is_none(),
+        "restoration is not admission"
+    );
+    let decoded_root: Arc<dyn std::any::Any + Send + Sync> = Arc::new("folded root");
+    let decoded_first: Arc<dyn std::any::Any + Send + Sync> = Arc::new("folded first");
+    context.admit(
+        &chain,
+        vec![(decoded_root.clone(), 128), (decoded_first, 128)],
+    );
+    let content = context
+        .cached_content(&key)
+        .expect("successful fold admits external decode");
+    assert!(context.get(&root).unwrap().expires_at > context.get(&first).unwrap().expires_at);
+    overwrite_context_content(store, &owner, vec![0]).await;
+    let sibling = store
+        .materialize_in_context(&owner, TurnNodeKind::Response, &second, &mut context)
+        .await
+        .unwrap();
+    assert_eq!(
+        sibling.nodes[1].raw.as_ref().unwrap().payload["items"][0],
+        item
+    );
+    assert!(Arc::ptr_eq(
+        sibling.nodes[0].decoded.as_ref().unwrap(),
+        &decoded_root
+    ));
+    assert!(
+        Arc::ptr_eq(&context.cached_content(&key).unwrap(), &content),
+        "new suffix reuses external decode"
+    );
+    assert!(
+        sibling.expires_at > chain.expires_at,
+        "short sibling does not shorten independent head TTL"
+    );
+    assert!(matches!(
+        store
+            .materialize_in_context(&owner, TurnNodeKind::Response, &expired, &mut context)
+            .await,
+        Err(TurnUnavailable::Unavailable)
+    ));
+    assert!(matches!(
+        store
+            .materialize_in_context(
+                &owner,
+                TurnNodeKind::Response,
+                &TurnNodeId::response(),
+                &mut context
+            )
+            .await,
+        Err(TurnUnavailable::Unavailable)
+    ));
+    assert!(matches!(
+        store
+            .materialize_in_context(
+                &principal("foreign"),
+                TurnNodeKind::Response,
+                &second,
+                &mut context
+            )
+            .await,
+        Err(TurnUnavailable::Unavailable)
+    ));
+    assert!(matches!(
+        store
+            .materialize_in_context(&owner, TurnNodeKind::Agent, &second, &mut context)
+            .await,
+        Err(TurnUnavailable::Unavailable)
+    ));
+    let mut fresh = TurnReadContext::new(&owner, TurnNodeKind::Response);
+    assert!(matches!(
+        store
+            .materialize_in_context(&owner, TurnNodeKind::Response, &second, &mut fresh)
+            .await,
+        Err(TurnUnavailable::Storage(_))
+    ));
+    assert!(fresh.is_empty());
+    assert!(fresh.cached_content(&key).is_none());
+    let foreign = principal("foreign-reader");
+    let mut foreign_context = TurnReadContext::new(&foreign, TurnNodeKind::Response);
+    assert!(
+        matches!(
+            store
+                .materialize_in_context(
+                    &foreign,
+                    TurnNodeKind::Response,
+                    &root,
+                    &mut foreign_context
+                )
+                .await,
+            Err(TurnUnavailable::Unavailable)
+        ),
+        "a fresh foreign context cannot fetch owner nodes"
+    );
+    let corrupt = TurnNodeId::response();
+    store
+        .commit(TurnCommit {
+            id: corrupt.clone(),
+            parent_id: Some(root.clone()),
+            principal: owner.clone(),
+            kind: TurnNodeKind::Response,
+            payload_version: 1,
+            payload: serde_json::json!({"inline": true}),
+            idle_ttl: Duration::from_secs(60),
+            reusable_prefix: None,
+        })
+        .await
+        .unwrap();
+    let query = "UPDATE turn_chain_nodes SET payload = $1 WHERE id = $2";
+    match store {
+        SqlTurnChainStore::Sqlite(pool, _) => {
+            sqlx::query(query)
+                .bind(vec![0u8])
+                .bind(corrupt.as_str())
+                .execute(pool)
+                .await
+                .unwrap();
+        }
+        SqlTurnChainStore::Postgres(pool) => {
+            sqlx::query(query)
+                .bind(vec![0u8])
+                .bind(corrupt.as_str())
+                .execute(pool)
+                .await
+                .unwrap();
+        }
+    }
+    assert!(
+        matches!(
+            store
+                .materialize_in_context(&owner, TurnNodeKind::Response, &corrupt, &mut context)
+                .await,
+            Err(TurnUnavailable::Storage(_))
+        ),
+        "cached ancestry must not conceal a corrupt new suffix"
+    );
+    assert!(context.get(&corrupt).is_none());
+
+    let encoded = crate::storage_codec::encode(&serde_json::to_vec(&item).unwrap()).unwrap();
+    overwrite_context_content(store, &owner, encoded).await;
+    // Abandoning a materialization models a failed domain fold: the next read
+    // clears its pending content, so admitting only the root cannot leak it.
+    let mut abandoned = TurnReadContext::new(&owner, TurnNodeKind::Response);
+    store
+        .materialize_in_context(&owner, TurnNodeKind::Response, &first, &mut abandoned)
+        .await
+        .unwrap();
+    let root_chain = store
+        .materialize_in_context(&owner, TurnNodeKind::Response, &root, &mut abandoned)
+        .await
+        .unwrap();
+    abandoned.admit(&root_chain, vec![(decoded_root.clone(), 128)]);
+    assert!(abandoned.cached_content(&key).is_none());
+
+    let mut budget = TurnReadContext::with_budget(&owner, TurnNodeKind::Response, 256);
+    let root_chain = store
+        .materialize_in_context(&owner, TurnNodeKind::Response, &root, &mut budget)
+        .await
+        .unwrap();
+    budget.admit(&root_chain, vec![(decoded_root.clone(), 128)]);
+    let branch = store
+        .materialize_in_context(&owner, TurnNodeKind::Response, &first, &mut budget)
+        .await
+        .unwrap();
+    budget.admit(
+        &branch,
+        vec![(decoded_root, 0), (Arc::new("folded suffix"), 128)],
+    );
+    assert!(
+        !budget.admission_open(),
+        "external content shares the node budget"
+    );
+    assert!(
+        budget.get(&root).is_some(),
+        "budget refusal preserves existing hits"
+    );
+    assert!(budget.get(&first).is_none());
+    assert!(budget.cached_content(&key).is_none());
+    let fallback = store
+        .materialize_in_context(&owner, TurnNodeKind::Response, &second, &mut budget)
+        .await
+        .unwrap();
+    assert_eq!(
+        fallback.nodes[1].raw.as_ref().unwrap().payload["items"][0],
+        item
+    );
+    assert!(budget.cached_content(&key).is_none());
+    overwrite_context_content(store, &owner, vec![0]).await;
+    assert!(
+        matches!(
+            store
+                .materialize_in_context(&owner, TurnNodeKind::Response, &first, &mut budget)
+                .await,
+            Err(TurnUnavailable::Storage(_))
+        ),
+        "closed admission must not stage fallback content"
+    );
+    // A missing owner-scoped row must not be replaced by a foreign row.
+    match store {
+        SqlTurnChainStore::Sqlite(pool, _) => {
+            sqlx::query("DELETE FROM turn_chain_node_contents WHERE principal = $1")
+                .bind(owner.continuation_key())
+                .execute(pool)
+                .await
+                .unwrap();
+            sqlx::query("DELETE FROM turn_chain_contents WHERE principal = $1")
+                .bind(owner.continuation_key())
+                .execute(pool)
+                .await
+                .unwrap();
+        }
+        SqlTurnChainStore::Postgres(pool) => {
+            sqlx::query("DELETE FROM turn_chain_node_contents WHERE principal = $1")
+                .bind(owner.continuation_key())
+                .execute(pool)
+                .await
+                .unwrap();
+            sqlx::query("DELETE FROM turn_chain_contents WHERE principal = $1")
+                .bind(owner.continuation_key())
+                .execute(pool)
+                .await
+                .unwrap();
+        }
+    }
+    store
+        .commit(TurnCommit {
+            id: TurnNodeId::response(),
+            parent_id: None,
+            principal: principal("foreign-content"),
+            kind: TurnNodeKind::Response,
+            payload_version: 1,
+            payload: serde_json::json!({"items": [item]}),
+            idle_ttl: Duration::from_secs(60),
+            reusable_prefix: None,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        store
+            .materialize_in_context(&owner, TurnNodeKind::Response, &second, &mut fresh)
+            .await,
+        Err(TurnUnavailable::Storage(_))
+    ));
+    assert!(fresh.cached_content(&key).is_none());
+}
+
+#[tokio::test]
+async fn request_context_external_suffix_reuse_errors_and_budget_fallback() {
+    assert_request_context_contract(&test_store().await).await;
+}
+
+#[tokio::test]
+async fn sqlite_0007_upgrade_and_generation_v3_rebuild_find_existing_history() {
+    use crate::generation_chain::{GenerationChain, GenerationSource};
+    use stravia_runtime_contract::protocol::ids::OPEN_RESPONSES_2026_04_24;
+    use stravia_runtime_contract::protocol::ir::{
+        AiItem, AiRequest, AiResponse, MessageContent, OpenResponsesExt, ProtocolExt, Role,
+    };
+
+    let owner = principal("upgraded-generation");
+    let question = AiItem {
+        role: Role::User,
+        content: MessageContent::Text(Arc::new("question".into())),
+        tool_calls: None,
+        tool_call_id: None,
+        meta: None,
+    };
+    let request = |items| {
+        let mut request = AiRequest::new("model", items);
+        request.ext = Some(ProtocolExt::OpenResponses(OpenResponsesExt::default()));
+        request
+    };
+    // Obtain a real persisted generation payload through the write interface,
+    // rather than constructing a payload coupled to private generation fields.
+    let seed_store = Arc::new(test_store().await);
+    let seed_chain = GenerationChain::from_turn_chain(
+        seed_store.clone(),
+        Duration::from_secs(60),
+        None,
+        crate::runtime_cache::RuntimeCache::tinyufo(1),
+    );
+    let mut write = seed_chain
+        .begin(owner.clone(), request(vec![question.clone()]))
+        .await
+        .unwrap();
+    let mut response = AiResponse::new("upstream", "model");
+    response.push_output_text("answer");
+    let source = GenerationSource::Target(crate::history_marker::ThinkingSource {
+        namespace: "provider:model".into(),
+        protocol: Some(OPEN_RESPONSES_2026_04_24.into()),
+        actual_model: "model".into(),
+        target_id: "provider:model".into(),
+        authority: Some("provider:model".into()),
+    });
+    assert!(write.stage(&mut response, &source, None));
+    write.persist().await.unwrap();
+    let id = TurnNodeId::new(write.id());
+    let nodes = seed_store
+        .materialize(&owner, TurnNodeKind::Response, &id)
+        .await
+        .unwrap();
+    let expected = crate::generation_chain::rebuilt_prefix(nodes.clone(), 123)
+        .unwrap()
+        .unwrap();
+    assert!(
+        expected
+            .namespace
+            .starts_with("stravia-generation-history-v3:")
+    );
+
+    let data_dir = tempfile::tempdir().unwrap();
+    let pool = crate::db::init_pool(data_dir.path()).await.unwrap();
+    let migrator = sqlx::migrate!("./migrations/sqlite");
+    migrator.run_to(7, &pool).await.unwrap();
+    let mut encoded = content::encode(nodes[0].payload.clone()).unwrap();
+    let now = chrono::Utc::now().timestamp_millis();
+    let mut transaction = pool.begin().await.unwrap();
+    sqlx::query("INSERT INTO turn_chain_nodes \
+        (id, kind, parent_id, principal, payload_version, payload, legacy_payload, created_at, expires_at, \
+         prefix_namespace, prefix_fingerprint, prefix_item_count, prefix_completed_at, storage_format) \
+        VALUES (?, 'response', NULL, ?, ?, ?, NULL, ?, ?, 'generation:v2:legacy', 'obsolete', 2, 123, 2)")
+        .bind(id.as_str()).bind(owner.continuation_key()).bind(i64::from(nodes[0].payload_version))
+        .bind(&encoded.payload).bind(now).bind(now + 60_000).execute(&mut *transaction).await.unwrap();
+    content::put_sqlite(
+        &mut transaction,
+        id.as_str(),
+        &owner.continuation_key(),
+        &mut encoded,
+    )
+    .await
+    .unwrap();
+    transaction.commit().await.unwrap();
+    crate::migrations::migrate_sqlite(&pool, None)
+        .await
+        .unwrap();
+    let store = Arc::new(SqlTurnChainStore::sqlite(
+        pool.clone(),
+        Arc::new(tokio::sync::Mutex::new(())),
+    ));
+    let proof = expected.projection.clone().unwrap();
+    let query = ReusablePrefixQuery {
+        namespace: expected.namespace.clone(),
+        fingerprints: vec![(expected.fingerprint.clone(), expected.item_count)],
+        projection: Some(ReusablePrefixProjectionQuery {
+            version: proof.version,
+            controls_fingerprint: proof.controls_fingerprint,
+            context_fingerprints: vec![(proof.context_fingerprint, expected.item_count)],
+        }),
+    };
+    assert!(
+        store
+            .find_reusable_prefixes(&owner, TurnNodeKind::Response, &query)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let upgraded_chain = GenerationChain::from_turn_chain(
+        store.clone(),
+        Duration::from_secs(60),
+        None,
+        crate::runtime_cache::RuntimeCache::tinyufo(1),
+    );
+    upgraded_chain.rebuild_prefixes().await.unwrap();
+    let candidates = store
+        .find_reusable_prefixes(&owner, TurnNodeKind::Response, &query)
+        .await
+        .unwrap();
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].node_id, id);
+    assert_eq!(candidates[0].completed_at, 123);
+    assert_eq!(
+        store
+            .materialize(&owner, TurnNodeKind::Response, &id)
+            .await
+            .unwrap(),
+        nodes
+    );
+    let mut replay = vec![question];
+    replay.extend(response.items);
+    replay.push(AiItem {
+        role: Role::User,
+        content: MessageContent::Text(Arc::new("next".into())),
+        tool_calls: None,
+        tool_call_id: None,
+        meta: None,
+    });
+    let resumed = upgraded_chain.begin(owner, request(replay)).await.unwrap();
+    assert_eq!(
+        resumed.parent_id(),
+        Some(id.as_str()),
+        "upgraded index drives authoritative history discovery"
+    );
 }

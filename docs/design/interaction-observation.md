@@ -441,7 +441,7 @@ Observation、Rejected Request、Debug manifest 与 Trace 文件跟随 `log_rete
 
 Layer 只保留静态操作名、内部生成的 span／parent ID、时间、白名单状态，以及 `node_count`、`reference_count`、`candidate_count`、`event_count` 四个非负整数工作量字段；忽略其他 span 字段，不使用 `ret`／`err` 自动记录业务值。默认终态为 `closed`，仅表示 span 生命周期结束；业务代码在已知结果时显式记录 `completed`、`error`、`cancelled` 或 `abandoned`。不能把函数返回、future 被丢弃或父 span 关闭自动解释为成功。
 
-时间线默认保留 1,024 个活动 span 与 10,000 个结束记录，可用 `STRAVIA_PERF_TRACE_ACTIVE_CAPACITY` 与 `STRAVIA_PERF_TRACE_COMPLETED_CAPACITY` 环境变量在进程启动时调整；活动区满时拒收新 span（相应耗时也不入直方图），结束区满时淘汰最旧记录。JSON `metadata.capacity`、`dropped_active`、`dropped_completed`、`incomplete` 与 `incomplete_total` 显式描述容量、丢弃数、当前未完成记录数与累计未完成数，不承诺完整请求树。关闭 Debug 将活动记录冻结为未完成记录；随后关闭的旧 span 不补写终态或直方图，重新开启只接收新周期的数据。
+时间线默认保留 1,024 个活动 span 与 10,000 个结束记录，可用 `STRAVIA_PERF_TRACE_ACTIVE_CAPACITY` 与 `STRAVIA_PERF_TRACE_COMPLETED_CAPACITY` 环境变量在进程启动时调整；活动区满时拒收新 span（相应耗时也不入直方图），结束区满时淘汰最旧记录。JSON `metadata.capacity`、`dropped_active`、`dropped_completed`、`incomplete` 与 `incomplete_total` 显式描述容量、丢弃数、当前导出的未完成记录数，以及历史冻结计数加当前活动 span 数，不承诺完整请求树。这些计数不能区分仍活动的 span 与 Debug 关闭时冻结的 span。关闭 Debug 将活动记录冻结为未完成记录；随后关闭的旧 span 不补写终态或直方图，重新开启只接收新周期的数据。
 
 导出使用标准 Chrome Trace 事件：已结束 span 为 `X`，未结束或被 Debug 关闭截断的 span 只有 `B`，不伪造结束时间；可见父子间附带 flow。每个 span 使用合成 track，`tid` 不是操作系统线程。可导入 Perfetto 或 Chrome trace viewer 查看墙钟时长与父子关联；`active_us` 仅表示 span 被 enter 的区间并集（重入或并发 enter 不重复累加），不是 CPU 时间，未 enter 的 span 不输出该值。该时间线不是 CPU／堆 profiler；进程 CPU／RSS 仍是独立全局采样，不能归因到单个 span。
 
@@ -457,8 +457,8 @@ Layer 只保留静态操作名、内部生成的 span／parent ID、时间、白
 |---|---|
 |`sql_query_count` / `sql_query_duration_us`|直属 SQLx 查询事件数及其累计耗时；没有查询事件时省略|
 |`sql_pool_acquire_count` / `sql_pool_acquire_duration_us`|直属成功连接获取次数及其累计耗时；没有事件时省略|
-|`node_count`|本次底层历史物化或内容恢复的节点数|
-|`reference_count`|本次内容写入或恢复的引用条目数|
+|`node_count`|本次底层操作处理的节点数；`turn_chain.ancestor.select` 记录实际从 SQL 读取的新后缀节点数，不含请求上下文命中的祖先|
+|`reference_count`|内容写入的引用条目数；不能据此推断读取的外置内容行数|
 |`candidate_count`|前缀查询返回或对应发现阶段已统计的候选数；未完成统计时可能省略|
 |`event_count`|`observation.writer.persist_events` 收到的事件批量大小，包含随后可能被过滤掉的事件|
 
@@ -470,16 +470,20 @@ SQL 事件只计入最近的 span，不重复累加到祖先。父 span 的直�
 |---|---|
 |`generation_chain.parent.*`、`generation_chain.references.resolve_available`、`generation_chain.ancestor.*`|区分显式父节点、前缀发现、压缩来源、引用恢复及后台祖先访问|
 |`generation_chain.history.load`|Generation Materialization Cache 未命中或 Item Reference 恢复所需的祖先历史读取，不能代表所有底层读链|
-|`turn_chain.materialize` → `turn_chain.ancestor.select` / `turn_chain.content.restore`|覆盖包括绕过 Generation 缓存的直接物化，拆分祖先查询与共享内容恢复|
+|`turn_chain.materialize` → `turn_chain.ancestor.select`|覆盖包括绕过 Generation 缓存的直接物化；请求上下文路径单列祖先查询，父子 `node_count` 不相加|
 |`turn_chain.commit` → `turn_chain.content.put`|区分节点提交与按引用执行的内容 upsert／引用 insert|
 |`turn_chain.prefix.lookup`|持久前缀候选查询|
 |`observation.attribution.admit` / `observation.writer.admit_persist`|区分后台交互归属判定与准入记录落盘|
 |`observation.writer.persist_events`、`persist_tail_source`、`filter_client_tool_results` 等|观察事件批次、工具尾迹与工具结果归属查询|
 |`observation.manifest.*` / `observation.maintenance.*`|Debug manifest 写入、计数与保留期维护；不在空闲的每个 writer tick 上建立 span|
 
+`turn_chain.content.restore` 是 `stravia::perf` 日志事件，不是时间线 span；其中 `content_read_count` / `reference_count` 表示本次实际从数据库恢复的唯一外置内容行数，不含请求上下文命中。性能时间线不会导出该事件，因此只有时间线的基准不能声称直接测得外置内容行数。
+
 `stravia_generation_materialization_cache_access_total{result="hit"|"miss"}` 统计普通物化与含 Item Reference 的父节点恢复对 Generation Materialization Cache 的访问。物化对象和按 ingress 隔离的祖先引用目录现共用[统一派生缓存](architecture.md#统一派生缓存与-server-配置)：Memory / SQLite 使用 TinyUFO，PostgreSQL 使用 Redis。普通父节点恢复命中缓存后不再读链；含 Item Reference 时，若对应 ingress 的引用目录也命中则不再读链，否则仍需读取祖先历史构造目录。物化 hit 本身不证明目录 hit。请求准备阶段的有界发现工作区只复用节点与解码材料，不计入该跨请求缓存的 hit/miss 或记账字节；应结合 `generation_chain.history.load` 与底层 `turn_chain.materialize` 的次数及 SQL 归因验证实际减少的读取，不能把 `candidate_count` 当作逐一核验次数。直接调用底层 Turn Chain 物化不会经过该缓存，因此不能仅凭命中率推断底层读取次数。逻辑缓存记账不等于进程或 Redis 实际内存。
 
 调查时，在同一进程、同一段复现操作前后各导出一次 metrics，按 `operation` 比较 `_count` 和 `_sum` 差值，并在操作完成后立即导出 timeline。先按查询次数判断高频来源，再按耗时判断慢路径；用工作量字段区分大批次与过多小批次，用父子关系识别重复物化。指标是累计值，关闭或清除 Debug 数据不会归零；有界 timeline 与累计 metrics 也不覆盖相同时间窗口，不能直接相除推导每请求查询量。
+
+`tests/common/measure_history_paths.py` 对真实 Server 使用隔离数据库与 loopback 上游，分别报告新建或持续连接的 `connect_ms`、不含连接建立的 `http_request_ms` 和总 `latency_ms`；普通模式、连接模式及 SharedCache 容量必须在前后对照中一致。专用进程默认用 `--trace-completed-capacity 20000`，不改变产品默认值；结束记录淘汰、活动拒收、不完整 span 或缺少完整请求根/子树证据时，报告仍判无效，不能为通过比较而忽略这些标记。完整且明确归属于独立 `observation.*` 根的历史重建单列为观测工作，不混入 Inference Run 子树；未知根、缺失祖先或环仍判为归属不完整。正常完整投影场景与将独立测试 Principal 的派生投影置为未知的共享祖先诊断场景分别报告；后者只验证保守回退的读取复用，不代表正常数据的收益。内容、父节点、拒绝时无父关系和完整压缩窗口是正确性依据，候选数量与读链次数只作工作量证据。
 
 ### 7.2 脱敏
 

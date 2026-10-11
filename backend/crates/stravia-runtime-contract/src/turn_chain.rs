@@ -1,4 +1,9 @@
-use std::time::Duration;
+use std::{
+    any::Any,
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -160,6 +165,198 @@ pub struct MaterializedTurnChain {
     pub expires_at: std::time::Instant,
 }
 
+/// One request's validated, decoded history workspace. Raw node payloads are
+/// never retained. Decoded nodes and restored external contents share one byte
+/// budget; only a successful domain fold followed by `admit` retains either.
+/// Budget refusal closes admission without discarding existing cache hits.
+pub struct TurnReadContext {
+    principal: Principal,
+    kind: TurnNodeKind,
+    nodes: HashMap<TurnNodeId, SharedTurnNode>,
+    bytes: usize,
+    budget: usize,
+    admission_open: bool,
+    validated_until: HashMap<TurnNodeId, Instant>,
+    contents: HashMap<String, (Arc<Value>, usize)>,
+    pending_contents: HashMap<String, (Arc<Value>, usize)>,
+    pending_bytes: usize,
+}
+
+#[derive(Clone)]
+pub struct SharedTurnNode {
+    pub id: TurnNodeId,
+    pub kind: TurnNodeKind,
+    pub parent_id: Option<TurnNodeId>,
+    pub payload_version: u32,
+    pub expires_at: Instant,
+    pub raw: Option<Arc<TurnNode>>,
+    pub decoded: Option<Arc<dyn Any + Send + Sync>>,
+}
+
+pub struct SharedMaterializedTurnChain {
+    pub nodes: Vec<SharedTurnNode>,
+    pub expires_at: Instant,
+}
+
+impl TurnReadContext {
+    pub const BYTE_LIMIT: usize = 16 * 1024 * 1024;
+
+    pub fn new(principal: &Principal, kind: TurnNodeKind) -> Self {
+        Self::with_budget(principal, kind, Self::BYTE_LIMIT)
+    }
+
+    pub fn with_budget(principal: &Principal, kind: TurnNodeKind, budget: usize) -> Self {
+        Self {
+            principal: principal.clone(),
+            kind,
+            nodes: HashMap::new(),
+            bytes: 0,
+            budget: budget.min(Self::BYTE_LIMIT),
+            admission_open: true,
+            validated_until: HashMap::new(),
+            contents: HashMap::new(),
+            pending_contents: HashMap::new(),
+            pending_bytes: 0,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.nodes.is_empty()
+    }
+
+    pub fn admission_open(&self) -> bool {
+        self.admission_open
+    }
+
+    /// Adapters clear unadmitted content before starting every candidate read.
+    pub fn begin_read(&mut self) {
+        self.pending_contents.clear();
+        self.pending_bytes = 0;
+    }
+
+    pub fn cached_content(&self, key: &str) -> Option<Arc<Value>> {
+        self.contents.get(key).map(|(value, _)| value.clone())
+    }
+
+    pub fn stage_content(&mut self, key: String, value: Arc<Value>, bytes: usize) {
+        if !self.admission_open
+            || self.contents.contains_key(&key)
+            || self.pending_contents.contains_key(&key)
+        {
+            return;
+        }
+        let remaining = self
+            .budget
+            .saturating_sub(self.bytes)
+            .saturating_sub(self.pending_bytes);
+        if bytes > remaining {
+            self.admission_open = false;
+            self.begin_read();
+            return;
+        }
+        self.pending_bytes += bytes;
+        self.pending_contents.insert(key, (value, bytes));
+    }
+
+    pub fn matches(&self, principal: &Principal, kind: TurnNodeKind) -> bool {
+        &self.principal == principal && self.kind == kind
+    }
+
+    /// Only call after the entire chain has passed domain decoding and folding.
+    /// Sizes include decoded payloads and their owned allocations.
+    pub fn admit(
+        &mut self,
+        chain: &SharedMaterializedTurnChain,
+        decoded: Vec<(Arc<dyn Any + Send + Sync>, usize)>,
+    ) {
+        let pending = std::mem::take(&mut self.pending_contents);
+        let content_bytes = std::mem::take(&mut self.pending_bytes);
+        if !self.admission_open
+            || decoded.len() != chain.nodes.len()
+            || chain.expires_at <= Instant::now()
+            || chain.nodes.iter().any(|node| node.kind != self.kind)
+        {
+            return;
+        }
+        let additional = chain
+            .nodes
+            .iter()
+            .zip(&decoded)
+            .filter(|(node, _)| !self.nodes.contains_key(&node.id))
+            .try_fold(0usize, |sum, (_, (_, size))| sum.checked_add(*size));
+        let Some(additional) = additional else {
+            self.admission_open = false;
+            return;
+        };
+        let Some(additional) = additional.checked_add(content_bytes) else {
+            self.admission_open = false;
+            return;
+        };
+        if additional > self.budget.saturating_sub(self.bytes) {
+            self.admission_open = false;
+            return;
+        }
+        let mut prefix_expiry: Option<Instant> = None;
+        for (node, (decoded, _)) in chain.nodes.iter().zip(decoded) {
+            let retained = self
+                .nodes
+                .entry(node.id.clone())
+                .and_modify(|retained| {
+                    retained.expires_at = retained.expires_at.max(node.expires_at);
+                })
+                .or_insert_with(|| SharedTurnNode {
+                    raw: None,
+                    decoded: Some(decoded),
+                    ..node.clone()
+                });
+            let expiry = prefix_expiry.map_or(retained.expires_at, |expiry| {
+                expiry.min(retained.expires_at)
+            });
+            prefix_expiry = Some(expiry);
+            self.validated_until.insert(node.id.clone(), expiry);
+        }
+        self.contents.extend(pending);
+        self.bytes += additional;
+    }
+
+    /// Returns a complete validated ancestor chain, checking each node's own TTL.
+    pub fn get(&self, id: &TurnNodeId) -> Option<SharedMaterializedTurnChain> {
+        self.get_at(id, Instant::now())
+    }
+
+    /// Checks a complete proof at the read's monotonic completion boundary.
+    pub fn get_at(&self, id: &TurnNodeId, now: Instant) -> Option<SharedMaterializedTurnChain> {
+        let mut nodes = Vec::new();
+        let mut next = Some(id);
+        let mut expires_at = None;
+        while let Some(id) = next {
+            let node = self.nodes.get(id)?;
+            if node.expires_at <= now || nodes.len() >= self.nodes.len() {
+                return None;
+            }
+            expires_at = Some(expires_at.map_or(node.expires_at, |expiry: Instant| {
+                expiry.min(node.expires_at)
+            }));
+            nodes.push(node.clone());
+            next = node.parent_id.as_ref();
+        }
+        nodes.reverse();
+        Some(SharedMaterializedTurnChain {
+            nodes,
+            expires_at: expires_at?,
+        })
+    }
+
+    pub fn validated_ids(&self) -> Vec<String> {
+        let now = Instant::now();
+        self.validated_until
+            .iter()
+            .filter(|(_, expiry)| **expiry > now)
+            .map(|(id, _)| id.as_str().to_owned())
+            .collect()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TurnCommit {
     pub id: TurnNodeId,
@@ -171,18 +368,42 @@ pub struct TurnCommit {
     pub idle_ttl: Duration,
     pub reusable_prefix: Option<ReusablePrefixMetadata>,
 }
+/// Version of the optional controls/client-context exclusion proof. Unknown
+/// versions must remain eligible for the authoritative history matcher.
+pub const REUSABLE_PREFIX_PROJECTION_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReusablePrefixProjection {
+    pub version: u32,
+    pub controls_fingerprint: String,
+    pub context_fingerprint: String,
+}
+
+/// Context fingerprints pair each request prefix with its canonical unit count,
+/// not its item count. This proof can exclude candidates, never establish a hit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReusablePrefixProjectionQuery {
+    pub version: u32,
+    pub controls_fingerprint: String,
+    pub context_fingerprints: Vec<(String, u32)>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReusablePrefixMetadata {
     pub namespace: String,
     pub fingerprint: String,
     pub item_count: u32,
     pub completed_at: i64,
+    pub projection: Option<ReusablePrefixProjection>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReusablePrefixQuery {
     pub namespace: String,
     pub fingerprints: Vec<(String, u32)>,
+    /// Absent or unknown proofs leave all candidates eligible. Even a known
+    /// proof only prefilters; callers must still perform exact history matching.
+    pub projection: Option<ReusablePrefixProjectionQuery>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -233,6 +454,39 @@ pub trait TurnChainStore: Send + Sync {
         })
     }
 
+    async fn materialize_in_context(
+        &self,
+        principal: &Principal,
+        kind: TurnNodeKind,
+        id: &TurnNodeId,
+        context: &mut TurnReadContext,
+    ) -> Result<SharedMaterializedTurnChain, TurnUnavailable> {
+        context.begin_read();
+        if !context.matches(principal, kind) {
+            return Err(TurnUnavailable::Unavailable);
+        }
+        if let Some(chain) = context.get(id) {
+            return Ok(chain);
+        }
+        let chain = self.materialize_with_expiry(principal, kind, id).await?;
+        Ok(SharedMaterializedTurnChain {
+            expires_at: chain.expires_at,
+            nodes: chain
+                .nodes
+                .into_iter()
+                .map(|node| SharedTurnNode {
+                    id: node.id.clone(),
+                    kind: node.kind,
+                    parent_id: node.parent_id.clone(),
+                    payload_version: node.payload_version,
+                    expires_at: chain.expires_at,
+                    raw: Some(Arc::new(node)),
+                    decoded: None,
+                })
+                .collect(),
+        })
+    }
+
     async fn commit(&self, commit: TurnCommit) -> Result<TurnNodeId, TurnCommitError>;
 
     async fn find_reusable_prefixes(
@@ -245,8 +499,10 @@ pub trait TurnChainStore: Send + Sync {
     }
 
     /// Rebuild derived prefix indexes for stored nodes whose namespace falls
-    /// outside `namespace_prefix`. `decode` maps one chain's nodes and its
-    /// completion time to fresh metadata; returning `None` clears the index.
+    /// outside `namespace_prefix`. A change to projection semantics must bump
+    /// that namespace generation so retained client history rebuilds the proof.
+    /// `decode` maps one chain's nodes and its completion time to fresh metadata;
+    /// returning `None` clears both the prefix index and its optional projection.
     /// Stores without derived prefix indexes keep the default no-op.
     async fn rebuild_prefixes(
         &self,

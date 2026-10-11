@@ -1122,11 +1122,7 @@ async fn acquire_turn(
             .expect("admitted root RPM context");
         input.compaction_source_generation_id = generation.compaction_source_generation_id.clone();
         input.generation_parent_target = generation.write.as_ref().map_or(
-            crate::router::GenerationParentTarget::Resolved {
-                parent_id: None,
-                target: None,
-                expires_at: None,
-            },
+            crate::router::GenerationParentTarget::absent(&generation.principal),
             |write| write.parent_target(),
         );
         input.generation_root_id = generation

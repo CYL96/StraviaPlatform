@@ -30,6 +30,8 @@ use stravia_runtime_contract::turn_chain::TurnNodeId;
 use stravia_runtime_contract::turn_chain::TurnNodeKind;
 use stravia_runtime_contract::turn_chain::TurnUnavailable;
 
+mod continuation;
+pub(crate) use continuation::GenerationParentTarget;
 mod materialize;
 pub(crate) use materialize::rebuilt_prefix;
 mod pending;
@@ -737,97 +739,12 @@ impl GenerationChain {
         write.parent = Arc::new(parent);
         Ok(write)
     }
-
-    pub(crate) fn continuation_lookup(&self) -> Arc<dyn crate::router::ContinuationLookup> {
-        Arc::new(GenerationChainContinuationLookup {
-            chain: self.clone(),
-        })
-    }
 }
 
 impl GenerationChainWrite {
     /// Move the preparation workspace out before model execution or leg cloning.
     pub(crate) fn take_discovery_workspace(&mut self) -> Option<GenerationDiscoveryWorkspace> {
         self.discovery_workspace.take()
-    }
-
-    pub(crate) fn parent_target(&self) -> crate::router::GenerationParentTarget {
-        if self.parent.parent_id.is_some() && self.parent.parent_expires_at.is_none() {
-            // Adapters without a retainable deadline require the original fresh lookup.
-            return crate::router::GenerationParentTarget::Unresolved;
-        }
-        let target = self
-            .parent
-            .parent_state
-            .as_ref()
-            .map(|state| &state.selected_target_key)
-            .or(self.parent.parent_target_key.as_ref())
-            .filter(|key| !key.is_empty())
-            .cloned();
-        crate::router::GenerationParentTarget::Resolved {
-            parent_id: self.parent.parent_id.clone(),
-            target,
-            expires_at: self.parent.parent_expires_at,
-        }
-    }
-}
-
-struct GenerationChainContinuationLookup {
-    chain: GenerationChain,
-}
-
-#[async_trait]
-impl crate::router::ContinuationLookup for GenerationChainContinuationLookup {
-    async fn preferred_target(&self, principal: &Principal, request: &AiRequest) -> Option<String> {
-        let parent_id = crate::router::parent_id_from_request(request)?;
-        let materialized = self
-            .chain
-            .store
-            .materialize_generation(principal, &TurnNodeId::new(parent_id))
-            .await
-            .ok()?;
-        (!materialized.effective_state.selected_target_key.is_empty())
-            .then(|| materialized.effective_state.selected_target_key.clone())
-    }
-
-    async fn prepare(
-        &self,
-        principal: &Principal,
-        target: crate::router::ContinuationTarget<'_>,
-        request: &mut Arc<AiRequest>,
-        full_fallback: &mut Option<Arc<AiRequest>>,
-    ) -> Option<String> {
-        *full_fallback = None;
-        let parent_id = crate::router::parent_id_from_request(request)?;
-        let candidate_state =
-            GenerationChainState::from_request(request, target.namespace, target.protocol)
-                .with_provider_model(target.actual_model);
-        if self
-            .chain
-            .store
-            .prepare_target_continuation(
-                principal,
-                &parent_id,
-                request,
-                &candidate_state,
-                target.allow_ephemeral_response,
-                full_fallback,
-            )
-            .await
-        {
-            crate::router::parent_id_from_request(request)
-        } else {
-            if crate::router::parent_id_from_request(request).is_some()
-                || request
-                    .meta
-                    .vendor
-                    .ingress
-                    .contains_key("previous_response_id")
-            {
-                crate::router::clear_previous_response_id(Arc::make_mut(request));
-            }
-            None
-        }
     }
 }
 
@@ -962,7 +879,7 @@ struct ClientHistoryState {
 
 /// Namespace generation stamped on stored reusable prefixes. Bumping the
 /// version makes every older index stale at startup rebuild.
-const GENERATION_PREFIX_NAMESPACE: &str = "stravia-generation-history-v2:";
+const GENERATION_PREFIX_NAMESPACE: &str = "stravia-generation-history-v3:";
 
 impl ClientHistoryState {
     fn from_request(request: &AiRequest, items: &[AiItem]) -> Self {

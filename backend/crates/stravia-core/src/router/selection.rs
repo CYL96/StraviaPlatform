@@ -94,16 +94,8 @@ impl RouteSelector {
             ) => self.continuation.preferred_target(principal, request).await,
             (
                 Some(ConversationIdentity::GenerationParent(id)),
-                crate::router::GenerationParentTarget::Resolved {
-                    parent_id,
-                    target,
-                    expires_at,
-                },
-            ) if parent_id.as_ref() == Some(id)
-                && expires_at.is_some_and(|expiry| expiry > std::time::Instant::now()) =>
-            {
-                target.clone()
-            }
+                resolved @ crate::router::GenerationParentTarget::Resolved(_),
+            ) => resolved.preferred_target(principal, id),
             _ => None,
         };
         let snapshot = self
@@ -443,6 +435,7 @@ mod tests {
             &self,
             _principal: &Principal,
             _target: ContinuationTarget<'_>,
+            _parent: &crate::router::GenerationParentTarget,
             _request: &mut Arc<AiRequest>,
             _full_fallback: &mut Option<Arc<AiRequest>>,
         ) -> Option<String> {
@@ -1257,11 +1250,12 @@ mod tests {
                 targets.push(continued);
             }
             let route = route(targets);
-            let evidence = crate::router::GenerationParentTarget::Resolved {
-                parent_id: Some(parent_id.into()),
-                target: Some("continued:model".into()),
-                expires_at: Some(expires_at),
-            };
+            let evidence = crate::router::GenerationParentTarget::route_evidence(
+                &principal(),
+                parent_id,
+                "continued:model",
+                expires_at,
+            );
             let mut policy = fixture
                 .selector
                 .select(

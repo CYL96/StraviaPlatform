@@ -481,7 +481,7 @@ CREATE TABLE "turn_chain_nodes" (
  parent_id TEXT, principal TEXT NOT NULL, payload_version INTEGER NOT NULL CHECK(payload_version>0),
  payload BLOB NOT NULL, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL,
  prefix_namespace TEXT, prefix_fingerprint TEXT, prefix_item_count INTEGER, prefix_completed_at INTEGER,
- storage_format INTEGER NOT NULL DEFAULT 2 CHECK(storage_format IN (0,1,2)),
+ storage_format INTEGER NOT NULL DEFAULT 2 CHECK(storage_format IN (0,1,2)), prefix_projection_version INTEGER, prefix_controls_fingerprint TEXT, prefix_context_fingerprint TEXT,
  UNIQUE(id,principal), UNIQUE(id,principal,kind),
  FOREIGN KEY(parent_id,principal,kind) REFERENCES "turn_chain_nodes"(id,principal,kind) ON DELETE RESTRICT
 );

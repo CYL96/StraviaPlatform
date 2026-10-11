@@ -68,6 +68,20 @@ pub(super) fn project_client_commit<'a>(
     })
 }
 
+impl ClientHistoryState {
+    pub(super) fn reusable_projection(
+        &self,
+    ) -> stravia_runtime_contract::turn_chain::ReusablePrefixProjection {
+        stravia_runtime_contract::turn_chain::ReusablePrefixProjection {
+            version: stravia_runtime_contract::turn_chain::REUSABLE_PREFIX_PROJECTION_VERSION,
+            controls_fingerprint: self.controls_fingerprint.clone(),
+            // from_request and replay compute this from actual retained client
+            // items, never effective history or a provider/redaction proof.
+            context_fingerprint: self.context_fingerprint.clone(),
+        }
+    }
+}
+
 pub(crate) fn project_client_history(
     ingress: ProtocolId,
     response: &AiResponse,

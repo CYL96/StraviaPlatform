@@ -6,18 +6,7 @@ use stravia_runtime_contract::protocol::ids::ProtocolId;
 use stravia_runtime_contract::protocol::ir::AiRequest;
 use stravia_runtime_contract::protocol::ir::ProtocolExt;
 
-/// Internal evidence from an already validated Generation Chain parent.
-/// A resolved miss must not initiate another history lookup.
-#[derive(Clone, Debug, Default)]
-pub(crate) enum GenerationParentTarget {
-    #[default]
-    Unresolved,
-    Resolved {
-        parent_id: Option<String>,
-        target: Option<String>,
-        expires_at: Option<std::time::Instant>,
-    },
-}
+pub(crate) use crate::generation_chain::GenerationParentTarget;
 
 pub struct ContinuationTarget<'a> {
     pub namespace: &'a str,
@@ -27,7 +16,7 @@ pub struct ContinuationTarget<'a> {
 }
 
 #[async_trait]
-pub trait ContinuationLookup: Send + Sync {
+pub(crate) trait ContinuationLookup: Send + Sync {
     /// Resolve affinity when reusable validated parent evidence is unavailable.
     /// Resolved parents travel separately from client-writable IR.
     async fn preferred_target(
@@ -44,6 +33,7 @@ pub trait ContinuationLookup: Send + Sync {
         &self,
         principal: &Principal,
         target: ContinuationTarget<'_>,
+        parent: &GenerationParentTarget,
         request: &mut Arc<AiRequest>,
         full_fallback: &mut Option<Arc<AiRequest>>,
     ) -> Option<String>;
@@ -77,6 +67,7 @@ impl ContinuationLookup for ScriptedContinuation {
         &self,
         _principal: &Principal,
         _target: ContinuationTarget<'_>,
+        _parent: &GenerationParentTarget,
         request: &mut Arc<AiRequest>,
         full_fallback: &mut Option<Arc<AiRequest>>,
     ) -> Option<String> {
