@@ -99,8 +99,10 @@ impl Gateway {
         }
         if key == "base" {
             return Ok(ProviderIcon {
-                body: include_bytes!("../../../../../frontend/stravia-webui/static/stravia-logo.svg")
-                    .to_vec(),
+                body: include_bytes!(
+                    "../../../../../frontend/stravia-webui/static/stravia-logo.svg"
+                )
+                .to_vec(),
                 content_type: "image/svg+xml",
             });
         }

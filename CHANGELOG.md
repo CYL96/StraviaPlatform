@@ -35,6 +35,7 @@
 
 ### Fixed
 
+- Admin model-sync CI fixtures now select direct connections when no outbound proxy is configured, preserving the production error for explicitly selected but unconfigured proxies. Rust icon formatting checks are restored, and icon tests no longer depend on an internal SVG marker name.
 - Restored WebUI CI formatting checks and aligned service-card logo regressions with local SVG precedence. Browser coverage still verifies remote-logo loading and visible fallback when no built-in icon is available; runtime logo selection is unchanged.
 - Markdown in Console Chat and request observations now closes bold/italic emphasis next to CJK text, such as `**名称（别名）**之后`, which CommonMark previously left as literal asterisks. Emphasis follows the CJK-friendly CommonMark draft via `marked-cjk-friendly`.
 - Console Chat no longer shows empty “Thinking” blocks for reasoning items whose summary is blank, whitespace-only, or only hidden comments, during streaming, after completion, or after stop/failure. Signed reasoning items are still stored and replayed unchanged.

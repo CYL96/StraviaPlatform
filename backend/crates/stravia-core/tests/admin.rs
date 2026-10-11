@@ -2050,7 +2050,7 @@ async fn catalog_provider_input_for(
             value: "sk-test".to_string(),
         },
         vendor_options: Default::default(),
-        use_proxy: true,
+        use_proxy: false,
     })
 }
 
@@ -2299,7 +2299,6 @@ async fn provider_icon_serves_base_provider_icon() -> anyhow::Result<()> {
     assert_eq!(icon.content_type, "image/svg+xml");
     let svg = String::from_utf8(icon.body)?;
     assert!(svg.contains("<svg"), "base icon must contain svg root");
-    assert!(svg.contains("cadence-motion"), "base icon must be the official Stravia mark");
 
     gw.shutdown().await;
     drop(gw);
@@ -2319,7 +2318,6 @@ async fn vendor_plugins_summary_includes_registered_icon_svg() -> anyhow::Result
         .expect("base plugin exists");
     let base_svg = base.icon_svg.as_deref().expect("base plugin has icon_svg");
     assert!(base_svg.contains("<svg"), "base icon must be SVG");
-    assert!(base_svg.contains("cadence-motion"), "base icon must be the official Stravia mark");
 
     let codex = plugins
         .iter()

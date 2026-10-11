@@ -1045,7 +1045,12 @@ fn descriptor_icon_svg(descriptor: &stravia_vendor_sdk::VendorDescriptor) -> Opt
         .iter()
         .find(|profile| profile.provider_id == descriptor.vendor_id)
         .and_then(|profile| profile.icon_svg.clone())
-        .or_else(|| descriptor.providers.iter().find_map(|profile| profile.icon_svg.clone()))
+        .or_else(|| {
+            descriptor
+                .providers
+                .iter()
+                .find_map(|profile| profile.icon_svg.clone())
+        })
 }
 
 /// 安装记录本身建立接管关系；加载失败也不得绕过记录去调用基础插件。
