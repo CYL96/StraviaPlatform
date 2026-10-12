@@ -449,8 +449,10 @@ function retryAll(): void {
       <MetricStrip {metrics} label={m.common_usage_summary()} />
     {/if}
 
-    <div class="grid gap-6 min-[1280px]:grid-cols-12">
-      <section class="route-section flex flex-col min-[1280px]:col-span-7" aria-labelledby="token-activity-title">
+    <div class="grid gap-6 min-[1280px]:grid-cols-12 min-[1280px]:gap-y-0">
+      <section
+        class="route-section flex flex-col min-[1280px]:col-span-7 min-[1280px]:row-span-2 min-[1280px]:grid min-[1280px]:grid-rows-subgrid"
+        aria-labelledby="token-activity-title">
         <div class="route-section-header">
           <div>
             <h2 id="token-activity-title" class="route-section-title">
@@ -478,7 +480,9 @@ function retryAll(): void {
         </div>
       </section>
 
-      <section class="route-section min-[1280px]:col-span-5" aria-labelledby="latency-trend-title">
+      <section
+        class="route-section min-[1280px]:col-span-5 min-[1280px]:row-span-2 min-[1280px]:grid min-[1280px]:grid-rows-subgrid"
+        aria-labelledby="latency-trend-title">
         <div class="route-section-header">
           <div>
             <h2 id="latency-trend-title" class="route-section-title">{m.stats_latency_speed()}</h2>
