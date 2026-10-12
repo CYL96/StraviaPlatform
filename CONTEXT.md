@@ -429,6 +429,31 @@ _避免使用_：Provider Offering、Catalog Model
 Provider Model 是属于一个已保存 Provider 实例、以 upstream model ID 标识的持久化模型快照，可以表示纯媒体生成模型，不以具备聊天能力为前提。它不同于共享 Provider Catalog 条目，也不同于负责客户端路由的 Route 和 Target；模型身份与其支持的能力相互区分。
 _避免使用_：Provider Model Override、Catalog Model
 
+## 模型清单同步（Provider Model Sync）
+
+模型清单同步是针对一个已保存 Provider，由后台自动检查或管理员手动触发、检查并协调该服务提供的 Provider Model 清单的操作。发现新的 Provider Model 不等于添加供客户端调用的 Route。
+_避免使用_：自动添加客户端模型、产品更新、共享目录刷新
+
+## 模型清单变更（Provider Model List Change）
+
+模型清单变更是某个已保存 Provider 下 Provider Model 的新增、提供状态变化、同步刷新规格或管理员 Selection Policy 修改。上游不再提供与管理员手动禁用是不同事实，自动同步、手动同步与手动修改是不同变更来源。
+_避免使用_：把不再提供统称为禁用、Route 变更、请求运行状态
+
+## 模型变更记录（Model Change Record）
+
+模型变更记录是某个 Provider 的一次模型清单同步或手动清单修改的可回看结果，模型变化与同步失败分别表达；其归属跟随具体连接身份，改名不拆分、同名重建不合并。记录时间表示 Stravia 确认结果的时间，首次同步发现的模型不因此被视为上游刚发布的模型。
+_避免使用_：上游发布时间、用模型更新时间重建历史、按服务展示名称合并历史
+
+## 不再提供（No Longer Offered）
+
+不再提供是曾被某个 Provider 发现的模型，在一次成功、完整的模型清单同步中不再出现的提供状态。它不同于管理员手动禁用，也不等于上游弃用。
+_避免使用_：手动禁用、模型已删除、同步失败
+
+## 上游弃用（Deprecated by Service）
+
+上游弃用是服务模型发现或来源元数据将模型生命周期标记为 `deprecated` 的状态，模型仍可能出现在服务清单中。它不同于不再提供与管理员手动禁用；是否允许发送继续由 Selection Policy 与 Effective Availability 决定。
+_避免使用_：不再提供、手动禁用、模型已删除
+
 ## Provider Model Editing
 
 Provider Model Editing 是管理面针对一个 Provider Model 的当前详情与未提交规格形成的临时编辑上下文，也涵盖尚未保存的手动模型草稿。它不是持久化的 Model Snapshot State，不改变 Selection Policy 与 Destination RPM 各自独立生效的含义。
@@ -436,7 +461,7 @@ _避免使用_：Provider Connection Draft、持久化模型快照、跨模型�
 
 ## Model Snapshot State
 
-Model Snapshot State 表达 Provider Model 规格快照的来源与编辑状态：尚未登记、已从明确来源导入、或已经管理员编辑。未知规格保持未知；普通同步不能覆盖已导入或人工修正的规格。它不同于发现方式、当前是否提供模型以及 Selection Policy。
+Model Snapshot State 表达 Provider Model 规格快照的来源与编辑状态：尚未登记、已从明确来源导入、或已经管理员编辑。未知规格保持未知；普通同步可以补齐尚未登记的规格，并让已导入、未被管理员编辑的规格跟随来源更新；人工编辑后由管理员接管整条模型规格，而非仅保护被编辑的字段。
 _避免使用_：模型可用性、占位默认规格、从字段值推断人工修改
 
 ## Model Specification
@@ -446,12 +471,12 @@ _避免使用_：实测能力、实际可用能力、把未登记称为不支持
 
 ## Selection Policy
 
-Selection Policy 是管理员对 Provider Model 新路由候选资格的本地策略，取值为自动跟随、强制可用或强制禁用。
+Selection Policy 是管理员对 Provider Model 路由候选资格与后续上游发送资格的本地策略，取值为自动跟随、强制可用或强制禁用。
 _避免使用_：Enabled、Availability Override
 
 ## Effective Availability
 
-Effective Availability 是 Selection Policy、Provider discovery presence 与上游生命周期共同计算出的“可用/禁用”结果；它只约束新的路由候选，不改写已有 Target。
+Effective Availability 是 Selection Policy、Provider discovery presence 与上游生命周期共同计算出的“可用/不可用”结果；它既约束新的路由候选，也约束已有 Target 的后续上游发送，但不删除或改写绑定配置。
 _避免使用_：Provider Status、Model Status
 
 ## Route
