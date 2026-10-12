@@ -4,7 +4,6 @@ import { onMount, tick } from 'svelte'
 import { page } from '$app/state'
 import { createQuery, useQueryClient } from '@tanstack/svelte-query'
 import { SvelteFlowProvider } from '@xyflow/svelte'
-import CalendarRangeIcon from '@lucide/svelte/icons/calendar-range'
 import MaximizeIcon from '@lucide/svelte/icons/maximize'
 import MinimizeIcon from '@lucide/svelte/icons/minimize'
 import RefreshCwIcon from '@lucide/svelte/icons/refresh-cw'
@@ -14,7 +13,7 @@ import { toast } from 'svelte-sonner'
 
 import { admin } from '$lib/admin-client'
 import { localizeBackendErrorMessage } from '$lib/backend-error'
-import { formatCompactCount, formatLogTime } from '$lib/format'
+import { formatCompactCount } from '$lib/format'
 import { effectiveModelDisplayName } from '$lib/logical-model'
 import { observationStatusLabel } from '$lib/observation-labels'
 import { observationOutputPreview } from '$lib/observation-conversation'
@@ -32,6 +31,7 @@ import FailedRequestTable from '$lib/components/failed-request-table.svelte'
 import PageHeader from '$lib/components/page-header.svelte'
 import StatusIndicator from '$lib/components/status-indicator.svelte'
 import RequestFailure from '$lib/components/request-failure.svelte'
+import TimeWindowControls from '$lib/components/time-window-controls.svelte'
 import * as Alert from '$lib/components/ui/alert'
 import * as AlertDialog from '$lib/components/ui/alert-dialog'
 import { Button } from '$lib/components/ui/button'
@@ -131,6 +131,14 @@ function durationLabel(minutes: number): string {
   return minutes === 60 ? m.observation_window_hour() : m.observation_window_hours({ count: minutes / 60 })
 }
 
+const windowPresets = $derived(
+  OBSERVATION_PRESET_MINUTES.map((minutes) => ({ value: String(minutes), label: durationLabel(minutes) })),
+)
+const windowSelectedLabel = $derived(
+  ws.customRange ? m.observation_custom_range() : durationLabel(ws.durationMs / 60_000),
+)
+const windowPresetValue = $derived(ws.customRange ? '' : String(ws.durationMs / 60_000))
+
 function localDateTime(timestamp: number): string {
   const date = new Date(timestamp)
   const pad = (value: number) => String(value).padStart(2, '0')
@@ -217,6 +225,23 @@ async function downloadBundle(): Promise<void> {
     tone={ws.streamConnected ? 'healthy' : 'neutral'} />
 {/snippet}
 
+{#snippet windowTrailing()}
+  <Button
+    variant="ghost"
+    size="icon-sm"
+    aria-label={m.observation_refresh_anchor()}
+    onclick={() => void ws.refreshAnchor()}><RefreshCwIcon /></Button>
+  <Button
+    bind:ref={fullscreenButton}
+    variant="ghost"
+    size="icon-sm"
+    aria-label={fullscreen ? m.observation_exit_fullscreen() : m.observation_enter_fullscreen()}
+    title={fullscreen ? m.observation_exit_fullscreen() : m.observation_enter_fullscreen()}
+    onclick={() => void toggleFullscreen()}>
+    {#if fullscreen}<MinimizeIcon />{:else}<MaximizeIcon />{/if}
+  </Button>
+{/snippet}
+
 {#snippet headerActions()}
   <div class="flex flex-wrap items-center gap-2">
     <Button variant="outline" onclick={() => (filterOpen = true)}
@@ -254,57 +279,25 @@ async function downloadBundle(): Promise<void> {
             value="failures">{m.observation_failed_requests()}</Tabs.Trigger
           ></Tabs.List>
       </Tabs.Root>
-      <div class="window-controls">
-        <Select.Root
-          type="single"
-          value={ws.customRange ? '' : String(ws.durationMs / 60_000)}
-          onValueChange={(value: string) => void ws.choosePreset(Number(value))}>
-          <Select.Trigger aria-label={m.observation_time_window()} class="w-28">
-            {ws.customRange ? m.observation_custom_range() : durationLabel(ws.durationMs / 60_000)}
-          </Select.Trigger>
-          <Select.Content portalProps={{ to: fullscreen ? workspaceEl : undefined }}>
-            <Select.Group>
-              {#each OBSERVATION_PRESET_MINUTES as minutes (minutes)}
-                <Select.Item value={String(minutes)} label={durationLabel(minutes)}>
-                  {durationLabel(minutes)}
-                </Select.Item>
-              {/each}
-            </Select.Group>
-          </Select.Content>
-        </Select.Root>
-        <Button variant="ghost" size="sm" disabled={ws.loading} onclick={() => void ws.changeWindow(1)}
-          >{m.observation_older_window()}</Button>
-        <Button
-          variant="ghost"
-          size="sm"
-          class="range-picker"
-          aria-label={m.observation_choose_range()}
-          onclick={openRange}>
-          <CalendarRangeIcon data-icon="inline-start" />
-          <span class="range-label">
-            {formatLogTime(ws.windowStart)} — {ws.liveWindow ? m.observation_live() : formatLogTime(ws.windowEnd)}
-          </span>
-        </Button>
-        <Button
-          variant="ghost"
-          size="sm"
-          disabled={ws.liveWindow || ws.loading}
-          onclick={() => void ws.changeWindow(-1)}>{m.observation_newer_window()}</Button>
-        <Button
-          variant="ghost"
-          size="icon-sm"
-          aria-label={m.observation_refresh_anchor()}
-          onclick={() => void ws.refreshAnchor()}><RefreshCwIcon /></Button>
-        <Button
-          bind:ref={fullscreenButton}
-          variant="ghost"
-          size="icon-sm"
-          aria-label={fullscreen ? m.observation_exit_fullscreen() : m.observation_enter_fullscreen()}
-          title={fullscreen ? m.observation_exit_fullscreen() : m.observation_enter_fullscreen()}
-          onclick={() => void toggleFullscreen()}>
-          {#if fullscreen}<MinimizeIcon />{:else}<MaximizeIcon />{/if}
-        </Button>
-      </div>
+      <TimeWindowControls
+        presets={windowPresets}
+        value={windowPresetValue}
+        selectedLabel={windowSelectedLabel}
+        startMs={ws.windowStart}
+        endMs={ws.windowEnd}
+        live={ws.liveWindow}
+        selectLabel={m.observation_time_window()}
+        rangeLabel={m.observation_choose_range()}
+        olderLabel={m.observation_older_window()}
+        newerLabel={m.observation_newer_window()}
+        olderDisabled={ws.loading}
+        newerDisabled={ws.liveWindow || ws.loading}
+        portalTarget={fullscreen ? workspaceEl : undefined}
+        onpreset={(value: string) => void ws.choosePreset(Number(value))}
+        onolder={() => void ws.changeWindow(1)}
+        onnewer={() => void ws.changeWindow(-1)}
+        onrange={openRange}
+        trailing={windowTrailing} />
     </div>
 
     {#if ws.activeTab === 'interactions'}
@@ -630,16 +623,6 @@ async function downloadBundle(): Promise<void> {
   border-bottom: 1px solid var(--border);
   padding: 0.55rem 0.75rem;
 }
-.window-controls {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 0.3rem;
-}
-.range-label {
-  font-family: var(--font-technical);
-  font-size: 0.7rem;
-}
 .observation-workspace.workspace-fullscreen,
 .observation-workspace:fullscreen {
   position: fixed;
@@ -699,13 +682,6 @@ async function downloadBundle(): Promise<void> {
   .workspace-toolbar {
     align-items: stretch;
     flex-direction: column;
-  }
-  .window-controls {
-    justify-content: space-between;
-  }
-  .window-controls :global(.range-picker) {
-    order: 1;
-    width: 100%;
   }
 }
 </style>

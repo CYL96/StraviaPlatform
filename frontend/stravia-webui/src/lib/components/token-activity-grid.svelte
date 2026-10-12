@@ -25,23 +25,22 @@ const multiDay = $derived.by(() => {
   return first.toDateString() !== last.toDateString()
 })
 
-// 列起点恰为本地 00:00（小时列取 0 时列、6h 段列取 00–06 段）。
-function isDayStart(start: number): boolean {
-  const d = new Date(start)
-  return d.getHours() === 0 && d.getMinutes() === 0 && d.getSeconds() === 0 && d.getMilliseconds() === 0
-}
-
 // 稀疏列标签：列多时跳格标注，避免相邻文字互相重叠。
-// 亚日粒度的多日窗口只标注首列与每个自然日首列（本地 00:00），
-// 日期唯一且不与相邻文字重叠；单日窗口沿用时刻标注。
+// 查询范围锚定实际结束时间，不一定经过本地 00:00；跨日列按日期变化标注。
+// 单日窗口沿用时刻标注。
 const colLabels = $derived.by(() => {
   const step = Math.max(model.colCount > 4 ? 2 : 1, Math.ceil(model.colCount / 10))
+  let lastDayLabel = -Math.max(2, step)
   return model.colStarts.map((start, index) => {
     if (model.bucketMs >= SIX_HOURS_MS) {
       return index % step === 0 ? formatMonthDay(start) : null
     }
     if (multiDay) {
-      return index === 0 || isDayStart(start) ? formatMonthDay(start) : null
+      const previous = model.colStarts[index - 1]
+      const startsDay = previous == null || new Date(previous).toDateString() !== new Date(start).toDateString()
+      if (!startsDay || index - lastDayLabel < Math.max(2, step)) return null
+      lastDayLabel = index
+      return formatMonthDay(start)
     }
     return index % step === 0 ? formatMinuteTime(start) : null
   })
@@ -59,7 +58,7 @@ function cellText(cell: ActivityCell): string {
 }
 </script>
 
-<div class="flex min-w-0 flex-col items-end">
+<div class="flex min-w-0 flex-col items-start">
   <div
     class="grid w-fit gap-1"
     style="grid-template-columns:repeat({model.colCount},{cellPx}px);grid-auto-rows:{cellPx}px"
@@ -72,6 +71,7 @@ function cellText(cell: ActivityCell): string {
           class="token-activity-cell cursor-default rounded-[3px] p-0 data-[level=0]:bg-secondary data-[level=1]:bg-chart-4 data-[level=2]:bg-chart-3 data-[level=3]:bg-chart-2 data-[level=4]:bg-chart-1"
           style="grid-column:{cell.col + 1};grid-row:{cell.row + 1}"
           data-level={cell.level}
+          data-start={cell.start}
           aria-label={cellText(cell)} />
         <Tooltip.Content side="top" sideOffset={4}>{cellText(cell)}</Tooltip.Content>
       </Tooltip.Root>
@@ -88,7 +88,7 @@ function cellText(cell: ActivityCell): string {
       {/each}
     </div>
   {/if}
-  <div class="mt-2 flex w-fit items-center gap-1 text-[0.625rem] leading-3 text-muted-foreground">
+  <div class="mt-2 flex w-fit self-end items-center gap-1 text-[0.625rem] leading-3 text-muted-foreground">
     <span class="mr-1">{m.stats_activity_less()}</span>
     {#each [0, 1, 2, 3, 4] as level (level)}
       <span

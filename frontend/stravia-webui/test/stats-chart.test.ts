@@ -1,9 +1,11 @@
 import { describe, expect, test } from 'bun:test'
 
-import { buildActivityGrid, buildLatencyChart } from '../src/lib/stats-chart'
+import { buildActivityGrid, buildLatencyChart, planActivityGrid } from '../src/lib/stats-chart'
 
 const HOUR_MS = 3_600_000
 const DAY_MS = 86_400_000
+const QUARTER_MS = 900_000
+const MAX_BUCKETS = 512
 
 describe('latency chart', () => {
   test('missing latency points follow the requested coarse grain, not the base quarter hour', () => {
@@ -268,5 +270,207 @@ describe('activity grid', () => {
     expect(grid.colCount).toBe(6)
     const positions = new Set(grid.cells.map((cell) => `${cell.col}:${cell.row}`))
     expect(positions.size).toBe(grid.cells.length)
+  })
+})
+
+/** 把 plan 的输出直接喂进 buildActivityGrid，返回图模型。 */
+function planAndBuild(opts: { startMs: number; endMs: number; bucketMs: number; widthPx: number; heightPx: number }) {
+  const plan = planActivityGrid(opts)
+  return { plan, model: buildActivityGrid([], plan) }
+}
+
+describe('planActivityGrid', () => {
+  const VIEWPORT = { widthPx: 640, heightPx: 224 }
+
+  test('keeps the requested grain and extends whole columns to fill the viewport', () => {
+    const end = Date.UTC(2026, 8, 17, 12)
+    const { plan, model } = planAndBuild({ startMs: end - 6 * HOUR_MS, endMs: end, bucketMs: QUARTER_MS, ...VIEWPORT })
+    expect(plan.bucketMs).toBe(QUARTER_MS)
+    expect(plan.endMs).toBe(end)
+    // start = end - colCount*rowCount*bucket，且早于所选起点（向左补满）。
+    expect(plan.startMs).toBe(end - plan.colCount * plan.rowCount * plan.bucketMs)
+    expect(plan.startMs).toBeLessThan(end - 6 * HOUR_MS)
+    expect(plan.colCount * plan.rowCount).toBeLessThanOrEqual(MAX_BUCKETS)
+    // 完整覆盖所选范围：最后一项恰好是所选 endMs 前的最后一个桶。
+    expect(model.cells.at(-1)!.start + plan.bucketMs).toBe(end)
+    expect(model.cells[0].start).toBe(plan.startMs)
+    expect(model.bucketMs).toBe(plan.bucketMs)
+  })
+
+  test('a resize to the same width reproduces the same plan and range', () => {
+    const end = Date.UTC(2026, 8, 17, 12)
+    const first = planActivityGrid({
+      startMs: end - 24 * HOUR_MS,
+      endMs: end,
+      bucketMs: HOUR_MS,
+      widthPx: 700,
+      heightPx: 224,
+    })
+    const second = planActivityGrid({
+      startMs: end - 24 * HOUR_MS,
+      endMs: end,
+      bucketMs: HOUR_MS,
+      widthPx: 700,
+      heightPx: 225,
+    })
+    expect(second.bucketMs).toBe(first.bucketMs)
+    expect(second.startMs).toBe(first.startMs)
+    expect(second.endMs).toBe(first.endMs)
+    expect(second.rowCount).toBe(first.rowCount)
+  })
+
+  test('coarsens by quarter-hour multiples instead of truncating a too-wide selection', () => {
+    const end = Date.UTC(2026, 8, 17, 12)
+    // 很窄的可视宽度把 15m 粒度逼到必须合桶。
+    const { plan, model } = planAndBuild({
+      startMs: end - 24 * HOUR_MS,
+      endMs: end,
+      bucketMs: QUARTER_MS,
+      widthPx: 90,
+      heightPx: 224,
+    })
+    expect(plan.bucketMs % QUARTER_MS).toBe(0)
+    expect(plan.bucketMs).toBeGreaterThan(QUARTER_MS)
+    // 合并后单图仍不超过 512 桶。
+    expect(plan.colCount * plan.rowCount).toBeLessThanOrEqual(MAX_BUCKETS)
+    // 所选范围完整保留，不截断、不右移：最后一个桶紧贴 endMs。
+    expect(model.cells.at(-1)!.start + plan.bucketMs).toBe(end)
+    expect(model.cells[0].start).toBeLessThanOrEqual(end - 24 * HOUR_MS)
+    // 每格与列号在网格内唯一，无重叠。
+    const positions = new Set(model.cells.map((cell) => `${cell.col}:${cell.row}`))
+    expect(positions.size).toBe(model.cells.length)
+    model.cells.forEach((cell) => {
+      expect(cell.col).toBeGreaterThanOrEqual(0)
+      expect(cell.col).toBeLessThan(plan.colCount)
+      expect(cell.row).toBeGreaterThanOrEqual(0)
+      expect(cell.row).toBeLessThan(plan.rowCount)
+    })
+  })
+
+  test('row count shrinks for coarse grains so cellPx never overflow 224px', () => {
+    const end = Date.UTC(2026, 8, 17)
+    for (const bucketMs of [QUARTER_MS, HOUR_MS, 6 * HOUR_MS, DAY_MS, 7 * DAY_MS]) {
+      const plan = planActivityGrid({ startMs: end - 7 * DAY_MS, endMs: end, bucketMs, widthPx: 640, heightPx: 224 })
+      expect(plan.bucketMs % QUARTER_MS).toBe(0)
+      expect(plan.cellPx).toBeGreaterThanOrEqual(10)
+      // clientHeight 包含 py-4 的 32px；列标签与图例另预留 38px。
+      const gridHeight = plan.rowCount * plan.cellPx + (plan.rowCount - 1) * 4
+      expect(gridHeight + 32 + 38).toBeLessThanOrEqual(224)
+    }
+  })
+
+  test('colCount * cellPx fits inside the measured width', () => {
+    const end = Date.UTC(2026, 8, 17, 12)
+    for (const widthPx of [120, 320, 480, 640, 960, 1280]) {
+      const plan = planActivityGrid({
+        startMs: end - 24 * HOUR_MS,
+        endMs: end,
+        bucketMs: HOUR_MS,
+        widthPx,
+        heightPx: 224,
+      })
+      expect(plan.colCount * plan.cellPx + (plan.colCount - 1) * 4).toBeLessThanOrEqual(widthPx)
+      expect(plan.colCount).toBeGreaterThanOrEqual(1)
+    }
+  })
+
+  test('stays queryable when history reaches back near the epoch', () => {
+    // 自定义范围落在 1970 附近时，向左补历史不得越过有效的 15m 正边界。
+    const end = 3 * QUARTER_MS
+    const plan = planActivityGrid({
+      startMs: QUARTER_MS,
+      endMs: end,
+      bucketMs: QUARTER_MS,
+      widthPx: 640,
+      heightPx: 224,
+    })
+    expect(plan.endMs).toBe(end)
+    expect(plan.startMs).toBeGreaterThan(0)
+    expect(plan.startMs % QUARTER_MS).toBe(0)
+    expect(plan.startMs).toBe(QUARTER_MS)
+    expect(plan.bucketMs).toBe(QUARTER_MS)
+    const model = buildActivityGrid([], plan)
+    expect(model.cells.at(-1)!.start + plan.bucketMs).toBe(end)
+    expect(model.cells[0].start).toBe(plan.startMs)
+  })
+
+  test('exposes plan fields the caller can pass straight to buildActivityGrid', () => {
+    const end = Date.UTC(2026, 8, 17, 12)
+    const plan = planActivityGrid({
+      startMs: end - 3 * DAY_MS,
+      endMs: end,
+      bucketMs: 6 * HOUR_MS,
+      widthPx: 640,
+      heightPx: 224,
+    })
+    const model = buildActivityGrid([], plan)
+    expect(model.colCount).toBe(plan.colCount)
+    expect(model.rowCount).toBe(plan.rowCount)
+    expect(model.bucketMs).toBe(plan.bucketMs)
+    expect(model.cells.length).toBeLessThanOrEqual(MAX_BUCKETS)
+  })
+
+  test('wider viewports query more genuine history without changing the fitting grain', () => {
+    const endMs = Date.UTC(2026, 8, 17, 12)
+    const selected = { startMs: endMs - 24 * HOUR_MS, endMs, bucketMs: HOUR_MS, heightPx: 224 }
+    const narrow = planActivityGrid({ ...selected, widthPx: 320 })
+    const wide = planActivityGrid({ ...selected, widthPx: 640 })
+    expect(narrow.bucketMs).toBe(HOUR_MS)
+    expect(wide.bucketMs).toBe(HOUR_MS)
+    expect(wide.startMs).toBeLessThan(narrow.startMs)
+    expect(narrow.startMs).toBeLessThanOrEqual(selected.startMs)
+    expect(wide.colCount).toBeGreaterThan(narrow.colCount)
+    expect(planActivityGrid({ ...selected, widthPx: 320 })).toEqual(narrow)
+  })
+
+  test('reduces full columns at the 512-bucket cap instead of overflowing', () => {
+    const endMs = Date.UTC(2026, 8, 17, 12)
+    const plan = planActivityGrid({
+      startMs: endMs - 24 * HOUR_MS,
+      endMs,
+      bucketMs: HOUR_MS,
+      widthPx: 20_000,
+      heightPx: 224,
+    })
+    expect(plan.bucketMs).toBe(HOUR_MS)
+    expect(plan.colCount).toBe(85)
+    expect(plan.rowCount).toBe(6)
+    expect(plan.colCount * plan.rowCount).toBe(510)
+    expect(buildActivityGrid([], plan).cells).toHaveLength(510)
+    expect(plan.colCount * plan.cellPx + (plan.colCount - 1) * 4).toBeLessThanOrEqual(20_000)
+  })
+
+  test('covers non-divisible selected spans and allows a partial epoch-edge bucket', () => {
+    const plan = planActivityGrid({
+      startMs: QUARTER_MS,
+      endMs: 6 * QUARTER_MS,
+      bucketMs: 2 * QUARTER_MS,
+      widthPx: 640,
+      heightPx: 224,
+    })
+    expect(plan.startMs).toBe(QUARTER_MS)
+    expect(plan.endMs).toBe(6 * QUARTER_MS)
+    expect(plan.bucketMs).toBe(2 * QUARTER_MS)
+    const model = buildActivityGrid([], plan)
+    expect(model.cells.map((cell) => cell.start)).toEqual([QUARTER_MS, 3 * QUARTER_MS, 5 * QUARTER_MS])
+    expect(model.cells.at(-1)!.start).toBeLessThan(plan.endMs)
+    expect(model.cells.at(-1)!.start + plan.bucketMs).toBeGreaterThan(plan.endMs)
+    expect(model.colCount).toBeLessThanOrEqual(plan.colCount)
+    expect(model.cells.length).toBeLessThanOrEqual(MAX_BUCKETS)
+  })
+
+  test('zero viewport computes a bounded measurement-stage plan', () => {
+    const end = Date.UTC(2026, 8, 17, 12)
+    const plan = planActivityGrid({
+      startMs: end - 6 * HOUR_MS,
+      endMs: end,
+      bucketMs: QUARTER_MS,
+      widthPx: 0,
+      heightPx: 0,
+    })
+    expect(plan.colCount).toBeGreaterThanOrEqual(1)
+    expect(plan.endMs).toBe(end)
+    expect(plan.cellPx).toBeGreaterThan(0)
+    expect(plan.startMs).toBeGreaterThan(0)
   })
 })
