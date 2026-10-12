@@ -71,8 +71,8 @@ const STATS_BASE_BUCKET_MS = 900_000
 const MAX_ACTIVITY_BUCKETS = 512
 /** gap-1：方格之间的间距。 */
 const ACTIVITY_GAP_PX = 4
-/** 容器内边距（py-4=32）与列标签、图例（≈38）的预留像素，cellPx 不得侵占。 */
-const ACTIVITY_VERTICAL_OVERHEAD_PX = 70
+/** 容器内边距（py-2=16）与列标签、图例（≈38）的预留像素，cellPx 不得侵占。 */
+const ACTIVITY_VERTICAL_OVERHEAD_PX = 54
 /** 方格可读的最小与最大边长。 */
 const MIN_CELL_PX = 10
 const MAX_CELL_PX = 24

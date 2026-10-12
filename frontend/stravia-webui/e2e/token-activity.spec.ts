@@ -105,15 +105,6 @@ async function expectCoverage(page: Page, selectedStart: number, end: number, re
           Number(url.searchParams.get('bucket')) * 1000 === plan.bucket,
       ),
     ).toBe(true)
-    const visibleTime = (value: number) => {
-      const date = new Date(value)
-      return `${date.getUTCMonth() + 1}/${date.getUTCDate()}/${date.getUTCFullYear()} ${date.toISOString().slice(11, 19)}`
-    }
-    await expect(
-      page
-        .getByRole('region', { name: 'Token activity', exact: true })
-        .getByText(`${visibleTime(plan.start)} – ${visibleTime(end)}`, { exact: true }),
-    ).toBeVisible()
   }).toPass()
   return { wrapper, cells }
 }
@@ -133,6 +124,15 @@ test('presets retain base grain while real history fills the available width', a
     await page.getByRole('option', { name: label, exact: true }).click()
     const { wrapper } = await expectCoverage(page, END - hours * HOUR, END, requests)
     await expect(wrapper).toHaveAttribute('data-activity-bucket', String(bucket))
+    const latency = page.getByLabel('Latency and speed chart', { exact: true })
+    await expect(latency).toBeVisible()
+    await expect(async () => {
+      const activityBox = (await wrapper.boundingBox())!
+      const latencyBox = (await latency.boundingBox())!
+      expect(Math.abs(activityBox.y - latencyBox.y)).toBeLessThanOrEqual(1)
+      expect(Math.abs(activityBox.y + activityBox.height - latencyBox.y - latencyBox.height)).toBeLessThanOrEqual(1)
+      expect(await wrapper.evaluate((el) => el.scrollHeight > el.clientHeight)).toBe(false)
+    }).toPass()
   }
 })
 

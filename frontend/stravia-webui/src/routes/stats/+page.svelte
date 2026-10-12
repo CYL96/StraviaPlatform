@@ -461,11 +461,8 @@ function retryAll(): void {
             </p>
           </div>
         </div>
-        <p class="font-technical text-xs text-muted-foreground tabular-nums">
-          {formatLogTime(activityPlan.startMs)} – {formatLogTime(activityPlan.endMs)}
-        </p>
         <div
-          class="h-56 min-w-0 flex flex-col justify-center py-4"
+          class="h-40 min-w-0 flex flex-col justify-center py-2"
           bind:clientWidth={activityWidth}
           bind:clientHeight={activityHeight}
           data-activity-start={activityPlan.startMs}

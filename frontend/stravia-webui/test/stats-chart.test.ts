@@ -347,15 +347,15 @@ describe('planActivityGrid', () => {
     })
   })
 
-  test('row count shrinks for coarse grains so cellPx never overflow 224px', () => {
+  test('coarse grains keep cells, labels and legend within the compact chart height', () => {
     const end = Date.UTC(2026, 8, 17)
     for (const bucketMs of [QUARTER_MS, HOUR_MS, 6 * HOUR_MS, DAY_MS, 7 * DAY_MS]) {
-      const plan = planActivityGrid({ startMs: end - 7 * DAY_MS, endMs: end, bucketMs, widthPx: 640, heightPx: 224 })
+      const plan = planActivityGrid({ startMs: end - 7 * DAY_MS, endMs: end, bucketMs, widthPx: 640, heightPx: 160 })
       expect(plan.bucketMs % QUARTER_MS).toBe(0)
       expect(plan.cellPx).toBeGreaterThanOrEqual(10)
-      // clientHeight 包含 py-4 的 32px；列标签与图例另预留 38px。
+      // clientHeight 包含 py-2 的 16px；列标签与图例另预留 38px。
       const gridHeight = plan.rowCount * plan.cellPx + (plan.rowCount - 1) * 4
-      expect(gridHeight + 32 + 38).toBeLessThanOrEqual(224)
+      expect(gridHeight + 16 + 38).toBeLessThanOrEqual(160)
     }
   })
 
