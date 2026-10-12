@@ -64,7 +64,7 @@ const activities = $derived(observationConversationActivities(detail, liveBlocks
       {#each groups as group, index (group[0].id)}
         {@const user = group[0].role === 'user'}
         {@const actor = user ? m.observation_chat_you() : group[0].model || m.observation_chat_model()}
-        <ConversationMessage {user} {actor} label={actor}>
+        <ConversationMessage {user} label={actor}>
           {#each group as message (message.id)}
             {#if !user}
               {#each activities.get(message.id) ?? [] as activity (activity.id)}
