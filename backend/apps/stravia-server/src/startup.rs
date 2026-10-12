@@ -134,6 +134,13 @@ impl StartupHttpApp {
         }
     }
 
+    /// 停止接收 HTTP 请求后，请求当前 Gateway 的后台操作协作停止。
+    pub async fn request_shutdown(&self) {
+        if let Some(prepared) = &self.prepared {
+            prepared.request_shutdown().await;
+        }
+    }
+
     /// HTTP 监听器排空后由宿主显式等待关闭；准备失败时无需业务清理。
     pub async fn shutdown(self) {
         if let Some(prepared) = self.prepared {

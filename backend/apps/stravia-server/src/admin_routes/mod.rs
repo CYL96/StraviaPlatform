@@ -14,8 +14,9 @@ use stravia_core::auth::{
 };
 use stravia_core::provider_catalog::CatalogError;
 use stravia_core::provider_models::{
-    CreateManualProviderModel, ProviderModelSelectionPolicy, UpdateProviderModel,
-    UpdateProviderModelSelection,
+    CreateManualProviderModel, ModelChangeQuery, ProviderModelSelectionPolicy,
+    ProviderModelSyncFailure, UpdateProviderModel, UpdateProviderModelSelection,
+    UpdateProviderModelSyncState,
 };
 use stravia_media::admin::MediaUnderstandingConfigUpdate;
 use stravia_web_search::WebSearchConfig;
@@ -145,6 +146,12 @@ fn create_router_inner(gateway: Gateway, auth: Option<AdminHttpState>) -> Router
             "/providers/{id}/models/sync",
             post(sync_provider_models_handler),
         )
+        .route(
+            "/providers/{id}/models/sync-state",
+            get(provider_model_sync_state_handler).put(update_provider_model_sync_state_handler),
+        )
+        .route("/model-changes", get(list_model_changes_handler))
+        .route("/model-changes/{id}", get(get_model_change_handler))
         .route(
             "/providers/{id}/model",
             get(get_provider_model_handler)

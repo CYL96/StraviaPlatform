@@ -7,7 +7,7 @@ import { createQuery, useQueryClient } from '@tanstack/svelte-query'
 import ArrowLeftIcon from '@lucide/svelte/icons/arrow-left'
 import PlusIcon from '@lucide/svelte/icons/plus'
 import RefreshCwIcon from '@lucide/svelte/icons/refresh-cw'
-import { toast } from 'svelte-sonner'
+import { getModelChanges, syncToast, syncErrorToast, modelChangeReason } from '$lib/model-changes'
 
 import { admin } from '$lib/admin-client'
 import { localizeBackendErrorMessage } from '$lib/backend-error'
@@ -37,8 +37,8 @@ const providerDescriptorsQuery = createQuery(() => ({
 }))
 const routesQuery = createQuery(() => ({ queryKey: ['models'], queryFn: admin.models.list }))
 let syncStatus = $state<'idle' | 'syncing' | 'success' | 'error'>('idle')
-let syncSummary = $state<ProviderModelSyncSummary>()
-let syncCompletedAt = $state<Date>()
+let syncProviderId = $state('')
+const changesSheet = getModelChanges()
 let syncError = $state('')
 let autoSyncStarted = $state(false)
 let savedProvider = $state<Provider>()
@@ -76,34 +76,36 @@ function parseProviderDetailView(value: string | null): ProviderDetailView {
   return value === 'models' || value === 'routes' ? value : 'connection'
 }
 
-async function syncModels(): Promise<ProviderModelSyncSummary | undefined> {
-  if (!canDiscoverModels) return undefined
-  syncStatus = 'syncing'
-  syncError = ''
+async function syncModels(id = providerId): Promise<ProviderModelSyncSummary | undefined> {
+  if (id === providerId && !canDiscoverModels) return undefined
+  if (id === providerId) {
+    syncProviderId = id
+    syncStatus = 'syncing'
+    syncError = ''
+  }
   try {
-    const summary = await admin.providers.syncModels(providerId)
-    syncSummary = summary
-    syncCompletedAt = new Date()
-    syncStatus = 'success'
-    await queryClient.invalidateQueries({ queryKey: ['provider-models', providerId] })
-    const url = new URL(page.url)
-    url.searchParams.delete('sync')
-    await goto(resolve(`/providers/${encodeURIComponent(providerId)}${url.search}`), {
-      replaceState: true,
-      noScroll: true,
-      keepFocus: true,
-    })
-    toast.success(m.providers_model_list_updated(), {
-      description: m.providers_value_new_value_no_longer_offered_value_available({
-        added: summary.added,
-        missing: summary.missing,
-        restored: summary.restored,
-      }),
-    })
+    const summary = await admin.providers.syncModels(id)
+    if (id === providerId) syncStatus = 'success'
+    await queryClient.invalidateQueries({ queryKey: ['provider-models', id] })
+    await queryClient.invalidateQueries({ queryKey: ['provider-model-sync-state', id] })
+    if (page.params.id === id && page.url.searchParams.get('sync') === 'created') {
+      const url = new URL(page.url)
+      url.searchParams.delete('sync')
+      await goto(resolve(`/providers/${encodeURIComponent(id)}${url.search}`), {
+        replaceState: true,
+        noScroll: true,
+        keepFocus: true,
+      })
+    }
+    syncToast(summary, changesSheet.reveal, () => void syncModels(id))
     return summary
   } catch (error) {
-    syncStatus = 'error'
-    syncError = localizeBackendErrorMessage(error)
+    if (id === providerId) {
+      syncStatus = 'error'
+      syncError = modelChangeReason(localizeBackendErrorMessage(error))
+    }
+    syncErrorToast(error, changesSheet.reveal, () => void syncModels(id))
+    await queryClient.invalidateQueries({ queryKey: ['provider-model-sync-state', id] })
     return undefined
   }
 }
@@ -190,7 +192,7 @@ async function syncModels(): Promise<ProviderModelSyncSummary | undefined> {
     {#if view === 'connection' || (view === 'models' && !usesProviderModels)}
       <ProviderConnectionView {provider} onSaved={(saved: Provider) => (savedProvider = saved)} />
     {:else if view === 'models'}
-      {#if syncStatus === 'syncing' || syncStatus === 'error'}
+      {#if syncProviderId === providerId && (syncStatus === 'syncing' || syncStatus === 'error')}
         <section class="rounded-xl border p-4" aria-live="polite">
           {#if syncStatus === 'syncing'}
             <div class="flex items-center gap-3">
@@ -206,7 +208,9 @@ async function syncModels(): Promise<ProviderModelSyncSummary | undefined> {
             <div class="flex flex-wrap items-center justify-between gap-3">
               <div>
                 <p class="font-medium text-destructive">
-                  {m.providers_connection_saved_but_models_couldn_t_synced()}
+                  {page.url.searchParams.get('sync') === 'created'
+                    ? m.providers_connection_saved_but_models_couldn_t_synced()
+                    : m.model_changes_failed()}
                 </p>
                 <p class="mt-1 text-sm text-muted-foreground">{syncError}</p>
               </div>
@@ -221,8 +225,6 @@ async function syncModels(): Promise<ProviderModelSyncSummary | undefined> {
         providerId={provider.id}
         routes={routesQuery.data ?? []}
         routeReferencesReady={!routesQuery.isPending && !routesQuery.isError}
-        syncedAt={syncCompletedAt}
-        syncedSummary={syncSummary}
         onSync={canDiscoverModels ? syncModels : undefined} />
     {:else if view === 'routes'}
       <section class="route-section" aria-labelledby="provider-route-references-title">

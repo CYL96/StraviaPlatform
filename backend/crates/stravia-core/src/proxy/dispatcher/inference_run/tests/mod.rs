@@ -813,12 +813,7 @@ async fn serve_openai_response(status: u16, body: serde_json::Value) -> (String,
     let calls = Arc::new(AtomicUsize::new(0));
     let observed = calls.clone();
     tokio::spawn(async move {
-        let (mut socket, _) = listener.accept().await.expect("accept provider request");
-        let mut request = vec![0_u8; 16 * 1024];
-        let _ = socket
-            .read(&mut request)
-            .await
-            .expect("read provider request");
+        let (mut socket, _) = accept_test_inference_request(&listener).await;
         observed.fetch_add(1, Ordering::SeqCst);
         let body = body.to_string();
         let reason = if status >= 500 {
@@ -959,23 +954,14 @@ async fn serve_openai_sequence_with_requests(
     let observed_requests = requests.clone();
     tokio::spawn(async move {
         for body in bodies {
-            let (mut socket, _) = listener
-                .accept()
-                .await
-                .expect("accept provider sequence request");
-            let mut request = vec![0_u8; 16 * 1024];
-            let read = socket
-                .read(&mut request)
-                .await
-                .expect("read provider sequence request");
-            let request = String::from_utf8_lossy(&request[..read]).into_owned();
-            observed_requests.lock().push(request.clone());
-            observed.fetch_add(1, Ordering::SeqCst);
+            let (mut socket, request) = accept_test_inference_request(&listener).await;
             let is_stream = request
                 .split_once("\r\n\r\n")
                 .and_then(|(_, body)| serde_json::from_str::<serde_json::Value>(body).ok())
                 .and_then(|body| body["stream"].as_bool())
                 .unwrap_or(false);
+            observed_requests.lock().push(request);
+            observed.fetch_add(1, Ordering::SeqCst);
             let (content_type, body) = if is_stream {
                 (
                     "text/event-stream",
@@ -995,6 +981,37 @@ async fn serve_openai_sequence_with_requests(
         }
     });
     (format!("http://{address}/v1"), calls, requests)
+}
+
+async fn accept_test_inference_request(
+    listener: &tokio::net::TcpListener,
+) -> (tokio::net::TcpStream, String) {
+    loop {
+        let (mut socket, _) = listener.accept().await.expect("accept provider request");
+        let request = read_test_http_request(&mut socket).await;
+        let mut request_line = request
+            .lines()
+            .next()
+            .expect("HTTP request line")
+            .split_whitespace();
+        let method = request_line.next().expect("HTTP request method");
+        let path = request_line.next().expect("HTTP request path");
+        if method == "GET" && path == "/v1/models" {
+            // Restarted Gateways discover saved Providers by default. These fixtures
+            // only script inference: discovery must not consume responses or counters.
+            let body = r#"{"error":{"message":"Model discovery is not supported by this inference fixture"}}"#;
+            let response = format!(
+                "HTTP/1.1 404 Not Found\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write unsupported discovery response");
+            continue;
+        }
+        return (socket, request);
+    }
 }
 
 async fn read_test_http_request(socket: &mut tokio::net::TcpStream) -> String {

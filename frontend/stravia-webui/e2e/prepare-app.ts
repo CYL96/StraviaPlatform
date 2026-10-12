@@ -355,6 +355,20 @@ export async function prepareApp(page: Page): Promise<void> {
       return
     }
 
+    if (/^\/providers\/[^/]+\/models\/sync-state$/.test(path)) {
+      await route.fulfill({
+        json: {
+          data: {
+            automatic_sync: true,
+            in_progress: false,
+            pause_reason: null,
+            last_check: null,
+            has_successful_sync: true,
+          },
+        },
+      })
+      return
+    }
     await route.fulfill({ json: { data: [] } })
   })
 }

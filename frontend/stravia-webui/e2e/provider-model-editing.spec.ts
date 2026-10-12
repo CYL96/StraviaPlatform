@@ -136,6 +136,36 @@ async function openModel(page: Page, name: string) {
 const discardDialog = (page: Page) => page.getByRole('alertdialog', { name: 'Discard unsaved model changes?' })
 const nameField = (page: Page) => page.locator('#provider-model-name')
 
+test('automatic sync preference saves independently without submitting or clearing a model draft', async ({ page }) => {
+  const fixture = await setup(page)
+  let enabled = true
+  await page.route(`**/api/v1/providers/${providerId}/models/sync-state`, async (route) => {
+    if (route.request().method() === 'PUT') enabled = route.request().postDataJSON().automatic_sync
+    await route.fulfill({
+      json: {
+        data: {
+          automatic_sync: enabled,
+          in_progress: false,
+          pause_reason: null,
+          last_check: null,
+          has_successful_sync: true,
+        },
+      },
+    })
+  })
+  await page.reload()
+  await openModel(page, 'Alpha Model')
+  await nameField(page).fill('Unsaved Alpha specification')
+  await page.getByRole('switch', { name: 'Automatic sync' }).click()
+  await expect(page.getByRole('switch', { name: 'Automatic sync' })).not.toBeChecked()
+  await expect(nameField(page)).toHaveValue('Unsaved Alpha specification')
+  expect(fixture.writes).toEqual([])
+  expect(fixture.selections).toEqual([])
+  await page.getByRole('switch', { name: 'Automatic sync' }).click()
+  await expect(page.getByRole('switch', { name: 'Automatic sync' })).toBeChecked()
+  await expect(nameField(page)).toHaveValue('Unsaved Alpha specification')
+})
+
 test('late Alpha detail cannot replace Beta after an in-app model switch', async ({ page }) => {
   const fixture = await setup(page)
   const gate = deferred()

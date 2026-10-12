@@ -925,12 +925,28 @@ async fn suspended_allowance_survives_restart_and_startup_read_confirms_recovery
     drop(gateway);
     let path = directory.path().to_owned();
     let startup = tokio::spawn(async move { new_gateway(path).await });
-    let request = tokio::time::timeout(std::time::Duration::from_secs(10), upstream.next()).await?;
-    assert_eq!(request.operation(), "allowance");
-    request.reply(UpstreamReply {
-        status: StatusCode::INTERNAL_SERVER_ERROR,
-        body: b"unavailable".to_vec(),
-    });
+    let mut discovery_replied = false;
+    let mut allowance_replied = false;
+    while !discovery_replied || !allowance_replied {
+        let request =
+            tokio::time::timeout(std::time::Duration::from_secs(10), upstream.next()).await?;
+        match request.operation() {
+            "model_discovery" => {
+                assert!(!discovery_replied);
+                discovery_replied = true;
+                request.reply(UpstreamReply::models());
+            }
+            "allowance" => {
+                assert!(!allowance_replied);
+                allowance_replied = true;
+                request.reply(UpstreamReply {
+                    status: StatusCode::INTERNAL_SERVER_ERROR,
+                    body: b"unavailable".to_vec(),
+                });
+            }
+            operation => panic!("unexpected startup operation: {operation}"),
+        }
+    }
     let gateway = startup.await??;
     let router = create_router(gateway.clone());
     let rejection = tokio::spawn(invoke(

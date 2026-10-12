@@ -382,7 +382,16 @@ def test_google_models_uses_declared_models_auth_not_inference_auth(
                 method, f"{provider_url}/{path}",
                 payload={} if method == "POST" else None, headers=admin_env["auth"],
             )
-            assert status == 200, body
+            assert status == 200 and "error" not in body, body
+            if method == "GET":
+                assert body["data"] == ["probe-model"], body
+            else:
+                assert body["data"]["outcome"] == "success", body
+        status, body = http_request(
+            "GET", f"{provider_url}/models", headers=admin_env["auth"],
+        )
+        assert status == 200, body
+        assert [model["id"] for model in body["data"]["models"]] == ["probe-model"], body
         assert len(received) == 2
         for request in received:
             assert request["path"] == "/custom/inventory?key=endpoint-owned%2Bvalue&region=east"

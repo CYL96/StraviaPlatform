@@ -34,6 +34,7 @@ interface ErrorPayload {
   code?: string
   params?: Record<string, unknown>
   data?: unknown
+  details?: { sync_summary?: import('$lib/types').ProviderModelSyncSummary }
 }
 
 export const isTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
@@ -79,10 +80,16 @@ export async function decodeAdmin<T>(response: Response): Promise<T> {
   const object = payload !== null && typeof payload === 'object' ? (payload as ErrorPayload) : undefined
   if (!response.ok) {
     const message = typeof object?.error === 'string' ? object.error : `HTTP ${response.status}`
-    const error = new Error(message) as Error & { code?: string; params?: Record<string, unknown>; status?: number }
+    const error = new Error(message) as Error & {
+      code?: string
+      params?: Record<string, unknown>
+      status?: number
+      details?: ErrorPayload['details']
+    }
     error.status = response.status
     if (object?.code) error.code = object.code
     if (object?.params) error.params = object.params
+    if (object?.details) error.details = object.details
     throw error
   }
   if (typeof object?.error === 'string' && object.error.trim()) throw new Error(object.error)

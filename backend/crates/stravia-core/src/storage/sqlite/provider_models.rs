@@ -9,10 +9,11 @@ use sqlx::{Connection, Sqlite, SqliteConnection, Transaction};
 use super::SqliteStorage;
 use super::routes::SqliteRouteStore;
 use crate::provider_models::{
-    NewProviderModelRecord, PriceComponents, ProviderModelCostRule, ProviderModelCostRuleKind,
-    ProviderModelMetadata, ProviderModelMutation, ProviderModelPresence,
-    ProviderModelPresenceUpdate, ProviderModelReconciliation, ProviderModelRecord,
-    ProviderModelReimport, ProviderModelSelectionPolicy, ProviderModelSourceKind,
+    ModelChangePage, ModelChangeQuery, ModelChangeRecord, NewProviderModelRecord, PriceComponents,
+    ProviderModelCostRule, ProviderModelCostRuleKind, ProviderModelMetadata, ProviderModelMutation,
+    ProviderModelPresence, ProviderModelPresenceUpdate, ProviderModelReconciliation,
+    ProviderModelRecord, ProviderModelReimport, ProviderModelSelectionPolicy,
+    ProviderModelSourceKind, ProviderModelSyncState, ProviderModelSyncSummary,
     ReimportProviderModel, SnapshotState, SourceStamp,
 };
 use crate::storage::CONFIG_EPOCH_KEY;
@@ -89,6 +90,33 @@ impl ProviderModelStore for SqliteStorage {
     ) -> anyhow::Result<()> {
         let mut connection = self.pool.acquire().await?;
         let mut tx = connection.begin_with("BEGIN IMMEDIATE").await?;
+        if let Some(expected) = &reconciliation.expected_provider {
+            let provider = sqlx::query_as::<_, crate::db::models::Provider>(
+                "SELECT * FROM providers WHERE id = ?",
+            )
+            .bind(provider_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            anyhow::ensure!(
+                provider.as_ref().is_some_and(|provider| {
+                    crate::provider_models::same_discovery_provider(provider, expected)
+                }),
+                "Provider changed while synchronizing discovered models"
+            );
+        }
+        for (model_id, revision) in &reconciliation.expected_revisions {
+            let current = sqlx::query_scalar::<_, i64>(
+                "SELECT revision FROM provider_models WHERE provider_id = ? AND model_id = ?",
+            )
+            .bind(provider_id)
+            .bind(model_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            anyhow::ensure!(
+                current == Some(*revision),
+                "Provider Model has changed while synchronizing discovered models"
+            );
+        }
         let has_writes = !reconciliation.updates.is_empty() || !reconciliation.inserts.is_empty();
         for update in &reconciliation.updates {
             let revision = sqlx::query_scalar::<_, i64>(
@@ -156,6 +184,12 @@ impl ProviderModelStore for SqliteStorage {
         for input in reconciliation.inserts {
             insert_record(&mut tx, input).await?;
         }
+        if let Some(summary) = reconciliation.sync_summary {
+            save_summary(&mut tx, provider_id, &summary, true).await?;
+        }
+        if let Some(record) = reconciliation.change_record {
+            insert_change(&mut tx, &record).await?;
+        }
         // Presence/metadata changes alter model resolution and prices; notify
         // other replicas in the same commit. An empty reconciliation writes
         // nothing and must not publish a spurious epoch.
@@ -166,7 +200,11 @@ impl ProviderModelStore for SqliteStorage {
         Ok(())
     }
 
-    async fn create(&self, input: NewProviderModelRecord) -> anyhow::Result<ProviderModelMutation> {
+    async fn create(
+        &self,
+        input: NewProviderModelRecord,
+        change_record: Option<ModelChangeRecord>,
+    ) -> anyhow::Result<ProviderModelMutation> {
         let mut connection = self.pool.acquire().await?;
         let mut tx = connection.begin_with("BEGIN IMMEDIATE").await?;
         let exists = sqlx::query_scalar::<_, i64>(
@@ -183,6 +221,9 @@ impl ProviderModelStore for SqliteStorage {
         let provider_id = input.provider_id.clone();
         let model_id = input.model_id.clone();
         insert_record(&mut tx, input).await?;
+        if let Some(change) = change_record {
+            insert_change(&mut tx, &change).await?;
+        }
         bump_config_epoch(&mut tx).await?;
         let record = get_record(&mut tx, &provider_id, &model_id)
             .await?
@@ -287,9 +328,20 @@ impl ProviderModelStore for SqliteStorage {
         model_id: &str,
         policy: ProviderModelSelectionPolicy,
         expected_revision: i64,
+        change_record: Option<ModelChangeRecord>,
     ) -> anyhow::Result<ProviderModelMutation> {
         let mut connection = self.pool.acquire().await?;
         let mut tx = connection.begin_with("BEGIN IMMEDIATE").await?;
+        if let Some(record) = get_record(&mut tx, provider_id, model_id).await? {
+            if record.revision != expected_revision {
+                return Ok(ProviderModelMutation::Conflict);
+            }
+            if record.selection_policy == policy {
+                return Ok(ProviderModelMutation::Applied(Box::new(record)));
+            }
+        } else {
+            return Ok(ProviderModelMutation::NotFound);
+        }
         let result = sqlx::query(
             r#"UPDATE provider_models
        SET selection_policy = ?, revision = revision + 1, updated_at = datetime('now')
@@ -313,11 +365,138 @@ impl ProviderModelStore for SqliteStorage {
         // Selection policy gates whether the resolved model may serve traffic;
         // publish the change atomically with the write it accompanies.
         bump_config_epoch(&mut tx).await?;
+        if let Some(change) = change_record {
+            insert_change(&mut tx, &change).await?;
+        }
         let record = get_record(&mut tx, provider_id, model_id)
             .await?
             .context("updated Provider Model not found")?;
         tx.commit().await?;
         Ok(ProviderModelMutation::Applied(Box::new(record)))
+    }
+
+    async fn sync_state(&self, provider_id: &str) -> anyhow::Result<ProviderModelSyncState> {
+        load_sync_state(&mut *self.pool.acquire().await?, provider_id).await
+    }
+
+    async fn set_automatic_sync(
+        &self,
+        provider_id: &str,
+        enabled: bool,
+    ) -> anyhow::Result<ProviderModelSyncState> {
+        let mut connection = self.pool.acquire().await?;
+        let mut tx = connection.begin_with("BEGIN IMMEDIATE").await?;
+        sqlx::query("INSERT INTO provider_model_sync_state (provider_id, automatic_sync) VALUES (?, ?) ON CONFLICT(provider_id) DO UPDATE SET automatic_sync = excluded.automatic_sync")
+            .bind(provider_id).bind(enabled).execute(&mut *tx).await?;
+        let state = load_sync_state(&mut tx, provider_id).await?;
+        tx.commit().await?;
+        Ok(state)
+    }
+
+    async fn save_sync_failure(
+        &self,
+        provider_id: &str,
+        summary: ProviderModelSyncSummary,
+        mut record: ModelChangeRecord,
+    ) -> anyhow::Result<()> {
+        let mut connection = self.pool.acquire().await?;
+        let mut tx = connection.begin_with("BEGIN IMMEDIATE").await?;
+        if sqlx::query_scalar::<_, String>("SELECT id FROM providers WHERE id = ?")
+            .bind(provider_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .is_some()
+        {
+            save_summary(&mut tx, provider_id, &summary, false).await?;
+        }
+        if let Some(json) =
+            sqlx::query_scalar::<_, String>("SELECT record_json FROM model_changes WHERE id = ?")
+                .bind(&record.id)
+                .fetch_optional(&mut *tx)
+                .await?
+        {
+            let mut existing: ModelChangeRecord = serde_json::from_str(&json)?;
+            existing.outcome = record.outcome;
+            existing.error = record.error;
+            record = existing;
+            sqlx::query("UPDATE model_changes SET record_json = ? WHERE id = ?")
+                .bind(serde_json::to_string(&record)?)
+                .bind(&record.id)
+                .execute(&mut *tx)
+                .await?;
+        } else {
+            insert_change(&mut tx, &record).await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn list_changes(&self, query: ModelChangeQuery) -> anyhow::Result<ModelChangePage> {
+        let cursor = crate::storage::model_changes::cursor(&query)?;
+        let limit = query.limit.unwrap_or(25).clamp(1, 100);
+        let mut builder = sqlx::QueryBuilder::<Sqlite>::new(
+            "SELECT c.record_json, NOT EXISTS(SELECT 1 FROM providers p WHERE p.id = c.provider_id) AS deleted FROM model_changes c WHERE c.checked_at >= ",
+        );
+        builder.push_bind(crate::storage::model_changes::cutoff());
+        if let Some(id) = query.provider_id {
+            builder.push(" AND c.provider_id = ").push_bind(id);
+        }
+        if let Some(source) = query.source {
+            builder.push(" AND c.source = ").push_bind(source.as_str());
+        }
+        if let Some((time, id)) = cursor {
+            builder
+                .push(" AND (c.checked_at, c.id) < (")
+                .push_bind(time)
+                .push(", ")
+                .push_bind(id)
+                .push(")");
+        }
+        if let Some(kind) = query.change_type {
+            let kind = kind.as_str();
+            builder.push(" AND (EXISTS(SELECT 1 FROM model_change_items item WHERE item.record_id = c.id AND item.change_type = ").push_bind(kind).push(")");
+            if kind == "sync_failed" {
+                builder.push(" OR json_extract(c.record_json, '$.error') IS NOT NULL");
+            }
+            builder.push(")");
+        }
+        if let Some(q) = query.q {
+            let q = q.to_lowercase();
+            builder.push(" AND EXISTS(SELECT 1 FROM model_change_items item WHERE item.record_id = c.id AND (instr(item.name_key, ").push_bind(q.clone())
+                .push(") > 0 OR instr(item.model_id_key, ").push_bind(q).push(") > 0))");
+        }
+        builder
+            .push(" ORDER BY c.checked_at DESC, c.id DESC LIMIT ")
+            .push_bind((limit + 1) as i64);
+        let rows: Vec<(String, bool)> = builder.build_query_as().fetch_all(&self.pool).await?;
+        let records = rows
+            .into_iter()
+            .map(|(json, deleted)| {
+                let mut record: ModelChangeRecord = serde_json::from_str(&json)?;
+                record.provider_deleted = deleted;
+                Ok(record)
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        crate::storage::model_changes::page(records, limit)
+    }
+
+    async fn get_change(&self, id: &str) -> anyhow::Result<Option<ModelChangeRecord>> {
+        let row = sqlx::query_as::<_, (String, bool)>("SELECT c.record_json, NOT EXISTS(SELECT 1 FROM providers p WHERE p.id = c.provider_id) FROM model_changes c WHERE c.id = ? AND c.checked_at >= ?")
+            .bind(id).bind(crate::storage::model_changes::cutoff()).fetch_optional(&self.pool).await?;
+        row.map(|(json, deleted)| {
+            let mut record: ModelChangeRecord = serde_json::from_str(&json)?;
+            record.provider_deleted = deleted;
+            Ok(record)
+        })
+        .transpose()
+    }
+
+    async fn prune_changes(&self, before: &str) -> anyhow::Result<()> {
+        sqlx::query("DELETE FROM model_changes WHERE checked_at < ?")
+            .bind(before)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     async fn delete_manual(&self, provider_id: &str, model_id: &str) -> anyhow::Result<bool> {
@@ -339,6 +518,57 @@ impl ProviderModelStore for SqliteStorage {
         tx.commit().await?;
         Ok(deleted)
     }
+}
+
+async fn load_sync_state(
+    connection: &mut SqliteConnection,
+    provider_id: &str,
+) -> anyhow::Result<ProviderModelSyncState> {
+    let row = sqlx::query_as::<_, (bool, bool, Option<String>)>("SELECT automatic_sync, has_successful_sync, last_check FROM provider_model_sync_state WHERE provider_id = ?")
+        .bind(provider_id).fetch_optional(connection).await?;
+    let Some((automatic_sync, has_successful_sync, last_check)) = row else {
+        return Ok(Default::default());
+    };
+    Ok(ProviderModelSyncState {
+        automatic_sync,
+        has_successful_sync,
+        last_check: last_check
+            .map(|json| serde_json::from_str(&json))
+            .transpose()?,
+        ..Default::default()
+    })
+}
+
+async fn save_summary(
+    tx: &mut Transaction<'_, Sqlite>,
+    provider_id: &str,
+    summary: &ProviderModelSyncSummary,
+    success: bool,
+) -> anyhow::Result<()> {
+    sqlx::query("INSERT INTO provider_model_sync_state (provider_id, last_check, has_successful_sync) VALUES (?, ?, ?) ON CONFLICT(provider_id) DO UPDATE SET last_check = excluded.last_check, has_successful_sync = provider_model_sync_state.has_successful_sync OR excluded.has_successful_sync")
+        .bind(provider_id).bind(serde_json::to_string(summary)?).bind(success).execute(&mut **tx).await?;
+    Ok(())
+}
+
+async fn insert_change(
+    tx: &mut Transaction<'_, Sqlite>,
+    record: &ModelChangeRecord,
+) -> anyhow::Result<()> {
+    sqlx::query("INSERT INTO model_changes (id, provider_id, checked_at, source, record_json) VALUES (?, ?, ?, ?, ?)")
+        .bind(&record.id).bind(&record.provider_id).bind(&record.checked_at)
+        .bind(record.source.as_str())
+        .bind(serde_json::to_string(record)?).execute(&mut **tx).await?;
+    for item in &record.changes {
+        let name_key = item.name.to_lowercase();
+        let model_id_key = item.model_id.to_lowercase();
+        for kind in &item.types {
+            sqlx::query("INSERT INTO model_change_items (record_id, name_key, model_id_key, change_type) VALUES (?, ?, ?, ?)")
+                .bind(&record.id).bind(&name_key).bind(&model_id_key)
+                .bind(kind.as_str())
+                .execute(&mut **tx).await?;
+        }
+    }
+    Ok(())
 }
 
 async fn get_record(
@@ -880,16 +1110,19 @@ mod tests {
         let storage = SqliteStorage::from_pool(pool);
         for model_id in ["first", "second"] {
             storage
-                .create(NewProviderModelRecord {
-                    provider_id: "provider".into(),
-                    model_id: model_id.into(),
-                    source_kind: ProviderModelSourceKind::Discovered,
-                    snapshot_state: SnapshotState::Unregistered,
-                    metadata_source_provider_id: None,
-                    presence: ProviderModelPresence::Present,
-                    selection_policy: ProviderModelSelectionPolicy::Auto,
-                    metadata: ProviderModelMetadata::bare(model_id),
-                })
+                .create(
+                    NewProviderModelRecord {
+                        provider_id: "provider".into(),
+                        model_id: model_id.into(),
+                        source_kind: ProviderModelSourceKind::Discovered,
+                        snapshot_state: SnapshotState::Unregistered,
+                        metadata_source_provider_id: None,
+                        presence: ProviderModelPresence::Present,
+                        selection_policy: ProviderModelSelectionPolicy::Auto,
+                        metadata: ProviderModelMetadata::bare(model_id),
+                    },
+                    None,
+                )
                 .await
                 .unwrap();
         }
@@ -927,7 +1160,8 @@ mod tests {
                     "provider",
                     ProviderModelReconciliation {
                         inserts: vec![],
-                        updates
+                        updates,
+                        ..Default::default()
                     }
                 )
                 .await
@@ -972,16 +1206,19 @@ mod tests {
         let create_task = tokio::spawn(async move {
             started_tx.send(()).expect("signal create start");
             storage
-                .create(NewProviderModelRecord {
-                    provider_id: "provider".into(),
-                    model_id: "model".into(),
-                    source_kind: ProviderModelSourceKind::Manual,
-                    snapshot_state: SnapshotState::Edited { source: None },
-                    metadata_source_provider_id: None,
-                    presence: ProviderModelPresence::Present,
-                    selection_policy: ProviderModelSelectionPolicy::Auto,
-                    metadata: ProviderModelMetadata::bare("model"),
-                })
+                .create(
+                    NewProviderModelRecord {
+                        provider_id: "provider".into(),
+                        model_id: "model".into(),
+                        source_kind: ProviderModelSourceKind::Manual,
+                        snapshot_state: SnapshotState::Edited { source: None },
+                        metadata_source_provider_id: None,
+                        presence: ProviderModelPresence::Present,
+                        selection_policy: ProviderModelSelectionPolicy::Auto,
+                        metadata: ProviderModelMetadata::bare("model"),
+                    },
+                    None,
+                )
                 .await
         });
         started_rx.await.expect("create start");
@@ -1020,16 +1257,19 @@ mod tests {
         .unwrap();
         let storage = SqliteStorage::from_pool(pool);
         let mutation = storage
-            .create(NewProviderModelRecord {
-                provider_id: "provider".into(),
-                model_id: "model".into(),
-                source_kind: ProviderModelSourceKind::Discovered,
-                snapshot_state: SnapshotState::Unregistered,
-                metadata_source_provider_id: Some("catalog".into()),
-                presence: ProviderModelPresence::Present,
-                selection_policy: ProviderModelSelectionPolicy::Auto,
-                metadata: ProviderModelMetadata::bare("model"),
-            })
+            .create(
+                NewProviderModelRecord {
+                    provider_id: "provider".into(),
+                    model_id: "model".into(),
+                    source_kind: ProviderModelSourceKind::Discovered,
+                    snapshot_state: SnapshotState::Unregistered,
+                    metadata_source_provider_id: Some("catalog".into()),
+                    presence: ProviderModelPresence::Present,
+                    selection_policy: ProviderModelSelectionPolicy::Auto,
+                    metadata: ProviderModelMetadata::bare("model"),
+                },
+                None,
+            )
             .await
             .unwrap();
         assert!(matches!(mutation, ProviderModelMutation::Applied(_)));

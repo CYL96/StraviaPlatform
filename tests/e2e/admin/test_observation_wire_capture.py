@@ -16,7 +16,7 @@ from tests.common.helpers import download_observation_bundle, http_request, obse
 from tests.e2e.admin.test_compaction_diagnostics import _semantic, diagnostic_provider
 from tests.e2e.admin.test_observations import (
     _create_route,
-    _detail,
+    _finished_detail,
     _route_interactions,
     _sse_event,
     _wait_for,
@@ -68,7 +68,9 @@ def _finalized_route_detail(env: dict[str, Any], route_id: str) -> dict[str, Any
     interactions = _route_interactions(env, route_id)
     if not interactions:
         return None
-    detail = _detail(env, interactions[0]["id"])
+    detail = _finished_detail(env, interactions[0]["id"])
+    if detail is None:
+        return None
     runs = detail.get("runs", [])
     if not runs or runs[0]["status"] == "running":
         return None

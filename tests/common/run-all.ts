@@ -147,6 +147,7 @@ const workspace = [
 const localIgnored: Record<string, true> = {
   "agent::artifact::tests::postgres_download_lifecycle_survives_reconstruction": true,
   "compaction::retention_tests::postgres_retention_contracts": true,
+  postgres_admin_history_preserves_batches_and_retention: true,
   "browser::tests::chrome_javascript_redirect_rebinds_readiness": true,
   "browser::tests::chrome_worlds_timeout_cancel_and_profile_cleanup": true,
   "browser::tests::chrome_google_challenges_stop_before_deadline": true,
@@ -378,6 +379,7 @@ try {
   environment.STRAVIA_TEST_REDIS_URL = `redis://127.0.0.1:${redisPort}/0`;
   // SQLx 的 session advisory 迁移锁按数据库隔离，随机 schema 不能隔离并行 worker。
   const storagePostgresUrls: Record<string, string> = {};
+  const adminPostgresUrls: Record<string, string> = {};
   const postgresDatabaseCommands: string[] = [];
   for (const worker of [
     "master",
@@ -390,6 +392,13 @@ try {
     );
     storagePostgresUrls[worker] =
       `postgres://stravia:${password}@127.0.0.1:${port}/${database}`;
+    const adminDatabase = `stravia_admin_${worker}`;
+    postgresDatabaseCommands.push(
+      "-c",
+      `CREATE DATABASE ${adminDatabase} OWNER stravia`,
+    );
+    adminPostgresUrls[worker] =
+      `postgres://stravia:${password}@127.0.0.1:${port}/${adminDatabase}`;
   }
   const rustPostgresUrls = Array.from({ length: rustProcesses }, (_, index) => {
     const database = `stravia_rust_${index}`;
@@ -515,13 +524,6 @@ try {
     "services",
     `stravia-server${executableSuffix}`,
   );
-  const releaseServer = join(
-    repository,
-    "target",
-    "test-artifacts",
-    "release",
-    `stravia-server${executableSuffix}`,
-  );
   environment.STRAVIA_STORAGE_HARNESS_BINARY = join(
     repository,
     "target",
@@ -623,7 +625,7 @@ try {
           ),
         ]
       : []),
-    ...(pythonReady && releaseReady
+    ...(pythonReady && servicesReady
       ? [
           run(
             "admin",
@@ -641,11 +643,17 @@ try {
               "--deselect",
               "tests/e2e/admin/test_auth.py::test_development_task_accepts_vite_origin_without_bypassing_csrf",
             ],
-            { env: { STRAVIA_BINARY: releaseServer } },
+            {
+              env: {
+                STRAVIA_BINARY: serviceServer,
+                STRAVIA_STORAGE_TEST_POSTGRES_URLS:
+                  JSON.stringify(adminPostgresUrls),
+              },
+            },
           ),
         ]
       : []),
-    ...(releaseReady
+    ...(releaseReady && servicesReady
       ? [
           run(
             "web-chromium",
@@ -665,7 +673,7 @@ try {
             {
               env: {
                 PLAYWRIGHT_USE_PREBUILT: "1",
-                STRAVIA_BINARY: releaseServer,
+                STRAVIA_BINARY: serviceServer,
               },
             },
           ),

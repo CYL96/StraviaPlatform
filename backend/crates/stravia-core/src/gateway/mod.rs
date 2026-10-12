@@ -9,6 +9,7 @@ mod extensions;
 mod history_marker_executions;
 mod icon;
 mod lifecycle;
+mod provider_model_sync;
 mod runtime;
 #[cfg(test)]
 mod vendor_auxiliary_tests;
@@ -104,6 +105,7 @@ pub struct Gateway {
     pub(crate) _postgres_pool: Option<Pool<Postgres>>,
     history_marker_execution_gate: Arc<tokio::sync::RwLock<()>>,
     pub(crate) lifecycle: Arc<GatewayLifecycle>,
+    pub(crate) provider_model_sync: Arc<provider_model_sync::ProviderModelSyncRuntime>,
     lifecycle_owner: bool,
 }
 
@@ -159,6 +161,7 @@ impl Gateway {
             _postgres_pool: self._postgres_pool.clone(),
             history_marker_execution_gate: Arc::clone(&self.history_marker_execution_gate),
             lifecycle: Arc::clone(&self.lifecycle),
+            provider_model_sync: Arc::clone(&self.provider_model_sync),
             lifecycle_owner,
         }
     }

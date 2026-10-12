@@ -85,12 +85,15 @@ impl Deadline {
             // and the first poll would otherwise be lost.
             notified.as_mut().enable();
             let at = self.at();
-            if Instant::now() >= at {
+            let now = Instant::now();
+            if now >= at {
                 return;
             }
             tokio::select! {
                 biased;
-                _ = tokio::time::sleep_until(at.into()) => {}
+                // 截止时间属于真实时钟；受控 Tokio 时钟可能已推进，不能把
+                // 真实绝对时间直接转入另一个时钟域而反复立即唤醒。
+                _ = tokio::time::sleep(at.duration_since(now)) => {}
                 () = notified => {}
             }
         }

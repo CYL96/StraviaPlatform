@@ -16,11 +16,20 @@ import { SvelteURLSearchParams } from 'svelte/reactivity'
 import { toast } from 'svelte-sonner'
 
 import { admin } from '$lib/admin-client'
+import {
+  getModelChanges,
+  summaryDescription,
+  sourceLabel,
+  syncToast,
+  syncErrorToast,
+  modelChangeReason,
+} from '$lib/model-changes'
+import { Switch } from '$lib/components/ui/switch'
 import { localizeBackendErrorMessage } from '$lib/backend-error'
 import { ProviderModelEditing } from '$lib/provider-model-editing.svelte'
 import type { ProviderModelEditingOperation } from '$lib/provider-model-editing'
 import { getDataTableLabels } from '$lib/data-table-labels'
-import { formatTime } from '$lib/format'
+import { formatLogTime } from '$lib/format'
 import { formatSpecificationTokens } from '$lib/model-specification'
 import ModalityIcons from '$lib/components/modality-icons.svelte'
 import { localeState } from '$lib/localization.svelte'
@@ -60,16 +69,14 @@ interface Props {
   providerId: string
   routes: Route[]
   routeReferencesReady: boolean
-  syncedAt?: Date
-  syncedSummary?: ProviderModelSyncSummary
-  onSync?: () => Promise<ProviderModelSyncSummary | undefined> | ProviderModelSyncSummary | undefined
+  onSync?: (providerId: string) => Promise<ProviderModelSyncSummary | undefined> | ProviderModelSyncSummary | undefined
 }
 
 type AvailabilityFilter = 'all' | 'available' | 'unavailable'
 type SourceFilter = 'all' | 'discovered' | 'manual'
 type ReferenceFilter = 'all' | 'referenced' | 'unreferenced'
 
-let { providerId, routes, routeReferencesReady, syncedAt, syncedSummary, onSync }: Props = $props()
+let { providerId, routes, routeReferencesReady, onSync }: Props = $props()
 const queryClient = useQueryClient()
 let search = $state('')
 let columnFilters = $state<ColumnFiltersState>([
@@ -85,8 +92,10 @@ let filtersOpen = $state(false)
 let manualOpen = $state(false)
 let manualTemplateId = $state('')
 let syncing = $state(false)
-let syncSummary = $state<ProviderModelSyncSummary>()
-let lastSyncedAt = $state<Date>()
+const changesSheet = getModelChanges()
+let preferenceSaving = $state(false)
+let preferenceError = $state('')
+let preferenceEpoch = 0
 let editor = $state<{ submit: () => void }>()
 let addingRouteModelId = $state('')
 let internalNavigation = false
@@ -94,7 +103,36 @@ let internalNavigation = false
 const modelsQuery = createQuery(() => ({
   queryKey: ['provider-models', providerId],
   queryFn: () => admin.providers.models(providerId),
+  refetchInterval: 15_000,
 }))
+const syncStateQuery = createQuery(() => ({
+  queryKey: ['provider-model-sync-state', providerId],
+  queryFn: () => admin.providers.syncState(providerId),
+  refetchInterval: 5_000,
+}))
+async function saveAutomaticSync(enabled: boolean): Promise<void> {
+  const id = providerId
+  const epoch = ++preferenceEpoch
+  preferenceSaving = true
+  preferenceError = ''
+  try {
+    const state = await admin.providers.updateSyncState(id, { automatic_sync: enabled })
+    if (id !== providerId || epoch !== preferenceEpoch) return
+    queryClient.setQueryData(['provider-model-sync-state', id], state)
+  } catch (error) {
+    if (id === providerId && epoch === preferenceEpoch) preferenceError = localizeBackendErrorMessage(error)
+  } finally {
+    if (id === providerId && epoch === preferenceEpoch) preferenceSaving = false
+  }
+}
+$effect(() => {
+  if (providerId) {
+    preferenceEpoch += 1
+    preferenceSaving = false
+    preferenceError = ''
+    syncing = false
+  }
+})
 const canonicalModelsQuery = createQuery(() => ({
   queryKey: ['catalog', 'canonical-models'],
   queryFn: () => admin.catalog.canonicalModels(),
@@ -115,8 +153,7 @@ const editing = new ProviderModelEditing({
   },
 })
 const modelEditing = $derived(editing.state)
-const displayedSyncedAt = $derived(syncedAt ?? lastSyncedAt)
-const displayedSyncSummary = $derived(syncedSummary ?? syncSummary)
+const displayedSyncSummary = $derived(syncStateQuery.data?.last_check)
 const models = $derived(modelsQuery.data?.models ?? [])
 const requestedModelId = $derived(page.url.searchParams.get('model') ?? '')
 const availabilityFilter = $derived(catalogFilterValue<AvailabilityFilter>('availability', 'all'))
@@ -267,7 +304,10 @@ beforeNavigate((navigation) => {
   })
 })
 
-onDestroy(() => editing.dispose())
+onDestroy(() => {
+  preferenceEpoch += 1
+  editing.dispose()
+})
 
 function modelReferences(modelId: string): Array<{ route: Route; target: Route['targets'][number] }> {
   return routes.flatMap((route) =>
@@ -387,34 +427,43 @@ async function refreshModelData(operation: ProviderModelEditingOperation): Promi
   if (failure?.status === 'rejected') throw failure.reason
 }
 
-async function syncModels(): Promise<void> {
-  if (onSync) {
-    syncing = true
+async function syncModels(id = providerId): Promise<void> {
+  const sync = onSync
+  if (sync) {
+    if (id === providerId) syncing = true
     try {
-      const summary = await onSync()
+      const summary = await sync(id)
       if (!summary) return
-      syncSummary = summary
-      await modelsQuery.refetch()
-      lastSyncedAt = new Date()
+      if (id === providerId) {
+        await modelsQuery.refetch()
+        await syncStateQuery.refetch()
+      }
     } finally {
-      syncing = false
+      if (id === providerId) syncing = false
     }
     return
   }
-  syncing = true
+  if (id === providerId) syncing = true
+  const retry = () => {
+    if (id === providerId) editing.requestLeave(() => syncModels(id))
+    else void syncModels(id)
+  }
   try {
-    syncSummary = await admin.providers.syncModels(providerId)
-    await modelsQuery.refetch()
-    lastSyncedAt = new Date()
+    const summary = await admin.providers.syncModels(id)
+    syncToast(summary, changesSheet.reveal, retry)
+    await queryClient.invalidateQueries({ queryKey: ['provider-models', id] })
+    await queryClient.invalidateQueries({ queryKey: ['provider-model-sync-state', id] })
   } catch (error) {
-    toast.error(localizeBackendErrorMessage(error))
+    syncErrorToast(error, changesSheet.reveal, retry)
+    await queryClient.invalidateQueries({ queryKey: ['provider-model-sync-state', id] })
   } finally {
-    syncing = false
+    if (id === providerId) syncing = false
   }
 }
 
 function requestSync(): void {
-  editing.requestLeave(syncModels)
+  const id = providerId
+  editing.requestLeave(() => syncModels(id))
 }
 
 async function prepareManualModel(): Promise<void> {
@@ -440,6 +489,28 @@ function clearManualTemplate(): void {
   manualTemplateId = ''
 }
 </script>
+
+<div class="flex flex-wrap items-center gap-3">
+  {#if syncStateQuery.data}
+    <Switch
+      id="automatic-model-sync"
+      checked={syncStateQuery.data.automatic_sync}
+      disabled={preferenceSaving}
+      onCheckedChange={(value: boolean) => void saveAutomaticSync(value)} />
+    <label for="automatic-model-sync">{m.model_changes_automatic()}</label>
+    {#if preferenceSaving}<Spinner />{/if}
+    {#if syncStateQuery.data.in_progress}<p role="status">{m.model_changes_in_progress()}</p>{/if}
+    {#if syncStateQuery.data.automatic_sync && syncStateQuery.data.pause_reason}<p>
+        {modelChangeReason(syncStateQuery.data.pause_reason)}
+      </p>{/if}
+  {/if}
+</div>
+{#if preferenceError}<RequestFailure
+    message={preferenceError}
+    retry={() => saveAutomaticSync(!syncStateQuery.data?.automatic_sync)} />{/if}
+{#if syncStateQuery.isError}<RequestFailure
+    message={localizeBackendErrorMessage(syncStateQuery.error)}
+    retry={() => syncStateQuery.refetch()} />{/if}
 
 {#snippet providerModelIdentityCell(context: DataTableCellContext<ProviderModelSummary>)}
   {@const model = context.row.original}
@@ -693,22 +764,26 @@ function clearManualTemplate(): void {
         <p class="route-section-description">
           {m.provider_model_catalog_page_summary()}
         </p>
-        <p class="mt-2 text-xs text-muted-foreground">
-          {#if displayedSyncedAt}
+        <p class="mt-2 text-sm">
+          {#if displayedSyncSummary}
             {m.provider_model_catalog_last_checked()}
-            {formatTime(displayedSyncedAt)}
-            {#if displayedSyncSummary}
-              · {displayedSyncSummary.added}
-              {m.provider_model_catalog_new()} · {displayedSyncSummary.missing}
-              {m.provider_model_catalog_no_longer_offered()} · {displayedSyncSummary.restored}
-              {m.provider_model_catalog_available_again()}
-            {/if}
-          {:else}
-            {m.provider_model_catalog_sync_list_check_model_updates()}
+            <span class="text-xs text-muted-foreground"
+              >{formatLogTime(displayedSyncSummary.checked_at)} · {sourceLabel(displayedSyncSummary.source)}</span>
+            {#if summaryDescription(displayedSyncSummary)}
+              · {summaryDescription(displayedSyncSummary)}{/if}
+            {#if displayedSyncSummary.error}<span class="block text-destructive"
+                >{modelChangeReason(displayedSyncSummary.error)}</span
+              >{/if}
+          {:else if syncStateQuery.isPending}
+            <Spinner />
+          {:else if !syncStateQuery.isError}
+            {m.model_changes_not_checked()}
           {/if}
         </p>
       </div>
       <div class="flex flex-wrap gap-2">
+        <Button data-model-changes-trigger variant="outline" onclick={() => changesSheet.show(providerId)}
+          >{m.model_changes_title()}</Button>
         <Button variant="outline" onclick={() => (manualOpen = true)}
           ><PlusIcon data-icon="inline-start" />{m.provider_model_catalog_add_model_manually()}</Button>
         <Button variant="outline" onclick={requestSync} disabled={syncing}>

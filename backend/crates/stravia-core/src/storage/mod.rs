@@ -1,5 +1,6 @@
 pub mod maintenance;
 pub mod memory;
+mod model_changes;
 pub mod postgres;
 pub mod sql;
 pub mod sqlite;

@@ -12,9 +12,10 @@ use crate::db::models::{
 };
 use crate::plugin::PluginStore;
 use crate::provider_models::{
-    NewProviderModelRecord, ProviderModelMutation, ProviderModelReconciliation,
-    ProviderModelRecord, ProviderModelReimport, ProviderModelSelectionPolicy,
-    ProviderModelSourceKind, ReimportProviderModel, SnapshotState, SourceStamp,
+    ModelChangePage, ModelChangeQuery, ModelChangeRecord, NewProviderModelRecord,
+    ProviderModelMutation, ProviderModelReconciliation, ProviderModelRecord, ProviderModelReimport,
+    ProviderModelSelectionPolicy, ProviderModelSourceKind, ProviderModelSyncState,
+    ProviderModelSyncSummary, ReimportProviderModel, SnapshotState, SourceStamp,
 };
 
 use super::traits::{
@@ -31,6 +32,8 @@ pub struct MemoryStorage {
     models: Arc<RwLock<Vec<RouteConfig>>>,
     settings: Arc<RwLock<Vec<(String, String)>>>,
     provider_models: Arc<RwLock<Vec<ProviderModelRecord>>>,
+    model_sync_states: Arc<RwLock<std::collections::HashMap<String, ProviderModelSyncState>>>,
+    model_changes: Arc<RwLock<Vec<ModelChangeRecord>>>,
     oauth_credentials: Arc<MemoryOAuthCredentialStore>,
     allowance_guards:
         Arc<RwLock<std::collections::HashMap<String, std::collections::BTreeMap<String, String>>>>,
@@ -45,6 +48,18 @@ impl MemoryStorage {
         models: Vec<RouteConfig>,
         settings: Vec<(String, String)>,
     ) -> Self {
+        let model_sync_states = providers
+            .iter()
+            .map(|provider| {
+                (
+                    provider.id.clone(),
+                    ProviderModelSyncState {
+                        has_successful_sync: true,
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect();
         let providers = Arc::new(RwLock::new(providers));
         let provider_models = Arc::new(RwLock::new(Vec::new()));
         let oauth_credentials = Arc::new(MemoryOAuthCredentialStore {
@@ -60,6 +75,8 @@ impl MemoryStorage {
             models: Arc::new(RwLock::new(models)),
             settings: Arc::new(RwLock::new(settings)),
             provider_models,
+            model_sync_states: Arc::new(RwLock::new(model_sync_states)),
+            model_changes: Arc::new(RwLock::new(Vec::new())),
             oauth_credentials,
             allowance_guards: Arc::new(RwLock::new(std::collections::HashMap::new())),
             allowance_suspensions: Arc::new(RwLock::new(std::collections::HashMap::new())),
@@ -219,6 +236,7 @@ impl ProviderStore for MemoryStorage {
         let mut oauth_credentials = self.oauth_credentials.credentials.write().await;
         self.plugin_store.remove_memory_provider_data(id).await;
         providers.retain(|provider| provider.id != id);
+        self.model_sync_states.write().await.remove(id);
         provider_models.retain(|model| model.provider_id != id);
         oauth_credentials.remove(id);
         self.allowance_guards.write().await.remove(id);
@@ -717,7 +735,31 @@ impl ProviderModelStore for MemoryStorage {
         reconciliation: ProviderModelReconciliation,
     ) -> anyhow::Result<()> {
         let now = now_rfc3339();
+        let providers = self.providers.read().await;
+        if let Some(expected) = &reconciliation.expected_provider {
+            anyhow::ensure!(
+                providers.iter().any(|provider| provider.id == provider_id
+                    && crate::provider_models::same_discovery_provider(provider, expected)),
+                "Provider changed while synchronizing discovered models"
+            );
+        }
         let mut items = self.provider_models.write().await;
+        let mut states = self.model_sync_states.write().await;
+        let mut changes = self.model_changes.write().await;
+        for (model_id, revision) in &reconciliation.expected_revisions {
+            anyhow::ensure!(
+                items.iter().any(|item| item.provider_id == provider_id
+                    && &item.model_id == model_id
+                    && &item.revision == revision),
+                "Provider Model has changed while synchronizing discovered models"
+            );
+        }
+        if let Some(record) = &reconciliation.change_record {
+            anyhow::ensure!(
+                !changes.iter().any(|item| item.id == record.id),
+                "duplicate model change record"
+            );
+        }
         for update in &reconciliation.updates {
             anyhow::ensure!(
                 items.iter().any(|item| item.provider_id == provider_id
@@ -766,10 +808,23 @@ impl ProviderModelStore for MemoryStorage {
         for input in reconciliation.inserts {
             items.push(memory_provider_model(input, now.clone()));
         }
+        if let Some(summary) = reconciliation.sync_summary {
+            let state = states.entry(provider_id.to_owned()).or_default();
+            state.last_check = Some(summary);
+            state.has_successful_sync = true;
+        }
+        if let Some(record) = reconciliation.change_record {
+            changes.push(record);
+        }
         Ok(())
     }
 
-    async fn create(&self, input: NewProviderModelRecord) -> anyhow::Result<ProviderModelMutation> {
+    async fn create(
+        &self,
+        input: NewProviderModelRecord,
+        change_record: Option<ModelChangeRecord>,
+    ) -> anyhow::Result<ProviderModelMutation> {
+        let _providers = self.providers.read().await;
         let mut items = self.provider_models.write().await;
         if items
             .iter()
@@ -777,8 +832,18 @@ impl ProviderModelStore for MemoryStorage {
         {
             return Ok(ProviderModelMutation::Conflict);
         }
+        let mut changes = self.model_changes.write().await;
+        if let Some(change) = &change_record {
+            anyhow::ensure!(
+                !changes.iter().any(|item| item.id == change.id),
+                "duplicate model change record"
+            );
+        }
         let record = memory_provider_model(input, now_rfc3339());
         items.push(record.clone());
+        if let Some(change) = change_record {
+            changes.push(change);
+        }
         Ok(ProviderModelMutation::Applied(Box::new(record)))
     }
 
@@ -926,6 +991,7 @@ impl ProviderModelStore for MemoryStorage {
         model_id: &str,
         policy: ProviderModelSelectionPolicy,
         expected_revision: i64,
+        change_record: Option<ModelChangeRecord>,
     ) -> anyhow::Result<ProviderModelMutation> {
         let mut items = self.provider_models.write().await;
         let Some(item) = items
@@ -937,10 +1003,123 @@ impl ProviderModelStore for MemoryStorage {
         if item.revision != expected_revision {
             return Ok(ProviderModelMutation::Conflict);
         }
+        if item.selection_policy == policy {
+            return Ok(ProviderModelMutation::Applied(Box::new(item.clone())));
+        }
+        let mut changes = self.model_changes.write().await;
+        if let Some(change) = &change_record {
+            anyhow::ensure!(
+                !changes.iter().any(|item| item.id == change.id),
+                "duplicate model change record"
+            );
+        }
         item.selection_policy = policy;
         item.revision += 1;
         item.updated_at = now_rfc3339();
+        if let Some(change) = change_record {
+            changes.push(change);
+        }
         Ok(ProviderModelMutation::Applied(Box::new(item.clone())))
+    }
+
+    async fn sync_state(&self, provider_id: &str) -> anyhow::Result<ProviderModelSyncState> {
+        Ok(self
+            .model_sync_states
+            .read()
+            .await
+            .get(provider_id)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    async fn set_automatic_sync(
+        &self,
+        provider_id: &str,
+        enabled: bool,
+    ) -> anyhow::Result<ProviderModelSyncState> {
+        let providers = self.providers.read().await;
+        anyhow::ensure!(
+            providers.iter().any(|provider| provider.id == provider_id),
+            "Provider not found"
+        );
+        let mut states = self.model_sync_states.write().await;
+        let state = states.entry(provider_id.to_owned()).or_default();
+        state.automatic_sync = enabled;
+        Ok(state.clone())
+    }
+
+    async fn save_sync_failure(
+        &self,
+        provider_id: &str,
+        summary: ProviderModelSyncSummary,
+        record: ModelChangeRecord,
+    ) -> anyhow::Result<()> {
+        let providers = self.providers.read().await;
+        let mut states = self.model_sync_states.write().await;
+        let mut changes = self.model_changes.write().await;
+        if providers.iter().any(|provider| provider.id == provider_id) {
+            states.entry(provider_id.to_owned()).or_default().last_check = Some(summary);
+        }
+        if let Some(existing) = changes.iter_mut().find(|item| item.id == record.id) {
+            existing.outcome = record.outcome;
+            existing.error = record.error;
+        } else {
+            changes.push(record);
+        }
+        Ok(())
+    }
+
+    async fn list_changes(&self, query: ModelChangeQuery) -> anyhow::Result<ModelChangePage> {
+        let cursor = super::model_changes::cursor(&query)?;
+        let cutoff = super::model_changes::cutoff();
+        let limit = query.limit.unwrap_or(25).clamp(1, 100);
+        let needle = query.q.as_ref().map(|q| q.to_lowercase());
+        let providers = self.providers.read().await;
+        let changes = self.model_changes.read().await;
+        let mut records: Vec<_> = changes
+            .iter()
+            .filter(|record| {
+                record.checked_at >= cutoff
+                    && cursor
+                        .as_ref()
+                        .is_none_or(|(time, id)| (&record.checked_at, &record.id) < (time, id))
+                    && super::model_changes::matches(record, &query, needle.as_deref())
+            })
+            .collect();
+        records.sort_by(|a, b| (&b.checked_at, &b.id).cmp(&(&a.checked_at, &a.id)));
+        records.truncate(limit + 1);
+        let mut records: Vec<_> = records.into_iter().cloned().collect();
+        for record in &mut records {
+            record.provider_deleted = !providers
+                .iter()
+                .any(|provider| provider.id == record.provider_id);
+        }
+        super::model_changes::page(records, limit)
+    }
+
+    async fn get_change(&self, id: &str) -> anyhow::Result<Option<ModelChangeRecord>> {
+        let providers = self.providers.read().await;
+        let mut record = self
+            .model_changes
+            .read()
+            .await
+            .iter()
+            .find(|record| record.id == id && record.checked_at >= super::model_changes::cutoff())
+            .cloned();
+        if let Some(record) = &mut record {
+            record.provider_deleted = !providers
+                .iter()
+                .any(|provider| provider.id == record.provider_id);
+        }
+        Ok(record)
+    }
+
+    async fn prune_changes(&self, before: &str) -> anyhow::Result<()> {
+        self.model_changes
+            .write()
+            .await
+            .retain(|record| record.checked_at.as_str() >= before);
+        Ok(())
     }
 
     async fn delete_manual(&self, provider_id: &str, model_id: &str) -> anyhow::Result<bool> {
@@ -1492,7 +1671,7 @@ mod tests {
         let store = storage.provider_models();
         for model_id in ["first", "second"] {
             store
-                .create(new_provider_model_record(model_id))
+                .create(new_provider_model_record(model_id), None)
                 .await
                 .unwrap();
         }
@@ -1536,7 +1715,8 @@ mod tests {
                     "provider",
                     ProviderModelReconciliation {
                         inserts: vec![],
-                        updates
+                        updates,
+                        ..Default::default()
                     }
                 )
                 .await
@@ -1560,7 +1740,7 @@ mod tests {
         let store = storage.provider_models();
         for model_id in ["zhipuai/GLM-4.6", "gpt-4o-mini"] {
             store
-                .create(new_provider_model_record(model_id))
+                .create(new_provider_model_record(model_id), None)
                 .await
                 .expect("insert fixture model");
         }
@@ -1598,7 +1778,7 @@ mod tests {
         let store = storage.provider_models();
         for model_id in ["openai/gpt-4o", "azure/gpt-4o"] {
             store
-                .create(new_provider_model_record(model_id))
+                .create(new_provider_model_record(model_id), None)
                 .await
                 .expect("insert fixture model");
         }
@@ -1954,7 +2134,7 @@ mod tests {
         );
         let models = storage.provider_models();
         models
-            .create(discovered_provider_model("m1"))
+            .create(discovered_provider_model("m1"), None)
             .await
             .expect("insert model");
 
@@ -2169,7 +2349,7 @@ mod tests {
         );
         let models = storage.provider_models();
         models
-            .create(discovered_provider_model("m1"))
+            .create(discovered_provider_model("m1"), None)
             .await
             .expect("insert model");
         storage
@@ -2256,7 +2436,7 @@ mod tests {
         let storage = MemoryStorage::new(vec![provider("provider")], Vec::new(), Vec::new());
         let models = storage.provider_models();
         models
-            .create(discovered_provider_model("m1"))
+            .create(discovered_provider_model("m1"), None)
             .await
             .expect("insert model");
         storage

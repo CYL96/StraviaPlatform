@@ -1182,28 +1182,137 @@ describe('Stravia desktop smoke', () => {
   })
 
   // 退出会关闭共享的原生会话，必须在所有页面交互验证之后执行。
-  it('keeps the session in the tray and stops the listener on application exit', async () => {
+  it('completes live model sync in the tray and cancels discovery on full application exit', async () => {
     const serverPort = (await browser.tauri.execute(({ core }) => core.invoke('get_server_port'))) as number
     const nativeSession = (await browser.tauri.execute(({ core }) =>
       core.invoke('get_admin_session'),
     )) as DesktopAdminSession
-    await browser.tauri.execute(({ core }) => core.invoke('plugin:window|close', { label: 'main' }))
-    await expectProtectedStatus(serverPort, nativeSession.access_token)
-    await browser.tauri.execute(({ core }) => {
-      setTimeout(() => void core.invoke('plugin:process|exit', { code: 0 }), 0)
+    let entered!: () => void
+    let release!: () => void
+    let disconnected!: () => void
+    let discoveryEntered = new Promise<void>((resolve) => (entered = resolve))
+    let discoveryRelease = new Promise<void>((resolve) => (release = resolve))
+    const discoveryDisconnected = new Promise<void>((resolve) => (disconnected = resolve))
+    let discoveries = 0
+    const upstream = createProvider((request, response) => {
+      if (request.url !== '/models') {
+        response.writeHead(404)
+        response.end()
+        return
+      }
+      discoveries += 1
+      const invocation = discoveries
+      if (invocation === 2) response.once('close', disconnected)
+      entered()
+      void discoveryRelease
+        .then(() => {
+          if (!response.destroyed) {
+            response.writeHead(200, { 'content-type': 'application/json' })
+            response.end(JSON.stringify({ data: [{ id: 'tray-live-model' }] }))
+          }
+        })
+        .catch((error: unknown) => {
+          response.destroy(new Error('Synthetic discovery response failed', { cause: error }))
+        })
     })
-    await browser.waitUntil(
-      async () => {
-        try {
-          await fetch(`http://127.0.0.1:${serverPort}/healthz`)
-          return false
-        } catch {
-          return true
-        }
-      },
-      { timeout: 10_000, timeoutMsg: 'application exit did not stop the native HTTP listener' },
-    )
-    // 原生退出已结束内嵌 WebDriver；写入真实实例，而非 @wdio/globals 的只读取代理。
-    globalThis.browser.sessionId = ''
+    await new Promise<void>((resolve, reject) => {
+      upstream.once('error', reject)
+      upstream.listen(0, '127.0.0.1', resolve)
+    })
+    const origin = `http://127.0.0.1:${(upstream.address() as AddressInfo).port}`
+    const api = (path: string, method = 'GET', body?: unknown) =>
+      adminRequest(serverPort, path, { method, ...(body === undefined ? {} : { body: JSON.stringify(body) }) })
+    const deadline = async (event: Promise<void>, label: string) => {
+      let timer: ReturnType<typeof setTimeout> | undefined
+      try {
+        await Promise.race([
+          event,
+          new Promise<never>((_resolve, reject) => {
+            timer = setTimeout(() => reject(new Error(label)), 15_000)
+          }),
+        ])
+      } finally {
+        if (timer) clearTimeout(timer)
+      }
+    }
+    try {
+      const provider = createdResource(
+        await api('/providers', 'POST', {
+          name: 'Tray background lifetime',
+          source: {
+            type: 'custom',
+            vendor: 'custom',
+            channel: 'default',
+            protocol: 'openai-compatible',
+            base_url: origin,
+            models_source: `${origin}/models`,
+          },
+          credential: { type: 'none' },
+          vendor_options: {},
+          use_proxy: false,
+        }),
+        'Tray provider',
+      )
+      const path = `/providers/${provider.id}/models`
+      await api(`${path}/sync-state`, 'PUT', { automatic_sync: false })
+      const completing = api(`${path}/sync`, 'POST', {})
+      await deadline(discoveryEntered, 'live model discovery never entered the local fixture')
+      await browser.tauri.execute(({ core }) => core.invoke('plugin:window|close', { label: 'main' }))
+      expect(
+        await browser.tauri.execute(({ core }) => core.invoke('plugin:window|is_visible', { label: 'main' })),
+      ).toBe(false)
+      await expectProtectedStatus(serverPort, nativeSession.access_token)
+      release()
+      const summary = (await completing) as { record_id: string; added: number }
+      expect(summary.added).toBe(1)
+      expect(summary.record_id).toBeTruthy()
+      const history = (await api(`/model-changes/${summary.record_id}`)) as {
+        changes: Array<{ model_id: string; types: string[] }>
+      }
+      expect(history.changes.map((change) => change.model_id)).toEqual(['tray-live-model'])
+      expect(history.changes[0].types).toContain('added')
+      discoveryEntered = new Promise<void>((resolve) => (entered = resolve))
+      discoveryRelease = new Promise<void>((resolve) => (release = resolve))
+      const cancellation = fetch(`http://127.0.0.1:${serverPort}/api/v1${path}/sync`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${nativeSession.access_token}`, 'content-type': 'application/json' },
+        body: '{}',
+      }).then(
+        async (response) => {
+          expect(response.status).toBeGreaterThanOrEqual(400)
+          const result = (await response.json()) as { error?: string }
+          expect(result.error).toBeTruthy()
+          return { completed: false }
+        },
+        (error: unknown) => {
+          if (!(error instanceof TypeError)) throw error
+          return { completed: false }
+        },
+      )
+      await deadline(discoveryEntered, 'second discovery never entered the local fixture')
+      await browser.tauri.execute(({ core }) => {
+        setTimeout(() => void core.invoke('plugin:process|exit', { code: 0 }), 0)
+      })
+      await deadline(discoveryDisconnected, 'full exit left the discovery upstream socket running')
+      expect(await cancellation).toEqual({ completed: false })
+      await browser.waitUntil(
+        async () => {
+          try {
+            await fetch(`http://127.0.0.1:${serverPort}/healthz`)
+            return false
+          } catch {
+            return true
+          }
+        },
+        { timeout: 10_000, timeoutMsg: 'application exit did not stop the native HTTP listener' },
+      )
+      // Native exit ends the embedded driver; update the actual instance, not
+      // @wdio/globals' read-only proxy.
+      globalThis.browser.sessionId = ''
+    } finally {
+      release()
+      upstream.closeAllConnections()
+      await new Promise<void>((resolve, reject) => upstream.close((error) => (error ? reject(error) : resolve())))
+    }
   })
 })

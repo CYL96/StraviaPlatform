@@ -953,9 +953,9 @@ SQLite/PostgreSQL `0014_remove_shared_rpm_pools` 删除已保存的池额度与�
 
 从 Catalog 创建 Provider 时，Core 将 channel 解析为运行时 `protocol`、`base_url`、认证模式和 `models_source = catalog`，并保存 Catalog revision/fingerprint。OAuth 完成后，认证驱动可将 `models_source` 更新为账号作用域的动态模型端点；目录身份字段仍不可修改，变更 channel 需重建 Provider。
 
-Provider discovery 只负责提供当前可见的模型 ID。动态端点响应包含 `visibility` 时只保留 `list` 项；Core 再以相同 Provider Catalog scope 中的精确 upstream model ID 补齐初始 metadata。Catalog 独有模型不会扩充动态 discovery 集合，端点独有模型则以最小 metadata 创建。没有可靠账号 discovery 的 Catalog Provider 直接使用其按需加载的 scoped inventory。
+Provider discovery 提供当前可见的模型 ID，以及发现通道明确声明的规格和生命周期。动态端点响应包含 `visibility` 时只保留 `list` 项；Core 再以相同 Provider Catalog scope 中的精确 upstream model ID 补齐来源 metadata。Catalog 独有模型不会扩充动态 discovery 集合，端点独有且未声明规格的模型则以最小 metadata 创建。没有可靠账号 discovery 的 Catalog Provider 直接使用其按需加载的 scoped inventory。
 
-`provider_models` 按 `(provider_id, model_id)` 保存 Provider 实例拥有的可编辑模型快照。`snapshot_state` 区分 `unregistered`、带来源的 `imported` 和保留可知来源的 `edited`；来源可为 Provider Catalog、Canonical Model 或 Discovery。ID-only discovery 不填充虚假的能力、模态或上下文默认值；只有未登记快照可在普通同步中首次获取真实规格。已导入和人工编辑规格保持不变，插件拥有的执行 metadata、presence 与生命周期仍按各自契约刷新。管理员显式 re-import 才整体替换规格。对账写入使用 expected revision 防止覆盖并发编辑；旧行保守迁移为来源未知的 edited，不重写 `metadata_json`。未知字段仍保存在完整 metadata 中，常用查询列与分档成本规则继续规范化到关系列。
+`provider_models` 按 `(provider_id, model_id)` 保存 Provider 实例拥有的可编辑模型快照。`snapshot_state` 区分 `unregistered`、带来源的 `imported` 和保留可知来源的 `edited`；来源可为 Provider Catalog、Canonical Model 或 Discovery。ID-only discovery 不填充虚假的能力、模态或上下文默认值；未登记快照可在普通同步中首次获取真实规格，Imported 且未被人工接管的整条规格继续跟随来源刷新。Edited 保留管理员接管的完整规格，插件拥有的执行 metadata、presence 与生命周期仍按各自契约刷新；显式 re-import 可重新整体导入规格。手动添加的模型不被 discovery 覆盖或因未出现而标记 missing。对账写入使用发现前的连接快照及 expected revision 防止覆盖并发编辑；旧行保守迁移为来源未知的 edited，不重写 `metadata_json`。未知字段仍保存在完整 metadata 中，常用查询列与分档成本规则继续规范化到关系列。
 
 模型价格只登记 `input`、`output`、`cache_read` 与 `cache_write`，基础价格、`context_over_200k` 和 `tiers` 使用相同字段集合。推理、音频输入和音频输出不再分别登记单价；目录导入与管理写入不会保留这些退休价格。SQLite 与 PostgreSQL 的 `0013_remove_extra_model_prices` 增量迁移清理已保存快照中的三项价格及对应投影列，保留其他价格的十进制精度、快照身份、revision、推理强度和音频模态，不修改用量记录。升级前备份数据库；恢复这些已删除的价格需要升级前备份。
 
@@ -979,7 +979,7 @@ Canonical Model 只用作一次性模板：客户端 Route ID 落在 `models.mod
 
 `stravia-core` 通过 crate-private Provider connection 与 Route 两个深模块收口管理写入。Provider connection 负责 Catalog/custom 解析、Adapter Credentials、Base URL、OAuth、连通性与删除；Route 负责 Provider Model snapshot、discovery、Selection Policy、Canonical Model 一次性模板、Route ID 与 Target。Admin HTTP 只做 DTO adapter：`POST /api/v1/models/bind` 执行一键或指定 Route ID 的 Target 绑定，`POST /api/v1/models/unbind` 摘除 Target，并在最后一个 Target 被摘除时删除 Route。
 
-`GET/POST /api/v1/providers/{provider_id}/models` 分别列出 Provider Model 与创建手动模型，`POST /models/sync` 执行 discovery 对账。单模型详情、编辑、选择策略、re-import 和手动删除使用 `/api/v1/providers/{provider_id}/model` 及其子资源，并通过 `model` query 或 `model_id` body 字段传递可包含 `/` 的模型 ID。`SelectionPolicy` 的 `auto`、`force_enabled`、`force_disabled` 与 discovery presence、生命周期共同计算 Effective Availability，只影响新 Target 资格；已有 Target 不因 missing 或 deprecated 被自动删除。删除 Provider 会在存储事务内摘除其 Target、删除空 Route，并把仍有 Target 的 Route 主目标更新为剩余的第一项。
+`GET/POST /api/v1/providers/{provider_id}/models` 分别列出 Provider Model 与创建手动模型，`POST /models/sync` 执行 discovery 对账。单模型详情、编辑、选择策略、re-import 和手动删除使用 `/api/v1/providers/{provider_id}/model` 及其子资源，并通过 `model` query 或 `model_id` body 字段传递可包含 `/` 的模型 ID。`SelectionPolicy` 的 `auto`、`force_enabled`、`force_disabled` 与 discovery presence、生命周期共同计算 Effective Availability，既影响新 Target 资格，也校验已有 Target 的后续上游发送；已有 Target 不因 missing 或 deprecated 被自动删除。ForceEnabled 保留本地覆盖，但不绕过 Provider 停用、凭据或其他执行限制。删除 Provider 会在存储事务内摘除其 Target、删除空 Route，并把仍有 Target 的 Route 主目标更新为剩余的第一项。
 
 ### 9.3 Provider Model Editing
 
@@ -990,6 +990,34 @@ WebUI 的 `frontend/stravia-webui/src/lib/provider-model-editing.ts` 是 Provide
 未提交规格离开前统一确认，覆盖模型切换、关闭手动抽屉、页内 URL 导航、浏览器 Back/Forward 和需要丢弃规格的 re-import。保留编辑不执行待定动作；确认丢弃先用已确认 metadata 的新副本重置表单，等待 editor 更新，再执行唯一待定动作。视图仍拥有 `goto`、浏览器历史恢复、焦点、对话框、toast 和 DOM；字段编辑、验证及 metadata 序列化继续由已有 editor 负责，不引入通用编辑框架。
 
 模型写入和相关刷新收敛前，禁止重复写入、规格编辑、关闭和页内导航。重新加载页面或卸载只能使用浏览器原生离开提示，不能取消后端已经接受的写入。写入成功先接受返回详情与 revision，再刷新相关列表；刷新失败明确表示更改已保存，Retry 只重读，不重复提交写入。删除成功后先清空编辑上下文，刷新或导航失败不能复活已删除详情。Selection Policy 独立生效，更新可用状态、策略和 revision，但保留规格 metadata 引用与未提交字段；Destination RPM 表单和目录内联编辑仍使用各自既有 seam，不并入这个写入上下文。
+
+### 9.4 后台清单维护与模型变更记录
+
+Gateway 启动时检查已保存且符合条件的 Provider，此后每小时检查一次。自动同步偏好缺省开启；已停用、已知凭据失效、插件不可用或 channel 不支持 ModelDiscovery 的连接暂停，恢复后在正常周期重新参与。新连接保留保存后立即同步的管理流程。后台任务属于 GatewayLifecycle，不依赖管理浏览器、Desktop 窗口或托盘可见性；完全退出协作取消插件网络子任务。不增加失败快速重试、可配置频率或跨实例调度锁。
+
+Server/Desktop 关闭时先停止接收新请求并通过 `Gateway::request_shutdown` 取消后台任务，再排空 HTTP，最后通过 `Gateway::shutdown` 等待任务结束并关闭观测与缓存。不能把取消放在 HTTP 排空之后：手动同步请求可能正在等待同一发现任务，形成互相等待。请求取消本身不提前关闭仍供在途请求使用的观测与缓存。
+
+每个实例内同一 Provider 的手动与自动同步单飞。手动请求加入正在执行的后台检查时返回同一个已确认结果、记录身份和 `automatic_sync` 来源；其他连接独立执行。关闭自动偏好只阻止后续自动启动，不撤销已开始的操作。来源发现、Vendor publication fence、连接快照与模型 revision 复检沿用 Core 的 Route module；过期发现明确失败，不覆盖人工值或透明重试。
+
+变更事实由 Core 在协调时生成。同步库存、检查摘要和成功变更批次在同一个存储事务中提交；手动添加及 Selection Policy 修改也与独立记录原子提交，重复设置相同策略不制造记录。普通人工规格编辑、re-import 和内部插件字段变化不进入此时间线。失败 discovery、空清单、非法或不完整响应保留上次有效库存；失败历史仅在存储确认后可查询，历史保存失败显式报告且不终止其他请求。提交后的插件恢复写入失败返回 `partial_success`，保留已提交的模型事实、原记录身份和差异，不宣称整次回滚。
+
+账号级 discovery 已完整成功时，可选 Provider Catalog 富化失败按 ADR-0073 明确告警，但不把已确认库存判成失败或扩大成员集合。已有 Imported／Edited 的有效目录规格、名称与可重导入来源保留；新模型和未登记规格仍可使用 Canonical／bare metadata。缺少明确上游 `status` 的失败富化不能清除旧 deprecated；只有 discovery 明确声明的合法生命周期（`alpha`、`beta`、`deprecated`）或 `null` 才更新该事实，随后据同一个有效状态生成计数、历史与发送资格。此回退不把失败的目录刷新标为成功。
+
+管理接口沿用既有鉴权、CSRF 和响应包装，Server 与 Desktop 共享 AdminService：
+
+| 接口 | 契约 |
+| --- | --- |
+| `POST /api/v1/providers/{id}/models/sync` | 返回 `added`、`missing`、`restored`、`deprecated`、`deprecation_cleared`、`specification_updated`、服务器 UTC `checked_at`、实际 `source`、可空 `record_id`、`outcome` 和可空 `error`。分类可重叠，不把其总和当不同模型总数。成功无变化仍更新摘要但没有记录。失败响应可在 `details.sync_summary` 返回已保存的检查事实。 |
+| `GET /api/v1/providers/{id}/models/sync-state` | 返回持久自动偏好与最近摘要、当前实例的 `in_progress`、独立的 `pause_reason` 和首次成功检查标记；进行中状态不跨重启保存。 |
+| `PUT /api/v1/providers/{id}/models/sync-state` | 只接受完整偏好 `{ "automatic_sync": true \| false }`，不提交连接或模型草稿。 |
+| `GET /api/v1/model-changes` | 支持 `provider_id`、`type`、`source`、模型名称／ID 的字面、不区分大小写 `q`、`cursor` 和有界 `limit`；按确认时间、稳定记录身份倒序返回 `{ records, next_cursor }`，匹配批次仍返回全部变更。 |
+| `GET /api/v1/model-changes/{id}` | 返回保留期内的当次服务名快照、来源、结果、首次同步标记、具体模型及规范化字段前后值，不从当前模型重建历史。 |
+
+来源为 `automatic_sync`、`manual_sync`、`manual_change`；结果为 `success`、`partial_success`、`failure`。变更类别区分 `added`、`missing`、`restored`、`deprecated`、`deprecation_cleared`、`specification_updated`、`manual_added`、`selection_policy_changed` 和 `sync_failed`。Missing 不等于上游弃用或手动禁用，解除弃用不是管理员重新启用。差异保留未知、显式空列表与真实零值，仅前端本地化和格式化。
+
+SQLite/PostgreSQL `0019_provider_model_sync` 增加独立同步状态、变更批次及检索投影。已有连接迁移为默认自动参与并标记已有成功同步，不虚构检查时间、首次同步或过去历史；新连接首次成功检查独立标记。记录保留 90 天，读取即排除严格早于期限的记录，周期维护清理到期数据。历史不绑定 Provider 的级联删除，读取动态标记已删除服务；改名仍按同一 Provider ID 连续查询，同名重建不合并。升级前按部署流程备份数据库，由应用执行 migrations，不使用参考 schema 初始化实例。
+
+WebUI 的全局与单服务入口共用根布局中的一个「模型变更」只读侧栏；手动 toast 的「查看详情」按精确 `record_id` 展开，不替换成最新批次，切换页签或页面后仍可操作，失败及部分成功的重试保留原 Provider ID。同步完成不把已离开详情页的用户导航回来，也不把原服务的进行中或错误状态显示在后来打开的服务上；关闭侧栏时优先恢复原控件，原控件已卸载时回退到当前页签或 Shell 导航。打开页面只读取持久结果，后台完成不弹 toast 或抢焦点；「自动同步」开关与最近摘要、暂停原因独立展示，旧页面请求的迟到响应不写入新服务的缓存或状态。后台默认参与会产生正常发现请求；需要例外时关闭单服务偏好，手动检查不受此开关限制。
 
 ---
 

@@ -308,6 +308,13 @@ pub fn run() {
 
 pub(crate) async fn shutdown_desktop(app: &tauri::AppHandle, startup: &StartupController) {
     startup.wait_for_initialization().await;
+    if let Some(runtime) = app.try_state::<Arc<DesktopGatewayRuntime>>() {
+        runtime.request_shutdown();
+    }
+    // 手动同步 HTTP 请求也在等待后台发现，必须先取消发现才能正常排空。
+    if let Some(gateway) = app.try_state::<Gateway>() {
+        gateway.request_shutdown();
+    }
     if let Some(runtime) = app.try_state::<Arc<DesktopGatewayRuntime>>()
         && runtime.shutdown().await.is_err()
     {

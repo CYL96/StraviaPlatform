@@ -218,6 +218,12 @@ impl Gateway {
         GatewayBuilder::new(config)
     }
 
+    /// 请求后台任务协作停止，不排空 HTTP 请求或关闭观测写入与缓存。
+    /// 宿主停止接收请求后调用，排空请求后仍须等待 `shutdown` 完成清理。
+    pub fn request_shutdown(&self) {
+        self.lifecycle.cancellation.cancel();
+    }
+
     pub async fn shutdown(&self) {
         self.lifecycle.shutdown().await;
         self.observation.shutdown().await;
@@ -545,6 +551,9 @@ impl Gateway {
             _postgres_pool: postgres_pool,
             history_marker_execution_gate: Arc::new(tokio::sync::RwLock::new(())),
             lifecycle: Arc::new(GatewayLifecycle::new()),
+            provider_model_sync: Arc::new(
+                super::provider_model_sync::ProviderModelSyncRuntime::default(),
+            ),
             principal_admission: Arc::new(admission::PrincipalAdmission::new()),
             rpm_admission,
             lifecycle_owner: true,
@@ -569,6 +578,7 @@ impl Gateway {
         );
         configure_gateway_extensions(&mut gw, Vec::new(), Vec::new(), Vec::new(), Vec::new())
             .await?;
+        gw.start_provider_model_sync().await?;
         if gw.config.catalog_background_refresh {
             let catalog_sync = gw.catalog_sync.clone();
             let cancellation = gw.lifecycle.cancellation.clone();

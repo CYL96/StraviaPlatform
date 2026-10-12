@@ -10,6 +10,7 @@ import { tick } from 'svelte'
 import { toast } from 'svelte-sonner'
 
 import { admin } from '$lib/admin-client'
+import { getModelChanges } from '$lib/model-changes'
 import { localizeBackendErrorMessage } from '$lib/backend-error'
 import { getDataTableLabels } from '$lib/data-table-labels'
 import { formatDuration } from '$lib/format'
@@ -52,6 +53,7 @@ const capabilityDriftsQuery = createQuery(() => ({
 }))
 
 let editorOpen = $state(false)
+const changesSheet = getModelChanges()
 let deleteTarget = $state<Provider>()
 let deleteOpen = $state(false)
 let copyTarget = $state<Provider>()
@@ -294,6 +296,11 @@ async function copyProvider(): Promise<void> {
 }
 </script>
 
+{#snippet modelChangesAction()}
+  <Button data-model-changes-trigger variant="outline" size="sm" onclick={() => changesSheet.show()}
+    >{m.model_changes_title()}</Button>
+{/snippet}
+
 <svelte:head><title>{m.common_model_services()} · Stravia</title></svelte:head>
 
 {#snippet providerPageActions()}
@@ -455,6 +462,7 @@ async function copyProvider(): Promise<void> {
         <Button class="mt-3" variant="outline" onclick={() => void providersQuery.refetch()}>{m.common_retry()}</Button>
       </div>
     {:else if providers.length === 0}
+      {@render modelChangesAction()}
       <Empty.Root class="py-10">
         <Empty.Header
           ><Empty.Title>{m.providers_no_model_services_connected()}</Empty.Title><Empty.Description
@@ -474,8 +482,7 @@ async function copyProvider(): Promise<void> {
           globalFilterEnabled
           globalFilterPlaceholder={m.providers_table_search()}
           columnToggle
-          exportable
-          exportFilename="stravia-model-services.csv"
+          toolbarLast={modelChangesAction}
           stripedRows
           scrollHeight="100%"
           stickyHeader
@@ -487,6 +494,7 @@ async function copyProvider(): Promise<void> {
       </div>
 
       <div class="route-mobile-list">
+        {@render modelChangesAction()}
         {#each providers as provider (provider.id)}
           {@const drifts = driftsByProvider[provider.id] ?? []}
           {@const credentialInvalid = provider.credential_status === 'invalid'}

@@ -17,6 +17,11 @@ import type {
   ProviderModelList,
   ProviderModelSelectionPolicy,
   ProviderModelSyncSummary,
+  ProviderModelSyncState,
+  UpdateProviderModelSyncState,
+  ModelChangeQuery,
+  ModelChangePage,
+  ModelChangeRecord,
   CanonicalModelList,
   ApiKeyStats,
   CreateApiKey,
@@ -171,6 +176,10 @@ export const admin = {
     preview: (input: ConnectClientApplyRequest) =>
       request<ConnectClientApplyPlan>('POST', '/connect-clients/preview', input),
   },
+  modelChanges: {
+    list: (query: ModelChangeQuery = {}) => request<ModelChangePage>('GET', `/model-changes${queryString(query)}`),
+    get: (id: string) => request<ModelChangeRecord>('GET', `/model-changes/${encodeURIComponent(id)}`),
+  },
   providers: {
     descriptors: () => request<ProviderDescriptor[]>('GET', '/vendors'),
     list: () => request<Provider[]>('GET', '/providers'),
@@ -186,6 +195,9 @@ export const admin = {
     capabilityDrifts: () => request<ImageCapabilityDrift[]>('GET', '/providers/image-capability-drifts'),
     models: (id: string) => request<ProviderModelList>('GET', `/providers/${id}/models`),
     syncModels: (id: string) => request<ProviderModelSyncSummary>('POST', `/providers/${id}/models/sync`),
+    syncState: (id: string) => request<ProviderModelSyncState>('GET', `/providers/${id}/models/sync-state`),
+    updateSyncState: (id: string, input: UpdateProviderModelSyncState) =>
+      request<ProviderModelSyncState>('PUT', `/providers/${id}/models/sync-state`, input),
     prepareModel: (id: string, modelId: string, templateId?: string) =>
       request<PreparedProviderModel>('POST', `/providers/${id}/model/prepare`, {
         model_id: modelId,

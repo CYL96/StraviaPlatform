@@ -105,6 +105,7 @@ interface Props {
   cellEditor?: Snippet<[DataTableCell<TData>, () => void, () => void]>
   toolbar?: Snippet<[DataTable<TData>]>
   toolbarEnd?: Snippet<[DataTable<TData>]>
+  toolbarLast?: Snippet<[DataTable<TData>]>
   empty?: Snippet
   loadingContent?: Snippet
   footer?: Snippet<[DataTable<TData>]>
@@ -212,6 +213,7 @@ let {
   cellEditor,
   toolbar,
   toolbarEnd,
+  toolbarLast,
   empty,
   loadingContent,
   footer,
@@ -553,6 +555,7 @@ const showToolbar = $derived(
   Boolean(
     toolbar ||
     toolbarEnd ||
+    toolbarLast ||
     globalFilterEnabled ||
     columnToggle ||
     exportable ||
@@ -1160,6 +1163,7 @@ $effect(() => {
             <DownloadIcon data-icon="inline-start" />{resolvedLabels.exportCsv}
           </Button>
         {/if}
+        {#if toolbarLast}{@render toolbarLast(table)}{/if}
       </div>
     </div>
   {/if}

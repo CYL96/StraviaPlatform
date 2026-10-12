@@ -1,7 +1,7 @@
 use super::*;
 
 pub(crate) struct GatewayLifecycle {
-    pub(super) cancellation: stravia_runtime_contract::CancellationToken,
+    pub(crate) cancellation: stravia_runtime_contract::CancellationToken,
     owners: AtomicUsize,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
@@ -26,6 +26,20 @@ impl GatewayLifecycle {
     pub(crate) fn spawn(&self, task: impl Future<Output = ()> + Send + 'static) {
         let handle = tokio::spawn(task);
         let mut tasks = self.tasks.lock();
+        // 周期维护不断启动有限任务；完成的句柄不应随实例运行时间累积。
+        tasks.retain_mut(|task| {
+            if !task.is_finished() {
+                return true;
+            }
+            match futures::FutureExt::now_or_never(task) {
+                Some(Ok(())) => false,
+                Some(Err(error)) => {
+                    tracing::warn!(%error, "gateway background task failed");
+                    false
+                }
+                None => true,
+            }
+        });
         tasks.push(handle);
     }
 
@@ -41,13 +55,18 @@ impl GatewayLifecycle {
     /// operations drain normally.
     pub(super) async fn shutdown(&self) {
         self.cancellation.cancel();
-        let tasks = {
-            let mut tasks = self.tasks.lock();
-            std::mem::take(&mut *tasks)
-        };
-        for task in tasks {
-            if let Err(error) = task.await {
-                tracing::debug!(%error, "gateway task failed during shutdown");
+        loop {
+            let tasks = {
+                let mut tasks = self.tasks.lock();
+                std::mem::take(&mut *tasks)
+            };
+            if tasks.is_empty() {
+                break;
+            }
+            for task in tasks {
+                if let Err(error) = task.await {
+                    tracing::debug!(%error, "gateway task failed during shutdown");
+                }
             }
         }
     }

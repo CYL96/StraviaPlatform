@@ -199,6 +199,21 @@ CREATE TABLE "model_backends" (
     enabled                INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1))
 );
 
+CREATE TABLE model_change_items (
+    record_id TEXT NOT NULL REFERENCES model_changes(id) ON DELETE CASCADE,
+    name_key TEXT NOT NULL,
+    model_id_key TEXT NOT NULL,
+    change_type TEXT NOT NULL
+);
+
+CREATE TABLE model_changes (
+    id TEXT PRIMARY KEY,
+    provider_id TEXT NOT NULL,
+    checked_at TEXT NOT NULL,
+    source TEXT NOT NULL,
+    record_json TEXT NOT NULL
+);
+
 CREATE TABLE model_turn_observations (
     id TEXT PRIMARY KEY,
     run_id TEXT NOT NULL REFERENCES inference_run_observations(id) ON DELETE CASCADE,
@@ -332,6 +347,13 @@ CREATE TABLE provider_model_cost_rules (
     FOREIGN KEY (provider_id, model_id)
         REFERENCES provider_models(provider_id, model_id)
         ON DELETE CASCADE
+);
+
+CREATE TABLE provider_model_sync_state (
+    provider_id TEXT PRIMARY KEY REFERENCES providers(id) ON DELETE CASCADE,
+    automatic_sync INTEGER NOT NULL DEFAULT 1,
+    has_successful_sync INTEGER NOT NULL DEFAULT 0,
+    last_check TEXT
 );
 
 CREATE TABLE provider_models (
@@ -703,6 +725,12 @@ CREATE INDEX interaction_observations_filter_idx ON interaction_observations(sta
 CREATE INDEX interaction_observations_generation_idx ON interaction_observations(generation_root_id, last_active_at);
 
 CREATE INDEX interaction_observations_window_idx ON interaction_observations(root_id, last_active_at DESC, id);
+
+CREATE INDEX model_change_items_record ON model_change_items(record_id, change_type);
+
+CREATE INDEX model_changes_order ON model_changes(checked_at DESC, id DESC);
+
+CREATE INDEX model_changes_provider_order ON model_changes(provider_id, checked_at DESC, id DESC);
 
 CREATE INDEX model_turns_analytics_idx ON model_turn_observations(started_at, route_id, api_key_id, status);
 

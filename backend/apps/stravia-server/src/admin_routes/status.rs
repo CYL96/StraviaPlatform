@@ -75,7 +75,22 @@ pub(super) fn provider_model_err(error: anyhow::Error) -> axum::response::Respon
         return catalog_error_response(catalog_error);
     }
     let message = error.to_string();
-    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&message)
+    let failure = error
+        .downcast_ref::<ProviderModelSyncFailure>()
+        .or_else(|| {
+            error
+                .chain()
+                .find_map(|cause| cause.downcast_ref::<ProviderModelSyncFailure>())
+        });
+    let details = failure.map(|failure| serde_json::json!({ "sync_summary": failure.summary }));
+    let structured_message = if details.is_some() {
+        error
+            .chain()
+            .find_map(|cause| serde_json::from_str::<serde_json::Value>(&cause.to_string()).ok())
+    } else {
+        serde_json::from_str::<serde_json::Value>(&message).ok()
+    };
+    if let Some(value) = structured_message
         && let Some(code) = value.get("code").and_then(serde_json::Value::as_str)
     {
         let status = match code {
@@ -83,22 +98,31 @@ pub(super) fn provider_model_err(error: anyhow::Error) -> axum::response::Respon
             "PROVIDER_MODEL_CONFLICT" => StatusCode::CONFLICT,
             _ => StatusCode::BAD_REQUEST,
         };
-        return (
-            status,
-            Json(serde_json::json!({
-                "code": code,
-                "error": value.get("message").and_then(serde_json::Value::as_str)
-                    .unwrap_or("Provider Model request failed"),
-                "params": value.get("params").cloned().unwrap_or(serde_json::Value::Null),
-            })),
-        )
-            .into_response();
+        let mut body = serde_json::json!({
+            "code": code,
+            "error": value.get("message").and_then(serde_json::Value::as_str)
+                .unwrap_or("Provider Model request failed"),
+            "params": value.get("params").cloned().unwrap_or(serde_json::Value::Null),
+        });
+        if let Some(details) = details {
+            body["details"] = details;
+        }
+        return (status, Json(body)).into_response();
     }
-    (
-        StatusCode::BAD_REQUEST,
-        Json(serde_json::json!({ "error": message })),
-    )
-        .into_response()
+    let mut body = serde_json::json!({ "error": message });
+    if let Some(details) = details {
+        body["details"] = details;
+    }
+    let status = if failure.is_some_and(|failure| {
+        failure.summary.error.as_deref().is_some_and(|message| {
+            message.starts_with("Provider or model changed during discovery;")
+        })
+    }) {
+        StatusCode::CONFLICT
+    } else {
+        StatusCode::BAD_REQUEST
+    };
+    (status, Json(body)).into_response()
 }
 
 pub(super) fn err(e: anyhow::Error) -> axum::response::Response {

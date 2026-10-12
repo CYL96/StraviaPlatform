@@ -2,12 +2,15 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::*;
 use crate::provider_models::{
-    CreateManualProviderModel, ModelModalities, NewProviderModelRecord, ProviderModelDetail,
-    ProviderModelMetadata, ProviderModelMutation, ProviderModelPresence,
-    ProviderModelPresenceUpdate, ProviderModelReconciliation, ProviderModelReimport,
-    ProviderModelSelectionPolicy, ProviderModelSourceKind, ProviderModelSummary,
-    ProviderModelSyncSummary, ReimportProviderModel, SnapshotState, SourceStamp,
-    UpdateProviderModel, UpdateProviderModelSelection, normalize_model_id,
+    CreateManualProviderModel, ModelChangeItem, ModelChangeOutcome, ModelChangePage,
+    ModelChangeQuery, ModelChangeRecord, ModelChangeSource, ModelChangeType, ModelModalities,
+    ModelSpecificationDiff, NewProviderModelRecord, ProviderModelDetail, ProviderModelMetadata,
+    ProviderModelMutation, ProviderModelPresence, ProviderModelPresenceUpdate,
+    ProviderModelReconciliation, ProviderModelReimport, ProviderModelSelectionPolicy,
+    ProviderModelSourceKind, ProviderModelSummary, ProviderModelSyncFailure,
+    ProviderModelSyncState, ProviderModelSyncSummary, ReimportProviderModel, SnapshotState,
+    SourceStamp, UpdateProviderModel, UpdateProviderModelSelection, UpdateProviderModelSyncState,
+    normalize_model_id, same_discovery_provider,
 };
 
 #[derive(Debug, Clone, Serialize)]
@@ -112,7 +115,57 @@ impl AdminService {
         &self,
         provider_id: &str,
     ) -> anyhow::Result<ProviderModelSyncSummary> {
-        RouteModule::new(&self.gw).sync(provider_id).await
+        self.gw
+            .sync_provider_inventory(provider_id, ModelChangeSource::ManualSync)
+            .await
+    }
+
+    pub async fn provider_model_sync_state(
+        &self,
+        provider_id: &str,
+    ) -> anyhow::Result<ProviderModelSyncState> {
+        let provider = RouteModule::new(&self.gw).get_provider(provider_id).await?;
+        let mut state = self
+            .gw
+            .storage
+            .provider_models()
+            .sync_state(provider_id)
+            .await?;
+        state.in_progress = self.gw.provider_model_sync.in_progress(provider_id);
+        state.pause_reason = self
+            .gw
+            .provider_model_pause_reason(&provider, state.automatic_sync);
+        Ok(state)
+    }
+
+    pub async fn update_provider_model_sync_state(
+        &self,
+        provider_id: &str,
+        input: UpdateProviderModelSyncState,
+    ) -> anyhow::Result<ProviderModelSyncState> {
+        RouteModule::new(&self.gw).get_provider(provider_id).await?;
+        self.gw
+            .storage
+            .provider_models()
+            .set_automatic_sync(provider_id, input.automatic_sync)
+            .await?;
+        self.provider_model_sync_state(provider_id).await
+    }
+
+    pub async fn list_model_changes(
+        &self,
+        query: ModelChangeQuery,
+    ) -> anyhow::Result<ModelChangePage> {
+        self.gw.storage.provider_models().list_changes(query).await
+    }
+
+    pub async fn get_model_change(&self, id: &str) -> anyhow::Result<ModelChangeRecord> {
+        self.gw
+            .storage
+            .provider_models()
+            .get_change(id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Model change record not found"))
     }
 }
 
@@ -261,21 +314,36 @@ impl RouteModule<'_> {
             }
             None => None,
         };
+        let change = manual_record(
+            &provider,
+            change_item(
+                &model_id,
+                &metadata,
+                None,
+                ProviderModelPresence::Present,
+                ProviderModelSelectionPolicy::Auto,
+                vec![ModelChangeType::ManualAdded],
+                vec![],
+            ),
+        );
         apply_provider_model_mutation(
             self.gw,
             self.gw
                 .storage
                 .provider_models()
-                .create(NewProviderModelRecord {
-                    provider_id: provider_id.to_string(),
-                    model_id: model_id.clone(),
-                    source_kind: ProviderModelSourceKind::Manual,
-                    snapshot_state: SnapshotState::Edited { source },
-                    metadata_source_provider_id: None,
-                    presence: ProviderModelPresence::Present,
-                    selection_policy: ProviderModelSelectionPolicy::Auto,
-                    metadata,
-                })
+                .create(
+                    NewProviderModelRecord {
+                        provider_id: provider_id.to_string(),
+                        model_id: model_id.clone(),
+                        source_kind: ProviderModelSourceKind::Manual,
+                        snapshot_state: SnapshotState::Edited { source },
+                        metadata_source_provider_id: None,
+                        presence: ProviderModelPresence::Present,
+                        selection_policy: ProviderModelSelectionPolicy::Auto,
+                        metadata,
+                    },
+                    Some(change),
+                )
                 .await?,
             &provider,
             &model_id,
@@ -340,12 +408,39 @@ impl RouteModule<'_> {
             .ok_or_else(|| anyhow::anyhow!("provider vendor is missing"))?;
         let _permit = self.gw.vendor_plugins.write_permit(vendor).await?;
         let model_id = normalize_model_id(model_id)?;
+        let current = self
+            .gw
+            .storage
+            .provider_models()
+            .get(provider_id, &model_id)
+            .await?
+            .ok_or_else(|| provider_model_not_found(provider_id, &model_id))?;
+        let change = (current.selection_policy != input.policy).then(|| {
+            manual_record(
+                &provider,
+                change_item(
+                    &model_id,
+                    &current.metadata,
+                    Some(&current),
+                    current.presence,
+                    input.policy,
+                    vec![ModelChangeType::SelectionPolicyChanged],
+                    vec![],
+                ),
+            )
+        });
         apply_provider_model_mutation(
             self.gw,
             self.gw
                 .storage
                 .provider_models()
-                .update_selection_policy(provider_id, &model_id, input.policy, input.revision)
+                .update_selection_policy(
+                    provider_id,
+                    &model_id,
+                    input.policy,
+                    input.revision,
+                    change,
+                )
                 .await?,
             &provider,
             &model_id,
@@ -474,50 +569,126 @@ impl RouteModule<'_> {
         }
     }
 
-    pub(crate) async fn sync(&self, provider_id: &str) -> anyhow::Result<ProviderModelSyncSummary> {
+    pub(crate) async fn sync(
+        &self,
+        provider_id: &str,
+        origin: ModelChangeSource,
+    ) -> anyhow::Result<ProviderModelSyncSummary> {
         let provider = self.get_provider(provider_id).await?;
-        let (sources, _publication_guard) = self.discover_provider_model_sources(&provider).await?;
-        if sources.is_empty() {
-            anyhow::bail!("Provider model discovery returned an empty list");
+        let mut summary = empty_summary(origin);
+        let result = self.reconcile_sync(&provider, &mut summary).await;
+        match result {
+            Ok(()) => Ok(summary),
+            Err(error) => {
+                summary = empty_summary(origin);
+                summary.outcome = ModelChangeOutcome::Failure;
+                summary.error = Some(safe_sync_error(&error));
+                let record = sync_record(&provider, &summary, false, vec![]);
+                summary.record_id = Some(record.id.clone());
+                if let Err(storage_error) = self
+                    .gw
+                    .storage
+                    .provider_models()
+                    .save_sync_failure(provider_id, summary.clone(), record)
+                    .await
+                {
+                    tracing::warn!(provider_id, error = ?storage_error, "model sync failure history could not be saved");
+                    summary.record_id = None;
+                    summary.error = Some(format!(
+                        "{}; check history could not be saved",
+                        summary.error.as_deref().unwrap_or("Synchronization failed")
+                    ));
+                }
+                Err(error.context(ProviderModelSyncFailure { summary }))
+            }
         }
+    }
+
+    async fn reconcile_sync(
+        &self,
+        provider: &Provider,
+        summary: &mut ProviderModelSyncSummary,
+    ) -> anyhow::Result<()> {
+        let provider_id = provider.id.as_str();
         let existing = self
             .gw
             .storage
             .provider_models()
             .list_for_provider(provider_id)
             .await?;
+        let state = self
+            .gw
+            .storage
+            .provider_models()
+            .sync_state(provider_id)
+            .await?;
+        let (sources, _publication_guard) = self.discover_provider_model_sources(provider).await?;
+        anyhow::ensure!(
+            !sources.is_empty(),
+            "Provider model discovery returned an empty list"
+        );
         let existing_by_id: BTreeMap<_, _> = existing
             .iter()
             .map(|model| (model.model_id.as_str(), model))
             .collect();
         let seen_ids: BTreeSet<String> = sources.keys().cloned().collect();
-        let mut reconciliation = ProviderModelReconciliation::default();
-        let mut summary = ProviderModelSyncSummary {
-            added: 0,
-            missing: 0,
-            restored: 0,
-            deprecated: 0,
+        let mut reconciliation = ProviderModelReconciliation {
+            expected_provider: Some(provider.clone()),
+            expected_revisions: existing
+                .iter()
+                .map(|model| (model.model_id.clone(), model.revision))
+                .collect(),
+            ..Default::default()
         };
+        let mut changes = Vec::new();
 
         for (model_id, source) in sources {
-            let metadata = source.metadata;
+            let mut metadata = source.metadata;
             let incoming_state = source.snapshot_state;
             if let Some(current) = existing_by_id.get(model_id.as_str()) {
                 if current.source_kind == ProviderModelSourceKind::Manual {
                     continue;
                 }
+                // Missing optional enrichment is not a lifecycle declaration.
+                // A Discover status (including explicit null) remains authoritative.
+                if source.catalog_metadata_unavailable && !source.discovery_declares_lifecycle {
+                    metadata.status = current.metadata.status.clone();
+                }
+                let mut types = Vec::new();
                 if current.presence == ProviderModelPresence::Missing {
                     summary.restored += 1;
+                    types.push(ModelChangeType::Restored);
                 }
                 if current.metadata.status.as_deref() != Some("deprecated")
                     && metadata.status.as_deref() == Some("deprecated")
                 {
                     summary.deprecated += 1;
+                    types.push(ModelChangeType::Deprecated);
+                }
+                if current.metadata.status.as_deref() == Some("deprecated")
+                    && metadata.status.as_deref() != Some("deprecated")
+                {
+                    summary.deprecation_cleared += 1;
+                    types.push(ModelChangeType::DeprecationCleared);
                 }
                 // 上游声明的规格对未被用户接管的记录保持权威：Unregistered 首次
                 // 导入、Imported 持续跟随来源刷新；Edited 记录由用户接管，仅更新
                 // 插件托管的运行时字段与既有 provenance。
-                let follows_upstream = matches!(incoming_state, SnapshotState::Imported { .. })
+                // Failed catalog enrichment is not evidence that its last valid
+                // specification disappeared or changed to a Canonical fallback.
+                let retain_catalog_specification = source.catalog_metadata_unavailable
+                    && matches!(
+                        current.snapshot_state.source(),
+                        Some(SourceStamp::ProviderCatalog { .. })
+                    );
+                let metadata_source_provider_id = if retain_catalog_specification {
+                    current.metadata_source_provider_id.clone()
+                } else {
+                    source.metadata_source_provider_id
+                };
+                let follows_upstream = !retain_catalog_specification
+                    && (matches!(incoming_state, SnapshotState::Imported { .. })
+                        || matches!(current.snapshot_state, SnapshotState::Unregistered))
                     && !matches!(current.snapshot_state, SnapshotState::Edited { .. });
                 let refresh_source = follows_upstream && current.snapshot_state != incoming_state;
                 let mut merged = if follows_upstream {
@@ -525,22 +696,43 @@ impl RouteModule<'_> {
                 } else {
                     current.metadata.clone()
                 };
+                if !retain_catalog_specification
+                    && !matches!(current.snapshot_state, SnapshotState::Edited { .. })
+                {
+                    merged.name = metadata.name.clone();
+                }
                 merged.status = metadata.status.clone();
                 merged.provider = metadata.provider.clone();
                 merged.experimental = metadata.experimental.clone();
                 merged.extensions = metadata.extensions.clone();
+                let specification = specification_diff(&current.metadata, &merged)?;
+                if !specification.is_empty() {
+                    summary.specification_updated += 1;
+                    types.push(ModelChangeType::SpecificationUpdated);
+                }
+                if !types.is_empty() {
+                    changes.push(change_item(
+                        &model_id,
+                        &merged,
+                        Some(current),
+                        ProviderModelPresence::Present,
+                        current.selection_policy,
+                        types,
+                        specification,
+                    ));
+                }
                 let refreshed_metadata =
                     (refresh_source || merged != current.metadata).then_some(merged);
                 if current.presence != ProviderModelPresence::Present
                     || current.metadata.status != metadata.status
-                    || current.metadata_source_provider_id != source.metadata_source_provider_id
+                    || current.metadata_source_provider_id != metadata_source_provider_id
                     || refreshed_metadata.is_some()
                 {
                     reconciliation.updates.push(ProviderModelPresenceUpdate {
                         model_id,
                         expected_revision: current.revision,
                         snapshot_state: refresh_source.then_some(incoming_state),
-                        metadata_source_provider_id: source.metadata_source_provider_id,
+                        metadata_source_provider_id,
                         presence: ProviderModelPresence::Present,
                         lifecycle_status: metadata.status.clone(),
                         metadata: refreshed_metadata,
@@ -549,9 +741,20 @@ impl RouteModule<'_> {
                 continue;
             }
             summary.added += 1;
+            let mut types = vec![ModelChangeType::Added];
             if metadata.status.as_deref() == Some("deprecated") {
                 summary.deprecated += 1;
+                types.push(ModelChangeType::Deprecated);
             }
+            changes.push(change_item(
+                &model_id,
+                &metadata,
+                None,
+                ProviderModelPresence::Present,
+                ProviderModelSelectionPolicy::Auto,
+                types,
+                vec![],
+            ));
             reconciliation.inserts.push(NewProviderModelRecord {
                 provider_id: provider_id.to_string(),
                 model_id,
@@ -572,6 +775,15 @@ impl RouteModule<'_> {
                 && current.presence != ProviderModelPresence::Missing
             {
                 summary.missing += 1;
+                changes.push(change_item(
+                    &current.model_id,
+                    &current.metadata,
+                    Some(current),
+                    ProviderModelPresence::Missing,
+                    current.selection_policy,
+                    vec![ModelChangeType::Missing],
+                    vec![],
+                ));
                 reconciliation.updates.push(ProviderModelPresenceUpdate {
                     model_id: current.model_id.clone(),
                     expected_revision: current.revision,
@@ -590,6 +802,14 @@ impl RouteModule<'_> {
             "Provider changed while synchronizing discovered models"
         );
         let reconciled = !reconciliation.updates.is_empty() || !reconciliation.inserts.is_empty();
+        summary.checked_at = checked_at();
+        if !changes.is_empty() {
+            let record = sync_record(provider, summary, !state.has_successful_sync, changes);
+            summary.record_id = Some(record.id.clone());
+            reconciliation.change_record = Some(record);
+        }
+        reconciliation.sync_summary = Some(summary.clone());
+        let committed_record = reconciliation.change_record.clone();
         self.gw
             .storage
             .provider_models()
@@ -598,12 +818,43 @@ impl RouteModule<'_> {
         if reconciled {
             self.gw.route_policy_state.clear_pricing();
         }
-        self.gw
+        if let Err(error) = self
+            .gw
             .vendor_plugins
             .store
             .recovered(provider_id, "models")
-            .await?;
-        Ok(summary)
+            .await
+        {
+            summary.outcome = ModelChangeOutcome::PartialSuccess;
+            tracing::warn!(provider_id, error = ?error, "model inventory committed but plugin recovery failed");
+            summary.error = Some("Inventory saved; plugin recovery status could not be updated; check provider status".into());
+            let had_committed_record = committed_record.is_some();
+            let mut record = committed_record.unwrap_or_else(|| {
+                sync_record(provider, summary, !state.has_successful_sync, vec![])
+            });
+            record.outcome = summary.outcome;
+            record.error = summary.error.clone();
+            if summary.record_id.is_none() {
+                summary.record_id = Some(record.id.clone());
+            }
+            if let Err(storage_error) = self
+                .gw
+                .storage
+                .provider_models()
+                .save_sync_failure(provider_id, summary.clone(), record)
+                .await
+            {
+                tracing::warn!(provider_id, error = ?storage_error, "postcommit model sync status could not be saved");
+                if !had_committed_record {
+                    summary.record_id = None;
+                }
+                summary.error = Some(format!(
+                    "{}; postcommit status could not be saved",
+                    summary.error.as_deref().unwrap_or("Inventory saved")
+                ));
+            }
+        }
+        Ok(())
     }
 
     async fn discover_provider_model_sources(
@@ -619,6 +870,7 @@ impl RouteModule<'_> {
         // reconciliation has committed.
         let publication_guard = discovered.write_fence().await?;
         let mut catalog_sources = BTreeMap::new();
+        let mut catalog_metadata_unavailable = false;
         if let Some(catalog_provider_id) = provider
             .preset_key
             .as_deref()
@@ -639,6 +891,23 @@ impl RouteModule<'_> {
                 {
                     None
                 }
+                Err(error)
+                    if matches!(
+                        error.downcast_ref::<crate::provider_catalog::CatalogError>(),
+                        Some(crate::provider_catalog::CatalogError::ScopeRefresh { .. })
+                    ) =>
+                {
+                    // Discover already established the complete inventory. ADR-0073
+                    // permits Canonical/bare metadata when optional scoped enrichment
+                    // fails; this must not turn a valid upstream discovery into failure
+                    // or mark the catalog refresh itself successful.
+                    tracing::warn!(
+                        provider_id = %provider.id,
+                        "Provider Catalog metadata refresh failed; retaining discovered inventory and using Canonical or unregistered metadata"
+                    );
+                    catalog_metadata_unavailable = true;
+                    None
+                }
                 Err(error) => return Err(error),
             };
             if let Some(scope) = scope {
@@ -656,6 +925,7 @@ impl RouteModule<'_> {
         let mut sources = BTreeMap::new();
         for model in discovered.models {
             let model_id = normalize_model_id(&model.id)?;
+            let discovery_declares_lifecycle = model.metadata.contains_key("status");
             let catalog_source = catalog_sources.remove(&model_id);
             let (template, metadata_source_provider_id, stamp) = match catalog_source {
                 Some(source) => {
@@ -697,6 +967,8 @@ impl RouteModule<'_> {
                     metadata,
                     metadata_source_provider_id,
                     snapshot_state,
+                    catalog_metadata_unavailable,
+                    discovery_declares_lifecycle,
                 },
             );
         }
@@ -708,6 +980,8 @@ struct DiscoveredModelSource {
     metadata: ProviderModelMetadata,
     metadata_source_provider_id: Option<String>,
     snapshot_state: SnapshotState,
+    catalog_metadata_unavailable: bool,
+    discovery_declares_lifecycle: bool,
 }
 
 fn canonical_template_id(template: &Value) -> anyhow::Result<String> {
@@ -718,22 +992,133 @@ fn canonical_template_id(template: &Value) -> anyhow::Result<String> {
         .ok_or_else(|| anyhow::anyhow!("Canonical Model template is missing id"))
 }
 
-fn same_discovery_provider(left: &Provider, right: &Provider) -> bool {
-    left.id == right.id
-        && left.vendor == right.vendor
-        && left.protocol == right.protocol
-        && left.base_url == right.base_url
-        && left.preset_key == right.preset_key
-        && left.channel == right.channel
-        && left.models_source == right.models_source
-        && left.static_models == right.static_models
-        && left.api_key == right.api_key
-        && left.adapter_credentials == right.adapter_credentials
-        && left.vendor_options == right.vendor_options
-        && left.auth_mode == right.auth_mode
-        && left.use_proxy == right.use_proxy
-        && left.is_enabled == right.is_enabled
-        && left.updated_at == right.updated_at
+fn checked_at() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
+fn empty_summary(source: ModelChangeSource) -> ProviderModelSyncSummary {
+    ProviderModelSyncSummary {
+        added: 0,
+        missing: 0,
+        restored: 0,
+        deprecated: 0,
+        checked_at: checked_at(),
+        source,
+        record_id: None,
+        deprecation_cleared: 0,
+        specification_updated: 0,
+        outcome: ModelChangeOutcome::Success,
+        error: None,
+    }
+}
+
+fn safe_sync_error(error: &anyhow::Error) -> String {
+    // Upstream diagnostics can contain arbitrary response bodies and credentials.
+    // Persist only a bounded category, never plugin/network error text.
+    let text = error.to_string().to_ascii_lowercase();
+    if text.contains("changed") || text.contains("conflict") || text.contains("revision") {
+        "Provider or model changed during discovery; check current settings and sync again".into()
+    } else if text.contains("empty")
+        || text.contains("invalid")
+        || text.contains("duplicate")
+        || text.contains("pagination")
+    {
+        "Discovery did not return a complete valid inventory; previous inventory retained".into()
+    } else if text.contains("credential") || text.contains("auth") {
+        "Discovery could not authenticate; check provider credentials".into()
+    } else if text.contains("cancel") {
+        "Model discovery was cancelled".into()
+    } else {
+        "Model discovery or persistence failed; check provider settings and try again".into()
+    }
+}
+
+fn change_item(
+    model_id: &str,
+    metadata: &ProviderModelMetadata,
+    before: Option<&crate::provider_models::ProviderModelRecord>,
+    presence: ProviderModelPresence,
+    policy: ProviderModelSelectionPolicy,
+    types: Vec<ModelChangeType>,
+    specification: Vec<ModelSpecificationDiff>,
+) -> ModelChangeItem {
+    ModelChangeItem {
+        model_id: model_id.into(),
+        name: metadata.name.clone().unwrap_or_else(|| model_id.into()),
+        types,
+        specification,
+        before_presence: before.map(|m| m.presence),
+        after_presence: Some(presence),
+        before_deprecated: before.map(|m| m.metadata.lifecycle_status() == Some("deprecated")),
+        after_deprecated: Some(metadata.lifecycle_status() == Some("deprecated")),
+        before_policy: before.map(|m| m.selection_policy),
+        after_policy: Some(policy),
+    }
+}
+
+fn sync_record(
+    provider: &Provider,
+    summary: &ProviderModelSyncSummary,
+    initial_sync: bool,
+    changes: Vec<ModelChangeItem>,
+) -> ModelChangeRecord {
+    ModelChangeRecord {
+        id: stravia_runtime_contract::identifier::new_id(),
+        provider_id: provider.id.clone(),
+        provider_name: provider.name.clone(),
+        provider_deleted: false,
+        source: summary.source,
+        checked_at: summary.checked_at.clone(),
+        outcome: summary.outcome,
+        initial_sync,
+        changes,
+        error: summary.error.clone(),
+    }
+}
+
+fn manual_record(provider: &Provider, item: ModelChangeItem) -> ModelChangeRecord {
+    sync_record(
+        provider,
+        &empty_summary(ModelChangeSource::ManualChange),
+        false,
+        vec![item],
+    )
+}
+
+fn specification_diff(
+    before: &ProviderModelMetadata,
+    after: &ProviderModelMetadata,
+) -> anyhow::Result<Vec<ModelSpecificationDiff>> {
+    fn facts(metadata: &ProviderModelMetadata) -> anyhow::Result<[Value; 6]> {
+        Ok([
+            serde_json::to_value(&metadata.name)?,
+            serde_json::to_value(metadata.limit.as_ref().and_then(|limit| limit.context))?,
+            serde_json::to_value(metadata.modalities.as_ref().map(|m| &m.input))?,
+            serde_json::to_value(metadata.modalities.as_ref().map(|m| &m.output))?,
+            serde_json::to_value(&metadata.reasoning_efforts)?,
+            serde_json::to_value(&metadata.cost)?,
+        ])
+    }
+    let before = facts(before)?;
+    let after = facts(after)?;
+    Ok([
+        "display_name",
+        "context",
+        "input_modalities",
+        "output_modalities",
+        "reasoning_efforts",
+        "price",
+    ]
+    .into_iter()
+    .zip(before.into_iter().zip(after))
+    .filter_map(|(field, (before, after))| {
+        (before != after).then(|| ModelSpecificationDiff {
+            field: field.into(),
+            before,
+            after,
+        })
+    })
+    .collect())
 }
 
 fn metadata_from_discovered_model(

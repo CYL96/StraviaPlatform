@@ -90,6 +90,13 @@ pub struct PreparedServerApp {
 }
 
 impl PreparedServerApp {
+    /// 停止接收 HTTP 请求后，先取消后台操作，避免同步请求阻挡自身排空。
+    pub async fn request_shutdown(&self) {
+        if let Some(gateway) = self.shutdown.lock().await.as_ref() {
+            gateway.request_shutdown();
+        }
+    }
+
     /// 宿主先排空 HTTP 请求，再等待业务任务、观测写入和缓存命名空间清理。
     pub async fn shutdown(self) {
         if let Some(gateway) = self.shutdown.lock().await.take() {

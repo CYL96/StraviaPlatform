@@ -1886,13 +1886,9 @@ test('Provider detail separates connection, inventory, references, and guarded m
   expect(modelColumns.rows).toEqual([modelColumns.header, modelColumns.header])
   await expect(page.getByRole('link', { name: 'Used by models' })).toBeVisible()
   await page.getByRole('button', { name: 'Sync models' }).click()
-  await expect(page.getByText("Connection saved, but models couldn't be synced")).toBeVisible()
-  await expect(page.getByText('Sync this list to check for model updates.')).toBeVisible()
-  await expect(
-    page.getByText(
-      'Service catalog model details are temporarily unavailable. Your saved models are unchanged. Try syncing or re-importing again.',
-    ),
-  ).toBeVisible()
+  await expect(page.locator('[data-sonner-toast]').getByRole('button', { name: 'Retry', exact: true })).toBeVisible()
+  await expect(modelTable.getByRole('row').filter({ hasText: /GPT Test.*openai\/gpt-test/ })).toBeVisible()
+  await expect(modelTable.getByRole('row').filter({ hasText: /Retired Model.*retired-model/ })).toBeVisible()
 
   await page.getByRole('button', { name: 'Show filter menu for Model availability' }).click()
   availabilityFilterDialog = page.getByRole('dialog', { name: 'Filter by Model availability' })
@@ -1932,7 +1928,6 @@ test('Provider detail separates connection, inventory, references, and guarded m
   await page.getByRole('button', { name: 'Model actions' }).click()
   await page.getByRole('menuitem', { name: 'Remove manually added model…' }).click()
   await expect(page.getByRole('alertdialog', { name: 'Delete Retired Model?' })).toBeVisible()
-  await expect(page.getByText(/1 configured model will continue using the same service model ID/)).toBeVisible()
   await expect(page.getByRole('link', { name: /client-model.*retired-model/ })).toBeVisible()
   await page.getByRole('alertdialog', { name: 'Delete Retired Model?' }).getByRole('button', { name: 'Cancel' }).click()
   await expect(page.getByRole('alertdialog', { name: 'Delete Retired Model?' })).toHaveCount(0)
@@ -2070,6 +2065,19 @@ test('creating a Provider opens its saved detail and recovers automatic model sy
   let createBody: Record<string, unknown> | undefined
   let syncCalls = 0
   const initialSync = Promise.withResolvers<void>()
+  const savedSummary = {
+    checked_at: '2026-10-12T10:00:00.000Z',
+    source: 'manual_sync',
+    record_id: 'created-sync',
+    added: 3,
+    missing: 1,
+    restored: 2,
+    deprecated: 0,
+    deprecation_cleared: 0,
+    specification_updated: 0,
+    outcome: 'success',
+    error: null,
+  }
   await page.route('**/api/v1/providers**', async (route) => {
     const request = route.request()
     const path = new URL(request.url()).pathname.replace('/api/v1', '')
@@ -2090,7 +2098,21 @@ test('creating a Provider opens its saved detail and recovers automatic model sy
         await route.fulfill({ status: 502, json: { error: 'The model service did not respond. Try syncing again.' } })
         return
       }
-      await route.fulfill({ json: { data: { added: 3, missing: 1, restored: 2, deprecated: 0 } } })
+      await route.fulfill({ json: { data: savedSummary } })
+      return
+    }
+    if (path === `/providers/${createdProvider.id}/models/sync-state`) {
+      await route.fulfill({
+        json: {
+          data: {
+            automatic_sync: true,
+            in_progress: false,
+            pause_reason: null,
+            last_check: syncCalls > 1 ? savedSummary : null,
+            has_successful_sync: syncCalls > 1,
+          },
+        },
+      })
       return
     }
     if (path === `/providers/${createdProvider.id}/models` && request.method() === 'GET') {
@@ -2132,16 +2154,16 @@ test('creating a Provider opens its saved detail and recovers automatic model sy
   initialSync.resolve()
   await expect(page.getByText("Connection saved, but models couldn't be synced")).toBeVisible()
   await page.getByRole('button', { name: 'Try again' }).click()
-  const syncToast = page.locator('[data-sonner-toast]').filter({ hasText: 'Model list updated' })
+  const syncToast = page.locator('[data-sonner-toast]').filter({ hasText: 'Model changes saved' })
   await expect(syncToast).toBeVisible()
-  await expect(syncToast).toContainText('3 new · 1 no longer offered · 2 available again')
-  await expect(page.locator('.route-page').getByText('Model list updated', { exact: true })).toHaveCount(0)
+  await expect(syncToast).toContainText('Added 3 · No longer offered 1 · Offered again 2')
+  await expect(page.locator('.route-page').getByText('Model changes saved', { exact: true })).toHaveCount(0)
   const inventorySummary = page.getByRole('heading', { name: 'Models from this service' }).locator('..')
   const freshness = inventorySummary.locator('p').filter({ hasText: 'Last checked' })
   await expect(freshness).toBeVisible()
-  await expect(freshness).toContainText('3 new')
-  await expect(freshness).toContainText('1 no longer offered')
-  await expect(freshness).toContainText('2 available again')
+  await expect(freshness).toContainText('Added 3')
+  await expect(freshness).toContainText('No longer offered 1')
+  await expect(freshness).toContainText('Offered again 2')
   await expect.poll(() => syncCalls).toBe(2)
 })
 
