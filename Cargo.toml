@@ -17,14 +17,6 @@ stravia-protocol-codec = { path = "backend/crates/stravia-protocol-codec" }
 stravia-vendor-sdk = { path = "backend/crates/stravia-vendor-sdk" }
 stravia-vendor-runtime = { path = "backend/crates/stravia-vendor-runtime" }
 stravia-vendor-common = { path = "backend/crates/stravia-vendor-common" }
-stravia-vendor-base = { path = "backend/crates/stravia-vendor-base" }
-stravia-vendor-codex = { path = "backend/crates/stravia-vendor-codex" }
-stravia-vendor-grok = { path = "backend/crates/stravia-vendor-grok" }
-stravia-vendor-command-code = { path = "backend/crates/stravia-vendor-command-code" }
-stravia-vendor-devin = { path = "backend/crates/stravia-vendor-devin" }
-stravia-vendor-opencode-free = { path = "backend/crates/stravia-vendor-opencode-free" }
-stravia-vendor-claudecode = { path = "backend/crates/stravia-vendor-claudecode" }
-stravia-vendor-antigravity = { path = "backend/crates/stravia-vendor-antigravity" }
 stravia-media = { path = "backend/crates/stravia-media" }
 stravia-web-search = { path = "backend/crates/stravia-web-search" }
 stravia-credential-protection = { path = "backend/crates/stravia-credential-protection" }
