@@ -27,7 +27,7 @@ import {
   formatTime,
   formatTps,
 } from '$lib/format'
-import { buildActivityGrid, buildLatencyChart } from '$lib/stats-chart'
+import { buildActivityGrid, buildLatencyChart, planActivityGrid } from '$lib/stats-chart'
 import type { ApiKeyStats, ProviderStats } from '$lib/types'
 import MetricStrip from '$lib/components/metric-strip.svelte'
 import LatencySpeedChart from '$lib/components/latency-speed-chart.svelte'
@@ -37,7 +37,7 @@ import PageHeader from '$lib/components/page-header.svelte'
 import StatusIndicator from '$lib/components/status-indicator.svelte'
 import { Button } from '$lib/components/ui/button'
 import { DataTable, createDataTableColumnHelper } from '$lib/components/ui/data-table'
-import * as Select from '$lib/components/ui/select'
+import TimeWindowControls from '$lib/components/time-window-controls.svelte'
 import { Skeleton } from '$lib/components/ui/skeleton'
 import * as Empty from '$lib/components/ui/empty'
 
@@ -65,12 +65,17 @@ const activityBucketSeconds = $derived(
     hoursNumber <= 6 ? 900 : hoursNumber <= 24 ? 3_600 : hoursNumber <= 72 ? 21_600 : 86_400,
   ),
 )
+let activityWidth = $state(0)
 let activityHeight = $state(0)
-const activityCellPx = $derived.by(() => {
-  const rows = activityGrid.rowCount
-  const freeH = activityHeight - 32 - 18 - 20 - (rows - 1) * 4
-  return freeH <= 0 ? 14 : Math.max(10, Math.floor(freeH / rows))
-})
+const activityPlan = $derived(
+  planActivityGrid({
+    startMs: window.start_at,
+    endMs: window.end_at,
+    bucketMs: activityBucketSeconds * 1_000,
+    widthPx: activityWidth,
+    heightPx: activityHeight,
+  }),
+)
 // Every query key owns an immutable absolute interval. Late responses only update their old key;
 // no placeholder data from another selection is presented as the newly selected window.
 const overviewQuery = createQuery(() => ({
@@ -85,9 +90,10 @@ const seriesQuery = createQuery(() => ({
   refetchInterval: 30_000,
 }))
 const activityQuery = createQuery(() => ({
-  queryKey: ['stats-series', window.start_at, window.end_at, activityBucketSeconds],
+  queryKey: ['stats-series', activityPlan.startMs, activityPlan.endMs, activityPlan.bucketMs / 1_000],
   queryFn: ({ queryKey }) =>
     admin.stats.series({ start_at: Number(queryKey[1]), end_at: Number(queryKey[2]) }, Number(queryKey[3])),
+  enabled: activityWidth > 0 && activityHeight > 0,
   refetchInterval: 30_000,
 }))
 const providersQuery = createQuery(() => ({
@@ -233,12 +239,11 @@ const modelStats = $derived(modelsQuery.data ?? [])
 const seriesStats = $derived(seriesQuery.data ?? [])
 const activityGrid = $derived(
   buildActivityGrid(activityQuery.data ?? [], {
-    startMs: window.start_at,
-    endMs: window.end_at,
-    bucketMs: activityQuery.data?.[0]?.bucket_ms ?? activityBucketSeconds * 1_000,
+    startMs: activityPlan.startMs,
+    endMs: activityPlan.endMs,
+    bucketMs: activityQuery.data?.[0]?.bucket_ms ?? activityPlan.bucketMs,
   }),
 )
-const hasActivity = $derived(hasTraffic || activityGrid.cells.some((cell) => cell.tokens !== 0))
 const latencyChart = $derived(buildLatencyChart(seriesStats, seriesStats[0]?.bucket_ms ?? seriesBucketSeconds * 1_000))
 const hasLatencyMetrics = $derived(latencyChart.some((point) => point.firstToken != null || point.outputTps != null))
 const errorChart = $derived(
@@ -301,11 +306,10 @@ const anyError = $derived(
 const analyticsPending = $derived.by(() => {
   const overview = overviewQuery.isPending
   const series = seriesQuery.isPending
-  const activity = activityQuery.isPending
   const providers = providersQuery.isPending
   const apiKeys = apiKeysQuery.isPending
   const models = modelsQuery.isPending
-  return overview || series || activity || providers || apiKeys || models
+  return overview || series || providers || apiKeys || models
 })
 const analyticsFetching = $derived.by(() => {
   const overview = overviewQuery.isFetching
@@ -354,37 +358,40 @@ function retryAll(): void {
 <svelte:head><title>{m.stats_usage()} · Stravia</title></svelte:head>
 
 {#snippet rangeAction()}
-  <div class="flex flex-wrap items-center gap-2">
-    <Select.Root type="single" value={hours} onValueChange={selectPreset}>
-      <Select.Trigger class="w-40" aria-label={m.stats_select_time_range()}
-        >{hours === '6'
-          ? m.stats_last_6h()
-          : hours === '24'
-            ? m.stats_last_24h()
-            : hours === '72'
-              ? m.stats_last_3d()
-              : hours === '168'
-                ? m.stats_last_7d()
-                : m.stats_date_time_range()}</Select.Trigger>
-      <Select.Content
-        ><Select.Group
-          ><Select.Item value="6">{m.stats_last_6h()}</Select.Item><Select.Item value="24"
-            >{m.stats_last_24h()}</Select.Item
-          ><Select.Item value="72">{m.stats_last_3d()}</Select.Item><Select.Item value="168"
-            >{m.stats_last_7d()}</Select.Item
-          ></Select.Group
-        ></Select.Content>
-    </Select.Root>
-    <Button variant="outline" onclick={() => shiftWindow(-1)} aria-label={m.stats_previous_window()}
-      >{m.stats_previous_window()}</Button>
-    <Button
-      variant="outline"
-      onclick={() => shiftWindow(1)}
-      disabled={window.end_at + spanMs > liveStatsWindow(spanMs).end_at}
-      aria-label={m.stats_next_window()}>{m.stats_next_window()}</Button>
-    <Button variant="outline" onclick={openRange}>{m.stats_date_time_range()}</Button>
-    {#if !live}<Button variant="outline" onclick={returnLive}>{m.stats_return_live()}</Button>{/if}
-  </div>
+  <TimeWindowControls
+    presets={[
+      { value: '6', label: m.stats_last_6h() },
+      { value: '24', label: m.stats_last_24h() },
+      { value: '72', label: m.stats_last_3d() },
+      { value: '168', label: m.stats_last_7d() },
+    ]}
+    value={hours}
+    selectedLabel={hours === '6'
+      ? m.stats_last_6h()
+      : hours === '24'
+        ? m.stats_last_24h()
+        : hours === '72'
+          ? m.stats_last_3d()
+          : hours === '168'
+            ? m.stats_last_7d()
+            : m.observation_custom_range()}
+    startMs={window.start_at}
+    endMs={window.end_at}
+    {live}
+    selectLabel={m.stats_select_time_range()}
+    rangeLabel={m.stats_date_time_range()}
+    olderLabel={m.stats_previous_window()}
+    newerLabel={m.stats_next_window()}
+    newerDisabled={window.end_at + spanMs > liveStatsWindow(spanMs).end_at}
+    onpreset={selectPreset}
+    onolder={() => shiftWindow(-1)}
+    onnewer={() => shiftWindow(1)}
+    onrange={openRange}
+    trailing={liveAction} />
+{/snippet}
+
+{#snippet liveAction()}
+  {#if !live}<Button variant="ghost" size="sm" onclick={returnLive}>{m.stats_return_live()}</Button>{/if}
 {/snippet}
 
 {#snippet providerStatsEmpty()}
@@ -416,12 +423,6 @@ function retryAll(): void {
     description={m.stats_page_summary()}
     meta={liveMeta}
     actions={rangeAction} />
-  <div class="flex flex-wrap gap-x-4 gap-y-1 text-sm text-muted-foreground" role="status">
-    <span class="font-technical tabular-nums">{formatLogTime(window.start_at)} – {formatLogTime(window.end_at)}</span>
-    <span>{live ? m.stats_current_bucket() : m.stats_fixed_window()}</span>
-    <span>{m.stats_history_available()}</span>
-  </div>
-
   {#if analyticsPending}
     <MetricStrip loading loadingLabel={m.stats_loading_analytics_metrics()} placeholderCount={6} />
     <div class="grid gap-6 min-[1280px]:grid-cols-12">
@@ -460,16 +461,24 @@ function retryAll(): void {
             </p>
           </div>
         </div>
-        {#if activityQuery.error && activityQuery.data === undefined}
-          {@render queryFailure(activityQuery.error, activityQuery.refetch, activityQuery.isFetching)}
-        {:else if hasActivity}<div
-            class="min-w-0 flex-1 flex flex-col justify-center overflow-x-auto py-4"
-            bind:clientHeight={activityHeight}>
-            <TokenActivityGrid model={activityGrid} cellPx={activityCellPx} />
-          </div>{:else}<Empty.Root class="min-h-40 flex-1 border-y"
-            ><Empty.Header><Empty.Description>{m.stats_send_first_request()}</Empty.Description></Empty.Header
-            ></Empty.Root
-          >{/if}
+        <p class="font-technical text-xs text-muted-foreground tabular-nums">
+          {formatLogTime(activityPlan.startMs)} – {formatLogTime(activityPlan.endMs)}
+        </p>
+        <div
+          class="h-56 min-w-0 flex flex-col justify-center py-4"
+          bind:clientWidth={activityWidth}
+          bind:clientHeight={activityHeight}
+          data-activity-start={activityPlan.startMs}
+          data-activity-end={activityPlan.endMs}
+          data-activity-bucket={activityPlan.bucketMs}>
+          {#if activityQuery.error && activityQuery.data === undefined}
+            {@render queryFailure(activityQuery.error, activityQuery.refetch, activityQuery.isFetching)}
+          {:else if activityWidth === 0 || activityHeight === 0 || activityQuery.isPending}
+            <Skeleton class="h-full w-full" />
+          {:else}
+            <TokenActivityGrid model={activityGrid} cellPx={activityPlan.cellPx} />
+          {/if}
+        </div>
       </section>
 
       <section class="route-section min-[1280px]:col-span-5" aria-labelledby="latency-trend-title">
