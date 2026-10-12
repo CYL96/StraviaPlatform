@@ -54,16 +54,16 @@ impl ProviderModelStore for SqliteStorage {
     ) -> anyhow::Result<Vec<ProviderModelRecord>> {
         let mut connection = self.pool.acquire().await?;
         let rows = sqlx::query_as::<_, ProviderModelRow>(
-            r#"SELECT provider_id, model_id, source_kind, snapshot_state, metadata_source_provider_id,
-                      presence, selection_policy, metadata_json, revision,
-                      created_at, updated_at
-               FROM provider_models
-               WHERE provider_id = ?
-               ORDER BY COALESCE(name, model_id) COLLATE NOCASE, model_id"#,
-        )
-        .bind(provider_id)
-        .fetch_all(&mut *connection)
-        .await?;
+    r#"SELECT provider_id, model_id, source_kind, snapshot_state, metadata_source_provider_id,
+              presence, selection_policy, metadata_json, revision,
+              created_at, updated_at
+       FROM provider_models
+       WHERE provider_id = ?
+       ORDER BY COALESCE(name, model_id) COLLATE NOCASE, model_id"#,
+            )
+            .bind(provider_id)
+            .fetch_all(&mut *connection)
+            .await?;
         let rules = load_rules_for_provider(&mut connection, provider_id).await?;
         rows.into_iter()
             .map(|row| {
@@ -92,12 +92,12 @@ impl ProviderModelStore for SqliteStorage {
         let has_writes = !reconciliation.updates.is_empty() || !reconciliation.inserts.is_empty();
         for update in &reconciliation.updates {
             let revision = sqlx::query_scalar::<_, i64>(
-                "SELECT revision FROM provider_models WHERE provider_id = ? AND model_id = ? AND source_kind = 'discovered'",
-            )
-            .bind(provider_id)
-            .bind(&update.model_id)
-            .fetch_optional(&mut *tx)
-            .await?;
+        "SELECT revision FROM provider_models WHERE provider_id = ? AND model_id = ? AND source_kind = 'discovered'",
+                    )
+                    .bind(provider_id)
+                    .bind(&update.model_id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
             anyhow::ensure!(
                 revision == Some(update.expected_revision),
                 "Provider Model has changed while synchronizing discovered models"
@@ -122,32 +122,32 @@ impl ProviderModelStore for SqliteStorage {
                 continue;
             }
             let metadata_json = sqlx::query_scalar::<_, String>(
-                "SELECT metadata_json FROM provider_models WHERE provider_id = ? AND model_id = ? AND source_kind = 'discovered'",
-            )
-            .bind(provider_id)
-            .bind(&update.model_id)
-            .fetch_optional(&mut *tx)
-            .await?;
+        "SELECT metadata_json FROM provider_models WHERE provider_id = ? AND model_id = ? AND source_kind = 'discovered'",
+                    )
+                    .bind(provider_id)
+                    .bind(&update.model_id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
             let metadata_json =
                 metadata_json.context("Provider Model disappeared during reconciliation")?;
             let mut metadata: ProviderModelMetadata = serde_json::from_str(&metadata_json)
                 .context("decode Provider Model metadata during reconciliation")?;
             metadata.status = update.lifecycle_status.clone();
             let result = sqlx::query(
-                r#"UPDATE provider_models
-                   SET presence = ?, lifecycle_status = ?, metadata_source_provider_id = ?, metadata_json = ?,
-                       revision = revision + 1, updated_at = datetime('now')
-                   WHERE provider_id = ? AND model_id = ? AND source_kind = 'discovered' AND revision = ?"#,
-            )
-            .bind(update.presence.as_str())
-            .bind(update.lifecycle_status)
-            .bind(update.metadata_source_provider_id)
-            .bind(serde_json::to_string(&metadata)?)
-            .bind(provider_id)
-            .bind(&update.model_id)
-            .bind(update.expected_revision)
-            .execute(&mut *tx)
-            .await?;
+        r#"UPDATE provider_models
+           SET presence = ?, lifecycle_status = ?, metadata_source_provider_id = ?, metadata_json = ?,
+               revision = revision + 1, updated_at = datetime('now')
+           WHERE provider_id = ? AND model_id = ? AND source_kind = 'discovered' AND revision = ?"#,
+                    )
+                    .bind(update.presence.as_str())
+                    .bind(update.lifecycle_status)
+                    .bind(update.metadata_source_provider_id)
+                    .bind(serde_json::to_string(&metadata)?)
+                    .bind(provider_id)
+                    .bind(&update.model_id)
+                    .bind(update.expected_revision)
+                    .execute(&mut *tx)
+                    .await?;
             anyhow::ensure!(
                 result.rows_affected() == 1,
                 "Provider Model has changed while synchronizing discovered models"
@@ -292,8 +292,8 @@ impl ProviderModelStore for SqliteStorage {
         let mut tx = connection.begin_with("BEGIN IMMEDIATE").await?;
         let result = sqlx::query(
             r#"UPDATE provider_models
-               SET selection_policy = ?, revision = revision + 1, updated_at = datetime('now')
-               WHERE provider_id = ? AND model_id = ? AND revision = ?"#,
+       SET selection_policy = ?, revision = revision + 1, updated_at = datetime('now')
+       WHERE provider_id = ? AND model_id = ? AND revision = ?"#,
         )
         .bind(policy.as_str())
         .bind(provider_id)
@@ -324,12 +324,12 @@ impl ProviderModelStore for SqliteStorage {
         let mut connection = self.pool.acquire().await?;
         let mut tx = connection.begin_with("BEGIN IMMEDIATE").await?;
         let result = sqlx::query(
-            "DELETE FROM provider_models WHERE provider_id = ? AND model_id = ? AND source_kind = 'manual'",
-        )
-        .bind(provider_id)
-        .bind(model_id)
-        .execute(&mut *tx)
-        .await?;
+    "DELETE FROM provider_models WHERE provider_id = ? AND model_id = ? AND source_kind = 'manual'",
+            )
+            .bind(provider_id)
+            .bind(model_id)
+            .execute(&mut *tx)
+            .await?;
         let deleted = result.rows_affected() == 1;
         if deleted {
             // Removing a manual record changes loose resolution results;

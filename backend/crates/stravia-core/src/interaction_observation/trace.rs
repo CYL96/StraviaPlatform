@@ -144,6 +144,8 @@ struct ManagerInner {
     actual_retained: AtomicU64,
     clear_generation: AtomicU64,
     available: bool,
+    #[cfg(feature = "test-support")]
+    wire_capture_limit_bytes: usize,
 }
 
 #[derive(Default)]
@@ -303,6 +305,12 @@ impl TraceManager {
             actual_retained: AtomicU64::new(retained),
             clear_generation: AtomicU64::new(0),
             available: true,
+            #[cfg(feature = "test-support")]
+            wire_capture_limit_bytes: std::env::var("STRAVIA_TEST_TRACE_WIRE_CAPTURE_LIMIT_BYTES")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .filter(|limit| (1..=WIRE_CAPTURE_LIMIT_BYTES).contains(limit))
+                .unwrap_or(WIRE_CAPTURE_LIMIT_BYTES),
         });
         tokio::spawn(writer_loop(Arc::clone(&inner), rx));
         Ok(Self { inner })
@@ -319,6 +327,8 @@ impl TraceManager {
                 actual_retained: AtomicU64::new(0),
                 clear_generation: AtomicU64::new(0),
                 available: false,
+                #[cfg(feature = "test-support")]
+                wire_capture_limit_bytes: WIRE_CAPTURE_LIMIT_BYTES,
             }),
         }
     }
@@ -465,7 +475,15 @@ impl TraceHandle {
 
     fn queue_record(&self, mut record: TraceRecord) -> TraceWriteOutcome {
         record.redact_before_queue();
-        if wire_value_size(&record.payload) > WIRE_CAPTURE_LIMIT_BYTES {
+        #[cfg(feature = "test-support")]
+        let wire_capture_limit = self.manager.inner.wire_capture_limit_bytes;
+        #[cfg(not(feature = "test-support"))]
+        let wire_capture_limit = WIRE_CAPTURE_LIMIT_BYTES;
+        if wire_value_size(&record.payload) > wire_capture_limit {
+            #[cfg(feature = "test-support")]
+            if wire_capture_limit != WIRE_CAPTURE_LIMIT_BYTES {
+                println!("STRAVIA_TEST_TRACE_WIRE_CAPTURE_LIMIT");
+            }
             self.mark_partial(WIRE_CAPTURE_LIMIT, false);
             return TraceWriteOutcome::Partial(WIRE_CAPTURE_LIMIT);
         }
@@ -777,6 +795,10 @@ impl ActiveWriter {
     async fn flush(&mut self, retained: &AtomicU64) -> io::Result<()> {
         use tokio::io::AsyncWriteExt;
         let result = async {
+            #[cfg(feature = "test-support")]
+            if !self.buffered.is_empty() {
+                crate::storage_test_faults::inject_io("debug")?;
+            }
             self.file.write_all(&self.buffered).await?;
             self.file.flush().await
         }

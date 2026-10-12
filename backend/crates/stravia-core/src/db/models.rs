@@ -825,9 +825,49 @@ pub struct WebAccessSettings {
     pub fetch_provider_ids: Vec<String>,
 }
 
+/// Long-term Stats Usage uses UTC quarter-hour buckets and half-open windows.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct StatsWindow {
+    pub start_at: Option<i64>,
+    pub end_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StatsQueryError(pub &'static str);
+
+impl std::fmt::Display for StatsQueryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for StatsQueryError {}
+
+impl StatsWindow {
+    pub const BASE_BUCKET_MS: i64 = 900_000;
+
+    pub fn validate(self) -> Result<(), StatsQueryError> {
+        match (self.start_at, self.end_at) {
+            (None, None) => Ok(()),
+            (Some(start), Some(end))
+                if start > 0
+                    && end > start
+                    && start % Self::BASE_BUCKET_MS == 0
+                    && end % Self::BASE_BUCKET_MS == 0 =>
+            {
+                Ok(())
+            }
+            _ => Err(StatsQueryError(
+                "start_at and end_at must be paired, positive, ordered quarter-hour boundaries",
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default, FromRow)]
 pub struct StatsOverview {
-    /// 保留期内的客户端请求数，包括准入前拒绝；内部轮次和重试不重复计数。
+    /// 所选窗口内的客户端请求数，包括准入前拒绝；内部轮次和重试不重复计数。
     pub total_requests: i64,
     /// 已完成 attempt 的已知净输入合计：逐次 max(总输入-cache-read,0)，任一未知则跳过，全未知为 None。
     pub total_input_tokens: Option<i64>,
@@ -846,9 +886,10 @@ pub struct StatsOverview {
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct StatsSeries {
-    /// Epoch milliseconds of the bucket start, aligned to the requested bucket
-    /// size and caller timezone offset.
+    /// Absolute start of this presentation bucket within the selected window.
     pub bucket_start: i64,
+    /// Effective presentation grain after whole-window coarsening.
+    pub bucket_ms: i64,
     /// 按客户端请求开始时间分桶的请求数，包括准入前拒绝。
     pub request_count: i64,
     /// 本桶内最终失败的客户端请求数；同一请求的内部轮次和重试只计一次。
@@ -867,6 +908,8 @@ pub struct StatsSeries {
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct ModelStats {
+    pub model_id: Option<String>,
+    pub deleted: bool,
     pub model: String,
     pub request_count: i64,
     /// 已完成 attempt 的已知净输入合计；任一操作数未知则跳过，全未知为 None。
@@ -878,6 +921,8 @@ pub struct ModelStats {
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct ProviderStats {
+    pub provider_id: Option<String>,
+    pub deleted: bool,
     pub provider: String,
     /// 涉及该服务的客户端请求数，不按内部轮次或尝试重复计数。
     pub request_count: i64,
@@ -891,6 +936,7 @@ pub struct ProviderStats {
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct ApiKeyStats {
+    pub deleted: bool,
     pub api_key_id: String,
     pub api_key_name: String,
     pub request_count: i64,

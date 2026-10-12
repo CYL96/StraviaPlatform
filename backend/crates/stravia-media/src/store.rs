@@ -186,7 +186,9 @@ impl MediaDerivativeStore {
         };
         let won = match insertion {
             Ok(rows_affected) => rows_affected == 1,
-            Err(error) => return Err(MediaStoreError::Storage(error.to_string())),
+            Err(error) => {
+                return Err(MediaStoreError::Storage(error.to_string()));
+            }
         };
         if won {
             return Ok(MediaDerivative {
@@ -240,7 +242,9 @@ impl MediaDerivativeStore {
                 .await
             }
         }
-        .map_err(|error| MediaStoreError::Storage(error.to_string()))?
+        .map_err(|error| {
+            MediaStoreError::Storage(error.to_string())
+        })?
         .ok_or(MediaStoreError::Unavailable)?;
         let remaining_ms = expires_at.saturating_sub(chrono::Utc::now().timestamp_millis());
         Ok(Duration::from_millis(
@@ -274,7 +278,9 @@ impl MediaDerivativeStore {
                 .await
             }
         }
-        .map_err(|error| MediaStoreError::Storage(error.to_string()))?;
+        .map_err(|error| {
+            MediaStoreError::Storage(error.to_string())
+        })?;
         Ok(id.map(ArtifactId::new))
     }
 

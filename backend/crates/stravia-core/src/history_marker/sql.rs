@@ -63,36 +63,36 @@ impl SqlHistoryMarkerStore {
         match self {
             Self::Sqlite(pool) => {
                 sqlx::query(
-                    "INSERT INTO history_markers \
-                     (reference, principal, kind, activity, segment_payload, created_at, updated_at, expires_at) \
-                     VALUES (?, ?, 'thinking', ?, ?, ?, ?, ?)",
-                )
-                .bind(&reference)
-                .bind(principal)
-                .bind(&input.activity)
-                .bind(segment)
-                .bind(now)
-                .bind(now)
-                .bind(expires_at)
-                .execute(pool)
-                .await
-                .map_err(storage)?;
+            "INSERT INTO history_markers \
+             (reference, principal, kind, activity, segment_payload, created_at, updated_at, expires_at) \
+             VALUES (?, ?, 'thinking', ?, ?, ?, ?, ?)",
+                            )
+                            .bind(&reference)
+                            .bind(principal)
+                            .bind(&input.activity)
+                            .bind(segment)
+                            .bind(now)
+                            .bind(now)
+                            .bind(expires_at)
+                            .execute(pool)
+                            .await
+        .map_err(storage)?;
             }
             Self::Postgres(pool) => {
                 sqlx::query(
-                    "INSERT INTO history_markers \
-                     (reference, principal, kind, activity, segment_payload, created_at, updated_at, expires_at) \
-                     VALUES ($1, $2, 'thinking', $3, $4, $5, $5, $6)",
-                )
-                .bind(&reference)
-                .bind(principal)
-                .bind(&input.activity)
-                .bind(segment)
-                .bind(now)
-                .bind(expires_at)
-                .execute(pool)
-                .await
-                .map_err(storage)?;
+            "INSERT INTO history_markers \
+             (reference, principal, kind, activity, segment_payload, created_at, updated_at, expires_at) \
+             VALUES ($1, $2, 'thinking', $3, $4, $5, $5, $6)",
+                            )
+                            .bind(&reference)
+                            .bind(principal)
+                            .bind(&input.activity)
+                            .bind(segment)
+                            .bind(now)
+                            .bind(expires_at)
+                            .execute(pool)
+                            .await
+        .map_err(storage)?;
             }
         }
         Ok(HistoryMarker {
@@ -111,8 +111,8 @@ impl SqlHistoryMarkerStore {
         let result = match self {
             Self::Sqlite(pool) => sqlx::query_as::<_, MarkerRow>(
                 "SELECT reference, kind, activity, call_payload, segment_payload, execution_state, \
-                 execution_owner, lease_expires_at, execution_deadline, published_at, expires_at \
-                 FROM history_markers WHERE principal = ? AND reference = ? AND expires_at > ?",
+         execution_owner, lease_expires_at, execution_deadline, published_at, expires_at \
+         FROM history_markers WHERE principal = ? AND reference = ? AND expires_at > ?",
             )
             .bind(principal)
             .bind(reference)
@@ -121,8 +121,8 @@ impl SqlHistoryMarkerStore {
             .await,
             Self::Postgres(pool) => sqlx::query_as::<_, MarkerRow>(
                 "SELECT reference, kind, activity, call_payload, segment_payload, execution_state, \
-                 execution_owner, lease_expires_at, execution_deadline, published_at, expires_at \
-                 FROM history_markers WHERE principal = $1 AND reference = $2 AND expires_at > $3",
+         execution_owner, lease_expires_at, execution_deadline, published_at, expires_at \
+         FROM history_markers WHERE principal = $1 AND reference = $2 AND expires_at > $3",
             )
             .bind(principal)
             .bind(reference)
@@ -144,8 +144,8 @@ impl SqlHistoryMarkerStore {
         let principal = principal.continuation_key();
         let now = Self::now();
         const SELECT: &str = "SELECT reference, kind, activity, call_payload, segment_payload, \
-             execution_state, execution_owner, lease_expires_at, execution_deadline, published_at, \
-             expires_at FROM history_markers WHERE principal = ";
+     execution_state, execution_owner, lease_expires_at, execution_deadline, published_at, \
+     expires_at FROM history_markers WHERE principal = ";
         let result = match self {
             Self::Sqlite(pool) => {
                 let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(SELECT);
@@ -405,9 +405,9 @@ impl HistoryMarkerStore for SqlHistoryMarkerStore {
             Self::Sqlite(pool) => {
                 sqlx::query(
                     "INSERT INTO history_markers \
-                     (reference, principal, kind, activity, tool_id, call_payload, execution_state, \
-                      execution_deadline, created_at, updated_at, expires_at) \
-                     VALUES (?, ?, 'platform', ?, ?, ?, 'pending', ?, ?, ?, ?)",
+             (reference, principal, kind, activity, tool_id, call_payload, execution_state, \
+              execution_deadline, created_at, updated_at, expires_at) \
+             VALUES (?, ?, 'platform', ?, ?, ?, 'pending', ?, ?, ?, ?)",
                 )
                 .bind(&reference)
                 .bind(principal)
@@ -425,9 +425,9 @@ impl HistoryMarkerStore for SqlHistoryMarkerStore {
             Self::Postgres(pool) => {
                 sqlx::query(
                     "INSERT INTO history_markers \
-                     (reference, principal, kind, activity, tool_id, call_payload, execution_state, \
-                      execution_deadline, created_at, updated_at, expires_at) \
-                     VALUES ($1, $2, 'platform', $3, $4, $5, 'pending', $6, $7, $7, $8)",
+             (reference, principal, kind, activity, tool_id, call_payload, execution_state, \
+              execution_deadline, created_at, updated_at, expires_at) \
+             VALUES ($1, $2, 'platform', $3, $4, $5, 'pending', $6, $7, $7, $8)",
                 )
                 .bind(&reference)
                 .bind(principal)
@@ -527,9 +527,9 @@ impl HistoryMarkerStore for SqlHistoryMarkerStore {
         let updated = match self {
             Self::Sqlite(pool) => sqlx::query(
                 "UPDATE history_markers SET execution_state = 'running', execution_owner = ?, \
-                 lease_expires_at = ?, updated_at = ? WHERE principal = ? AND reference = ? \
-                 AND kind = 'platform' AND execution_state = 'pending' AND execution_deadline > ? \
-                 AND expires_at > ?",
+     lease_expires_at = ?, updated_at = ? WHERE principal = ? AND reference = ? \
+     AND kind = 'platform' AND execution_state = 'pending' AND execution_deadline > ? \
+     AND expires_at > ?",
             )
             .bind(owner_id)
             .bind(lease_expires_at)
@@ -544,9 +544,9 @@ impl HistoryMarkerStore for SqlHistoryMarkerStore {
             .rows_affected(),
             Self::Postgres(pool) => sqlx::query(
                 "UPDATE history_markers SET execution_state = 'running', execution_owner = $1, \
-                 lease_expires_at = $2, updated_at = $3 WHERE principal = $4 AND reference = $5 \
-                 AND kind = 'platform' AND execution_state = 'pending' AND execution_deadline > $3 \
-                 AND expires_at > $3",
+     lease_expires_at = $2, updated_at = $3 WHERE principal = $4 AND reference = $5 \
+     AND kind = 'platform' AND execution_state = 'pending' AND execution_deadline > $3 \
+     AND expires_at > $3",
             )
             .bind(owner_id)
             .bind(lease_expires_at)
@@ -616,9 +616,9 @@ impl HistoryMarkerStore for SqlHistoryMarkerStore {
         let updated = match self {
             Self::Sqlite(pool) => sqlx::query(
                 "UPDATE history_markers SET execution_state = ?, segment_payload = ?, \
-                 execution_owner = NULL, lease_expires_at = NULL, updated_at = ? \
-                 WHERE principal = ? AND reference = ? AND execution_state = 'running' \
-                 AND execution_owner = ? AND execution_deadline > ? AND lease_expires_at > ?",
+         execution_owner = NULL, lease_expires_at = NULL, updated_at = ? \
+         WHERE principal = ? AND reference = ? AND execution_state = 'running' \
+         AND execution_owner = ? AND execution_deadline > ? AND lease_expires_at > ?",
             )
             .bind(state_to_db(state))
             .bind(&payload)
@@ -634,10 +634,10 @@ impl HistoryMarkerStore for SqlHistoryMarkerStore {
             .rows_affected(),
             Self::Postgres(pool) => sqlx::query(
                 "UPDATE history_markers SET execution_state = $1, segment_payload = $2, \
-                 execution_owner = NULL, lease_expires_at = NULL, updated_at = $3 \
-                 WHERE principal = $4 AND reference = $5 AND execution_state = 'running' \
-                 AND execution_owner = $6 AND execution_deadline > $3 \
-                 AND lease_expires_at > $3",
+         execution_owner = NULL, lease_expires_at = NULL, updated_at = $3 \
+         WHERE principal = $4 AND reference = $5 AND execution_state = 'running' \
+         AND execution_owner = $6 AND execution_deadline > $3 \
+         AND lease_expires_at > $3",
             )
             .bind(state_to_db(state))
             .bind(&payload)

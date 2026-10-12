@@ -92,28 +92,36 @@ WebSocket 在 socket writer 的实际终帧发送成功后、发送 ACK 之前�
 
 Interaction 卡片、详情与用量分析共享 `Confirmed Upstream Usage`：
 
-- 用量分析总览、时间分桶和 Provider 汇总的错误数与「失败的请求」共用同一请求级查询：包括准入前拒绝，以及终态为 `failed` 且已结束的 Inference Run；排除内部恢复后成功、进行中、单纯取消、断线和中断。按请求开始时间归入窗口和分桶，并排除已过保留期的记录；同一请求的多次尝试或隐藏 Model Turn 只计一次。只有拒绝请求、没有 Model Turn 的时间桶也必须显示错误；
+- 用量分析总览、时间分桶和 Provider 汇总的错误数与「失败的请求」共用同一请求级失败分类，分别从长期汇总和保留中的详情读取：包括准入前拒绝，以及终态为 `failed` 且已结束的 Inference Run；排除内部恢复后成功、进行中、单纯取消、断线和中断。按请求开始时间归入窗口和分桶；长期 Stats Usage 不按 Observation 保留期过滤，而「失败的请求」诊断列表仍仅查询保留中的详情；同一请求的多次尝试或隐藏 Model Turn 只计一次。只有拒绝请求、没有 Model Turn 的时间桶也必须显示错误；
 - 上述三处的请求数和错误率分母同样按客户端请求计数，不按 Model Turn 或 Target attempt 计数；准入前拒绝计入总览和时间分桶。Provider 汇总按请求涉及的服务归属，每个服务内对同一请求去重；没有涉及任何服务的拒绝不归属 Provider，一次跨服务的最终失败可分别计入多个服务，不能将各服务错误数相加当作全局错误数。Token、耗时和吞吐量仍沿用各自的模型轮次或尝试口径；
 - 汇总所有 Inference Run、隐藏 Model Turn、重试和 Target failover 中上游明确报告的 usage；
 - 管理面 `input_tokens` 统一表示净输入：每个 attempt 的总输入与缓存读取均已知时，先计算 `max(input_tokens - cache_read_tokens, 0)`，再累计各 attempt 的已知净值；缓存写入不参与扣减。任一操作数未知时，该 attempt 的净输入未知，`missing_input_tokens` 计入该缺失；
 - output 已包含 reasoning，不再累加或单列思考指标；cache read 与 cache write 保留独立展示。管理面按输入、输出分别呈现，不以缺少缓存分项的相加结果冒充总 Token；
 - 原始 IR、attempt 用量、持久化事件与 wire debug trace 保留上游总输入及 reasoning 子项；管理统计、列表、详情、分页事件查询与 Bundle 汇总在读取边界使用净输入投影，前端不再次扣减。Bundle 导出的原始 events 保持上游值，汇总先按 attempt 合并修订再计算净输入。历史查询立即使用新口径，无需改写数据库、事件或新增接口字段；轻量全局 SSE 通知仍不携带事件正文；
 - 每个实际上游 attempt 的 usage 最多记一次；
-- 流式 usage 在接收时观察，不以客户端输出已经提交为前提。正常完成以 Vendor 的完整返回值确认；失败或取消没有完整返回值时，以已收到的最后已知快照确认。多帧报告是同一 attempt 的修订，不重复累加；未知字段不抹掉已知值，明确报告的零可覆盖先前数值，完全未报告的字段保持 `null`；
+- 流式 usage 在接收时观察，不以客户端输出已经提交为前提。正常完成以 Vendor 的完整返回值确认；失败或取消没有完整返回值时，以已收到的最后已知快照确认。多帧报告是同一 attempt 的修订，不重复累加；未知字段不抹掉已知值，明确报告的零可覆盖先前数值，完全未报告的字段保持 `null`。OpenAI-compatible 流式解析按字段合并累计报告（包括只报告一个必需字段的零值修订），再交给通用累积器；该协议内归一化不改变其他 Vendor 的增量或累计契约；
 - Target attempt 成功与明确报告的 usage 不因随后还原或映射发布失败而改写；Model Turn 的唯一终态由内部完成 gate 记录，只有发布完成且未被取消或超时抢占才记成功；
 - 上游尚未报告或永不报告时保持 `unknown`，不显示为零，不用本地 tokenizer 估算；
 - Interaction、Run 与 Bundle 聚合按字段累计已报告部分；某次 attempt 的未知值不抹掉其他 attempt 的已确认值。全部未报告时该字段保持 `null`，明确报告的零保留为零。失败但已报告的用量同样累计，重复报告不重复计数；用量分析的 overview、series、model、API Key 汇总只统计成功的 Target attempt，按字段累计已报告部分：某次成功 attempt 的字段未知只不计入该值，不抹掉组内其他已确认用量，全部未知时该字段保持 `null`。失败或未完成 attempt 不参与这些成功尝试统计，但不否认其在 Run、Interaction 与 Bundle 中已报告的用量；
 - 全平台 TPS 使用测量对象自身的完整耗时，不扣首 Token 等待，也不使用 50ms 回退规则。首 Token 时间独立展示，不参与分母；
 - Run 耗时与 TPS 共用客户端接收到交付结束的时间：`delivery_completed_at - started_at`，包括内部重试、failover、平台工具与交付等待。分子使用 Run 的全部已报告输出，包括失败 attempt 已报告的输出；coverage 表明任一输出未知时 TPS 保持 `null`。运行中、成功但缺交付时间、无有效正耗时或输出未知时不猜测速率；失败、取消与中断等未交付终态可用 `finished_at` 收口。迟到 usage 修订不延长交付耗时，客户端跨请求执行工具的间隔不属于任一 Run；
 - Attempt TPS 使用自己的 `duration_ms`；Provider `avg_output_tps` 使用成功 attempt 的 `Σoutput_tokens / (Σduration_ms / 1000)`，不是单次 TPS 的平均值。成功样本缺输出或耗时、或总耗时为零时为 `null`；已知零输出保留为零。低延迟选路同样使用完整成功 attempt 耗时，仍按一小时成功率加权，保留 20 个成功样本、同组至少两个有效 Target 的门槛及既有亲和、优先级和 fallback；
-- 管理统计 `StatsOverview` 与 `StatsSeries` 的 `avg_output_tps` 使用同一成功 attempt 加权比率，单位为 tok/s；无成功样本、任一成功样本缺输出或 `duration_ms`、或完整耗时总和不为正时显式返回 JSON `null`，不省略字段。窗口和桶归属沿用所属 Model Turn 的开始时间与调用方时区，不按 attempt 完成时间归属，也不平均桶或 Provider 的 TPS。成功 attempt 不因随后 Model Turn 发布失败或客户端交付失败被排除。`avg_first_token_ms` 仍对已记录的首次 canonical 输出时间取平均，包含 Thinking，保留零；缺首字时间本身不使 TPS 失效。原有 `avg_duration_ms` 与部分已知 Token 累计规则不变；
+- 管理统计 `StatsOverview` 与 `StatsSeries` 的 `avg_output_tps` 使用同一成功 attempt 加权比率，单位为 tok/s；无成功样本、任一成功样本缺输出或 `duration_ms`、或完整耗时总和不为正时显式返回 JSON `null`，不省略字段。窗口和基础桶归属沿用所属 Model Turn 的开始时间，以绝对 Unix 时间整刻钟划分；调用方本地时区仅影响时间输入和显示，不按 attempt 完成时间归属，也不平均桶或 Provider 的 TPS。成功 attempt 不因随后 Model Turn 发布失败或客户端交付失败被排除。`avg_first_token_ms` 仍对已记录的首次 canonical 输出时间取平均，包含 Thinking，保留零；缺首字时间本身不使 TPS 失效。原有 `avg_duration_ms` 与部分已知 Token 累计规则不变；
 - Interaction、Run 与 Bundle 的既有聚合 `usage.coverage` 包含 `attempt_count` 和五项 `missing_*_tokens`；其中 `missing_input_tokens` 表示因总输入或缓存读取缺失而无法计算净输入的尝试数，其余项表示对应字段未报告的尝试数。`target_attempt_finished.usage` 不携带聚合 coverage；正在运行与终态未报告的区别仍由 attempt 状态表达。统计接口不新增覆盖字段或完整性标记。coverage 不替代 `observation_gap`，无法记录的 attempt 不计入已观察尝试总数；
-- 查询从现存 attempt 记录派生已确认累计与覆盖信息，旧版保存的 `null` 汇总不遮蔽仍然存在的用量；无需改写旧事件或自动拆分历史 Interaction。SQLite 与 PostgreSQL 使用相同计量规则，Route Scheduling 与成本计算仍读取原始用量；
+- Observation 详情与 Bundle 查询仍从现存 attempt 记录派生已确认累计与覆盖信息，旧版保存的 `null` 汇总不遮蔽仍然存在的用量；管理统计则从独立的 Stats Usage 充分聚合信息读取，不在查询时扫描尚未过期的详情。无需改写旧事件或自动拆分历史 Interaction。SQLite 与 PostgreSQL 使用相同计量规则，Route Scheduling 与成本计算仍读取原始用量；
 - 收到新的上游 usage 后立即更新持久化数值投影供查询；时间线与 SSE 在实际 `target_attempt_finished` 时显示合并结果，迟到事实以更高 sequence 的同 kind 终态修订承载，不新增独立 `usage_confirmed`、易失 usage 或 reset 协议。
 
 请求记录的链路 Token 阈值按整个根 DAG（含子孙）的已确认净输入与输出累计，不加回缓存分项；用量活动图与输入/输出构成图采用相同口径，缓存仍独立展示，输入标签保持「输入」。尚在运行且没有任何 Target attempt 报告 usage 的 Model Turn，临时加入该轮未缓存输入估算，不再次扣除缓存，使大输入请求无需等待首轮响应结束即可显示。估算每轮只计一次，不随重试重复累计；任一 attempt 报告 usage（包括明确的零）或该轮结束后，停止使用该轮估算。真实合计低于阈值时，链路可能重新隐藏。列表、总数、分页与实时匹配采用同一规则，0 表示不过滤。
 
-用量页展示「延迟与速度」图：首字延迟为左轴秒值和钢蓝实线，TPS 为右轴 tok/s 和钢蓝虚线，两轴独立线性缩放、从零起点自动扩展上限。用量页保留 6 小时、24 小时、3 天和 7 天，图与窗口汇总每 30 秒刷新，折线仍按一小时分桶。顶部原始窗口汇总兼作图例；悬停或通过方向键、Home/End 聚焦时间桶时读取同桶的两项值与单位。空桶和单项 `null` 各自断线，未知显示「—」，有效零输出显示 `0 tok/s`；不插值、不补零，不额外扩展首末数据点外的占位桶。说明按钮支持焦点和触摸，明确首字延迟包含 Thinking、TPS 包含首字等待。其他耗时展示保留。两种存储及 Server/Desktop 共用 Core 计量，无需新增列、迁移或历史回填。
+用量页展示「延迟与速度」图：首字延迟为左轴秒值和钢蓝实线，TPS 为右轴 tok/s 和钢蓝虚线，两轴独立线性缩放、从零起点自动扩展上限。顶部原始窗口汇总兼作图例；悬停或通过方向键、Home/End 聚焦时间桶时读取同桶的两项值与单位。空桶和单项 `null` 各自断线，未知显示「—」，有效零输出显示 `0 tok/s`；不插值、不补零。说明按钮支持焦点和触摸，明确首字延迟包含 Thinking、TPS 包含首字等待。其他耗时展示保留；加载失败与确实无数据分别表达，不能用零替代失败或未知。
+
+**用量页时间操作：**
+
+- 选择 6 小时、24 小时、3 天或 7 天预设进入实时模式；图与窗口汇总每 30 秒刷新。实时范围由连续整刻钟基础桶组成，包含尚在累计的当前桶，界面显示实际起止和当前桶未结束的状态；15 分钟是持久化粒度，不是发布更新的等待时间，也不是任意秒级滑动窗口。
+- 点击前后导航按当前窗口跨度平移；离开当前后固定绝对起止，刷新与新请求不使历史范围漂移。点击返回当前重新进入实时模式，向前浏览不生成未来用量。
+- 点击范围控件打开本地日期时间选择，起止必须为整刻钟，起点早于终点；错误输入不能应用，不能静默取整。自定义范围可超过 24 小时。应用后显示实际生效范围，并保持固定；本地时区只负责输入与显示，后端使用绝对时刻，无效或有歧义的本地时间不得静默改成另一时间。
+- Core 的 `StatsWindow` 采用 Unix 毫秒 `[start_at, end_at)`：两个边界必须成对、为正、对齐 `900000` 毫秒，且结束晚于开始；都省略表示全部累计。不再接受 `hours` 或 `tz_offset`。相邻窗口的公共边界只计入后一个窗口。
+- 序列可提供以秒为单位、为 900 倍数的 `bucket`；Core 自动选择足够粗的整倍基础桶，使返回不超过 512 点，`StatsSeries.bucket_ms` 返回实际展示粒度。长范围合并充分聚合信息，重新计算均值、错误率和 TPS，不平均桶均值，也不截掉范围来减少点数；同范围总览与趋势保持同一统计口径。
 
 输入估算不进入 Confirmed Upstream Usage、卡片数值、用量统计或计费。普通模型请求的筛选与路由调度共用同一估算：将消息 `items`、独立系统提示词 `instructions` 和工具定义 `tools` 一并计算 JSON 序列化字节数，除以 4 向上取整；工具说明与参数 schema 也属于输入，不能只按用户消息估算。它不是模型 tokenizer 的精确计数。估算随 `model_turn_started` 写入独立的 nullable 字段，已有记录不重算，不从截断的输入预览或 Debug 内容回填。
 
@@ -125,7 +133,9 @@ Gemini `thoughtsTokenCount` 保留为 reasoning 子项，输出仍只包含一�
 
 ### 3.4 Observation 不影响执行
 
-Observation 写入、SSE、Debug 分段文件、容量统计或导出失败不得改变 Inference Run 的响应、重试、Target 选择、Client Output Commit 或 Generation Chain 提交。无法记录时产生显式 `observation_gap` 或把 Debug Trace 标成 `partial`；不得阻塞、取消或伪造业务结果。
+Observation 写入、SSE、Debug 分段文件、容量统计或导出的普通诊断失败不得改变 Inference Run 的响应、重试、Target 选择、Client Output Commit 或 Generation Chain 提交。无法记录时产生显式 `observation_gap` 或把 Debug Trace 标成 `partial`；不得因普通观测缺口阻塞、取消或伪造业务结果。
+
+数据库、事务日志或实例文件存储失败（包括容量耗尽）适用 [ADR-0060 的请求/任务局部处理约束](../adr/0060-own-interaction-observation-outside-generation-chain.md#存储失败只影响所属请求或任务)：关键同步操作沿原 Result 失败当前相关请求或任务，Observation/Debug 独立异步写入失败只归所属诊断任务并保留 gap/partial，不牵连推理与无关请求/后台任务，Server/Desktop 继续服务。诊断不作为执行事实源；不新增全局 fatal 广播、全入口 scope、降级模式、健康检查或自动重试，不补造用量、不自动重放模型调用。独立长期 Stats 未可靠汇总时相关破坏性清理仍明确失败。队列满、Trace 限额及普通缺口保留原语义；该局部策略已实现并通过真实 Server SQLite/PostgreSQL 与 Desktop SQLite 的宿主/HTTP 验收，覆盖在途/后续请求、已交付后的后台 Media 任务、诊断 gap/partial 与双库 Stats 写失败的清理保护；真实 SQLITE_FULL 与隔离固定 PostgreSQL trigger 的边界见[整体架构 §4.10](architecture.md#410-interaction-observation)。专项及完整本地测试矩阵已通过，运行记录见[本地规格](../../.scratch/independent-usage-statistics/spec.md)。
 
 ### 3.5 凭据新增发现
 
@@ -347,7 +357,7 @@ SQLite 与 PostgreSQL 使用等价 schema 和索引。具体 SQL 由各自迁移
 
 #### `model_turn_observations`
 
-保存 Run 内每个 Model Turn 的身份、Route、开始/结束、状态和 usage。用量分析与 Route Scheduling Strategy 原来依赖 `request_logs` 的 24h/1h provider/model/latency/usage 聚合全部迁到此表；不得继续双写旧表。
+保存 Run 内每个 Model Turn 的身份、Route、开始/结束、状态和 usage。Route Scheduling Strategy 原来依赖 `request_logs` 的 24h/1h provider/model/latency/usage 聚合迁到 Observation 原始事实；不得继续双写旧表。管理用量分析已改读独立 Stats Usage，Model Turn 与 Target attempt 只作为其事务内计量来源与升级回填来源，不再要求详情长期存在。
 
 #### `target_attempt_observations`
 
@@ -364,6 +374,17 @@ SQLite 与 PostgreSQL 使用等价 schema 和索引。具体 SQL 由各自迁移
 #### Debug manifest（文件，不是关系表）
 
 `debug_trace_manifests` 已由迁移 0008 删除。状态存放在 `diagnostics/observation-debug/<trace_id>/manifest.json`，以临时文件加 rename 原子替换，启动扫描建立进程内 `DebugTraceIndex`，writer 增量更新。详情、失败请求列表和 Bundle 通过索引读取状态，API 结构不变；多实例只在拥有 Trace 文件的实例上可见。Run 终态提交并广播之前先写入 manifest 终态，不再持久化或广播 `trace_manifest_updated`。Rejected Request 保留 `debug_enabled` 准入快照，不再保存冗余 `debug_status` 列。运行时逐文件扫描隔离损坏或不可读 manifest，仅警告并跳过，不覆盖坏文件，不影响健康 Trace 查询与新捕获；升级导出则严格核对已有文件与数据库权威事实，匹配后才允许删表。升级的有界并发、临时查询索引和中断续迁契约见 [ADR-0077](../adr/0077-slim-interaction-observation-and-file-debug-manifests.md)。
+
+### 6.1.1 独立长期 Stats Usage
+
+Core 的 `UsageStatsStore` 在现有 SQLite/PostgreSQL 数据库内拥有长期管理汇总，不新建统计服务、第二个数据库或前端事实源。配对迁移 `0018_stats_usage.sql` 建立 `stats_usage_buckets` 和 `stats_usage_checkpoints` 及来源视图、触发器；全局、模型、Provider、API Key 的基础桶按绝对时间每 `900000` 毫秒划分。永久桶只保存维度身份、非秘密展示标签、时间、计数、已知值计数及指标的分子/分母，不保存正文、工具内容、Debug 或永久逐请求清单。不设自动过期或长期降采样期限；空间随时间桶和身份维度增长，不承诺固定容量。
+
+- **事实与修订：** 来源为保留中的请求、拒绝请求、Model Turn 和 Target attempt 数值投影。来源 INSERT/UPDATE 的触发器在同一源事务中扣除旧 checkpoint 贡献、替换 checkpoint、计入新贡献；checkpoint 以来源种类和稳定来源 ID 标识，不把重复 usage 帧或迟到修订作为新增消耗。未知修订字段保留已知值，明确零替换旧值。充分聚合信息使跨桶平均耗时、首字延迟、错误率与成功 attempt 加权 TPS 可重新计算，保留全部未知、部分已知和明确零的区别。
+- **清理与并发：** 来源 DELETE 只回收对应 checkpoint，不扣减永久桶。清理与源写入共享数据库事务一致性：汇总或 checkpoint 写入失败时源事务回滚，不能先成功删除来源再丢掉应计贡献。来源仍存在时保留修订所需 checkpoint；删除后该来源不能再合法修订，工作元数据随之回收，不另留永久请求账本。当前进程若发生携带统计事实的持久化失败，使用仅限清理的粘性失败标记拒绝清理：不能证明待处理统计事实已可靠汇总时，手动或自动清理明确失败。该标记不持久化，不新增重试或正常推理准入门槛；单纯正文、Debug、工具诊断的普通缺口不阻止清理。重启后已提交来源与汇总仍一致，但无法恢复此前被丢弃、未保存的已确认事实，因此不承诺完整账本。手动 Clear History、到期回收和保留期修改继续保护活动记录；Debug 清理、管理端本地 Console Chat 清理均不删除长期汇总。
+- **升级与恢复：** 建表、触发器安装及对实际保留事实的回填在同一 SQLx 迁移事务内完成；失败或中断回滚，重入不会重复入账。现有启动迁移完成后才构造存储并开放管理读取，不以空统计掩盖未完成升级；没有独立异步回填游标。只能恢复仍存在且可判定的事实，已删除或从未持久化的历史不可恢复，不调用上游补账、不解析 Debug 猜用量、不把缺口补零，也不自动重放模型调用。
+- **历史身份：** 以模型内部 Route ID、Provider ID、API Key ID 归属，不按可复用的客户端模型名或展示名称合并。桶不依赖配置外键级联；删除配置后保留非秘密名称与可信身份，不保留凭据或授权能力。同名重建是新身份，更名不拆分身份；旧事实无法证明归属时保留未知边界，不凭同名关联当前对象。分类返回 `deleted`，历史 `model_id` / `provider_id` 可为 `null`；已删除对象仍可识别，但不提供失效配置操作。
+
+长期 Stats Usage 与 Observation/Debug 的保留周期独立；清理后只剩汇总，不能再追溯到已删除的具体对话，也不能从 15 分钟桶恢复秒级历史分布。它保留管理分析现有成功 attempt 与请求级口径，不承诺完整财务账本或上游实际收费。Route Scheduling 继续从原始 Observation 读取精确 24h/1h 短窗口并叠加进行中占位，不读取长期桶替代选路事实。请求记录页面仍以精确到秒的绝对范围筛选并限制跨度 24 小时，不继承统计页的长期范围契约。
 
 ### 6.2 Debug 分段文件
 
@@ -408,7 +429,7 @@ diagnostics/observation-debug/
 
 ### 6.4 保留与清理
 
-Observation、Rejected Request、Debug manifest 与 Trace 文件跟随 `log_retention_days`；默认 7 天。
+Observation、Rejected Request、Debug manifest 与 Trace 文件跟随 `log_retention_days`；默认 7 天。此保留期不适用于独立 Stats Usage；调整保留期不会重置用量。清理确认应明确：删除请求详情或 Debug 后统计汇总仍保留，但无法再由汇总追溯已删除的详情；本地 Console Chat 删除也不撤销服务端消耗。
 
 清理不再依赖数据库 manifest 或 tombstone：按 manifest 的 `expires_at` 回收目录；删除先 rename 为 `.deleting-*`，随后幂等删除，启动补完中断的删除并回收无 manifest 的孤儿目录。关系数据清理后另删 owner 已不存在的 Trace 目录。
 
@@ -843,7 +864,7 @@ SQLite 与 PostgreSQL 新迁移执行：
 - release 与 debug 构建都编译 Observation/Trace，运行时默认关闭；
 - dev wire replay 需要时从版本化 Trace event 读取，不保留第二套旧 JSONL schema；
 - 更新 `README.md` 与 `README_CN.md`，删除“开发命令自动开启 `.scratch/wire-captures`”说明；
-- 更新 architecture、agent-core、ADR-0034 的实现引用：Route scheduling 和 stats 改读 Observation 的 Model Turn/Target attempt 聚合。
+- 更新 architecture、agent-core、ADR-0034 的实现引用：Route scheduling 读取 Observation 的原始 Model Turn/Target attempt 短窗口；管理 stats 读取独立长期 Stats Usage 汇总。
 
 ## 12. 依赖
 

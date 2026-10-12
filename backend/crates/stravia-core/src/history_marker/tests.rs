@@ -7,7 +7,7 @@ use stravia_runtime_contract::protocol::ir::AiItem;
 use stravia_runtime_contract::protocol::ir::AiRequest;
 use stravia_runtime_contract::protocol::ir::MessageContent;
 
-async fn sqlite_store() -> Arc<dyn HistoryMarkerStore> {
+async fn sqlite_pool() -> sqlx::SqlitePool {
     let pool = SqlitePoolOptions::new()
         .max_connections(1)
         .connect("sqlite::memory:")
@@ -16,7 +16,11 @@ async fn sqlite_store() -> Arc<dyn HistoryMarkerStore> {
     crate::migrations::migrate_sqlite(&pool, None)
         .await
         .expect("SQLite migrations");
-    Arc::new(SqlHistoryMarkerStore::sqlite(pool))
+    pool
+}
+
+async fn sqlite_store() -> Arc<dyn HistoryMarkerStore> {
+    Arc::new(SqlHistoryMarkerStore::sqlite(sqlite_pool().await))
 }
 
 fn principal(id: &str) -> Principal {
@@ -632,7 +636,8 @@ async fn sqlite_deadline_and_lost_lease_become_distinct_terminal_errors() {
 
 #[tokio::test]
 async fn sqlite_completed_marker_remains_immutable_after_its_execution_deadline() {
-    let store = sqlite_store().await;
+    let pool = sqlite_pool().await;
+    let store = SqlHistoryMarkerStore::sqlite(pool.clone());
     let owner = principal("owner");
     let marker = store
         .create_platform(
@@ -647,10 +652,35 @@ async fn sqlite_completed_marker_remains_immutable_after_its_execution_deadline(
         )
         .await
         .unwrap();
-    store
-        .claim_execution(&owner, &marker.reference, "worker", Duration::from_secs(1))
-        .await
-        .unwrap();
+    // Control persisted time boundaries, not scheduler latency: completion must
+    // happen before the deadline even when the full suite stalls this task.
+    assert_eq!(
+        sqlx::query("UPDATE history_markers SET execution_deadline = ? WHERE reference = ?")
+            .bind(i64::MAX)
+            .bind(&marker.reference)
+            .execute(&pool)
+            .await
+            .unwrap()
+            .rows_affected(),
+        1
+    );
+    assert_eq!(
+        store
+            .claim_execution(&owner, &marker.reference, "worker", Duration::from_secs(1))
+            .await
+            .unwrap(),
+        ClaimOutcome::Claimed
+    );
+    assert_eq!(
+        sqlx::query("UPDATE history_markers SET lease_expires_at = ? WHERE reference = ?")
+            .bind(i64::MAX)
+            .bind(&marker.reference)
+            .execute(&pool)
+            .await
+            .unwrap()
+            .rows_affected(),
+        1
+    );
     let segment = HiddenHistorySegment::Platform {
         call: call("completed"),
         result: ContentBlock::ToolResult {
@@ -671,12 +701,37 @@ async fn sqlite_completed_marker_remains_immutable_after_its_execution_deadline(
         )
         .await
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(75)).await;
+    let completed = store
+        .resolve(&owner, &marker.reference)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        completed.execution_state,
+        Some(PlatformExecutionState::Completed)
+    );
+    assert_eq!(completed.execution_deadline_unix_ms, Some(i64::MAX));
+    assert_eq!(
+        serde_json::to_value(completed.segment).unwrap(),
+        serde_json::to_value(Some(segment.clone())).unwrap()
+    );
+    // Only move the deadline into the past after observing a durable Completed
+    // result through the consumer API. Keep retention separate from execution.
+    assert_eq!(
+        sqlx::query("UPDATE history_markers SET execution_deadline = 0 WHERE reference = ?")
+            .bind(&marker.reference)
+            .execute(&pool)
+            .await
+            .unwrap()
+            .rows_affected(),
+        1
+    );
     let resolved = store
         .resolve(&owner, &marker.reference)
         .await
         .unwrap()
         .unwrap();
+    assert_eq!(resolved.execution_deadline_unix_ms, Some(0));
     assert_eq!(
         resolved.execution_state,
         Some(PlatformExecutionState::Completed)

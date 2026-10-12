@@ -646,6 +646,22 @@ async fn initialize_desktop(
         }
         runtime_ref.set_switch_publisher(Arc::new(TauriPortSwitchPublisher { app: app.clone() }));
         startup.ready(&app);
+        #[cfg(feature = "desktop-e2e")]
+        if std::env::var_os("STRAVIA_TEST_STORAGE_FAULT").is_some() {
+            use std::io::Write;
+            if let Some(session) = app.try_state::<commands::NativeAdminSession>() {
+                let access = session.test_access().await?;
+                let root = std::env::var_os("STRAVIA_DESKTOP_E2E_RUN_ROOT")
+                    .ok_or_else(|| anyhow::anyhow!("isolated native test root missing"))?;
+                let ready_path = PathBuf::from(root).join("native-storage-ready.json");
+                std::fs::write(ready_path, serde_json::to_vec(&serde_json::json!({
+                    "port": runtime_ref.current_port(), "session": access,
+                }))?)?;
+                // No session credentials in stdout, diagnostics or test reports.
+                println!("STRAVIA_DESKTOP_TEST_READY");
+                std::io::stdout().flush()?;
+            }
+        }
         Ok(())
     }
     .await;

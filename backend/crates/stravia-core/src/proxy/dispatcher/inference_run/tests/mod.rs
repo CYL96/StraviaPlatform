@@ -40,9 +40,7 @@ async fn shutdown_test_gateway(gateway: Gateway) {
 
 async fn close_test_gateway(gateway: Gateway, data_dir: tempfile::TempDir) {
     shutdown_test_gateway(gateway).await;
-    data_dir
-        .close()
-        .expect("remove temporary gateway directory");
+    crate::proxy::test_cleanup::close_temp_dir(data_dir);
 }
 
 async fn wait_for_observed_run_finish(

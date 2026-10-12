@@ -30,8 +30,8 @@ impl Drop for OAuthRefreshLease {
         let gateway = self.gateway.clone();
         let provider_id = self.provider_id.clone();
         let expected_version = self.expected_version;
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(async move {
+        if tokio::runtime::Handle::try_current().is_ok() {
+            tokio::spawn(async move {
                 if let Err(error) = gateway
                     .storage
                     .oauth_credentials()

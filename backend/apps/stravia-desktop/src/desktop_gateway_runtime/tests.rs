@@ -365,19 +365,77 @@ async fn occupied_fixed_port_falls_back_and_identifies_owners_in_the_background(
         name: "holder.exe".to_string(),
         pid: 41,
     };
+    struct PendingOwners {
+        owner: PortOwner,
+        entered: Notify,
+        released: SyncMutex<bool>,
+        release: Condvar,
+    }
+
+    impl PendingOwners {
+        fn release(&self) {
+            *self.released.lock() = true;
+            self.release.notify_all();
+        }
+    }
+
+    impl PortOwnerResolver for PendingOwners {
+        fn resolve(&self, _scope: BindScope, _port: u16) -> Result<Vec<PortOwner>, String> {
+            self.entered.notify_one();
+            let mut released = self.released.lock();
+            self.release
+                .wait_while(&mut released, |released| !*released);
+            Ok(vec![self.owner.clone()])
+        }
+    }
+
+    // Release the blocking resolver even if an assertion fails before the explicit release.
+    struct ReleaseOnDrop(Arc<PendingOwners>);
+
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
+
+    let owners = Arc::new(PendingOwners {
+        owner: owner.clone(),
+        entered: Notify::new(),
+        released: SyncMutex::new(false),
+        release: Condvar::new(),
+    });
+    let release_on_drop = ReleaseOnDrop(owners.clone());
     let runtime = DesktopGatewayRuntime::start(
         test_app(),
         Arc::new(TestStore::new(PortPreferenceLoad::Fixed(port))),
-        Arc::new(StaticOwners(vec![owner.clone()])),
+        owners.clone(),
     )
     .await
     .expect("runtime should fall back");
 
+    tokio::time::timeout(Duration::from_secs(2), owners.entered.notified())
+        .await
+        .expect("owner lookup should enter the resolver");
     let initial = runtime.snapshot().await;
     assert_eq!(initial.mode, DesktopPortMode::Fallback);
     assert_eq!(initial.fixed_port, Some(port));
     assert_ne!(initial.current_port, port);
     assert_eq!(initial.owner_lookup, OwnerLookupStatus::Identifying);
+    assert!(initial.owners.is_empty());
+    tokio::time::timeout(Duration::from_secs(2), async {
+        let response = reqwest::get(format!("http://127.0.0.1:{}/health", initial.current_port))
+            .await
+            .expect("fallback listener should remain reachable");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(response.text().await.unwrap(), "ok");
+    })
+    .await
+    .expect("fallback listener should respond while owner lookup is pending");
+    assert_eq!(
+        runtime.snapshot().await.owner_lookup,
+        OwnerLookupStatus::Identifying
+    );
+    drop(release_on_drop);
     let identified = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             let state = runtime.snapshot().await;
@@ -391,7 +449,6 @@ async fn occupied_fixed_port_falls_back_and_identifies_owners_in_the_background(
     .expect("owner lookup should finish");
     assert_eq!(identified.owner_lookup, OwnerLookupStatus::Found);
     assert_eq!(identified.owners, vec![owner]);
-    assert_reachable(initial.current_port).await;
 
     runtime.shutdown().await.expect("runtime should stop");
 }

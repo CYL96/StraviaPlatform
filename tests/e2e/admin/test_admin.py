@@ -1123,7 +1123,7 @@ def test_stats_overview_incremented(admin_env: dict[str, str]) -> None:
 
     status, resp = http_request(
         "GET",
-        f"{admin_env['admin']}/api/v1/stats/series?hours=24&bucket=3600",
+        f"{admin_env['admin']}/api/v1/stats/series?start_at={int(time.time() * 1000) // 900000 * 900000 - 86400000}&end_at={int(time.time() * 1000) // 900000 * 900000 + 900000}&bucket=3600",
         headers=admin_env["auth"],
     )
     assert status == 200

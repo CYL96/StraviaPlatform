@@ -200,8 +200,8 @@ impl LocalArtifactStore {
             ArtifactDatabase::Sqlite(pool) => {
                 sqlx::query_as(
                     "SELECT u.artifact_id, u.principal, u.token_hash, u.declared_size, \
-                     u.expires_at, a.mime_type, u.created_at, a.expires_at AS artifact_expires_at \
-                     FROM artifact_uploads u JOIN artifacts a ON a.id = u.artifact_id WHERE u.id = ?",
+     u.expires_at, a.mime_type, u.created_at, a.expires_at AS artifact_expires_at \
+     FROM artifact_uploads u JOIN artifacts a ON a.id = u.artifact_id WHERE u.id = ?",
                 )
                 .bind(upload_id)
                 .fetch_optional(pool)
@@ -210,8 +210,8 @@ impl LocalArtifactStore {
             ArtifactDatabase::Postgres(pool) => {
                 sqlx::query_as(
                     "SELECT u.artifact_id, u.principal, u.token_hash, u.declared_size, \
-                     u.expires_at, a.mime_type, u.created_at, a.expires_at AS artifact_expires_at \
-                     FROM artifact_uploads u JOIN artifacts a ON a.id = u.artifact_id WHERE u.id = $1",
+     u.expires_at, a.mime_type, u.created_at, a.expires_at AS artifact_expires_at \
+     FROM artifact_uploads u JOIN artifacts a ON a.id = u.artifact_id WHERE u.id = $1",
                 )
                 .bind(upload_id)
                 .fetch_optional(pool)
@@ -324,7 +324,7 @@ impl ArtifactStore for LocalArtifactStore {
                     .map_err(storage_error)?;
                 let (active_uploads, staged_bytes): (i64, i64) = sqlx::query_as(
                     "SELECT COUNT(*), COALESCE(SUM(declared_size), 0) FROM artifact_uploads \
-                     WHERE principal = ? AND expires_at > ?",
+             WHERE principal = ? AND expires_at > ?",
                 )
                 .bind(&principal_key)
                 .bind(created_at)
@@ -334,8 +334,8 @@ impl ArtifactStore for LocalArtifactStore {
                 validate_staging_quota(active_uploads, staged_bytes, request.size)?;
                 sqlx::query(
                     "INSERT INTO artifacts \
-                     (id, principal, mime_type, size, backend_key, state, expires_at, created_at) \
-                     VALUES (?, ?, ?, ?, ?, 'staging', ?, ?)",
+             (id, principal, mime_type, size, backend_key, state, expires_at, created_at) \
+             VALUES (?, ?, ?, ?, ?, 'staging', ?, ?)",
                 )
                 .bind(artifact_id.as_str())
                 .bind(&principal_key)
@@ -349,8 +349,8 @@ impl ArtifactStore for LocalArtifactStore {
                 .map_err(storage_error)?;
                 sqlx::query(
                     "INSERT INTO artifact_uploads \
-                     (id, artifact_id, principal, token_hash, declared_size, expires_at, created_at) \
-                     VALUES (?, ?, ?, ?, ?, ?, ?)",
+             (id, artifact_id, principal, token_hash, declared_size, expires_at, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
                 )
                 .bind(&upload_id)
                 .bind(artifact_id.as_str())
@@ -372,20 +372,20 @@ impl ArtifactStore for LocalArtifactStore {
                     .await
                     .map_err(storage_error)?;
                 let (active_uploads, staged_bytes): (i64, i64) = sqlx::query_as(
-                    "SELECT COUNT(*), LEAST(COALESCE(SUM(declared_size), 0), $3::bigint)::bigint FROM artifact_uploads \
-                     WHERE principal = $1 AND expires_at > $2",
-                )
-                .bind(&principal_key)
-                .bind(created_at)
-                .bind(MAX_PRINCIPAL_STAGING_BYTES as i64 + 1)
-                .fetch_one(&mut *transaction)
-                .await
-                .map_err(storage_error)?;
+            "SELECT COUNT(*), LEAST(COALESCE(SUM(declared_size), 0), $3::bigint)::bigint FROM artifact_uploads \
+             WHERE principal = $1 AND expires_at > $2",
+        )
+        .bind(&principal_key)
+        .bind(created_at)
+        .bind(MAX_PRINCIPAL_STAGING_BYTES as i64 + 1)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
                 validate_staging_quota(active_uploads, staged_bytes, request.size)?;
                 sqlx::query(
                     "INSERT INTO artifacts \
-                     (id, principal, mime_type, size, backend_key, state, expires_at, created_at) \
-                     VALUES ($1, $2, $3, $4, $5, 'staging', $6, $7)",
+             (id, principal, mime_type, size, backend_key, state, expires_at, created_at) \
+             VALUES ($1, $2, $3, $4, $5, 'staging', $6, $7)",
                 )
                 .bind(artifact_id.as_str())
                 .bind(&principal_key)
@@ -399,8 +399,8 @@ impl ArtifactStore for LocalArtifactStore {
                 .map_err(storage_error)?;
                 sqlx::query(
                     "INSERT INTO artifact_uploads \
-                     (id, artifact_id, principal, token_hash, declared_size, expires_at, created_at) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7)",
+             (id, artifact_id, principal, token_hash, declared_size, expires_at, created_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
                 )
                 .bind(&upload_id)
                 .bind(artifact_id.as_str())
@@ -496,6 +496,8 @@ impl ArtifactStore for LocalArtifactStore {
                 ));
             }
             digest.update(&chunk);
+            #[cfg(feature = "test-support")]
+            crate::storage_test_faults::inject_io("artifact").map_err(storage_error)?;
             file.write_all(&chunk).await.map_err(storage_error)?;
         }
         file.flush().await.map_err(storage_error)?;
@@ -514,8 +516,8 @@ impl ArtifactStore for LocalArtifactStore {
             ArtifactDatabase::Sqlite(pool) => {
                 sqlx::query(
                     "INSERT INTO artifact_upload_parts (upload_id, part_number, etag, size) \
-                     VALUES (?, ?, ?, ?) ON CONFLICT(upload_id, part_number) \
-                     DO UPDATE SET etag = excluded.etag, size = excluded.size",
+             VALUES (?, ?, ?, ?) ON CONFLICT(upload_id, part_number) \
+             DO UPDATE SET etag = excluded.etag, size = excluded.size",
                 )
                 .bind(upload_id)
                 .bind(i64::from(part_number))
@@ -528,8 +530,8 @@ impl ArtifactStore for LocalArtifactStore {
             ArtifactDatabase::Postgres(pool) => {
                 sqlx::query(
                     "INSERT INTO artifact_upload_parts (upload_id, part_number, etag, size) \
-                     VALUES ($1, $2, $3, $4) ON CONFLICT(upload_id, part_number) \
-                     DO UPDATE SET etag = EXCLUDED.etag, size = EXCLUDED.size",
+             VALUES ($1, $2, $3, $4) ON CONFLICT(upload_id, part_number) \
+             DO UPDATE SET etag = EXCLUDED.etag, size = EXCLUDED.size",
                 )
                 .bind(upload_id)
                 .bind(i64::from(part_number))
@@ -675,44 +677,43 @@ impl ArtifactStore for LocalArtifactStore {
         let upload_id = upload_id.to_owned();
         Self::complete_guarded(async move {
         if store.reuse_ready(&row, &artifact_id, &temporary).await? {
-            tokio::fs::remove_file(&temporary)
-                .await
-                .map_err(storage_error)?;
-            store.delete_ready(&principal, &ArtifactId::new(&row.artifact_id))
-                .await?;
+    tokio::fs::remove_file(&temporary).await
+        .map_err(storage_error)?;
+    store.delete_ready(&principal, &ArtifactId::new(&row.artifact_id))
+        .await?;
         } else {
-            tokio::fs::rename(&temporary, &final_path)
-                .await
-                .map_err(storage_error)?;
-            {
-                let settings = store.transfer_settings(None).await?;
-                if let Some(s3) = &settings.s3 {
-                    store.persist_s3_location(&row.artifact_id, s3).await?;
-                    store.upload_s3(
-                        s3,
-                        &ArtifactId::new(&row.artifact_id),
-                        &final_path,
-                        total_size,
-                        &row.mime_type,
-                    )
-                    .await?;
-                }
-            }
-            store.mark_ready(&row.artifact_id, &artifact_id).await?;
+    tokio::fs::rename(&temporary, &final_path)
+        .await
+        .map_err(storage_error)?;
+    {
+        let settings = store.transfer_settings(None).await?;
+        if let Some(s3) = &settings.s3 {
+            store.persist_s3_location(&row.artifact_id, s3).await?;
+            store.upload_s3(
+                s3,
+                &ArtifactId::new(&row.artifact_id),
+                &final_path,
+                total_size,
+                &row.mime_type,
+            )
+            .await?;
+        }
+    }
+    store.mark_ready(&row.artifact_id, &artifact_id).await?;
         }
         drop(publication_guard);
         store.upload_locks.lock().await.remove(artifact_id.as_str());
         if let Err(error) = tokio::fs::remove_dir_all(store.staging_dir(&upload_id)).await
-            && error.kind() != std::io::ErrorKind::NotFound
+    && error.kind() != std::io::ErrorKind::NotFound
         {
-            tracing::warn!(upload_id, error = %error, "completed Artifact staging cleanup failed");
+    tracing::warn!(upload_id, error = %error, "completed Artifact staging cleanup failed");
         }
         drop(upload_guard);
         store.upload_locks.lock().await.remove(&upload_id);
         Ok(ArtifactRef {
-            id: artifact_id,
-            mime_type: row.mime_type,
-            size: total_size,
+    id: artifact_id,
+    mime_type: row.mime_type,
+    size: total_size,
         })
         }).await
     }
@@ -853,8 +854,8 @@ impl ArtifactStore for LocalArtifactStore {
             ArtifactDatabase::Sqlite(pool) => {
                 sqlx::query_as(
                     "SELECT a.id, a.state, u.id FROM artifacts a \
-                     LEFT JOIN artifact_uploads u ON u.artifact_id = a.id \
-                     WHERE a.expires_at <= ? AND (a.state='ready' OR u.id IS NULL)",
+     LEFT JOIN artifact_uploads u ON u.artifact_id = a.id \
+     WHERE a.expires_at <= ? AND (a.state='ready' OR u.id IS NULL)",
                 )
                 .bind(now)
                 .fetch_all(pool)
@@ -863,8 +864,8 @@ impl ArtifactStore for LocalArtifactStore {
             ArtifactDatabase::Postgres(pool) => {
                 sqlx::query_as(
                     "SELECT a.id, a.state, u.id FROM artifacts a \
-                     LEFT JOIN artifact_uploads u ON u.artifact_id = a.id \
-                     WHERE a.expires_at <= $1 AND (a.state='ready' OR u.id IS NULL)",
+     LEFT JOIN artifact_uploads u ON u.artifact_id = a.id \
+     WHERE a.expires_at <= $1 AND (a.state='ready' OR u.id IS NULL)",
                 )
                 .bind(now)
                 .fetch_all(pool)
@@ -959,31 +960,31 @@ impl LocalArtifactStore {
         let pool = pool.clone();
         let artifact_id = artifact_id.to_owned();
         Self::complete_guarded(async move {
-            let _lock = lock;
-                let location = store.object_location(&artifact_id).await?;
-                let eligible: bool = sqlx::query_scalar(
-                    "SELECT EXISTS(SELECT 1 FROM artifacts WHERE id = ? AND state = 'ready' AND expires_at <= ? AND NOT EXISTS (SELECT 1 FROM artifact_download_grants g WHERE g.artifact_id=artifacts.id AND g.expires_at>?))",
-                )
-                .bind(&artifact_id)
-                .bind(now)
-                .bind(now)
-                .fetch_one(&pool)
-                .await
-                .map_err(storage_error)?;
-                if !eligible {
-                    return Ok(0);
-                }
-                store.remove_object_at(&artifact_id, location, &settings).await?;
-                sqlx::query(
-                    "DELETE FROM artifacts WHERE id = ? AND state = 'ready' AND expires_at <= ? AND NOT EXISTS (SELECT 1 FROM artifact_download_grants g WHERE g.artifact_id=artifacts.id AND g.expires_at>?)",
-                )
-                .bind(&artifact_id)
-                .bind(now)
-                .bind(now)
-                .execute(&pool)
-                .await
-                .map_err(storage_error)
-                .map(|result| result.rows_affected())
+    let _lock = lock;
+        let location = store.object_location(&artifact_id).await?;
+        let eligible: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM artifacts WHERE id = ? AND state = 'ready' AND expires_at <= ? AND NOT EXISTS (SELECT 1 FROM artifact_download_grants g WHERE g.artifact_id=artifacts.id AND g.expires_at>?))",
+        )
+        .bind(&artifact_id)
+        .bind(now)
+        .bind(now)
+        .fetch_one(&pool)
+        .await
+        .map_err(storage_error)?;
+        if !eligible {
+            return Ok(0);
+        }
+        store.remove_object_at(&artifact_id, location, &settings).await?;
+        sqlx::query(
+            "DELETE FROM artifacts WHERE id = ? AND state = 'ready' AND expires_at <= ? AND NOT EXISTS (SELECT 1 FROM artifact_download_grants g WHERE g.artifact_id=artifacts.id AND g.expires_at>?)",
+        )
+        .bind(&artifact_id)
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .map_err(storage_error)
+        .map(|result| result.rows_affected())
         }).await
     }
 
@@ -1006,7 +1007,7 @@ impl LocalArtifactStore {
         }
         let location = self.object_location(artifact_id).await?;
         let claimed = sqlx::query(
-            "UPDATE artifacts SET expires_at = expires_at WHERE id = $1 AND state = 'ready' AND expires_at <= $2 AND NOT EXISTS (SELECT 1 FROM artifact_download_grants g WHERE g.artifact_id=artifacts.id AND g.expires_at>$2)",
+    "UPDATE artifacts SET expires_at = expires_at WHERE id = $1 AND state = 'ready' AND expires_at <= $2 AND NOT EXISTS (SELECT 1 FROM artifact_download_grants g WHERE g.artifact_id=artifacts.id AND g.expires_at>$2)",
         )
         .bind(artifact_id)
         .bind(now)
@@ -1020,7 +1021,7 @@ impl LocalArtifactStore {
         self.remove_object_at(artifact_id, location, &settings)
             .await?;
         let deleted = sqlx::query(
-            "DELETE FROM artifacts WHERE id = $1 AND state = 'ready' AND expires_at <= $2 AND NOT EXISTS (SELECT 1 FROM artifact_download_grants g WHERE g.artifact_id=artifacts.id AND g.expires_at>$2)",
+    "DELETE FROM artifacts WHERE id = $1 AND state = 'ready' AND expires_at <= $2 AND NOT EXISTS (SELECT 1 FROM artifact_download_grants g WHERE g.artifact_id=artifacts.id AND g.expires_at>$2)",
         )
         .bind(artifact_id)
         .bind(now)
@@ -1080,26 +1081,26 @@ impl LocalArtifactStore {
         // 先识别可复用元数据，再用不可变的相同字节修复对象，最后才延长保留期。
         // 这样对象删除后 metadata DELETE 失败/取消不会让复用暴露缺失的对象。
         let existing_expires_at: Option<i64> = match &self.database {
-            ArtifactDatabase::Sqlite(pool) => sqlx::query_scalar(
-                "SELECT expires_at FROM artifacts WHERE id = ? AND principal = ? AND mime_type = ? AND size = ? AND state = 'ready'",
-            )
-            .bind(id.as_str())
-            .bind(&upload.principal)
-            .bind(&upload.mime_type)
-            .bind(upload.declared_size)
-            .fetch_optional(pool)
-            .await
-            .map_err(storage_error)?,
-            ArtifactDatabase::Postgres(pool) => sqlx::query_scalar(
-                "SELECT expires_at FROM artifacts WHERE id = $1 AND principal = $2 AND mime_type = $3 AND size = $4 AND state = 'ready'",
-            )
-            .bind(id.as_str())
-            .bind(&upload.principal)
-            .bind(&upload.mime_type)
-            .bind(upload.declared_size)
-            .fetch_optional(pool)
-            .await
-            .map_err(storage_error)?,
+    ArtifactDatabase::Sqlite(pool) => sqlx::query_scalar(
+        "SELECT expires_at FROM artifacts WHERE id = ? AND principal = ? AND mime_type = ? AND size = ? AND state = 'ready'",
+    )
+    .bind(id.as_str())
+    .bind(&upload.principal)
+    .bind(&upload.mime_type)
+    .bind(upload.declared_size)
+    .fetch_optional(pool)
+    .await
+    .map_err(storage_error)?,
+    ArtifactDatabase::Postgres(pool) => sqlx::query_scalar(
+        "SELECT expires_at FROM artifacts WHERE id = $1 AND principal = $2 AND mime_type = $3 AND size = $4 AND state = 'ready'",
+    )
+    .bind(id.as_str())
+    .bind(&upload.principal)
+    .bind(&upload.mime_type)
+    .bind(upload.declared_size)
+    .fetch_optional(pool)
+    .await
+    .map_err(storage_error)?,
         };
         let Some(existing_expires_at) = existing_expires_at else {
             return Ok(false);
@@ -1180,7 +1181,7 @@ impl LocalArtifactStore {
         let affected = match &self.database {
             ArtifactDatabase::Sqlite(pool) => sqlx::query(
                 "UPDATE artifacts SET expires_at = MAX(expires_at, ?) \
-                 WHERE id = ? AND principal = ? AND mime_type = ? AND size = ? AND state = 'ready'",
+         WHERE id = ? AND principal = ? AND mime_type = ? AND size = ? AND state = 'ready'",
             )
             .bind(upload.artifact_expires_at)
             .bind(id.as_str())
@@ -1193,7 +1194,7 @@ impl LocalArtifactStore {
             .rows_affected(),
             ArtifactDatabase::Postgres(pool) => sqlx::query(
                 "UPDATE artifacts SET expires_at = GREATEST(expires_at, $1) \
-                 WHERE id = $2 AND principal = $3 AND mime_type = $4 AND size = $5 AND state = 'ready'",
+         WHERE id = $2 AND principal = $3 AND mime_type = $4 AND size = $5 AND state = 'ready'",
             )
             .bind(upload.artifact_expires_at)
             .bind(id.as_str())
@@ -1218,17 +1219,17 @@ impl LocalArtifactStore {
                 let mut transaction = pool.begin().await.map_err(storage_error)?;
                 sqlx::query(
                     "INSERT INTO artifacts \
-                     (id, principal, mime_type, size, backend_key, state, expires_at, created_at, \
-                      storage_backend, storage_endpoint, storage_bucket) \
-                     SELECT ?, principal, mime_type, size, backend_key, 'ready', expires_at, created_at, \
-                            storage_backend, storage_endpoint, storage_bucket \
-                     FROM artifacts WHERE id = ? AND state = 'staging'",
+             (id, principal, mime_type, size, backend_key, state, expires_at, created_at, \
+              storage_backend, storage_endpoint, storage_bucket) \
+             SELECT ?, principal, mime_type, size, backend_key, 'ready', expires_at, created_at, \
+                    storage_backend, storage_endpoint, storage_bucket \
+             FROM artifacts WHERE id = ? AND state = 'staging'",
                 )
-                    .bind(artifact_id.as_str())
-                    .bind(staging_id)
-                    .execute(&mut *transaction)
-                    .await
-                    .map_err(storage_error)?;
+                .bind(artifact_id.as_str())
+                .bind(staging_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(storage_error)?;
                 sqlx::query("DELETE FROM artifacts WHERE id = ? AND state = 'staging'")
                     .bind(staging_id)
                     .execute(&mut *transaction)
@@ -1240,17 +1241,17 @@ impl LocalArtifactStore {
                 let mut transaction = pool.begin().await.map_err(storage_error)?;
                 sqlx::query(
                     "INSERT INTO artifacts \
-                     (id, principal, mime_type, size, backend_key, state, expires_at, created_at, \
-                      storage_backend, storage_endpoint, storage_bucket) \
-                     SELECT $1, principal, mime_type, size, backend_key, 'ready', expires_at, created_at, \
-                            storage_backend, storage_endpoint, storage_bucket \
-                     FROM artifacts WHERE id = $2 AND state = 'staging'",
+             (id, principal, mime_type, size, backend_key, state, expires_at, created_at, \
+              storage_backend, storage_endpoint, storage_bucket) \
+             SELECT $1, principal, mime_type, size, backend_key, 'ready', expires_at, created_at, \
+                    storage_backend, storage_endpoint, storage_bucket \
+             FROM artifacts WHERE id = $2 AND state = 'staging'",
                 )
-                    .bind(artifact_id.as_str())
-                    .bind(staging_id)
-                    .execute(&mut *transaction)
-                    .await
-                    .map_err(storage_error)?;
+                .bind(artifact_id.as_str())
+                .bind(staging_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(storage_error)?;
                 sqlx::query("DELETE FROM artifacts WHERE id = $1 AND state = 'staging'")
                     .bind(staging_id)
                     .execute(&mut *transaction)
@@ -1351,42 +1352,42 @@ impl LocalArtifactStore {
                 let store = self.clone();
                 let ids: Vec<_> = ids.into_iter().cloned().collect();
                 Self::complete_guarded(async move {
-                let _guards = guards;
-                let mut transaction = pool.begin().await.map_err(storage_error)?;
-                for id in &ids {
-                    let rows_affected = sqlx::query(
-                        "UPDATE artifacts SET expires_at = MAX(expires_at, ?) WHERE id = ? AND principal = ? AND state = 'ready' AND expires_at > ?",
-                    )
-                    .bind(extension)
-                    .bind(id.as_str())
-                    .bind(&principal_key)
-                    .bind(store.now())
-                    .execute(&mut *transaction)
-                    .await
-                    .map_err(storage_error)?
-                    .rows_affected();
-                    if rows_affected == 0 {
-                        return Err(ArtifactError::NotFound);
-                    }
-                }
-                transaction.commit().await.map_err(storage_error)?;
-                Ok(())
-                }).await?;
+        let _guards = guards;
+        let mut transaction = pool.begin().await.map_err(storage_error)?;
+        for id in &ids {
+            let rows_affected = sqlx::query(
+                "UPDATE artifacts SET expires_at = MAX(expires_at, ?) WHERE id = ? AND principal = ? AND state = 'ready' AND expires_at > ?",
+            )
+            .bind(extension)
+            .bind(id.as_str())
+            .bind(&principal_key)
+            .bind(store.now())
+            .execute(&mut *transaction)
+            .await
+            .map_err(storage_error)?
+            .rows_affected();
+            if rows_affected == 0 {
+                return Err(ArtifactError::NotFound);
+            }
+        }
+        transaction.commit().await.map_err(storage_error)?;
+        Ok(())
+        }).await?;
             }
             ArtifactDatabase::Postgres(pool) => {
                 let mut transaction = pool.begin().await.map_err(storage_error)?;
                 for id in &ids {
                     let rows_affected = sqlx::query(
-                        "UPDATE artifacts SET expires_at = GREATEST(expires_at, $1) WHERE id = $2 AND principal = $3 AND state = 'ready' AND expires_at > $4",
-                    )
-                    .bind(extension)
-                    .bind(id.as_str())
-                    .bind(&principal_key)
-                    .bind(self.now())
-                    .execute(&mut *transaction)
-                    .await
-                    .map_err(storage_error)?
-                    .rows_affected();
+                "UPDATE artifacts SET expires_at = GREATEST(expires_at, $1) WHERE id = $2 AND principal = $3 AND state = 'ready' AND expires_at > $4",
+            )
+            .bind(extension)
+            .bind(id.as_str())
+            .bind(&principal_key)
+            .bind(self.now())
+            .execute(&mut *transaction)
+            .await
+            .map_err(storage_error)?
+            .rows_affected();
                     if rows_affected == 0 {
                         return Err(ArtifactError::NotFound);
                     }
@@ -1424,6 +1425,6 @@ fn hex_bytes(bytes: &[u8]) -> String {
     output
 }
 
-fn storage_error(error: impl std::fmt::Display) -> ArtifactError {
+fn storage_error(error: impl std::error::Error + 'static) -> ArtifactError {
     ArtifactError::Storage(error.to_string())
 }

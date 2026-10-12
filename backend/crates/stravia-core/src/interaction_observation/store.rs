@@ -982,6 +982,17 @@ impl ObservationStore {
         events: &[(RunEvent, Option<String>, i64)],
         expires_at: i64,
     ) -> anyhow::Result<Vec<ObservationEvent>> {
+        #[cfg(feature = "test-support")]
+        crate::storage_test_faults::inject_io("observation")?;
+        #[cfg(feature = "test-support")]
+        match self {
+            Self::Sqlite(_, _, _) => {
+                crate::storage_test_faults::inject_sqlite("observation").await?
+            }
+            Self::Postgres(pool, _) => {
+                crate::storage_test_faults::inject_postgres(pool, "observation").await?;
+            }
+        }
         let mut prepared = Vec::with_capacity(events.len());
         for (run_event, block_id, now) in events {
             let now = *now;
@@ -1825,6 +1836,17 @@ impl ObservationStore {
 
     #[tracing::instrument(target = "stravia::perf", name = "observation.writer.reject", skip_all)]
     pub async fn reject(&self, rejection: Rejection<'_>) -> anyhow::Result<ObservationEvent> {
+        #[cfg(feature = "test-support")]
+        crate::storage_test_faults::inject_io("observation")?;
+        #[cfg(feature = "test-support")]
+        match self {
+            Self::Sqlite(_, _, _) => {
+                crate::storage_test_faults::inject_sqlite("observation").await?
+            }
+            Self::Postgres(pool, _) => {
+                crate::storage_test_faults::inject_postgres(pool, "observation").await?;
+            }
+        }
         let Rejection {
             ingress,
             outcome,
@@ -2522,7 +2544,7 @@ async fn usage_sqlite(
     u: &ConfirmedUsage,
     seq: i64,
 ) -> anyhow::Result<()> {
-    let changed=sqlx::query("UPDATE target_attempt_observations SET input_tokens=?,output_tokens=?,cache_read_tokens=?,cache_write_tokens=?,reasoning_tokens=?,usage_recorded=1,last_event_sequence=? WHERE id=? AND usage_recorded=0").bind(u.input_tokens).bind(u.output_tokens).bind(u.cache_read_tokens).bind(u.cache_write_tokens).bind(u.reasoning_tokens).bind(seq).bind(aid).execute(&mut **tx).await?.rows_affected();
+    let changed=sqlx::query("UPDATE target_attempt_observations SET input_tokens=COALESCE(?,input_tokens),output_tokens=COALESCE(?,output_tokens),cache_read_tokens=COALESCE(?,cache_read_tokens),cache_write_tokens=COALESCE(?,cache_write_tokens),reasoning_tokens=COALESCE(?,reasoning_tokens),usage_recorded=1,last_event_sequence=? WHERE id=?").bind(u.input_tokens).bind(u.output_tokens).bind(u.cache_read_tokens).bind(u.cache_write_tokens).bind(u.reasoning_tokens).bind(seq).bind(aid).execute(&mut **tx).await?.rows_affected();
     if changed > 0 {
         sqlx::query("UPDATE model_turn_observations SET (input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,reasoning_tokens)=(SELECT SUM(input_tokens),SUM(output_tokens),SUM(cache_read_tokens),SUM(cache_write_tokens),SUM(reasoning_tokens) FROM target_attempt_observations WHERE model_turn_id=model_turn_observations.id) WHERE id=(SELECT model_turn_id FROM target_attempt_observations WHERE id=?)").bind(aid).execute(&mut **tx).await?;
         recompute_usage_sqlite(tx, iid).await?;
@@ -2536,7 +2558,7 @@ async fn usage_postgres(
     u: &ConfirmedUsage,
     seq: i64,
 ) -> anyhow::Result<()> {
-    let changed=sqlx::query("UPDATE target_attempt_observations SET input_tokens=$1,output_tokens=$2,cache_read_tokens=$3,cache_write_tokens=$4,reasoning_tokens=$5,usage_recorded=TRUE,last_event_sequence=$6 WHERE id=$7 AND usage_recorded=FALSE").bind(u.input_tokens).bind(u.output_tokens).bind(u.cache_read_tokens).bind(u.cache_write_tokens).bind(u.reasoning_tokens).bind(seq).bind(aid).execute(&mut **tx).await?.rows_affected();
+    let changed=sqlx::query("UPDATE target_attempt_observations SET input_tokens=COALESCE($1,input_tokens),output_tokens=COALESCE($2,output_tokens),cache_read_tokens=COALESCE($3,cache_read_tokens),cache_write_tokens=COALESCE($4,cache_write_tokens),reasoning_tokens=COALESCE($5,reasoning_tokens),usage_recorded=TRUE,last_event_sequence=$6 WHERE id=$7").bind(u.input_tokens).bind(u.output_tokens).bind(u.cache_read_tokens).bind(u.cache_write_tokens).bind(u.reasoning_tokens).bind(seq).bind(aid).execute(&mut **tx).await?.rows_affected();
     if changed > 0 {
         sqlx::query("UPDATE model_turn_observations SET (input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,reasoning_tokens)=(SELECT SUM(input_tokens),SUM(output_tokens),SUM(cache_read_tokens),SUM(cache_write_tokens),SUM(reasoning_tokens) FROM target_attempt_observations WHERE model_turn_id=(SELECT model_turn_id FROM target_attempt_observations WHERE id=$1)) WHERE id=(SELECT model_turn_id FROM target_attempt_observations WHERE id=$1)").bind(aid).execute(&mut **tx).await?;
         recompute_usage_postgres(tx, iid).await?;
@@ -2834,11 +2856,13 @@ mod tests {
                         model_turn_id: run.into(),
                         attempt_id: run.into(),
                         usage: ConfirmedUsage {
-                            input_tokens: Some(1000),
-                            output_tokens: Some(1000),
-                            cache_read_tokens: Some(1000),
-                            cache_write_tokens: Some(1000),
-                            reasoning_tokens: Some(1000),
+                            // An identical confirmation is idempotent; changed confirmations
+                            // are revisions (covered by durable_usage_revisions_replace_contributions_and_reclaim_work).
+                            input_tokens: input,
+                            output_tokens: output,
+                            cache_read_tokens: cache,
+                            cache_write_tokens: None,
+                            reasoning_tokens: None,
                             coverage: None,
                         },
                     },
@@ -3120,6 +3144,68 @@ mod tests {
                 .input_tokens,
             Some(7)
         );
+        pool.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn durable_usage_revisions_replace_contributions_and_reclaim_work() -> anyhow::Result<()>
+    {
+        let directory = tempfile::tempdir()?;
+        let pool = crate::db::init_pool(directory.path()).await?;
+        crate::migrations::migrate_sqlite(&pool, None).await?;
+        let store = ObservationStore::Sqlite(
+            pool.clone(),
+            Arc::new(DebugTraceIndex::empty(std::path::Path::new("."))),
+            Arc::new(tokio::sync::Mutex::new(())),
+        );
+        confirmed_usage_scenario(&store).await?;
+        let totals = |pool: SqlitePool| async move {
+            sqlx::query_as::<_, (i64, i64, i64)>(
+                "SELECT SUM(request_count), SUM(input_tokens_sum), SUM(output_tokens_sum) FROM stats_usage_buckets WHERE scope='global'",
+            ).fetch_one(&pool).await
+        };
+        assert_eq!(totals(pool.clone()).await?, (1, 7, 6));
+        let revision = RunEvent::UsageConfirmed {
+            model_turn_id: "partial-usage".into(),
+            attempt_id: "partial-usage-reported".into(),
+            usage: ConfirmedUsage {
+                input_tokens: Some(15),
+                output_tokens: Some(0),
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+                reasoning_tokens: None,
+                coverage: None,
+            },
+        };
+        for timestamp in [8, 9] {
+            store
+                .persist_run_event(
+                    "partial-usage",
+                    "partial-usage",
+                    &revision,
+                    timestamp,
+                    i64::MAX,
+                )
+                .await?;
+        }
+        assert_eq!(totals(pool.clone()).await?, (1, 10, 3));
+        // A transaction interrupted before commit cannot leak a revised contribution.
+        let mut tx = pool.begin().await?;
+        sqlx::query("UPDATE target_attempt_observations SET output_tokens=999 WHERE id='partial-usage-reported'")
+            .execute(&mut *tx).await?;
+        tx.rollback().await?;
+        assert_eq!(totals(pool.clone()).await?, (1, 10, 3));
+        sqlx::query("DELETE FROM interaction_observations WHERE id='partial-usage'")
+            .execute(&pool)
+            .await?;
+        assert_eq!(totals(pool.clone()).await?, (1, 10, 3));
+        let checkpoints: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM stats_usage_checkpoints")
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(checkpoints, 0);
+        crate::migrations::migrate_sqlite(&pool, None).await?;
+        assert_eq!(totals(pool.clone()).await?, (1, 10, 3));
         pool.close().await;
         Ok(())
     }

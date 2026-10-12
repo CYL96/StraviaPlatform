@@ -19,26 +19,26 @@ pub(super) struct SqliteWebProviderStore {
 impl WebProviderStore for SqliteWebProviderStore {
     async fn list(&self) -> anyhow::Result<Vec<WebProvider>> {
         Ok(sqlx::query_as::<_, WebProvider>(
-            "SELECT id, name, kind, api_key, use_proxy, local_engines, last_test_success, last_test_at, created_at, updated_at FROM web_providers ORDER BY created_at DESC",
-        )
-        .fetch_all(&self.pool)
-        .await?)
+    "SELECT id, name, kind, api_key, use_proxy, local_engines, last_test_success, last_test_at, created_at, updated_at FROM web_providers ORDER BY created_at DESC",
+            )
+            .fetch_all(&self.pool)
+            .await?)
     }
 
     async fn get(&self, id: &str) -> anyhow::Result<Option<WebProvider>> {
         Ok(sqlx::query_as::<_, WebProvider>(
-            "SELECT id, name, kind, api_key, use_proxy, local_engines, last_test_success, last_test_at, created_at, updated_at FROM web_providers WHERE id = ?",
-        )
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await?)
+    "SELECT id, name, kind, api_key, use_proxy, local_engines, last_test_success, last_test_at, created_at, updated_at FROM web_providers WHERE id = ?",
+            )
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?)
     }
 
     async fn create(&self, input: CreateWebProvider) -> anyhow::Result<WebProvider> {
         let id = stravia_runtime_contract::identifier::new_id();
         sqlx::query(
             "INSERT INTO web_providers (id, name, kind, api_key, use_proxy, local_engines)
-             VALUES (?, ?, ?, ?, ?, ?)",
+     VALUES (?, ?, ?, ?, ?, ?)",
         )
         .bind(&id)
         .bind(input.name.trim())
@@ -70,8 +70,8 @@ impl WebProviderStore for SqliteWebProviderStore {
         };
         sqlx::query(
             "UPDATE web_providers
-             SET name = ?, api_key = ?, use_proxy = ?, local_engines = ?, updated_at = datetime('now')
-             WHERE id = ?",
+     SET name = ?, api_key = ?, use_proxy = ?, local_engines = ?, updated_at = datetime('now')
+     WHERE id = ?",
         )
         .bind(name.trim())
         .bind(api_key)
@@ -100,18 +100,18 @@ impl WebProviderStore for SqliteWebProviderStore {
             let Some(current) = current else { continue };
             let pruned = sqlx::query_scalar::<_, String>(
                 "SELECT CASE
-                    WHEN json_valid(?) THEN COALESCE(
-                        (SELECT json_group_array(ordered.value)
-                           FROM (
-                               SELECT entry.value AS value
-                                 FROM json_each(?) AS entry
-                                WHERE entry.value <> ?
-                                ORDER BY CAST(entry.key AS INTEGER)
-                           ) AS ordered),
-                        '[]'
-                    )
-                    ELSE '[]'
-                END",
+            WHEN json_valid(?) THEN COALESCE(
+                (SELECT json_group_array(ordered.value)
+                   FROM (
+                       SELECT entry.value AS value
+                         FROM json_each(?) AS entry
+                        WHERE entry.value <> ?
+                        ORDER BY CAST(entry.key AS INTEGER)
+                   ) AS ordered),
+                '[]'
+            )
+            ELSE '[]'
+        END",
             )
             .bind(&current)
             .bind(&current)
@@ -133,12 +133,12 @@ impl WebProviderStore for SqliteWebProviderStore {
     async fn exists_by_name(&self, name: &str, exclude_id: Option<&str>) -> anyhow::Result<bool> {
         let id = if let Some(exclude_id) = exclude_id {
             sqlx::query_scalar::<_, String>(
-                "SELECT id FROM web_providers WHERE lower(trim(name)) = lower(trim(?)) AND id != ? LIMIT 1",
-            )
-            .bind(name)
-            .bind(exclude_id)
-            .fetch_optional(&self.pool)
-            .await?
+        "SELECT id FROM web_providers WHERE lower(trim(name)) = lower(trim(?)) AND id != ? LIMIT 1",
+                    )
+                    .bind(name)
+                    .bind(exclude_id)
+                    .fetch_optional(&self.pool)
+                    .await?
         } else {
             sqlx::query_scalar::<_, String>(
                 "SELECT id FROM web_providers WHERE lower(trim(name)) = lower(trim(?)) LIMIT 1",
@@ -156,13 +156,13 @@ impl WebProviderStore for SqliteWebProviderStore {
         result: ProviderTestResult,
     ) -> anyhow::Result<()> {
         sqlx::query(
-            "UPDATE web_providers SET last_test_success = ?, last_test_at = ?, updated_at = datetime('now') WHERE id = ?",
-        )
-        .bind(result.success)
-        .bind(result.tested_at)
-        .bind(provider_id)
-        .execute(&self.pool)
-        .await?;
+    "UPDATE web_providers SET last_test_success = ?, last_test_at = ?, updated_at = datetime('now') WHERE id = ?",
+            )
+            .bind(result.success)
+            .bind(result.tested_at)
+            .bind(provider_id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -196,10 +196,10 @@ impl WebProviderStore for SqliteWebProviderStore {
         .fetch_all(&mut *tx)
         .await?;
         let web_providers = sqlx::query_as::<_, WebProvider>(
-            "SELECT id, name, kind, api_key, use_proxy, local_engines, last_test_success, last_test_at, created_at, updated_at FROM web_providers ORDER BY created_at DESC",
-        )
-        .fetch_all(&mut *tx)
-        .await?;
+    "SELECT id, name, kind, api_key, use_proxy, local_engines, last_test_success, last_test_at, created_at, updated_at FROM web_providers ORDER BY created_at DESC",
+            )
+            .fetch_all(&mut *tx)
+            .await?;
         let api_key_permissions =
             sqlx::query_scalar::<_, bool>("SELECT is_enabled FROM api_keys WHERE id = ?")
                 .bind(api_key_id)

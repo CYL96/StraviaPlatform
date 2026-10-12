@@ -4,9 +4,9 @@ status: accepted
 
 # 精简 Interaction Observation 事件并把 Debug manifest 移出数据库
 
-Interaction Observation 只持久化无法由其他来源给出的事实；Debug Trace 的全部状态元数据移出数据库。本决定部分取代 [ADR-0060](0060-own-interaction-observation-outside-generation-chain.md) 中「数据库只保存 manifest 与索引」的约定，并落地 [ADR-0062](0062-persist-diagnostic-content-at-canonical-item-boundaries.md) 的 Canonical Item 收口持久化；ADR-0060 关于 Observation 所有权、Generation Chain 隔离、保留期与「观察失败不影响推理」的决策不变。
+Interaction Observation 只持久化无法由其他来源给出的事实；Debug Trace 的全部状态元数据移出数据库。本决定部分取代 [ADR-0060](0060-own-interaction-observation-outside-generation-chain.md) 中「数据库只保存 manifest 与索引」的约定，并落地 [ADR-0062](0062-persist-diagnostic-content-at-canonical-item-boundaries.md) 的 Canonical Item 收口持久化；ADR-0060 关于 Observation 所有权、Generation Chain 隔离、保留期与「观测缺口不影响推理」的决策不变；存储失败按本次用户直接修订的 ADR-0060 只影响所属请求或任务，不终止实例。
 
-每条 Trace 的 manifest 改为 `data_dir/diagnostics/observation-debug/<trace_id>/manifest.json`，trace_id 即目录名；写入使用临时文件加 rename 原子替换，节奏沿用既有维护周期并在准入与 finish 时写盘。文件以 `FileTraceManifest` 扁平化保存 `TraceManifest` 的公开字段（包括 `schema_version: 2`、`trace_id`、`enabled`、`status`、`reasons`、`bytes_written`、`event_count`），加上 `run_id`/`rejection_id`、`relative_directory`、`created_at`、`completed_at`、`expires_at`、`tombstoned`；不构造独立 `owner` 包装，不保存绝对路径或下载凭据。进程内 `DebugTraceIndex` 在启动时扫描受管目录建立索引、由 Trace writer 增量更新；详情的 `debug_status`/`trace`、失败请求列表的 `debug_status` 与 Bundle 的 `runs[]` 改读索引，公开 API 结构不变。Run 终态事件提交并广播之前，`manifest.json` 必须已写入终态，使收到 `run_finished` 后重新拉取的详情能看到最终状态。索引与 Trace 文件一样只在持有它们的 Gateway 实例可见；这延续 ADR-0060 的单实例承诺，多实例下 Debug 状态只在拥有该 Trace 文件的实例上可见。
+每条 Trace 的 manifest 改为 `data_dir/diagnostics/observation-debug/<trace_id>/manifest.json`，trace_id 即目录名；写入使用临时文件加 rename 原子替换，节奏沿用既有维护周期并在准入与 finish 时写盘。文件以 `FileTraceManifest` 扁平化保存 `TraceManifest` 的公开字段（包括 `schema_version: 2`、`trace_id`、`enabled`、`status`、`reasons`、`bytes_written`、`event_count`），加上 `run_id`/`rejection_id`、`relative_directory`、`created_at`、`completed_at`、`expires_at`、`tombstoned`；不构造独立 `owner` 包装，不保存绝对路径或下载凭据。进程内 `DebugTraceIndex` 在启动时扫描受管目录建立索引、由 Trace writer 增量更新；详情的 `debug_status`/`trace`、失败请求列表的 `debug_status` 与 Bundle 的 `runs[]` 改读索引，公开 API 结构不变。成功路径中，Run 终态事件提交并广播之前，`manifest.json` 必须已写入终态，使收到 `run_finished` 后重新拉取的详情能看到最终状态；manifest 写入失败（包括容量耗尽）按 ADR-0060 归所属诊断任务并保留 gap/partial，不阻塞推理收口、不取消无关请求，也不伪称文件已持久化。索引与 Trace 文件一样只在持有它们的 Gateway 实例可见；这延续 ADR-0060 的单实例承诺，多实例下 Debug 状态只在拥有该 Trace 文件的实例上可见。
 
 生命周期与删除改为纯文件语义：sweep 对已完成且 owner 可回收的 Trace 直接按持久化的 `expires_at` 删除过期目录，不以运行时长重算期限；启动恢复保留既有完成时间与过期时间。运行时扫描遇到单个损坏、不可读、符号链接或目录身份不符的 manifest 时仅记录不含内容或路径的警告并跳过，不覆盖该文件，也不阻止其他 Trace 查询及新捕获；受管根目录不可用仍显式失败。升级导出对已有文件的严格校验不变。「清除 Debug 数据」删除全部目录并清空索引；「清除历史记录」在 purge 之后删除 owner 已不存在的目录；中断的删除先改名为 `.deleting-*` 再由启动补完，没有 manifest 的孤儿目录照旧回收。随之删除 `debug_trace_manifests` 表及其索引与守卫、`trace_manifest_updated` 事件（含历史行），以及只写不读的 `rejected_request_observations.debug_status` 列；`debug_enabled` 保留，它是准入时的开关快照而非 Debug 内容。
 
@@ -42,7 +42,7 @@ ForestQuery 增加可选且默认关闭的 `live_window`；实时 forest/changes
 
 Workspace 最多合并等待 100ms，`StreamingMarkdown` 最多追赶 300ms，与后端 100ms 共用最多 500ms 主动调度等待预算；外部 I/O、计算和实际渲染服务时间另测，不宣称端到端 500ms。首尾立即，历史/重连快照、替换、终态与 reduced-motion 直接显示已收到内容。动画只覆盖选中正文、展开 Thinking 与复用同一订阅的选中卡片输出。
 
-差量基线包含成员水位、matched 与 Debug 状态；必须更新受 root 筛选影响的兄弟状态，区分删除、筛选退出和时间窗迁移，不重发未变化兄弟。无法证明差量或重放完整时显式 reset 并重建权威视图。请求在途变化、查询失败的待处理状态与可见恢复、selection epoch、分页和历史迁出遵循 [观测设计 §9–10](../design/interaction-observation.md)。批量 Debug 判定仍读本实例文件索引，不变成共享事实或 TTL 缓存。此次补充不新增依赖或 schema，不改变认证、脱敏、Wire Capture、Bundle、Confirmed Upstream Usage、失败分类、单实例范围或「观察失败不影响推理」。
+差量基线包含成员水位、matched 与 Debug 状态；必须更新受 root 筛选影响的兄弟状态，区分删除、筛选退出和时间窗迁移，不重发未变化兄弟。无法证明差量或重放完整时显式 reset 并重建权威视图。请求在途变化、查询失败的待处理状态与可见恢复、selection epoch、分页和历史迁出遵循 [观测设计 §9–10](../design/interaction-observation.md)。批量 Debug 判定仍读本实例文件索引，不变成共享事实或 TTL 缓存。此次补充不新增依赖或 schema，不改变认证、脱敏、Wire Capture、Bundle、Confirmed Upstream Usage、失败分类、单实例范围或「普通观测缺口不影响推理，存储容量耗尽按 ADR-0060 终止实例」。
 
 ## Considered options
 

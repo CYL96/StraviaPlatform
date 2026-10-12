@@ -9,10 +9,10 @@ pub(super) struct SqliteApiKeyStore {
 impl ApiKeyStore for SqliteApiKeyStore {
     async fn list(&self) -> anyhow::Result<Vec<ApiKeyWithBindings>> {
         let rows = sqlx::query_as::<_, ApiKey>(
-            "SELECT id, token, name, rpm_limit, is_enabled, mcp_access_enabled, transparent_injection_enabled, inject_media_understanding, inject_web_search, inject_media_generation, expires_at, created_at, updated_at FROM api_keys ORDER BY created_at DESC",
-        )
-        .fetch_all(&self.pool)
-        .await?;
+    "SELECT id, token, name, rpm_limit, is_enabled, mcp_access_enabled, transparent_injection_enabled, inject_media_understanding, inject_web_search, inject_media_generation, expires_at, created_at, updated_at FROM api_keys ORDER BY created_at DESC",
+            )
+            .fetch_all(&self.pool)
+            .await?;
 
         let mut items = Vec::with_capacity(rows.len());
         for row in rows {
@@ -39,11 +39,11 @@ impl ApiKeyStore for SqliteApiKeyStore {
 
     async fn get(&self, id: &str) -> anyhow::Result<Option<ApiKeyWithBindings>> {
         let row = sqlx::query_as::<_, ApiKey>(
-            "SELECT id, token, name, rpm_limit, is_enabled, mcp_access_enabled, transparent_injection_enabled, inject_media_understanding, inject_web_search, inject_media_generation, expires_at, created_at, updated_at FROM api_keys WHERE id = ?",
-        )
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await?;
+    "SELECT id, token, name, rpm_limit, is_enabled, mcp_access_enabled, transparent_injection_enabled, inject_media_understanding, inject_web_search, inject_media_generation, expires_at, created_at, updated_at FROM api_keys WHERE id = ?",
+            )
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
 
         let Some(row) = row else {
             return Ok(None);
@@ -73,20 +73,20 @@ impl ApiKeyStore for SqliteApiKeyStore {
             .key
             .unwrap_or_else(|| format!("sk-{}", uuid::Uuid::new_v4().simple()));
         sqlx::query(
-            "INSERT INTO api_keys (id, token, name, rpm_limit, mcp_access_enabled, transparent_injection_enabled, inject_media_understanding, inject_web_search, inject_media_generation, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&id)
-        .bind(&key)
-        .bind(input.name.trim())
-        .bind(input.rpm_limit)
-        .bind(input.mcp_access_enabled)
-        .bind(input.transparent_injection_enabled)
-        .bind(input.inject_media_understanding)
-        .bind(input.inject_web_search)
-        .bind(input.inject_media_generation)
-        .bind(input.expires_at.as_ref().map(|v| v.trim()).filter(|v| !v.is_empty()))
-        .execute(&self.pool)
-        .await?;
+    "INSERT INTO api_keys (id, token, name, rpm_limit, mcp_access_enabled, transparent_injection_enabled, inject_media_understanding, inject_web_search, inject_media_generation, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&id)
+            .bind(&key)
+            .bind(input.name.trim())
+            .bind(input.rpm_limit)
+            .bind(input.mcp_access_enabled)
+            .bind(input.transparent_injection_enabled)
+            .bind(input.inject_media_understanding)
+            .bind(input.inject_web_search)
+            .bind(input.inject_media_generation)
+            .bind(input.expires_at.as_ref().map(|v| v.trim()).filter(|v| !v.is_empty()))
+            .execute(&self.pool)
+            .await?;
 
         replace_api_key_models(&self.pool, &id, &input.model_ids).await?;
         self.get(&id).await?.context("api key missing after create")
@@ -94,12 +94,12 @@ impl ApiKeyStore for SqliteApiKeyStore {
 
     async fn update(&self, id: &str, input: UpdateApiKey) -> anyhow::Result<ApiKeyWithBindings> {
         let current = sqlx::query_as::<_, ApiKey>(
-            "SELECT id, token, name, rpm_limit, is_enabled, mcp_access_enabled, transparent_injection_enabled, inject_media_understanding, inject_web_search, inject_media_generation, expires_at, created_at, updated_at FROM api_keys WHERE id = ?",
-        )
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await?
-        .context("api key not found for update")?;
+    "SELECT id, token, name, rpm_limit, is_enabled, mcp_access_enabled, transparent_injection_enabled, inject_media_understanding, inject_web_search, inject_media_generation, expires_at, created_at, updated_at FROM api_keys WHERE id = ?",
+            )
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?
+            .context("api key not found for update")?;
 
         let name = input.name.unwrap_or(current.name);
         let key = input.key.unwrap_or(current.token);
@@ -121,21 +121,21 @@ impl ApiKeyStore for SqliteApiKeyStore {
         let expires_at = input.expires_at.or(current.expires_at);
 
         sqlx::query(
-            "UPDATE api_keys SET token=?, name=?, rpm_limit=?, is_enabled=?, mcp_access_enabled=?, transparent_injection_enabled=?, inject_media_understanding=?, inject_web_search=?, inject_media_generation=?, expires_at=?, updated_at=datetime('now') WHERE id=?",
-        )
-        .bind(key)
-        .bind(name.trim())
-        .bind(rpm_limit)
-        .bind(is_enabled)
-        .bind(mcp_access_enabled)
-        .bind(transparent_injection_enabled)
-        .bind(inject_media_understanding)
-        .bind(inject_web_search)
-        .bind(inject_media_generation)
-        .bind(expires_at.as_ref().map(|v| v.trim()).filter(|v| !v.is_empty()))
-        .bind(id)
-        .execute(&self.pool)
-        .await?;
+    "UPDATE api_keys SET token=?, name=?, rpm_limit=?, is_enabled=?, mcp_access_enabled=?, transparent_injection_enabled=?, inject_media_understanding=?, inject_web_search=?, inject_media_generation=?, expires_at=?, updated_at=datetime('now') WHERE id=?",
+            )
+            .bind(key)
+            .bind(name.trim())
+            .bind(rpm_limit)
+            .bind(is_enabled)
+            .bind(mcp_access_enabled)
+            .bind(transparent_injection_enabled)
+            .bind(inject_media_understanding)
+            .bind(inject_web_search)
+            .bind(inject_media_generation)
+            .bind(expires_at.as_ref().map(|v| v.trim()).filter(|v| !v.is_empty()))
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
 
         if let Some(model_ids) = input.model_ids {
             replace_api_key_models(&self.pool, id, &model_ids).await?;
@@ -202,22 +202,22 @@ pub(super) struct SqliteAuthAccessStore {
 impl AuthAccessStore for SqliteAuthAccessStore {
     async fn find_api_key(&self, raw_key: &str) -> anyhow::Result<Option<ApiKeyAccessRecord>> {
         let row = sqlx::query_as::<
-            _,
-            (
-                String,
-                String,
-                bool,
-                Option<String>,
-                Option<i32>,
-                bool,
-                bool,
-                bool,
-                bool,
-            ),
-        >("SELECT id, name, is_enabled, expires_at, rpm_limit, transparent_injection_enabled, inject_media_understanding, inject_web_search, inject_media_generation FROM api_keys WHERE token = ?")
-        .bind(raw_key)
-        .fetch_optional(&self.pool)
-        .await?;
+    _,
+    (
+        String,
+        String,
+        bool,
+        Option<String>,
+        Option<i32>,
+        bool,
+        bool,
+        bool,
+        bool,
+    ),
+            >("SELECT id, name, is_enabled, expires_at, rpm_limit, transparent_injection_enabled, inject_media_understanding, inject_web_search, inject_media_generation FROM api_keys WHERE token = ?")
+            .bind(raw_key)
+            .fetch_optional(&self.pool)
+            .await?;
 
         Ok(row.map(
             |(
@@ -290,13 +290,13 @@ impl AuthAccessStore for SqliteAuthAccessStore {
     async fn model_access_allowed(&self, api_key_id: &str, model_id: &str) -> anyhow::Result<bool> {
         sqlx::query_scalar::<_, bool>(
             "SELECT
-                EXISTS (SELECT 1 FROM api_keys WHERE id = ?)
-                AND (
-                    NOT EXISTS (SELECT 1 FROM api_key_models WHERE api_key_id = ?)
-                    OR EXISTS (
-                        SELECT 1 FROM api_key_models WHERE api_key_id = ? AND model_id = ?
-                    )
-                )",
+        EXISTS (SELECT 1 FROM api_keys WHERE id = ?)
+        AND (
+            NOT EXISTS (SELECT 1 FROM api_key_models WHERE api_key_id = ?)
+            OR EXISTS (
+                SELECT 1 FROM api_key_models WHERE api_key_id = ? AND model_id = ?
+            )
+        )",
         )
         .bind(api_key_id)
         .bind(api_key_id)

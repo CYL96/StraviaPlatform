@@ -176,7 +176,94 @@ async fn responses_terminal_body_drop_preserves_observed_generation_chain() {
             .find(|event| event["type"] == "response.completed")
             .expect("completed response");
         let response_id = completed["response"]["id"].as_str().expect("response ID");
-        wait_for_observed_run_finish(&mut events).await;
+        // Query actual durable completion rather than assume a notification
+        // itself proves it; retain metadata-only evidence if the bound expires.
+        let mut observed_changes = Vec::new();
+        let mut observed_interactions = std::collections::BTreeSet::new();
+        let observed = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let event = events
+                    .next()
+                    .await
+                    .expect("Observation stream remains open");
+                let crate::interaction_observation::ObservationUpdate::Change(event) = event else {
+                    continue;
+                };
+                observed_changes.push((event.kind.clone(), event.run_id.clone()));
+                let Some(interaction_id) = event.interaction_id.as_deref() else {
+                    continue;
+                };
+                observed_interactions.insert(interaction_id.to_owned());
+                let detail = gateway
+                    .observation
+                    .get_interaction(interaction_id, Default::default())
+                    .await
+                    .expect("changed interaction query")
+                    .expect("changed interaction");
+                if detail.runs.iter().any(|run| {
+                    run.generation_node_id.as_deref() == Some(response_id)
+                        && run.status == "completed"
+                        && run.finished_at.is_some()
+                }) {
+                    break;
+                }
+            }
+        })
+        .await;
+        if observed.is_err() {
+            let mut persisted_runs = Vec::new();
+            let mut gap_categories = Vec::new();
+            for interaction_id in observed_interactions {
+                if let Ok(Some(detail)) = gateway
+                    .observation
+                    .get_interaction(&interaction_id, Default::default())
+                    .await
+                {
+                    for run in detail.runs {
+                        for event in &run.events {
+                            if event.kind == "observation_gap" {
+                                let category = match event
+                                    .payload
+                                    .get("reason")
+                                    .and_then(serde_json::Value::as_str)
+                                    .and_then(|reason| reason.split(':').next())
+                                {
+                                    Some("settlement_vendor_publication") => {
+                                        "settlement_vendor_publication"
+                                    }
+                                    Some("settlement_generation_commit") => {
+                                        "settlement_generation_commit"
+                                    }
+                                    Some("settlement_marker_publish") => {
+                                        "settlement_marker_publish"
+                                    }
+                                    Some("settlement_executions_without_run") => {
+                                        "settlement_executions_without_run"
+                                    }
+                                    Some("client_history_projection_unavailable") => {
+                                        "client_history_projection_unavailable"
+                                    }
+                                    Some("generation_parent_observation_unavailable") => {
+                                        "generation_parent_observation_unavailable"
+                                    }
+                                    _ => "other_observation_gap",
+                                };
+                                gap_categories.push((run.id.clone(), category));
+                            }
+                        }
+                        persisted_runs.push((
+                            run.id,
+                            run.status,
+                            run.generation_node_id,
+                            run.finished_at,
+                        ));
+                    }
+                }
+            }
+            panic!(
+                "delivered response generation not observed within 1s: response_id={response_id}, changes={observed_changes:?}, persisted_runs={persisted_runs:?}, gap_categories={gap_categories:?}"
+            );
+        }
         let forest = gateway
             .observation
             .query_forest(Default::default())

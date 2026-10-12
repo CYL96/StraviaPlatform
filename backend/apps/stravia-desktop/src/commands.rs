@@ -85,6 +85,11 @@ impl NativeAdminSession {
         Ok(response)
     }
 
+    #[cfg(feature = "desktop-e2e")]
+    pub(crate) async fn test_access(&self) -> Result<NativeAdminAccess, AuthError> {
+        self.get().await
+    }
+
     pub(crate) async fn revoke(&self) -> Result<(), AuthError> {
         let mut current = self.tokens.lock().await;
         if let Some(tokens) = current.as_ref() {

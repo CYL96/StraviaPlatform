@@ -41,6 +41,7 @@ pub(super) async fn prepare_client_completion(
         Ok(guards) => {
             let guards = std::sync::Arc::new(GuardedVendorPublications {
                 _guards: guards,
+                confirmed_sent: std::sync::atomic::AtomicBool::new(false),
                 publications: pending
                     .as_mut()
                     .map(|pending| std::mem::take(&mut pending.vendor_publications))
@@ -168,7 +169,7 @@ pub(super) async fn settle(
     };
 
     let guards = match prepared_vendor_guards {
-        Some(guards) => guards.ensure_current().map(|()| guards),
+        Some(guards) => guards.ensure_for_settlement().map(|()| guards),
         None => {
             let publications = pending_generation_chain
                 .as_ref()
@@ -179,6 +180,7 @@ pub(super) async fn settle(
                 .map(|guards| {
                     std::sync::Arc::new(GuardedVendorPublications {
                         _guards: guards,
+                        confirmed_sent: std::sync::atomic::AtomicBool::new(false),
                         publications: pending_generation_chain
                             .as_mut()
                             .map(|pending| std::mem::take(&mut pending.vendor_publications))
@@ -290,9 +292,11 @@ mod tests {
 
     use super::*;
     use crate::history_marker::{HistoryMarker, HistoryMarkerKind};
+    use stravia_runtime_contract::protocol::ids::OPEN_RESPONSES_2026_04_24;
     use stravia_runtime_contract::protocol::ids::OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1;
-    use stravia_runtime_contract::protocol::ir::AiItem;
-    use stravia_runtime_contract::protocol::ir::AiRequest;
+    use stravia_runtime_contract::protocol::ir::{
+        AiItem, AiRequest, OpenResponsesExt, ProtocolExt,
+    };
 
     async fn fixture() -> (
         tempfile::TempDir,
@@ -300,6 +304,7 @@ mod tests {
         RunLedger,
         RunObserver,
         crate::Gateway,
+        crate::interaction_observation::InteractionObservation,
     ) {
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
             .max_connections(1)
@@ -375,7 +380,7 @@ mod tests {
             ),
             crate::model_turn::CompactionPublications::default(),
         );
-        (directory, session, ledger, observer, gateway)
+        (directory, session, ledger, observer, gateway, observation)
     }
 
     fn staged_platform_batch(
@@ -398,9 +403,344 @@ mod tests {
         })
     }
 
+    const SENT_AT: i64 = 1_700_000_000_000;
+    const VENDOR: &str = "settlement-vendor";
+
+    async fn prepared_vendor_settlement(
+        gateway: &crate::Gateway,
+        session: &mut ClientProjectionSession,
+        ledger: &RunLedger,
+        observer: &RunObserver,
+        tracker: &crate::plugin::VendorOperationTracker,
+        caller: stravia_runtime_contract::CancellationToken,
+    ) -> (Settlement, String, crate::plugin::VendorPublicationFence) {
+        let operation = tracker.begin(VENDOR).expect("Vendor operation");
+        let publication =
+            operation.publication_fence(caller, stravia_runtime_contract::Deadline::never());
+        // A finished operation leaves a real generation publication fence alive.
+        drop(operation);
+        let marker = gateway
+            .history_markers
+            .create_platform(
+                &ledger.terminal.principal,
+                crate::history_marker::PlatformMarkerInput {
+                    tool_id: "web_search".into(),
+                    call: stravia_runtime_contract::protocol::ir::ToolCall {
+                        id: "platform-call".into(),
+                        name: "web_search".into(),
+                        arguments: "{}".into(),
+                    },
+                    activity: "Searching".into(),
+                    execution_limit: std::time::Duration::from_secs(60),
+                    pending_retention: std::time::Duration::from_secs(3600),
+                },
+            )
+            .await
+            .expect("Platform marker");
+        let batch = staged_platform_batch(session, &marker.reference);
+        let mut response = AiResponse::new("response", "model");
+        response.items = vec![AiItem::function_call(
+            stravia_runtime_contract::protocol::ir::ToolCall {
+                id: "client-call".into(),
+                name: "inspect".into(),
+                arguments: "{}".into(),
+            },
+        )];
+        let mut request = AiRequest::new("model", Vec::new());
+        request.meta.source_protocol = Some(OPEN_RESPONSES_2026_04_24);
+        request.ext = Some(ProtocolExt::OpenResponses(OpenResponsesExt::default()));
+        let mut write = gateway
+            .generation_chains
+            .begin(ledger.terminal.principal.clone(), request)
+            .await
+            .expect("begin Generation Chain");
+        let generation_id = write.id().to_owned();
+        assert!(write.stage(
+            &mut response,
+            &crate::generation_chain::GenerationSource::Hook {
+                protocol: OPEN_RESPONSES_2026_04_24,
+            },
+            None,
+        ));
+        ledger
+            .terminal
+            .stage_client_output(OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1, &response);
+        let mut pending = PendingGenerationChainWrite {
+            write,
+            vendor_publications: vec![publication.clone()],
+        };
+        let guards = prepare_client_completion(ledger, observer, Some(&mut pending))
+            .await
+            .expect("real Vendor read guards prepared");
+        (
+            Settlement {
+                staged_delivery: Some(batch),
+                pending_generation_chain: Some(pending),
+                delivery_completed_at: Some(SENT_AT),
+                delivered_response: Some(response),
+                prepared_vendor_guards: Some(guards),
+                ..Default::default()
+            },
+            generation_id,
+            publication,
+        )
+    }
+
+    async fn assert_generation_stored(
+        gateway: &crate::Gateway,
+        ledger: &RunLedger,
+        generation_id: &str,
+        stored: bool,
+    ) {
+        let mut request = AiRequest::new("model", Vec::new());
+        request.meta.source_protocol = Some(OPEN_RESPONSES_2026_04_24);
+        // begin resolves explicit parents from OpenResponsesExt, not vendor metadata alone.
+        request.ext = Some(ProtocolExt::OpenResponses(OpenResponsesExt::default()));
+        crate::router::stamp_previous_response_id(&mut request, generation_id);
+        let continuation = gateway
+            .generation_chains
+            .begin(ledger.terminal.principal.clone(), request)
+            .await;
+        if stored {
+            let continuation = continuation.expect("delivered generation persisted");
+            assert_eq!(continuation.parent_id(), Some(generation_id));
+        } else {
+            assert!(matches!(
+                continuation,
+                Err(crate::generation_chain::BeginError::PreviousResponseNotFound)
+            ));
+        }
+    }
+
+    async fn assert_delivered_history(
+        observation: &crate::interaction_observation::InteractionObservation,
+        response: AiResponse,
+        delivered: bool,
+    ) {
+        use crate::interaction_observation::{AdmissionFacts, IngressStart, RunStart};
+        let mut items = response.items;
+        items.push(AiItem::function_call_output(
+            "client-call",
+            serde_json::json!("result"),
+        ));
+        let _continuation = observation
+            .observe_ingress(IngressStart {
+                id: "settle-continuation".into(),
+                method: "POST".into(),
+                path: "/v1/chat/completions".into(),
+                protocol: OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1.to_string(),
+            })
+            .admit(
+                RunStart {
+                    id: "settle-continuation".into(),
+                    principal: "owner".into(),
+                    api_key_id: None,
+                    api_key_name: None,
+                    route_id: "local-route".into(),
+                    model_display_name: None,
+                    ingress_protocol: OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1.to_string(),
+                },
+                AdmissionFacts {
+                    client_request: Arc::new(AiRequest::new("model", items)),
+                    has_new_user: false,
+                    has_matching_pending_tool_result: true,
+                    generation_root_id: None,
+                    generation_parent_id: None,
+                },
+            );
+        observation.flush().await.expect("flush delivered history");
+        let forest = observation
+            .query_forest(Default::default())
+            .await
+            .expect("observation forest");
+        let mut found = false;
+        for interaction in forest.roots.iter().flat_map(|root| &root.interactions) {
+            let detail = observation
+                .get_interaction(&interaction.id, Default::default())
+                .await
+                .expect("interaction query")
+                .expect("interaction detail");
+            if let Some(run) = detail
+                .runs
+                .iter()
+                .find(|run| run.id == "settle-continuation")
+            {
+                assert_eq!(
+                    run.parent_run_id.as_deref(),
+                    delivered.then_some("settle-run")
+                );
+                found = true;
+            }
+        }
+        assert!(found, "continuation observation persisted");
+    }
+
+    #[tokio::test]
+    async fn confirmed_sent_settlement_survives_caller_cancellation() {
+        let (_directory, mut session, ledger, observer, gateway, observation) = fixture().await;
+        let tracker = crate::plugin::VendorOperationTracker::default();
+        let caller = stravia_runtime_contract::CancellationToken::new();
+        let (settlement, generation_id, publication) = prepared_vendor_settlement(
+            &gateway,
+            &mut session,
+            &ledger,
+            &observer,
+            &tracker,
+            caller.clone(),
+        )
+        .await;
+        let response = settlement
+            .delivered_response
+            .clone()
+            .expect("delivered response");
+        ledger.terminal.publish_prepared_client_completion(SENT_AT);
+        assert_eq!(ledger.terminal.delivery_completed_at(), Some(SENT_AT));
+        caller.cancel();
+        assert!(publication.ensure_current().is_err());
+        assert!(publication.ensure_generation_current().is_ok());
+        let outcome = settle(
+            &gateway,
+            &mut session,
+            &ledger,
+            &observer,
+            OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+            settlement,
+        )
+        .await;
+        assert!(outcome.failures.is_empty(), "{:?}", outcome.failures);
+        assert_eq!(outcome.published_platform_executions.len(), 1);
+        assert!(session.client_output_committed());
+        assert!(
+            ledger
+                .terminal
+                .generation_committed
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+        observer.finish(crate::interaction_observation::RunOutcome {
+            client_output_committed: true,
+            delivery: None,
+            delivery_completed_at: Some(SENT_AT),
+            status: "completed".into(),
+            terminal_reason: None,
+            generation_node_id: Some(generation_id.clone()),
+            generation_root_id: Some(generation_id.clone()),
+        });
+        assert_generation_stored(&gateway, &ledger, &generation_id, true).await;
+        assert_delivered_history(&observation, response, true).await;
+        observation.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn confirmed_sent_settlement_rejects_vendor_revocation_while_guards_are_held() {
+        let (_directory, mut session, ledger, observer, gateway, observation) = fixture().await;
+        let tracker = crate::plugin::VendorOperationTracker::default();
+        let (settlement, generation_id, publication) = prepared_vendor_settlement(
+            &gateway,
+            &mut session,
+            &ledger,
+            &observer,
+            &tracker,
+            stravia_runtime_contract::CancellationToken::new(),
+        )
+        .await;
+        let response = settlement
+            .delivered_response
+            .clone()
+            .expect("delivered response");
+        ledger.terminal.publish_prepared_client_completion(SENT_AT);
+        assert_eq!(ledger.terminal.delivery_completed_at(), Some(SENT_AT));
+        // Poll the actual drain once. It advances the epoch and cancels the
+        // publication token synchronously, then blocks on our prepared read locks.
+        let drain = tracker.cancel_and_drain_for_test(VENDOR);
+        tokio::pin!(drain);
+        assert!(matches!(
+            futures::poll!(drain.as_mut()),
+            std::task::Poll::Pending
+        ));
+        assert!(publication.ensure_generation_current().is_err());
+        let outcome = settle(
+            &gateway,
+            &mut session,
+            &ledger,
+            &observer,
+            OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+            settlement,
+        )
+        .await;
+        assert!(matches!(
+            outcome.failures.as_slice(),
+            [SettlementFailure::VendorPublication(_)]
+        ));
+        assert!(outcome.published_platform_executions.is_empty());
+        assert!(ledger.published_executions().is_empty());
+        assert!(!session.client_output_committed());
+        assert!(
+            !ledger
+                .terminal
+                .generation_committed
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+        drain
+            .await
+            .expect("revocation drains after settlement releases read guards");
+        assert_generation_stored(&gateway, &ledger, &generation_id, false).await;
+        assert_delivered_history(&observation, response, true).await;
+        observation.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn prepared_guards_without_sent_do_not_bypass_caller_cancellation() {
+        let (_directory, mut session, ledger, observer, gateway, observation) = fixture().await;
+        let tracker = crate::plugin::VendorOperationTracker::default();
+        let caller = stravia_runtime_contract::CancellationToken::new();
+        let (settlement, generation_id, _) = prepared_vendor_settlement(
+            &gateway,
+            &mut session,
+            &ledger,
+            &observer,
+            &tracker,
+            caller.clone(),
+        )
+        .await;
+        let response = settlement
+            .delivered_response
+            .clone()
+            .expect("staged response");
+        caller.cancel();
+        // The real synchronous callback must not issue a Sent certificate when
+        // strict validation fails, even though read guards were acquired earlier.
+        ledger.terminal.publish_prepared_client_completion(SENT_AT);
+        assert_eq!(ledger.terminal.delivery_completed_at(), None);
+        let outcome = settle(
+            &gateway,
+            &mut session,
+            &ledger,
+            &observer,
+            OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+            settlement,
+        )
+        .await;
+        assert!(matches!(
+            outcome.failures.as_slice(),
+            [SettlementFailure::VendorPublication(_)]
+        ));
+        assert!(outcome.published_platform_executions.is_empty());
+        assert!(ledger.published_executions().is_empty());
+        assert!(!session.client_output_committed());
+        assert!(
+            !ledger
+                .terminal
+                .generation_committed
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+        assert_generation_stored(&gateway, &ledger, &generation_id, false).await;
+        assert_delivered_history(&observation, response, false).await;
+        observation.shutdown().await;
+    }
+
     #[tokio::test]
     async fn settle_publishes_staged_markers_then_commits_and_stages() {
-        let (_directory, mut session, ledger, observer, gateway) = fixture().await;
+        let (_directory, mut session, ledger, observer, gateway, _observation) = fixture().await;
         let principal = ledger.terminal.principal.clone();
         let marker = gateway
             .history_markers
@@ -461,7 +801,7 @@ mod tests {
 
     #[tokio::test]
     async fn settle_enumerates_failures_and_still_runs_later_steps() {
-        let (_directory, mut session, ledger, observer, gateway) = fixture().await;
+        let (_directory, mut session, ledger, observer, gateway, _observation) = fixture().await;
         // A Marker that was never persisted makes publication fail.
         let batch = staged_platform_batch(&mut session, "abcdefghijklmnopqrstuvwxyzab");
         // A write that was never staged makes the commit persist fail.

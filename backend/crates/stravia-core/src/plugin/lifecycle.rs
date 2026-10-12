@@ -68,6 +68,12 @@ struct UpdateAdmission {
 }
 
 impl VendorOperationTracker {
+    #[cfg(test)]
+    pub(crate) async fn cancel_and_drain_for_test(&self, vendor_id: &str) -> anyhow::Result<()> {
+        self.cancel_and_drain(vendor_id).await?.resume();
+        Ok(())
+    }
+
     /// 只串行化连接配置与包切换，不等待兼容版本的推理或流式背压。
     pub(in crate::plugin) async fn configuration_guard(
         &self,
@@ -248,6 +254,14 @@ impl VendorPublicationFence {
         Ok(())
     }
 
+    pub(crate) fn ensure_generation_current(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.publications.is_cancelled() && self.activity.state.lock().epoch == self.epoch,
+            "vendor generation can no longer publish"
+        );
+        Ok(())
+    }
+
     pub(crate) async fn cancelled(&self) {
         tokio::select! {
             () = self.publications.cancelled() => {}
@@ -278,10 +292,7 @@ impl VendorPublicationFence {
             }
             guard = self.activity.writes.clone().read_owned() => guard,
         };
-        anyhow::ensure!(
-            !self.publications.is_cancelled() && self.activity.state.lock().epoch == self.epoch,
-            "vendor generation can no longer publish"
-        );
+        self.ensure_generation_current()?;
         Ok(guard)
     }
 }

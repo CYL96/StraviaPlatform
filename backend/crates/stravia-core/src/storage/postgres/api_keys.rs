@@ -38,20 +38,20 @@ impl ApiKeyStore for PostgresApiKeyStore {
             .key
             .unwrap_or_else(|| format!("sk-{}", uuid::Uuid::new_v4().simple()));
         sqlx::query(
-            "INSERT INTO api_keys (id, token, name, rpm_limit, mcp_access_enabled, transparent_injection_enabled, inject_media_understanding, inject_web_search, inject_media_generation, expires_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NULLIF($10, '')::timestamptz)",
-        )
-        .bind(&id)
-        .bind(&key)
-        .bind(input.name.trim())
-        .bind(input.rpm_limit)
-        .bind(input.mcp_access_enabled)
-        .bind(input.transparent_injection_enabled)
-        .bind(input.inject_media_understanding)
-        .bind(input.inject_web_search)
-        .bind(input.inject_media_generation)
-        .bind(input.expires_at.as_deref().map(str::trim).unwrap_or(""))
-        .execute(&self.pool)
-        .await?;
+    "INSERT INTO api_keys (id, token, name, rpm_limit, mcp_access_enabled, transparent_injection_enabled, inject_media_understanding, inject_web_search, inject_media_generation, expires_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NULLIF($10, '')::timestamptz)",
+            )
+            .bind(&id)
+            .bind(&key)
+            .bind(input.name.trim())
+            .bind(input.rpm_limit)
+            .bind(input.mcp_access_enabled)
+            .bind(input.transparent_injection_enabled)
+            .bind(input.inject_media_understanding)
+            .bind(input.inject_web_search)
+            .bind(input.inject_media_generation)
+            .bind(input.expires_at.as_deref().map(str::trim).unwrap_or(""))
+            .execute(&self.pool)
+            .await?;
         replace_api_key_models(&self.pool, &id, &input.model_ids).await?;
         self.get(&id).await?.context("api key missing after create")
     }
@@ -83,21 +83,21 @@ impl ApiKeyStore for PostgresApiKeyStore {
         let expires_at = input.expires_at.or(current.expires_at);
 
         sqlx::query(
-            "UPDATE api_keys SET token=$1, name=$2, rpm_limit=$3, is_enabled=$4, mcp_access_enabled=$5, transparent_injection_enabled=$6, inject_media_understanding=$7, inject_web_search=$8, inject_media_generation=$9, expires_at=NULLIF($10, '')::timestamptz, updated_at=CURRENT_TIMESTAMP WHERE id=$11",
-        )
-        .bind(key)
-        .bind(name.trim())
-        .bind(rpm_limit)
-        .bind(is_enabled)
-        .bind(mcp_access_enabled)
-        .bind(transparent_injection_enabled)
-        .bind(inject_media_understanding)
-        .bind(inject_web_search)
-        .bind(inject_media_generation)
-        .bind(expires_at.as_deref().map(str::trim).unwrap_or(""))
-        .bind(id)
-        .execute(&self.pool)
-        .await?;
+    "UPDATE api_keys SET token=$1, name=$2, rpm_limit=$3, is_enabled=$4, mcp_access_enabled=$5, transparent_injection_enabled=$6, inject_media_understanding=$7, inject_web_search=$8, inject_media_generation=$9, expires_at=NULLIF($10, '')::timestamptz, updated_at=CURRENT_TIMESTAMP WHERE id=$11",
+            )
+            .bind(key)
+            .bind(name.trim())
+            .bind(rpm_limit)
+            .bind(is_enabled)
+            .bind(mcp_access_enabled)
+            .bind(transparent_injection_enabled)
+            .bind(inject_media_understanding)
+            .bind(inject_web_search)
+            .bind(inject_media_generation)
+            .bind(expires_at.as_deref().map(str::trim).unwrap_or(""))
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
 
         if let Some(model_ids) = input.model_ids {
             replace_api_key_models(&self.pool, id, &model_ids).await?;
@@ -116,12 +116,12 @@ impl ApiKeyStore for PostgresApiKeyStore {
     async fn exists_by_name(&self, name: &str, exclude_id: Option<&str>) -> anyhow::Result<bool> {
         let row = if let Some(exclude_id) = exclude_id {
             sqlx::query_scalar::<_, String>(
-                "SELECT id FROM api_keys WHERE lower(trim(name)) = lower(trim($1)) AND id != $2 LIMIT 1",
-            )
-            .bind(name)
-            .bind(exclude_id)
-            .fetch_optional(&self.pool)
-            .await?
+        "SELECT id FROM api_keys WHERE lower(trim(name)) = lower(trim($1)) AND id != $2 LIMIT 1",
+                    )
+                    .bind(name)
+                    .bind(exclude_id)
+                    .fetch_optional(&self.pool)
+                    .await?
         } else {
             sqlx::query_scalar::<_, String>(
                 "SELECT id FROM api_keys WHERE lower(trim(name)) = lower(trim($1)) LIMIT 1",
@@ -161,24 +161,24 @@ pub(super) struct PostgresAuthAccessStore {
 impl AuthAccessStore for PostgresAuthAccessStore {
     async fn find_api_key(&self, raw_key: &str) -> anyhow::Result<Option<ApiKeyAccessRecord>> {
         let row = sqlx::query_as::<
-            _,
-            (
-                String,
-                String,
-                bool,
-                Option<String>,
-                Option<i32>,
-                bool,
-                bool,
-                bool,
-                bool,
-            ),
-        >(
-            "SELECT id, name, is_enabled, to_char(expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS expires_at, rpm_limit, transparent_injection_enabled, inject_media_understanding, inject_web_search, inject_media_generation FROM api_keys WHERE token = $1",
-        )
-        .bind(raw_key)
-        .fetch_optional(&self.pool)
-        .await?;
+    _,
+    (
+        String,
+        String,
+        bool,
+        Option<String>,
+        Option<i32>,
+        bool,
+        bool,
+        bool,
+        bool,
+    ),
+            >(
+    "SELECT id, name, is_enabled, to_char(expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS expires_at, rpm_limit, transparent_injection_enabled, inject_media_understanding, inject_web_search, inject_media_generation FROM api_keys WHERE token = $1",
+            )
+            .bind(raw_key)
+            .fetch_optional(&self.pool)
+            .await?;
 
         Ok(row.map(
             |(
@@ -253,13 +253,13 @@ impl AuthAccessStore for PostgresAuthAccessStore {
     async fn model_access_allowed(&self, api_key_id: &str, model_id: &str) -> anyhow::Result<bool> {
         sqlx::query_scalar::<_, bool>(
             "SELECT
-                EXISTS (SELECT 1 FROM api_keys WHERE id = $1)
-                AND (
-                    NOT EXISTS (SELECT 1 FROM api_key_models WHERE api_key_id = $1)
-                    OR EXISTS (
-                        SELECT 1 FROM api_key_models WHERE api_key_id = $1 AND model_id = $2
-                    )
-                )",
+        EXISTS (SELECT 1 FROM api_keys WHERE id = $1)
+        AND (
+            NOT EXISTS (SELECT 1 FROM api_key_models WHERE api_key_id = $1)
+            OR EXISTS (
+                SELECT 1 FROM api_key_models WHERE api_key_id = $1 AND model_id = $2
+            )
+        )",
         )
         .bind(api_key_id)
         .bind(model_id)

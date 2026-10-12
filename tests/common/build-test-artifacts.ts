@@ -5,6 +5,7 @@ import { cpus } from 'node:os'
 import { basename, join, resolve } from 'node:path'
 
 const repository = resolve(import.meta.dir, '../..')
+const cargoTarget = resolve(repository, process.env.CARGO_TARGET_DIR ?? 'target')
 const suffix = process.platform === 'win32' ? '.exe' : ''
 const checking = process.argv[2] === '--status'
 const mode = process.argv[checking ? 3 : 2]
@@ -49,12 +50,12 @@ const plans: Record<string, Plan> = {
       'stravia-server/test-harness',
     ],
     binaries: ['stravia-server', 'stravia-tools', 'stravia-storage-test-harness'].map((name) =>
-      join(repository, 'target', 'release', `${name}${suffix}`),
+      join(cargoTarget, 'release', `${name}${suffix}`),
     ),
   },
   release: {
     command: ['cargo', 'build', '--locked', '-p', 'stravia-server', '--release'],
-    binaries: [join(repository, 'target', 'release', `stravia-server${suffix}`)],
+    binaries: [join(cargoTarget, 'release', `stravia-server${suffix}`)],
   },
   development: {
     // dev:server 必须真正调用 cargo run；隔离其默认 feature graph，避免其它编译将它置脏。
@@ -71,7 +72,7 @@ const plans: Record<string, Plan> = {
   },
   'desktop-native': {
     command: ['task', '--color=false', 'build:desktop:e2e'],
-    binaries: [join(repository, 'target', 'debug', `stravia-desktop${suffix}`)],
+    binaries: [join(cargoTarget, 'debug', `stravia-desktop${suffix}`)],
   },
 }
 if (!mode || !Object.hasOwn(plans, mode))
@@ -107,7 +108,7 @@ const compilerKeys = [
 const compilerEnvironment = Object.fromEntries(
   Object.entries({
     ...process.env,
-    CARGO_TARGET_DIR: join(repository, 'target', mode === 'development' ? 'test-development' : ''),
+    CARGO_TARGET_DIR: mode === 'development' ? join(repository, 'target', 'test-development') : cargoTarget,
     // Windows 下多个大型 Core rlib 同时 mmap 会耗尽 commit limit；限制编译峰值而非测试覆盖。
     CARGO_BUILD_JOBS: '4',
   })

@@ -262,6 +262,9 @@ impl Gateway {
         request: VendorRequest,
         context: VendorCallContext,
     ) -> anyhow::Result<VendorExecution> {
+        if context.cancellation.is_cancelled() {
+            return Err(RuntimeError::Cancelled.into());
+        }
         let mut prepared = self
             .prepare_vendor_execution(provider_id, model, request.operation(), &context)
             .await?;
@@ -534,6 +537,9 @@ impl Gateway {
         request: VendorRequest,
         context: VendorCallContext,
     ) -> anyhow::Result<VendorExecution> {
+        if context.cancellation.is_cancelled() {
+            return Err(RuntimeError::Cancelled.into());
+        }
         anyhow::ensure!(
             request.operation() == prepared.kind,
             "prepared vendor operation kind changed"
@@ -586,6 +592,9 @@ impl Gateway {
         request: VendorRequest,
         context: VendorCallContext,
     ) -> anyhow::Result<VendorExecution> {
+        if context.cancellation.is_cancelled() {
+            return Err(RuntimeError::Cancelled.into());
+        }
         let operation_kind = request.operation();
         anyhow::ensure!(
             matches!(

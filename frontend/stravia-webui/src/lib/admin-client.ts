@@ -1,3 +1,4 @@
+import type { StatsWindow } from '$lib/types/stats'
 import { apiBase, authenticatedFetch, decodeAdmin, isTauri } from '$lib/auth'
 import type { ConnectClientApplyPlan } from '$lib/connect-client-apply'
 import type { ConnectClientApplyRequest } from '$lib/connect'
@@ -118,8 +119,8 @@ function queryString(query: object): string {
   return params.size > 0 ? `?${params}` : ''
 }
 
-function statsPath(path: string, hours?: number): string {
-  return hours == null ? path : `${path}?hours=${hours}`
+function statsPath(path: string, window?: StatsWindow, bucket?: number): string {
+  return `${path}${queryString({ ...window, bucket })}`
 }
 
 async function request<T>(method: HttpMethod, path: string, body?: unknown): Promise<T> {
@@ -360,17 +361,12 @@ export const admin = {
     },
   },
   stats: {
-    overview: (hours?: number) => request<StatsOverview>('GET', statsPath('/stats/overview', hours)),
-    series: (hours?: number, bucket?: number, tzOffset?: number) => {
-      const params = new URLSearchParams()
-      params.set('hours', String(hours ?? 24))
-      params.set('bucket', String(bucket ?? 3600))
-      params.set('tz_offset', String(tzOffset ?? 0))
-      return request<StatsSeries[]>('GET', `/stats/series?${params}`)
-    },
-    models: (hours?: number) => request<ModelStats[]>('GET', statsPath('/stats/models', hours)),
-    providers: (hours?: number) => request<ProviderStats[]>('GET', statsPath('/stats/providers', hours)),
-    apiKeys: (hours?: number) => request<ApiKeyStats[]>('GET', statsPath('/stats/api-keys', hours)),
+    overview: (window?: StatsWindow) => request<StatsOverview>('GET', statsPath('/stats/overview', window)),
+    series: (window?: StatsWindow, bucket?: number) =>
+      request<StatsSeries[]>('GET', statsPath('/stats/series', window, bucket)),
+    models: (window?: StatsWindow) => request<ModelStats[]>('GET', statsPath('/stats/models', window)),
+    providers: (window?: StatsWindow) => request<ProviderStats[]>('GET', statsPath('/stats/providers', window)),
+    apiKeys: (window?: StatsWindow) => request<ApiKeyStats[]>('GET', statsPath('/stats/api-keys', window)),
   },
   allowances: {
     list: () => request<ProviderAllowanceTarget[]>('GET', '/provider-allowances'),

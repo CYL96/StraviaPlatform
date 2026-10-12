@@ -77,10 +77,10 @@ pub fn create_router(gateway: Gateway) -> Router {
     router
         .layer(DefaultBodyLimit::max(PROXY_JSON_BODY_LIMIT_BYTES))
         .layer(middleware::from_fn_with_state(
-            observation_gateway,
+            observation_gateway.clone(),
             observe_inference_ingress,
         ))
-        .layer(middleware::from_fn(inject_context))
+        .layer(middleware::from_fn_with_state(observation_gateway, inject_context))
         .layer(TraceLayer::new_for_http().make_span_with(|request: &axum::extract::Request| {
             let (uri, _) = crate::interaction_observation::redact_url(&request.uri().to_string());
             tracing::debug_span!("request", method=%request.method(), uri=%uri, version=?request.version())

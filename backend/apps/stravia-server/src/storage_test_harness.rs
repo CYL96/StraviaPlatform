@@ -175,8 +175,76 @@ async fn verify_outbound_proxy_migration(pool: &sqlx::PgPool, schema: &str) -> a
     Ok(())
 }
 
+const RETAINED_USAGE_FIXTURE: &str = "\
+INSERT INTO interaction_observations(id,principal,api_key_id,api_key_name,root_id,root_run_id,first_route_id,status,started_at,last_active_at,expires_at) VALUES ('historical','owner','deleted-key','Old Key','historical','historical','deleted-model','completed',900000,2700200,4102444800000);
+INSERT INTO inference_run_observations(id,interaction_id,ingress_protocol,route_id,status,debug_enabled,started_at,last_active_at,finished_at,expires_at) VALUES ('historical','historical','responses','deleted-model','completed',FALSE,900000,2700200,2700200,4102444800000);
+INSERT INTO model_turn_observations(id,run_id,interaction_id,route_id,model_display_name,api_key_id,api_key_name,status,started_at,finished_at,last_event_sequence) VALUES ('known-turn','historical','historical','deleted-model','Old Model','deleted-key','Old Key','completed',1800000,1800200,1), ('unknown-turn','historical','historical','deleted-model','Old Model','deleted-key','Old Key','completed',2700000,2700200,2);
+INSERT INTO target_attempt_observations(id,model_turn_id,run_id,interaction_id,target_id,provider_id,provider_name,upstream_model,protocol,status,started_at,duration_ms,input_tokens,output_tokens,cache_read_tokens,last_event_sequence) VALUES ('known','known-turn','historical','historical','target','deleted-provider','Old Provider','upstream','responses','completed',1800000,100,10,0,2,1), ('unknown','unknown-turn','historical','historical','target','deleted-provider','Old Provider','upstream','responses','completed',2700000,NULL,NULL,NULL,NULL,2);
+INSERT INTO rejected_request_observations(id,occurred_at,method,path,ingress_protocol,stage,code,status_code,debug_enabled,last_event_sequence,expires_at) VALUES ('rejected',900000,'POST','/v1/responses','responses','admission','invalid_request',400,FALSE,3,4102444800000);";
+
+async fn prepare_usage_upgrade_fixture(fixture: &str) -> anyhow::Result<()> {
+    ensure!(
+        matches!(fixture, "retained" | "empty"),
+        "invalid upgrade fixture"
+    );
+    let backend = env::var("STRAVIA_STORAGE_BACKEND").context("STRAVIA_STORAGE_BACKEND")?;
+    match backend.as_str() {
+        "sqlite" => {
+            let path =
+                env::var("STRAVIA_STORAGE_SQLITE_PATH").context("STRAVIA_STORAGE_SQLITE_PATH")?;
+            let options = sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(path)
+                .create_if_missing(true)
+                .foreign_keys(true);
+            let pool = sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect_with(options)
+                .await?;
+            let migrations = sqlx::migrate!("../../crates/stravia-core/migrations/sqlite");
+            let prefix = sqlx::migrate::Migrator::with_migrations(
+                migrations
+                    .iter()
+                    .filter(|m| m.version <= 17)
+                    .cloned()
+                    .collect(),
+            );
+            prefix.run(&pool).await?;
+            if fixture == "retained" {
+                sqlx::raw_sql(RETAINED_USAGE_FIXTURE).execute(&pool).await?;
+            }
+            pool.close().await;
+        }
+        "postgres" => {
+            let url = env::var("STRAVIA_STORAGE_PG_URL").context("STRAVIA_STORAGE_PG_URL")?;
+            let pool = PgPoolOptions::new()
+                .max_connections(1)
+                .connect(&url)
+                .await?;
+            let migrations = sqlx::migrate!("../../crates/stravia-core/migrations/postgres");
+            let prefix = sqlx::migrate::Migrator::with_migrations(
+                migrations
+                    .iter()
+                    .filter(|m| m.version <= 17)
+                    .cloned()
+                    .collect(),
+            );
+            prefix.run(&pool).await?;
+            if fixture == "retained" {
+                sqlx::raw_sql(RETAINED_USAGE_FIXTURE).execute(&pool).await?;
+            }
+            pool.close().await;
+        }
+        _ => anyhow::bail!("invalid upgrade backend"),
+    }
+    println!("usage_upgrade_fixture={fixture}");
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    if let Ok(fixture) = env::var("STRAVIA_STORAGE_USAGE_UPGRADE_FIXTURE") {
+        return prepare_usage_upgrade_fixture(&fixture).await;
+    }
     if let Ok(action) = env::var("STRAVIA_STORAGE_SCHEMA_ACTION") {
         let pg_url = env::var("STRAVIA_STORAGE_PG_URL").context("STRAVIA_STORAGE_PG_URL")?;
         let schema = env::var("STRAVIA_STORAGE_PG_SCHEMA").context("STRAVIA_STORAGE_PG_SCHEMA")?;
@@ -200,6 +268,74 @@ async fn main() -> anyhow::Result<()> {
                 sqlx::raw_sql(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
                     .execute(&pool)
                     .await?;
+            }
+            "stats-attempt-fault-install" | "stats-attempt-fault-remove" => {
+                ensure!(
+                    !schema.is_empty()
+                        && schema != "public"
+                        && schema != "information_schema"
+                        && !schema.starts_with("pg_"),
+                    "stats fault requires an isolated schema"
+                );
+                let mut connection = pool.acquire().await?;
+                let mut transaction = connection.begin().await?;
+                sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+                    "SET LOCAL search_path TO \"{schema}\""
+                )))
+                .execute(&mut *transaction)
+                .await?;
+                let current_schema: Option<String> = sqlx::query_scalar("SELECT current_schema()")
+                    .fetch_one(&mut *transaction)
+                    .await?;
+                ensure!(
+                    current_schema.as_deref() == Some(schema.as_str()),
+                    "stats fault schema is missing or inaccessible: {schema}"
+                );
+                let has_stats_table: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (
+                        SELECT 1 FROM pg_catalog.pg_class AS relation
+                        JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+                        WHERE namespace.nspname = $1 AND relation.relname = 'stats_usage_buckets'
+                            AND relation.relkind IN ('r', 'p')
+                    )",
+                )
+                .bind(&schema)
+                .fetch_one(&mut *transaction)
+                .await?;
+                ensure!(
+                    has_stats_table,
+                    "stats fault table is missing from schema: {schema}"
+                );
+                if action == "stats-attempt-fault-install" {
+                    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+                        "CREATE FUNCTION \"{schema}\".stravia_test_stats_attempt_fault() RETURNS trigger
+                         LANGUAGE plpgsql AS $$
+                         DECLARE previous_successful_attempt_count bigint := 0;
+                         BEGIN
+                             IF TG_OP = 'UPDATE' THEN
+                                 previous_successful_attempt_count := COALESCE(OLD.successful_attempt_count, 0);
+                             END IF;
+                             IF NEW.successful_attempt_count > previous_successful_attempt_count THEN
+                                 RAISE EXCEPTION 'isolated stats attempt persistence fault' USING ERRCODE = 'P0001';
+                             END IF;
+                             RETURN NEW;
+                         END;
+                         $$;
+                         CREATE TRIGGER stravia_test_stats_attempt_fault
+                         BEFORE INSERT OR UPDATE ON \"{schema}\".stats_usage_buckets
+                         FOR EACH ROW EXECUTE FUNCTION \"{schema}\".stravia_test_stats_attempt_fault();",
+                    )))
+                    .execute(&mut *transaction)
+                    .await?;
+                } else {
+                    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+                        "DROP TRIGGER IF EXISTS stravia_test_stats_attempt_fault ON \"{schema}\".stats_usage_buckets;
+                         DROP FUNCTION IF EXISTS \"{schema}\".stravia_test_stats_attempt_fault();",
+                    )))
+                    .execute(&mut *transaction)
+                    .await?;
+                }
+                transaction.commit().await?;
             }
             "verify_rpm_migration" => {
                 let mut connection = pool.acquire().await?;
@@ -701,7 +837,9 @@ async fn main() -> anyhow::Result<()> {
         );
         let forest: serde_json::Value = forest.json().await?;
         observation_roots = forest["data"]["root_total"].as_i64().unwrap_or(0);
-        let stats = admin.get_stats_overview(None).await?;
+        let stats = admin
+            .get_stats_overview(stravia_core::db::models::StatsWindow::default())
+            .await?;
         stats_requests = stats.total_requests;
         if observation_roots >= 1 && stats_requests >= 1 {
             println!("backend={backend}");

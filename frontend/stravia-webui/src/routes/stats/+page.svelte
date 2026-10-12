@@ -1,4 +1,15 @@
 <script lang="ts">
+import { onMount } from 'svelte'
+import {
+  liveStatsWindow,
+  localStatsDateTime,
+  parseLocalStatsDateTime,
+  statsPresentationBucket,
+} from '$lib/stats-window'
+import type { StatsWindow } from '$lib/types/stats'
+import * as Dialog from '$lib/components/ui/dialog'
+import * as Field from '$lib/components/ui/field'
+import { Input } from '$lib/components/ui/input'
 import * as m from '$lib/paraglide/messages.js'
 import RequestFailure from '$lib/components/request-failure.svelte'
 import { createQuery } from '@tanstack/svelte-query'
@@ -16,13 +27,7 @@ import {
   formatTime,
   formatTps,
 } from '$lib/format'
-import {
-  activityColumnMs,
-  activityRowCount,
-  buildActivityGrid,
-  buildLatencyChart,
-  localTzOffsetMs,
-} from '$lib/stats-chart'
+import { buildActivityGrid, buildLatencyChart } from '$lib/stats-chart'
 import type { ApiKeyStats, ProviderStats } from '$lib/types'
 import MetricStrip from '$lib/components/metric-strip.svelte'
 import LatencySpeedChart from '$lib/components/latency-speed-chart.svelte'
@@ -37,56 +42,106 @@ import { Skeleton } from '$lib/components/ui/skeleton'
 import * as Empty from '$lib/components/ui/empty'
 
 let hours = $state('24')
-const hoursNumber = $derived(Number(hours))
-const overviewQuery = createQuery(() => ({
-  queryKey: ['stats-overview', hoursNumber],
-  queryFn: () => admin.stats.overview(hoursNumber),
-  refetchInterval: 30_000,
-}))
 const HOUR_MS = 3_600_000
-// 方格粒度跟随时间范围：6h→15 分钟，24h→1 小时，3 天→6 小时，7 天→1 天。
-const activityBucketSeconds = $derived(
-  hoursNumber <= 6 ? 900 : hoursNumber <= 24 ? 3_600 : hoursNumber <= 72 ? 21_600 : 86_400,
+let spanMs = $state(24 * HOUR_MS)
+let live = $state(true)
+let window = $state.raw<StatsWindow>(liveStatsWindow(24 * HOUR_MS))
+let rangeOpen = $state(false)
+let draftStart = $state('')
+let draftEnd = $state('')
+const draftStartMs = $derived(parseLocalStatsDateTime(draftStart))
+const draftEndMs = $derived(parseLocalStatsDateTime(draftEnd))
+const validDraftRange = $derived(
+  draftStartMs != null &&
+    draftEndMs != null &&
+    draftEndMs > draftStartMs &&
+    draftEndMs <= liveStatsWindow(spanMs).end_at,
 )
-// 方格尺寸由容器可用高度决定：扣除上下边距、列标签行与图例行后按行数均分；
-// 列数不设上限，按该尺寸在宽度上能容纳多少列就向前延伸多少整列历史。
-let activityWidth = $state(0)
+const hoursNumber = $derived(spanMs / HOUR_MS)
+const seriesBucketSeconds = $derived(statsPresentationBucket(spanMs, 3_600))
+const activityBucketSeconds = $derived(
+  statsPresentationBucket(
+    spanMs,
+    hoursNumber <= 6 ? 900 : hoursNumber <= 24 ? 3_600 : hoursNumber <= 72 ? 21_600 : 86_400,
+  ),
+)
 let activityHeight = $state(0)
 const activityCellPx = $derived.by(() => {
-  const rows = activityRowCount(activityBucketSeconds * 1_000)
+  const rows = activityGrid.rowCount
   const freeH = activityHeight - 32 - 18 - 20 - (rows - 1) * 4
-  if (freeH <= 0) return 14
-  return Math.max(10, Math.floor(freeH / rows))
+  return freeH <= 0 ? 14 : Math.max(10, Math.floor(freeH / rows))
 })
-const activityCols = $derived(Math.floor((activityWidth + 4) / (activityCellPx + 4)))
-const activityQueryHours = $derived(
-  Math.max(hoursNumber, Math.ceil((activityCols * activityColumnMs(activityBucketSeconds * 1_000)) / HOUR_MS)),
-)
+// Every query key owns an immutable absolute interval. Late responses only update their old key;
+// no placeholder data from another selection is presented as the newly selected window.
+const overviewQuery = createQuery(() => ({
+  queryKey: ['stats-overview', window.start_at, window.end_at],
+  queryFn: ({ queryKey }) => admin.stats.overview({ start_at: Number(queryKey[1]), end_at: Number(queryKey[2]) }),
+  refetchInterval: 30_000,
+}))
 const seriesQuery = createQuery(() => ({
-  queryKey: ['stats-series', hoursNumber, 3_600],
-  queryFn: () => admin.stats.series(hoursNumber, 3_600, localTzOffsetMs() / 1000),
+  queryKey: ['stats-series', window.start_at, window.end_at, seriesBucketSeconds],
+  queryFn: ({ queryKey }) =>
+    admin.stats.series({ start_at: Number(queryKey[1]), end_at: Number(queryKey[2]) }, Number(queryKey[3])),
   refetchInterval: 30_000,
 }))
 const activityQuery = createQuery(() => ({
-  queryKey: ['stats-series', activityQueryHours, activityBucketSeconds],
-  queryFn: () => admin.stats.series(activityQueryHours, activityBucketSeconds, localTzOffsetMs() / 1000),
+  queryKey: ['stats-series', window.start_at, window.end_at, activityBucketSeconds],
+  queryFn: ({ queryKey }) =>
+    admin.stats.series({ start_at: Number(queryKey[1]), end_at: Number(queryKey[2]) }, Number(queryKey[3])),
   refetchInterval: 30_000,
 }))
 const providersQuery = createQuery(() => ({
-  queryKey: ['stats-providers', hoursNumber],
-  queryFn: () => admin.stats.providers(hoursNumber),
+  queryKey: ['stats-providers', window.start_at, window.end_at],
+  queryFn: ({ queryKey }) => admin.stats.providers({ start_at: Number(queryKey[1]), end_at: Number(queryKey[2]) }),
   refetchInterval: 30_000,
 }))
 const apiKeysQuery = createQuery(() => ({
-  queryKey: ['stats-api-keys', hoursNumber],
-  queryFn: () => admin.stats.apiKeys(hoursNumber),
+  queryKey: ['stats-api-keys', window.start_at, window.end_at],
+  queryFn: ({ queryKey }) => admin.stats.apiKeys({ start_at: Number(queryKey[1]), end_at: Number(queryKey[2]) }),
   refetchInterval: 30_000,
 }))
 const modelsQuery = createQuery(() => ({
-  queryKey: ['stats-models', hoursNumber],
-  queryFn: () => admin.stats.models(hoursNumber),
+  queryKey: ['stats-models', window.start_at, window.end_at],
+  queryFn: ({ queryKey }) => admin.stats.models({ start_at: Number(queryKey[1]), end_at: Number(queryKey[2]) }),
   refetchInterval: 30_000,
 }))
+onMount(() => {
+  const timer = setInterval(() => {
+    if (!live) return
+    const current = liveStatsWindow(spanMs)
+    if (current.end_at !== window.end_at) window = current
+  }, 30_000)
+  return () => clearInterval(timer)
+})
+function selectPreset(value: string): void {
+  hours = value
+  spanMs = Number(value) * HOUR_MS
+  live = true
+  window = liveStatsWindow(spanMs)
+}
+function shiftWindow(direction: -1 | 1): void {
+  const end_at = window.end_at + direction * spanMs
+  if (end_at > liveStatsWindow(spanMs).end_at) return
+  live = false
+  window = { start_at: window.start_at + direction * spanMs, end_at }
+}
+function returnLive(): void {
+  live = true
+  window = liveStatsWindow(spanMs)
+}
+function openRange(): void {
+  draftStart = localStatsDateTime(window.start_at)
+  draftEnd = localStatsDateTime(window.end_at)
+  rangeOpen = true
+}
+function applyRange(): void {
+  if (!validDraftRange || draftStartMs == null || draftEndMs == null) return
+  spanMs = draftEndMs - draftStartMs
+  hours = ''
+  window = { start_at: draftStartMs, end_at: draftEndMs }
+  live = false
+  rangeOpen = false
+}
 
 const overview = $derived(overviewQuery.data)
 const hasTraffic = $derived((overview?.total_requests ?? 0) > 0)
@@ -95,10 +150,15 @@ const apiKeyStats = $derived(apiKeysQuery.data ?? [])
 const tableLabels = $derived(getDataTableLabels())
 const providerStatsColumnHelper = createDataTableColumnHelper<ProviderStats>()
 const providerStatsColumns = providerStatsColumnHelper.columns([
-  providerStatsColumnHelper.accessor('provider', {
-    header: () => m.common_model_service(),
-    meta: { label: () => m.common_model_service(), cellClass: 'font-medium' },
-  }),
+  providerStatsColumnHelper.accessor(
+    (provider) =>
+      `${provider.provider || provider.provider_id || '—'}${provider.deleted ? ` · ${m.stats_deleted_resource()}` : ''}`,
+    {
+      id: 'provider',
+      header: () => m.common_model_service(),
+      meta: { label: () => m.common_model_service(), cellClass: 'font-medium' },
+    },
+  ),
   providerStatsColumnHelper.accessor('request_count', {
     header: () => m.common_request_count_label(),
     cell: (context) => formatCompactCount(context.getValue()),
@@ -129,11 +189,15 @@ const providerStatsColumns = providerStatsColumnHelper.columns([
 ])
 const apiKeyStatsColumnHelper = createDataTableColumnHelper<ApiKeyStats>()
 const apiKeyStatsColumns = apiKeyStatsColumnHelper.columns([
-  apiKeyStatsColumnHelper.accessor((apiKey) => apiKey.api_key_name || apiKey.api_key_id, {
-    id: 'apiKey',
-    header: () => m.common_api_key(),
-    meta: { label: () => m.common_api_key(), cellClass: 'font-medium' },
-  }),
+  apiKeyStatsColumnHelper.accessor(
+    (apiKey) =>
+      `${apiKey.api_key_name || apiKey.api_key_id}${apiKey.deleted ? ` · ${m.stats_deleted_resource()}` : ''}`,
+    {
+      id: 'apiKey',
+      header: () => m.common_api_key(),
+      meta: { label: () => m.common_api_key(), cellClass: 'font-medium' },
+    },
+  ),
   apiKeyStatsColumnHelper.accessor('request_count', {
     header: () => m.common_request_count_label(),
     cell: (context) => formatCompactCount(context.getValue()),
@@ -169,16 +233,13 @@ const modelStats = $derived(modelsQuery.data ?? [])
 const seriesStats = $derived(seriesQuery.data ?? [])
 const activityGrid = $derived(
   buildActivityGrid(activityQuery.data ?? [], {
-    endMs: Date.now(),
-    spanMs: hoursNumber * HOUR_MS,
-    bucketMs: activityBucketSeconds * 1_000,
-    tzOffsetMs: localTzOffsetMs(),
-    minCols: activityCols,
+    startMs: window.start_at,
+    endMs: window.end_at,
+    bucketMs: activityQuery.data?.[0]?.bucket_ms ?? activityBucketSeconds * 1_000,
   }),
 )
-// 延伸窗口里可能存在所选范围外的历史活动，不能只看 overview 的当前范围计数。
 const hasActivity = $derived(hasTraffic || activityGrid.cells.some((cell) => cell.tokens !== 0))
-const latencyChart = $derived(buildLatencyChart(seriesStats, HOUR_MS))
+const latencyChart = $derived(buildLatencyChart(seriesStats, seriesStats[0]?.bucket_ms ?? seriesBucketSeconds * 1_000))
 const hasLatencyMetrics = $derived(latencyChart.some((point) => point.firstToken != null || point.outputTps != null))
 const errorChart = $derived(
   seriesStats.map((item) => ({ bucket: formatBucket(item.bucket_start), errors: item.error_count })),
@@ -195,8 +256,8 @@ const modelPie = $derived.by((): PieSlice[] => {
   const slices = modelStats
     .slice(0, 4)
     .map((item, index) => ({
-      key: item.model,
-      label: item.model,
+      key: item.model_id ?? item.model,
+      label: `${item.model || item.model_id || '—'}${item.deleted ? ` · ${m.stats_deleted_resource()}` : ''}`,
       value: item.request_count,
       color: MODEL_PIE_COLORS[index],
     }))
@@ -221,7 +282,7 @@ const tokenPie = $derived.by((): { slices: PieSlice[]; total: number } | null =>
   return total > 0 ? { slices, total } : null
 })
 const metrics = $derived([
-  { label: m.common_total_requests(), value: formatCompactCount(overview?.total_requests ?? 0) },
+  { label: m.common_total_requests(), value: formatCompactCount(overview?.total_requests) },
   { label: m.stats_input_tokens(), value: formatCompactCount(overview?.total_input_tokens) },
   { label: m.stats_output_tokens(), value: formatCompactCount(overview?.total_output_tokens) },
   { label: m.stats_cache_read_tokens(), value: formatCompactCount(overview?.total_cache_read_tokens) },
@@ -267,7 +328,7 @@ const failedAnalyticsLabels = $derived.by(() => {
 })
 
 function getProviderStatsRowId(provider: ProviderStats): string {
-  return provider.provider
+  return provider.provider_id ?? provider.provider
 }
 
 function getApiKeyStatsRowId(apiKey: ApiKeyStats): string {
@@ -293,24 +354,37 @@ function retryAll(): void {
 <svelte:head><title>{m.stats_usage()} · Stravia</title></svelte:head>
 
 {#snippet rangeAction()}
-  <Select.Root type="single" bind:value={hours}>
-    <Select.Trigger class="w-40" aria-label={m.stats_select_time_range()}
-      >{hours === '6'
-        ? m.stats_last_6h()
-        : hours === '24'
-          ? m.stats_last_24h()
-          : hours === '72'
-            ? m.stats_last_3d()
-            : m.stats_last_7d()}</Select.Trigger>
-    <Select.Content
-      ><Select.Group
-        ><Select.Item value="6">{m.stats_last_6h()}</Select.Item><Select.Item value="24"
-          >{m.stats_last_24h()}</Select.Item
-        ><Select.Item value="72">{m.stats_last_3d()}</Select.Item><Select.Item value="168"
-          >{m.stats_last_7d()}</Select.Item
-        ></Select.Group
-      ></Select.Content>
-  </Select.Root>
+  <div class="flex flex-wrap items-center gap-2">
+    <Select.Root type="single" value={hours} onValueChange={selectPreset}>
+      <Select.Trigger class="w-40" aria-label={m.stats_select_time_range()}
+        >{hours === '6'
+          ? m.stats_last_6h()
+          : hours === '24'
+            ? m.stats_last_24h()
+            : hours === '72'
+              ? m.stats_last_3d()
+              : hours === '168'
+                ? m.stats_last_7d()
+                : m.stats_date_time_range()}</Select.Trigger>
+      <Select.Content
+        ><Select.Group
+          ><Select.Item value="6">{m.stats_last_6h()}</Select.Item><Select.Item value="24"
+            >{m.stats_last_24h()}</Select.Item
+          ><Select.Item value="72">{m.stats_last_3d()}</Select.Item><Select.Item value="168"
+            >{m.stats_last_7d()}</Select.Item
+          ></Select.Group
+        ></Select.Content>
+    </Select.Root>
+    <Button variant="outline" onclick={() => shiftWindow(-1)} aria-label={m.stats_previous_window()}
+      >{m.stats_previous_window()}</Button>
+    <Button
+      variant="outline"
+      onclick={() => shiftWindow(1)}
+      disabled={window.end_at + spanMs > liveStatsWindow(spanMs).end_at}
+      aria-label={m.stats_next_window()}>{m.stats_next_window()}</Button>
+    <Button variant="outline" onclick={openRange}>{m.stats_date_time_range()}</Button>
+    {#if !live}<Button variant="outline" onclick={returnLive}>{m.stats_return_live()}</Button>{/if}
+  </div>
 {/snippet}
 
 {#snippet providerStatsEmpty()}
@@ -327,7 +401,7 @@ function retryAll(): void {
 {#snippet liveMeta()}
   <StatusIndicator
     compact
-    label={analyticsFetching ? m.stats_updating_30s() : m.stats_live_30s()}
+    label={analyticsFetching ? m.stats_updating_30s() : live ? m.stats_live_30s() : m.stats_fixed_window()}
     tone={anyError ? 'error' : 'healthy'} />
 {/snippet}
 
@@ -342,6 +416,11 @@ function retryAll(): void {
     description={m.stats_page_summary()}
     meta={liveMeta}
     actions={rangeAction} />
+  <div class="flex flex-wrap gap-x-4 gap-y-1 text-sm text-muted-foreground" role="status">
+    <span class="font-technical tabular-nums">{formatLogTime(window.start_at)} – {formatLogTime(window.end_at)}</span>
+    <span>{live ? m.stats_current_bucket() : m.stats_fixed_window()}</span>
+    <span>{m.stats_history_available()}</span>
+  </div>
 
   {#if analyticsPending}
     <MetricStrip loading loadingLabel={m.stats_loading_analytics_metrics()} placeholderCount={6} />
@@ -385,7 +464,6 @@ function retryAll(): void {
           {@render queryFailure(activityQuery.error, activityQuery.refetch, activityQuery.isFetching)}
         {:else if hasActivity}<div
             class="min-w-0 flex-1 flex flex-col justify-center overflow-x-auto py-4"
-            bind:clientWidth={activityWidth}
             bind:clientHeight={activityHeight}>
             <TokenActivityGrid model={activityGrid} cellPx={activityCellPx} />
           </div>{:else}<Empty.Root class="min-h-40 flex-1 border-y"
@@ -485,7 +563,13 @@ function retryAll(): void {
           </div>{:else}<Empty.Root class="border-y py-6"
             ><Empty.Header
               ><Empty.Description
-                >{hasTraffic ? m.stats_token_usage_unavailable() : m.stats_send_first_request()}</Empty.Description
+                >{hasTraffic
+                  ? overview &&
+                    [overview.total_input_tokens, overview.total_output_tokens].some((value) => value != null) &&
+                    (overview.total_input_tokens ?? 0) + (overview.total_output_tokens ?? 0) === 0
+                    ? m.stats_zero_tokens()
+                    : m.stats_token_usage_unavailable()
+                  : m.stats_send_first_request()}</Empty.Description
               ></Empty.Header
             ></Empty.Root
           >{/if}
@@ -560,9 +644,13 @@ function retryAll(): void {
             {#if providerStats.length === 0}<Empty.Root class="border-y py-6"
                 ><Empty.Header><Empty.Description>{m.stats_no_model_service_traffic()}</Empty.Description></Empty.Header
                 ></Empty.Root
-              >{:else}{#each providerStats.slice(0, 8) as provider (provider.provider)}<div class="route-mobile-row">
+              >{:else}{#each providerStats.slice(0, 8) as provider (provider.provider_id ?? provider.provider)}<div
+                  class="route-mobile-row">
                   <div class="min-w-0">
-                    <p class="truncate font-medium">{provider.provider}</p>
+                    <p class="truncate font-medium">
+                      {provider.provider || provider.provider_id || '—'}{#if provider.deleted}
+                        · {m.stats_deleted_resource()}{/if}
+                    </p>
                     <p class="font-technical mt-1 text-xs text-muted-foreground">
                       {formatTps(provider.avg_output_tps)} ·
                       <span class="text-destructive">{provider.error_count} {m.common_errors()}</span>
@@ -603,7 +691,10 @@ function retryAll(): void {
               ></Empty.Root
             >{:else}{#each apiKeyStats.slice(0, 8) as apiKey (apiKey.api_key_id)}<div class="route-mobile-row">
                 <div class="min-w-0">
-                  <p class="truncate font-medium">{apiKey.api_key_name || apiKey.api_key_id}</p>
+                  <p class="truncate font-medium">
+                    {apiKey.api_key_name || apiKey.api_key_id}{#if apiKey.deleted}
+                      · {m.stats_deleted_resource()}{/if}
+                  </p>
                   <p class="font-technical mt-1 text-xs text-muted-foreground">
                     {m.observation_usage_input()}
                     {formatCompactCount(apiKey.total_input_tokens)} · {m.observation_usage_output()}
@@ -621,3 +712,54 @@ function retryAll(): void {
     </section>
   {/if}
 </div>
+
+<Dialog.Root bind:open={rangeOpen}>
+  <Dialog.Content>
+    <Dialog.Header>
+      <Dialog.Title>{m.stats_date_time_range()}</Dialog.Title>
+      <Dialog.Description>{m.stats_range_help()}</Dialog.Description>
+    </Dialog.Header>
+    <form
+      class="flex flex-col gap-4"
+      onsubmit={(event) => {
+        event.preventDefault()
+        applyRange()
+      }}>
+      <Field.FieldGroup>
+        <Field.Field data-invalid={!validDraftRange || undefined}>
+          <Field.FieldLabel for="stats-start">{m.stats_range_start()}</Field.FieldLabel>
+          <Input
+            id="stats-start"
+            type="datetime-local"
+            step="900"
+            required
+            bind:value={draftStart}
+            aria-invalid={!validDraftRange}
+            aria-describedby="stats-range-validation" />
+        </Field.Field>
+        <Field.Field data-invalid={!validDraftRange || undefined}>
+          <Field.FieldLabel for="stats-end">{m.stats_range_end()}</Field.FieldLabel>
+          <Input
+            id="stats-end"
+            type="datetime-local"
+            step="900"
+            required
+            bind:value={draftEnd}
+            aria-invalid={!validDraftRange}
+            aria-describedby="stats-range-validation" />
+        </Field.Field>
+      </Field.FieldGroup>
+      <p
+        id="stats-range-validation"
+        class="text-sm"
+        class:text-destructive={!validDraftRange}
+        role={validDraftRange ? 'status' : 'alert'}>
+        {validDraftRange ? m.stats_range_help() : m.stats_range_invalid()}
+      </p>
+      <Dialog.Footer>
+        <Button type="button" variant="outline" onclick={() => (rangeOpen = false)}>{m.common_cancel()}</Button>
+        <Button type="submit" disabled={!validDraftRange}>{m.stats_apply_range()}</Button>
+      </Dialog.Footer>
+    </form>
+  </Dialog.Content>
+</Dialog.Root>

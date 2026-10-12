@@ -180,18 +180,18 @@ impl LocalArtifactStore {
         artifact_id: &str,
     ) -> Result<Option<(String, Option<String>, Option<String>, String)>, ArtifactError> {
         match &self.database {
-            ArtifactDatabase::Sqlite(pool) => sqlx::query_as(
-                "SELECT storage_backend,storage_endpoint,storage_bucket,backend_key FROM artifacts WHERE id=?",
-            )
-            .bind(artifact_id)
-            .fetch_optional(pool)
-            .await,
-            ArtifactDatabase::Postgres(pool) => sqlx::query_as(
-                "SELECT storage_backend,storage_endpoint,storage_bucket,backend_key FROM artifacts WHERE id=$1",
-            )
-            .bind(artifact_id)
-            .fetch_optional(pool)
-            .await,
+    ArtifactDatabase::Sqlite(pool) => sqlx::query_as(
+        "SELECT storage_backend,storage_endpoint,storage_bucket,backend_key FROM artifacts WHERE id=?",
+    )
+    .bind(artifact_id)
+    .fetch_optional(pool)
+    .await,
+    ArtifactDatabase::Postgres(pool) => sqlx::query_as(
+        "SELECT storage_backend,storage_endpoint,storage_bucket,backend_key FROM artifacts WHERE id=$1",
+    )
+    .bind(artifact_id)
+    .fetch_optional(pool)
+    .await,
         }
         .map_err(storage_error)
     }
@@ -261,8 +261,8 @@ impl LocalArtifactStore {
         s3: &ArtifactS3Settings,
     ) -> Result<(), ArtifactError> {
         match &self.database {
-            ArtifactDatabase::Sqlite(pool) => sqlx::query("UPDATE artifacts SET storage_backend='s3',storage_endpoint=?,storage_bucket=? WHERE id=?").bind(&s3.endpoint).bind(&s3.bucket).bind(id).execute(pool).await.map(|_|()),
-            ArtifactDatabase::Postgres(pool) => sqlx::query("UPDATE artifacts SET storage_backend='s3',storage_endpoint=$1,storage_bucket=$2 WHERE id=$3").bind(&s3.endpoint).bind(&s3.bucket).bind(id).execute(pool).await.map(|_|()),
+    ArtifactDatabase::Sqlite(pool) => sqlx::query("UPDATE artifacts SET storage_backend='s3',storage_endpoint=?,storage_bucket=? WHERE id=?").bind(&s3.endpoint).bind(&s3.bucket).bind(id).execute(pool).await.map(|_|()),
+    ArtifactDatabase::Postgres(pool) => sqlx::query("UPDATE artifacts SET storage_backend='s3',storage_endpoint=$1,storage_bucket=$2 WHERE id=$3").bind(&s3.endpoint).bind(&s3.bucket).bind(id).execute(pool).await.map(|_|()),
         }.map_err(storage_error)
     }
 }

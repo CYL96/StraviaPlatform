@@ -10,7 +10,7 @@ description = "Stravia Agent infra — Desktop Application"
 workspace = true
 
 [features]
-desktop-e2e = ["dep:tauri-plugin-wdio", "dep:tauri-plugin-wdio-webdriver", "dep:windows"]
+desktop-e2e = ["stravia-core/test-support", "dep:tauri-plugin-wdio", "dep:tauri-plugin-wdio-webdriver", "dep:windows"]
 
 [dependencies]
 anyhow = { workspace = true }

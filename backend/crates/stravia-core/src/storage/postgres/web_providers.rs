@@ -43,7 +43,7 @@ impl WebProviderStore for PostgresWebProviderStore {
         let id = stravia_runtime_contract::identifier::new_id();
         sqlx::query(
             "INSERT INTO web_providers (id, name, kind, api_key, use_proxy, local_engines)
-             VALUES ($1, $2, $3, $4, $5, $6)",
+     VALUES ($1, $2, $3, $4, $5, $6)",
         )
         .bind(&id)
         .bind(input.name.trim())
@@ -79,9 +79,9 @@ impl WebProviderStore for PostgresWebProviderStore {
         };
         sqlx::query(
             "UPDATE web_providers
-             SET name = $1, api_key = $2, use_proxy = $3, local_engines = $4,
-                 updated_at = CURRENT_TIMESTAMP
-             WHERE id = $5",
+     SET name = $1, api_key = $2, use_proxy = $3, local_engines = $4,
+         updated_at = CURRENT_TIMESTAMP
+     WHERE id = $5",
         )
         .bind(name.trim())
         .bind(api_key)
@@ -105,17 +105,17 @@ impl WebProviderStore for PostgresWebProviderStore {
         for key in [SEARCH_IDS_KEY, FETCH_IDS_KEY] {
             sqlx::query(
                 "UPDATE settings AS s
-                 SET value = (
-                     SELECT COALESCE(
-                         jsonb_agg(entry.value ORDER BY entry.ordinality),
-                         '[]'::jsonb
-                     )::text
-                     FROM jsonb_array_elements_text(s.value::jsonb)
-                         WITH ORDINALITY AS entry(value, ordinality)
-                     WHERE entry.value <> $2
-                 ),
-                 updated_at = CURRENT_TIMESTAMP
-                 WHERE s.name = $1",
+         SET value = (
+             SELECT COALESCE(
+                 jsonb_agg(entry.value ORDER BY entry.ordinality),
+                 '[]'::jsonb
+             )::text
+             FROM jsonb_array_elements_text(s.value::jsonb)
+                 WITH ORDINALITY AS entry(value, ordinality)
+             WHERE entry.value <> $2
+         ),
+         updated_at = CURRENT_TIMESTAMP
+         WHERE s.name = $1",
             )
             .bind(key)
             .bind(id)
@@ -129,12 +129,12 @@ impl WebProviderStore for PostgresWebProviderStore {
     async fn exists_by_name(&self, name: &str, exclude_id: Option<&str>) -> anyhow::Result<bool> {
         let id = if let Some(exclude_id) = exclude_id {
             sqlx::query_scalar::<_, String>(
-                "SELECT id FROM web_providers WHERE lower(trim(name)) = lower(trim($1)) AND id != $2 LIMIT 1",
-            )
-            .bind(name)
-            .bind(exclude_id)
-            .fetch_optional(&self.pool)
-            .await?
+        "SELECT id FROM web_providers WHERE lower(trim(name)) = lower(trim($1)) AND id != $2 LIMIT 1",
+                    )
+                    .bind(name)
+                    .bind(exclude_id)
+                    .fetch_optional(&self.pool)
+                    .await?
         } else {
             sqlx::query_scalar::<_, String>(
                 "SELECT id FROM web_providers WHERE lower(trim(name)) = lower(trim($1)) LIMIT 1",
@@ -153,12 +153,12 @@ impl WebProviderStore for PostgresWebProviderStore {
     ) -> anyhow::Result<()> {
         let _ = result.tested_at;
         sqlx::query(
-            "UPDATE web_providers SET last_test_success = $1, last_test_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = $2",
-        )
-        .bind(result.success)
-        .bind(provider_id)
-        .execute(&self.pool)
-        .await?;
+    "UPDATE web_providers SET last_test_success = $1, last_test_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = $2",
+            )
+            .bind(result.success)
+            .bind(provider_id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
     async fn load_settings(&self) -> anyhow::Result<WebAccessSettings> {

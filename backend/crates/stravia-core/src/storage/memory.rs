@@ -604,28 +604,50 @@ impl UsageStatsStore for MemoryStorage {
         super::traits::RouteSchedulingUsage::default()
     }
 
-    async fn stats_overview(&self, _hours: Option<i64>) -> anyhow::Result<StatsOverview> {
+    async fn stats_overview(
+        &self,
+        window: crate::db::models::StatsWindow,
+    ) -> anyhow::Result<StatsOverview> {
+        window.validate()?;
         Ok(StatsOverview::default())
     }
 
     async fn stats_series(
         &self,
-        _hours: i64,
-        _bucket_ms: i64,
-        _tz_offset_ms: i64,
+        window: crate::db::models::StatsWindow,
+        bucket_ms: i64,
     ) -> anyhow::Result<Vec<StatsSeries>> {
+        window.validate()?;
+        if bucket_ms < 900_000 || bucket_ms % 900_000 != 0 {
+            return Err(crate::db::models::StatsQueryError(
+                "bucket must be a positive multiple of 900 seconds",
+            )
+            .into());
+        }
         Ok(vec![])
     }
 
-    async fn stats_by_model(&self, _hours: Option<i64>) -> anyhow::Result<Vec<ModelStats>> {
+    async fn stats_by_model(
+        &self,
+        window: crate::db::models::StatsWindow,
+    ) -> anyhow::Result<Vec<ModelStats>> {
+        window.validate()?;
         Ok(vec![])
     }
 
-    async fn stats_by_provider(&self, _hours: Option<i64>) -> anyhow::Result<Vec<ProviderStats>> {
+    async fn stats_by_provider(
+        &self,
+        window: crate::db::models::StatsWindow,
+    ) -> anyhow::Result<Vec<ProviderStats>> {
+        window.validate()?;
         Ok(vec![])
     }
 
-    async fn stats_by_api_key(&self, _hours: Option<i64>) -> anyhow::Result<Vec<ApiKeyStats>> {
+    async fn stats_by_api_key(
+        &self,
+        window: crate::db::models::StatsWindow,
+    ) -> anyhow::Result<Vec<ApiKeyStats>> {
+        window.validate()?;
         Ok(vec![])
     }
 }

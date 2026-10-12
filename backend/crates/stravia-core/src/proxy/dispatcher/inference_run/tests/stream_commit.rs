@@ -273,6 +273,133 @@ async fn mid_stream_failures_preserve_public_retry_classification() {
 }
 
 #[tokio::test]
+async fn failed_terminal_body_drop_preserves_failed_run_without_generation() {
+    let data_dir = tempfile::tempdir().expect("temporary data directory");
+    let gateway = Gateway::new(crate::config::GatewayConfig {
+        data_dir: data_dir.path().to_path_buf(),
+        ..Default::default()
+    })
+    .await
+    .expect("Gateway");
+    let headers = authorized_headers(&gateway).await;
+    let mut events = gateway.observation.subscribe(0);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut request = AiRequest::new("failed-terminal-body-drop", Vec::new());
+    request.stream.enabled = true;
+    let recovery_gate = engine::TerminalReceiptRecoveryGate {
+        entered: Arc::new(tokio::sync::Notify::new()),
+        release: Arc::new(tokio::sync::Notify::new()),
+    };
+    let context = RequestContext::new(
+        OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+        std::time::Duration::from_secs(30),
+    );
+    context.extensions.insert(recovery_gate.clone());
+    let response = execute(RunInput {
+        gateway: gateway.clone(),
+        executor: Arc::new(MidStreamFailureExecutor {
+            failure: MidStreamFailure::Transport,
+            calls: calls.clone(),
+        }),
+        headers,
+        envelope: RawEnvelope::new(
+            Some(serde_json::json!({
+                "model": "failed-terminal-body-drop",
+                "stream": true
+            })),
+            HashMap::new(),
+            "POST",
+            "/v1/chat/completions",
+        ),
+        request,
+        ingress: OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+        context,
+    })
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let mut chunks = response.into_body().into_data_stream();
+    let mut wire = String::new();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !wire.contains("data: [DONE]\n\n") {
+            let chunk = chunks.next().await.expect("terminal frame").expect("chunk");
+            wire.push_str(std::str::from_utf8(&chunk).expect("SSE UTF-8"));
+        }
+    })
+    .await
+    .expect("failed terminal arrives");
+    // Poll the genuine executor failure through the protocol terminal, but do
+    // not poll EOF: a delivered terminal receipt must not promote it to success.
+    drop(chunks);
+    wire.lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter_map(|data| serde_json::from_str::<serde_json::Value>(data).ok())
+        .find(|event| event.get("error").is_some())
+        .expect("actual streamed error was delivered before [DONE]");
+
+    // The request-scoped passive gate holds the producer before recovery
+    // eligibility, so the real failure receipt is ready when that decision runs.
+    // Notifications only wake the durable query; the persisted Run is the
+    // evidence, within the existing one-second completion budget.
+    let (run, failed_requests) = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        recovery_gate.entered.notified().await;
+        recovery_gate.release.notify_one();
+        loop {
+            let event = events
+                .next()
+                .await
+                .expect("Observation stream remains open");
+            let crate::interaction_observation::ObservationUpdate::Change(event) = event else {
+                continue;
+            };
+            let (Some(interaction_id), Some(run_id)) =
+                (event.interaction_id.as_deref(), event.run_id.as_deref())
+            else {
+                continue;
+            };
+            let detail = gateway
+                .observation
+                .get_interaction(interaction_id, Default::default())
+                .await
+                .expect("changed interaction query")
+                .expect("changed interaction");
+            if let Some(run) = detail
+                .runs
+                .into_iter()
+                .find(|run| run.id == run_id && run.finished_at.is_some())
+            {
+                let failed_requests = gateway
+                    .observation
+                    .failed_requests(Default::default())
+                    .await
+                    .expect("durable failed request query");
+                break (run, failed_requests);
+            }
+        }
+    })
+    .await
+    .expect("delivered failure is durably settled within 1s");
+    assert_eq!(run.status, "failed", "failure must not become completed");
+    assert!(
+        !run.user_interrupted,
+        "terminal body drop is not cancellation"
+    );
+    assert_eq!(run.generation_node_id, None, "failure has no Generation");
+    assert_eq!(
+        run.generation_parent_id, None,
+        "failure has no Generation parent"
+    );
+    assert_eq!(failed_requests.total, 1);
+    assert_eq!(failed_requests.items.len(), 1);
+    assert_eq!(
+        failed_requests.items[0].run_id.as_deref(),
+        Some(run.id.as_str())
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "must not replay upstream");
+    close_test_gateway(gateway, data_dir).await;
+}
+
+#[tokio::test]
 async fn delivery_stops_reading_at_completed_for_buffered_and_live_turns() {
     let data_dir = tempfile::tempdir().expect("temporary data directory");
     let gateway = Gateway::new(crate::config::GatewayConfig {

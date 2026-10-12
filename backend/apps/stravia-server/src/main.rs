@@ -197,7 +197,11 @@ async fn run_server(
     }
     .await;
     // 包括准备或令牌输出失败：先停止接收并排空请求，再关闭 Gateway。
-    let stopped = server.shutdown().await;
+    let stopped = if result.is_err() {
+        server.shutdown_with_timeout(Duration::ZERO).await
+    } else {
+        server.shutdown().await
+    };
     startup.shutdown().await;
     match result {
         Ok(()) => stopped,

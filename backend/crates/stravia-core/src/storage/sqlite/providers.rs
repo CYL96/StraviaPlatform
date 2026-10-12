@@ -9,19 +9,19 @@ pub(super) struct SqliteProviderStore {
 impl ProviderStore for SqliteProviderStore {
     async fn list(&self) -> anyhow::Result<Vec<Provider>> {
         Ok(sqlx::query_as::<_, Provider>(
-            "SELECT id, name, vendor, protocol, base_url, preset_key, channel, models_source, static_models, api_key, adapter_credentials, vendor_options, auth_mode, use_proxy, last_test_success, last_test_at, is_enabled, credential_status, credential_invalid_at, revision, created_at, updated_at FROM providers ORDER BY created_at DESC",
-        )
-        .fetch_all(&self.pool)
-        .await?)
+    "SELECT id, name, vendor, protocol, base_url, preset_key, channel, models_source, static_models, api_key, adapter_credentials, vendor_options, auth_mode, use_proxy, last_test_success, last_test_at, is_enabled, credential_status, credential_invalid_at, revision, created_at, updated_at FROM providers ORDER BY created_at DESC",
+            )
+            .fetch_all(&self.pool)
+            .await?)
     }
 
     async fn get(&self, id: &str) -> anyhow::Result<Option<Provider>> {
         Ok(sqlx::query_as::<_, Provider>(
-            "SELECT id, name, vendor, protocol, base_url, preset_key, channel, models_source, static_models, api_key, adapter_credentials, vendor_options, auth_mode, use_proxy, last_test_success, last_test_at, is_enabled, credential_status, credential_invalid_at, revision, created_at, updated_at FROM providers WHERE id = ?",
-        )
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await?)
+    "SELECT id, name, vendor, protocol, base_url, preset_key, channel, models_source, static_models, api_key, adapter_credentials, vendor_options, auth_mode, use_proxy, last_test_success, last_test_at, is_enabled, credential_status, credential_invalid_at, revision, created_at, updated_at FROM providers WHERE id = ?",
+            )
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?)
     }
 
     async fn create(&self, input: CreateProviderRecord) -> anyhow::Result<Provider> {
@@ -32,24 +32,24 @@ impl ProviderStore for SqliteProviderStore {
             anyhow::bail!("unsupported provider auth_mode: {}", input.auth_mode);
         }
         sqlx::query(
-            "INSERT INTO providers (id, name, vendor, protocol, base_url, preset_key, channel, models_source, static_models, api_key, adapter_credentials, vendor_options, auth_mode, use_proxy) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&id)
-        .bind(&input.name)
-        .bind(&vendor)
-        .bind(&input.protocol)
-        .bind(&input.base_url)
-        .bind(&input.preset_key)
-        .bind(&input.channel)
-        .bind(&models_source)
-        .bind(&input.static_models)
-        .bind(&input.api_key)
-        .bind(&input.adapter_credentials)
-        .bind(&input.vendor_options)
-        .bind(&input.auth_mode)
-        .bind(input.use_proxy)
-        .execute(&self.pool)
-        .await?;
+    "INSERT INTO providers (id, name, vendor, protocol, base_url, preset_key, channel, models_source, static_models, api_key, adapter_credentials, vendor_options, auth_mode, use_proxy) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&id)
+            .bind(&input.name)
+            .bind(&vendor)
+            .bind(&input.protocol)
+            .bind(&input.base_url)
+            .bind(&input.preset_key)
+            .bind(&input.channel)
+            .bind(&models_source)
+            .bind(&input.static_models)
+            .bind(&input.api_key)
+            .bind(&input.adapter_credentials)
+            .bind(&input.vendor_options)
+            .bind(&input.auth_mode)
+            .bind(input.use_proxy)
+            .execute(&self.pool)
+            .await?;
         self.get(&id)
             .await?
             .context("provider missing after create")
@@ -110,27 +110,27 @@ impl ProviderStore for SqliteProviderStore {
         let is_enabled = input.is_enabled.unwrap_or(current.is_enabled);
 
         sqlx::query(
-            "UPDATE providers SET name=?, vendor=?, protocol=?, base_url=?, preset_key=?, channel=?, models_source=?, static_models=?, api_key=?, adapter_credentials=?, vendor_options=?, auth_mode=?, use_proxy=?, is_enabled=?, updated_at=datetime('now'), revision=revision+1, credential_status = CASE WHEN ? THEN 'ok' ELSE credential_status END, credential_invalid_at = CASE WHEN ? THEN NULL ELSE credential_invalid_at END WHERE id=?",
-        )
-        .bind(name)
-        .bind(vendor)
-        .bind(&protocol)
-        .bind(base_url)
-        .bind(preset_key)
-        .bind(channel)
-        .bind(&models_source)
-        .bind(static_models)
-        .bind(api_key)
-        .bind(adapter_credentials)
-        .bind(vendor_options)
-        .bind(auth_mode)
-        .bind(use_proxy)
-        .bind(is_enabled)
-        .bind(reset_credential_status)
-        .bind(reset_credential_status)
-        .bind(id)
-        .execute(&self.pool)
-        .await?;
+    "UPDATE providers SET name=?, vendor=?, protocol=?, base_url=?, preset_key=?, channel=?, models_source=?, static_models=?, api_key=?, adapter_credentials=?, vendor_options=?, auth_mode=?, use_proxy=?, is_enabled=?, updated_at=datetime('now'), revision=revision+1, credential_status = CASE WHEN ? THEN 'ok' ELSE credential_status END, credential_invalid_at = CASE WHEN ? THEN NULL ELSE credential_invalid_at END WHERE id=?",
+            )
+            .bind(name)
+            .bind(vendor)
+            .bind(&protocol)
+            .bind(base_url)
+            .bind(preset_key)
+            .bind(channel)
+            .bind(&models_source)
+            .bind(static_models)
+            .bind(api_key)
+            .bind(adapter_credentials)
+            .bind(vendor_options)
+            .bind(auth_mode)
+            .bind(use_proxy)
+            .bind(is_enabled)
+            .bind(reset_credential_status)
+            .bind(reset_credential_status)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
         self.get(id).await?.context("provider missing after update")
     }
 
@@ -139,7 +139,7 @@ impl ProviderStore for SqliteProviderStore {
 
         sqlx::query(
             "DELETE FROM model_backends
-             WHERE provider_id = ?",
+     WHERE provider_id = ?",
         )
         .bind(id)
         .execute(&mut *tx)
@@ -147,9 +147,9 @@ impl ProviderStore for SqliteProviderStore {
 
         sqlx::query(
             "DELETE FROM models
-             WHERE NOT EXISTS (
-                   SELECT 1 FROM model_backends WHERE model_id = models.id
-               )",
+     WHERE NOT EXISTS (
+           SELECT 1 FROM model_backends WHERE model_id = models.id
+       )",
         )
         .execute(&mut *tx)
         .await?;
@@ -191,14 +191,14 @@ impl ProviderStore for SqliteProviderStore {
     ) -> anyhow::Result<()> {
         // ADR-0073：手动测试成功是恢复路径——上游接受了当前凭据，清除失效。
         sqlx::query(
-            "UPDATE providers SET last_test_success = ?, last_test_at = datetime('now'), revision = revision + 1, credential_status = CASE WHEN ? THEN 'ok' ELSE credential_status END, credential_invalid_at = CASE WHEN ? THEN NULL ELSE credential_invalid_at END WHERE id = ?",
-        )
-        .bind(result.success)
-        .bind(result.success)
-        .bind(result.success)
-        .bind(provider_id)
-        .execute(&self.pool)
-        .await?;
+    "UPDATE providers SET last_test_success = ?, last_test_at = datetime('now'), revision = revision + 1, credential_status = CASE WHEN ? THEN 'ok' ELSE credential_status END, credential_invalid_at = CASE WHEN ? THEN NULL ELSE credential_invalid_at END WHERE id = ?",
+            )
+            .bind(result.success)
+            .bind(result.success)
+            .bind(result.success)
+            .bind(provider_id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -294,16 +294,16 @@ impl ProviderStore for SqliteProviderStore {
         // 才把拒绝证据归到当前凭据上，否则放弃标记。
         let result = sqlx::query(
             "UPDATE providers
-             SET credential_status = 'invalid',
-                 credential_invalid_at = COALESCE(credential_invalid_at, datetime('now')),
-                 revision = revision + 1
-             WHERE id = ?
-               AND revision = ?
-               AND ((? IS NULL AND NOT EXISTS (
-                       SELECT 1 FROM provider_oauth_credentials WHERE provider_id = providers.id))
-                    OR (? IS NOT NULL AND EXISTS (
-                       SELECT 1 FROM provider_oauth_credentials
-                       WHERE provider_id = providers.id AND status_version = ?)))",
+     SET credential_status = 'invalid',
+         credential_invalid_at = COALESCE(credential_invalid_at, datetime('now')),
+         revision = revision + 1
+     WHERE id = ?
+       AND revision = ?
+       AND ((? IS NULL AND NOT EXISTS (
+               SELECT 1 FROM provider_oauth_credentials WHERE provider_id = providers.id))
+            OR (? IS NOT NULL AND EXISTS (
+               SELECT 1 FROM provider_oauth_credentials
+               WHERE provider_id = providers.id AND status_version = ?)))",
         )
         .bind(id)
         .bind(expected.provider_revision)
@@ -319,11 +319,11 @@ impl ProviderStore for SqliteProviderStore {
         // 仅在失效时落写：周期性的 OAuth 主动刷新不应空转 revision，
         // 否则会让在途请求锁定的凭据代际无故过期、丢弃真实 401 证据。
         sqlx::query(
-            "UPDATE providers SET credential_status = 'ok', credential_invalid_at = NULL, revision = revision + 1 WHERE id = ? AND credential_status = 'invalid'",
-        )
-        .bind(id)
-        .execute(&self.pool)
-        .await?;
+    "UPDATE providers SET credential_status = 'ok', credential_invalid_at = NULL, revision = revision + 1 WHERE id = ? AND credential_status = 'invalid'",
+            )
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 

@@ -336,6 +336,27 @@ impl DeliveryAdapter {
             terminal,
         }))
     }
+    pub(super) fn take_confirmed_terminal_delivery(&mut self) -> Option<i64> {
+        let Self::Stream {
+            live: Some(live), ..
+        } = self
+        else {
+            return None;
+        };
+        let receipt = live.terminal_delivery.as_mut()?;
+        match receipt.try_recv() {
+            Ok(delivered_at) => {
+                live.terminal_delivery.take();
+                Some(delivered_at)
+            }
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => None,
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                live.terminal_delivery.take();
+                None
+            }
+        }
+    }
+
     pub(super) async fn wait_for_terminal_delivery(&mut self) -> Option<i64> {
         let Self::Stream {
             live: Some(live), ..
@@ -790,6 +811,52 @@ mod tests {
         let received_at = delivery.wait_for_terminal_delivery().await.unwrap();
         assert!((before..=after).contains(&received_at));
         assert_eq!(delivery.wait_for_terminal_delivery().await, None);
+    }
+
+    #[tokio::test]
+    async fn confirmed_terminal_receipt_survives_cancelled_finish() {
+        use futures::StreamExt;
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let (commit_tx, commit_rx) = tokio::sync::oneshot::channel();
+        let (terminal_tx, terminal_rx) = tokio::sync::oneshot::channel();
+        let (preflight_tx, _preflight_rx) = tokio::sync::oneshot::channel();
+        let cancellation = CancellationToken::new();
+        let mut delivery = DeliveryAdapter::live_stream(LiveStreamRequest {
+            ingress: OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+            egress: Some(OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1),
+            tx: tx.clone(),
+            cancellation: cancellation.clone(),
+            preflight: preflight_tx,
+            terminal_delivery: terminal_rx,
+            commit: commit_rx,
+        });
+        assert_eq!(delivery.take_confirmed_terminal_delivery(), None);
+        let response = DeliveryAdapter::response_from_receiver(
+            rx,
+            commit_tx,
+            terminal_tx,
+            OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+            None,
+        );
+        tx.send(Ok("data: [DONE]\n\n".into())).await.unwrap();
+        let before = chrono::Utc::now().timestamp_millis();
+        let mut body = response.into_body().into_data_stream();
+        assert_eq!(
+            body.next().await.unwrap().unwrap().as_ref(),
+            b"data: [DONE]\n\n"
+        );
+        let after = chrono::Utc::now().timestamp_millis();
+        drop(body);
+        cancellation.cancel();
+        assert_eq!(
+            delivery.finish_stream("stop".into()).await,
+            DeliveryProgress::Cancelled
+        );
+        let delivered_at = delivery
+            .take_confirmed_terminal_delivery()
+            .expect("actual terminal receipt");
+        assert!((before..=after).contains(&delivered_at));
+        assert_eq!(delivery.take_confirmed_terminal_delivery(), None);
     }
 
     #[tokio::test]

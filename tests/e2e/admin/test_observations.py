@@ -207,8 +207,8 @@ def test_websocket_waiting_client_disconnects_without_losing_generation(
     assert status == 200, resumed
     completed = _wait_for(
         "resumed disconnected Interaction",
-        lambda: (detail if (detail := _detail(admin_env, waiting["id"]))["interaction"]["status"]
-                 == "completed" else None),
+        lambda: (detail if (detail := _finished_detail(admin_env, waiting["id"])) is not None
+                 and detail["interaction"]["status"] == "completed" else None),
     )
     assert len(completed["runs"]) == 2
     assert any(run["parent_run_id"] == before["runs"][0]["id"] for run in completed["runs"])
@@ -318,8 +318,8 @@ def test_failed_request_survives_successful_client_retry_in_same_interaction(
     detail = _wait_for(
         "recovered interaction",
         lambda: (
-            detail if (detail := _detail(admin_env, failure["interaction_id"]))["interaction"]["status"]
-            == "completed" else None
+            detail if (detail := _finished_detail(admin_env, failure["interaction_id"])) is not None
+            and detail["interaction"]["status"] == "completed" else None
         ),
     )
     assert {run["status"] for run in detail["runs"]} == {"failed", "completed"}
@@ -398,7 +398,7 @@ def test_failed_request_excludes_recovered_internal_retry(admin_env: dict[str, A
     assert status == 200
     interaction = _wait_for(
         "internally recovered request",
-        lambda: next((item for item in _route_interactions(admin_env, route_id) if item["status"] == "completed"), None),
+        lambda: next(iter(_finished_route_interactions(admin_env, route_id)), None),
     )
     detail = _detail(admin_env, interaction["id"])
     assert len(detail["runs"]) == 1
@@ -692,6 +692,7 @@ def test_observation_explicit_range_rejects_invalid_bounds(
 
 
 def _wait_for(description: str, probe: Callable[[], Any], timeout: float = 10.0) -> Any:
+    __tracebackhide__ = True
     deadline = time.time() + timeout
     last: Any = None
     while time.time() < deadline:
@@ -746,6 +747,54 @@ def _detail(env: dict[str, Any], interaction_id: str) -> dict[str, Any]:
     return detail
 
 
+def _finished_detail(env: dict[str, Any], interaction_id: str) -> dict[str, Any] | None:
+    detail = _detail(env, interaction_id)
+    # Delivery receipts can settle status before asynchronous finalization. Detail
+    # itself reads Run rows before events, so even run_finished can accompany
+    # stale projection fields. Observe terminal sequences before reading again;
+    # do not poll the values that callers must independently assert.
+    terminal_sequences = {
+        run["id"]: max(
+            (event["sequence"] for event in run["events"] if event["kind"] == "run_finished"),
+            default=0,
+        )
+        for run in detail["runs"]
+    }
+    if not terminal_sequences or not all(terminal_sequences.values()):
+        return None
+    detail = _detail(env, interaction_id)
+    refreshed_terminal_sequences = {
+        run["id"]: max(
+            (event["sequence"] for event in run["events"] if event["kind"] == "run_finished"),
+            default=0,
+        )
+        for run in detail["runs"]
+    }
+    # A new Run or terminal revision needs its own post-observation read. Let the
+    # caller's existing deadline govern the next probe, without a nested wait.
+    return detail if refreshed_terminal_sequences == terminal_sequences else None
+
+
+def _finished_route_interactions(env: dict[str, Any], route_id: str) -> list[dict[str, Any]]:
+    finished = []
+    for interaction in _route_interactions(env, route_id):
+        if interaction["status"] != "completed":
+            continue
+        detail = _finished_detail(env, interaction["id"])
+        if detail is None:
+            continue
+        terminal_sequence = max(
+            event["sequence"] for run in detail["runs"] for event in run["events"]
+            if event["kind"] == "run_finished"
+        )
+        # _finished_detail has re-read projections after observing terminal facts.
+        # Keep the forest watermark requirement too: receipt-derived summaries
+        # must not be returned before they cover those same terminal facts.
+        if terminal_sequence <= interaction["last_event_sequence"]:
+            finished.append(interaction)
+    return finished
+
+
 def _event_page(env: dict[str, Any], interaction_id: str, **query: object) -> dict[str, Any]:
     status, body = http_request(
         "GET", f"{env['admin']}/api/v1/observations/interactions/{interaction_id}/events?{urlencode(query)}",
@@ -784,8 +833,8 @@ def test_observation_history_pages_decode_preserve_snapshot_and_do_not_write(adm
         interactions = _route_interactions(admin_env, route_id)
         if not interactions:
             return None
-        detail = _detail(admin_env, interactions[0]["id"])
-        return detail if detail["runs"] and all(run["status"] != "running" for run in detail["runs"]) else None
+        detail = _finished_detail(admin_env, interactions[0]["id"])
+        return detail if detail is not None and all(run["status"] != "running" for run in detail["runs"]) else None
 
     initial = _wait_for("completed history fixture", finished)
     interaction_id = initial["interaction"]["id"]
@@ -922,11 +971,7 @@ def test_observation_http_sse_usage_and_legacy_cutover(admin_env: dict[str, Any]
 
     interactions = _wait_for(
         "completed Interaction",
-        lambda: [
-            interaction
-            for interaction in _route_interactions(admin_env, route_id)
-            if interaction["status"] == "completed"
-        ],
+        lambda: _finished_route_interactions(admin_env, route_id),
         timeout=1.0,
     )
     assert len(interactions) == 1
@@ -1229,14 +1274,20 @@ def test_tool_loop_concurrent_branches_and_new_user_group_at_interaction_seam(
         quick_history + [{"role": "user", "content": "The todo list is unfinished. Continue."}],
     )
     assert status == 200, response
-    interactions = _wait_for(
-        "completed response and quick follow-up",
-        lambda: (lambda items: items if sum(
-            len(_detail(admin_env, item["id"])["runs"]) for item in items
-        ) == 2 else None)(_route_interactions(admin_env, quick_route)),
+    def finished_quick_followup():
+        items = _route_interactions(admin_env, quick_route)
+        details = [_finished_detail(admin_env, item["id"]) for item in items]
+        if any(detail is None for detail in details):
+            return None
+        if sum(len(detail["runs"]) for detail in details) == 2:
+            return items, details
+        return None
+
+    interactions, quick_details = _wait_for(
+        "completed response and quick follow-up", finished_quick_followup,
     )
     assert len(interactions) == 1
-    quick_detail = _detail(admin_env, interactions[0]["id"])
+    quick_detail = quick_details[0]
     assert quick_detail["interaction"]["input_preview"] == "finish this task"
     assert all(not run["user_interrupted"] for run in quick_detail["runs"])
 
@@ -1343,10 +1394,11 @@ def test_tool_result_with_user_input_preserves_running_branch_in_live_and_bundle
     assert old_outcome[0][1]["choices"][0]["message"]["content"] == "mock-ok-1"
     finished = _wait_for(
         "completed sibling branches in the same Interaction",
-        lambda: (lambda detail: detail if detail["interaction"]["status"] == "completed"
+        lambda: (lambda detail: detail if detail is not None
+            and detail["interaction"]["status"] == "completed"
             and next(run for run in detail["runs"] if run["id"] == old_run["id"])["status"]
             == "completed"
-            else None)(_detail(admin_env, original["interaction"]["id"])),
+            else None)(_finished_detail(admin_env, original["interaction"]["id"])),
     )
     terminal_run = next(run for run in finished["runs"] if run["id"] == old_run["id"])
     assert terminal_run["terminal_reason"] is None
@@ -1434,7 +1486,7 @@ def test_parentless_root_retry_respects_exact_principal_and_concurrency_boundari
         "separate committed root repetitions",
         lambda: (lambda items: items if len(items) == 2
             and all(item["status"] == "completed" for item in items) else None)(
-            _route_interactions(admin_env, committed_route)
+            _finished_route_interactions(admin_env, committed_route)
         ),
     )
     assert all(item["status"] == "completed" for item in committed)
@@ -1678,12 +1730,13 @@ def test_debug_snapshot_redaction_bundle_ticket_and_clear_active_history(
     interaction = _wait_for("debug Interaction", lambda: _route_interactions(admin_env, route_id))[0]
     detail = _wait_for(
         "finalized Debug trace",
-        lambda: (lambda value: value if value["interaction"]["status"] == "completed"
+        lambda: (lambda value: value if value is not None
+            and value["interaction"]["status"] == "completed"
             and value["runs"][0]["status"] == "completed"
             and value["runs"][0]["finished_at"] is not None
             and value["runs"][0].get("trace")
             and value["runs"][0]["trace"]["status"] == "complete" else None)(
-            _detail(admin_env, interaction["id"])
+            _finished_detail(admin_env, interaction["id"])
         ),
     )
     run = detail["runs"][0]
@@ -1840,8 +1893,9 @@ def test_debug_snapshot_redaction_bundle_ticket_and_clear_active_history(
     assert result and result[0][0] == 200
     _wait_for(
         "cleared active capture reaches terminal state",
-        lambda: (lambda value: value if value["runs"][0]["status"] == "completed" else None)(
-            _detail(admin_env, active["id"])
+        lambda: (lambda value: value if value is not None
+            and value["runs"][0]["status"] == "completed" else None)(
+            _finished_detail(admin_env, active["id"])
         ),
     )
     # Finishing the run must not resurrect its cleared trace directory.
@@ -2014,8 +2068,9 @@ def test_running_bundle_is_fixed_at_its_watermark_and_never_claims_completion(
     assert outcome and outcome[0][0] == 200
     finished = _wait_for(
         "completed live Interaction",
-        lambda: (lambda value: value if value["interaction"]["status"] == "completed" else None)(
-            _detail(admin_env, running["id"])
+        lambda: (lambda value: value if value is not None
+            and value["interaction"]["status"] == "completed" else None)(
+            _finished_detail(admin_env, running["id"])
         ),
     )
     assert finished["snapshot_sequence"] > through_sequence
@@ -2166,15 +2221,27 @@ def test_root_batches_filters_and_fixed_anchor_reload_preserve_complete_context(
     )
     assert status == 200, child
 
-    filtered = _wait_for(
-        "completed filtered root",
-        lambda: (lambda page: page if page["root_total"] == 1 and all(
-            item["status"] == "completed"
-            for root in page["roots"] for item in root["interactions"]
-        ) else None)(
-            _forest(admin_env, anchor_at=old_anchor, model=child_route, limit=10)
-        ),
-    )
+    def finished_filtered_root() -> dict[str, Any] | None:
+        page = _forest(admin_env, anchor_at=old_anchor, model=child_route, limit=10)
+        interactions = [item for root in page["roots"] for item in root["interactions"]]
+        if not interactions:
+            return None
+        for item in interactions:
+            if item["status"] != "completed":
+                return None
+            detail = _finished_detail(admin_env, item["id"])
+            if detail is None:
+                return None
+            terminal_sequence = max(
+                event["sequence"] for run in detail["runs"] for event in run["events"]
+                if event["kind"] == "run_finished"
+            )
+            if terminal_sequence > item["last_event_sequence"]:
+                return None
+        return page
+
+    filtered = _wait_for("completed filtered root", finished_filtered_root)
+    assert filtered["root_total"] == 1
     assert len(filtered["roots"]) == 1
     context = filtered["roots"][0]["interactions"]
     assert len(context) == 2

@@ -506,7 +506,9 @@ impl AdminService {
             super::provider_connection::ProviderReconnectResult::Redirect(_) => {
                 unreachable!("OAuth Callback cannot start an authorization")
             }
-            _ => anyhow::bail!("OAuth authorization callback returned an unexpected result"),
+            _ => {
+                anyhow::bail!("OAuth authorization callback returned an unexpected result")
+            }
         }
     }
 

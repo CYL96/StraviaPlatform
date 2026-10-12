@@ -17,12 +17,12 @@ impl SettingsStore for SqliteSettingsStore {
 
     async fn set(&self, key: &str, value: &str) -> anyhow::Result<()> {
         sqlx::query(
-            "INSERT INTO settings (name, value, updated_at) VALUES (?, ?, datetime('now')) ON CONFLICT(name) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
-        )
-        .bind(key)
-        .bind(value)
-        .execute(&self.pool)
-        .await?;
+    "INSERT INTO settings (name, value, updated_at) VALUES (?, ?, datetime('now')) ON CONFLICT(name) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+            )
+            .bind(key)
+            .bind(value)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 }

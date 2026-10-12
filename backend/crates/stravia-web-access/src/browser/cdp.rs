@@ -14,7 +14,20 @@ use reqwest_websocket::{Message, Upgrade};
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot};
 
-type Reply = oneshot::Sender<Result<Value, String>>;
+pub(super) const CALL_TIMEOUT: Duration = Duration::from_secs(60);
+
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub(super) struct ProtocolError(Value);
+
+impl ProtocolError {
+    pub(super) fn is_inactive_page(&self) -> bool {
+        self.0["code"].as_i64() == Some(-32000)
+            && self.0["message"].as_str() == Some("Not attached to an active page")
+    }
+}
+
+type Reply = oneshot::Sender<anyhow::Result<Value>>;
 
 #[derive(Clone)]
 pub(super) struct Cdp(Arc<Inner>);
@@ -81,7 +94,7 @@ impl Cdp {
             }
             writer_closed.store(true, Ordering::Release);
             for (_, reply) in writer_pending.lock().drain() {
-                let _ = reply.send(Err("Chrome CDP writer closed".into()));
+                let _ = reply.send(Err(anyhow::anyhow!("Chrome CDP writer closed")));
             }
         });
         let reader_pending = pending.clone();
@@ -91,13 +104,13 @@ impl Cdp {
                 let Message::Text(text) = message else {
                     continue;
                 };
-                let Ok(value) = serde_json::from_str::<Value>(&text) else {
+                let Ok(mut value) = serde_json::from_str::<Value>(&text) else {
                     break;
                 };
                 if let Some(id) = value["id"].as_u64() {
                     if let Some(reply) = reader_pending.lock().remove(&id) {
                         let result = if value.get("error").is_some() {
-                            Err(value["error"].to_string())
+                            Err(anyhow::Error::new(ProtocolError(value["error"].take())))
                         } else {
                             Ok(value["result"].clone())
                         };
@@ -109,7 +122,7 @@ impl Cdp {
             }
             reader_closed.store(true, Ordering::Release);
             for (_, reply) in reader_pending.lock().drain() {
-                let _ = reply.send(Err("Chrome CDP connection closed".into()));
+                let _ = reply.send(Err(anyhow::anyhow!("Chrome CDP connection closed")));
             }
         });
         Ok((
@@ -155,8 +168,6 @@ impl Cdp {
             .outgoing
             .send(Message::Text(message.to_string()))
             .map_err(|_| anyhow::anyhow!("Chrome CDP writer unavailable"))?;
-        tokio::time::timeout(Duration::from_secs(60), rx)
-            .await??
-            .map_err(anyhow::Error::msg)
+        tokio::time::timeout(CALL_TIMEOUT, rx).await??
     }
 }

@@ -93,6 +93,191 @@ fn invalid_tool_terminal_preserves_content_and_tail_usage_before_one_error() {
 }
 
 #[test]
+fn streaming_usage_revisions_preserve_unknown_fields_and_accept_partial_zero() {
+    use crate::accumulator::StreamResponseAccumulator;
+    use crate::codec::openai::compatible::chat_completions::OpenAIChatCompletionsV1;
+    use crate::transform::ProtocolTransform;
+
+    // Exercise both ordinary choice frames and dedicated usage tail frames.
+    for choices in [
+        serde_json::json!([]),
+        serde_json::json!([{"delta": {"content": "ok"}, "finish_reason": null}]),
+    ] {
+        for reports in [
+            vec![
+                serde_json::json!({"prompt_tokens": 20, "completion_tokens": 7, "prompt_tokens_details": {"cached_tokens": 5}, "completion_tokens_details": {"reasoning_tokens": 2}}),
+                serde_json::json!({"prompt_tokens": 20, "completion_tokens": 7}),
+                serde_json::json!({"completion_tokens": 0}),
+                serde_json::json!({"prompt_tokens": null}),
+                serde_json::json!({"prompt_tokens_details": {"cached_tokens": 5}, "completion_tokens_details": {"reasoning_tokens": null}}),
+            ],
+            vec![
+                serde_json::json!({"completion_tokens": 0}),
+                serde_json::json!({"prompt_tokens": 20, "prompt_tokens_details": {"cached_tokens": 5}, "completion_tokens_details": {"reasoning_tokens": 2}}),
+            ],
+        ] {
+            let mut upstream = String::new();
+            for report in reports {
+                upstream.push_str(&data_sse(&serde_json::json!({"id": "chat", "model": "model", "choices": choices, "usage": report}).to_string()));
+            }
+            upstream.push_str(&data_sse("[DONE]"));
+            for chunk_size in [1, 7, upstream.len()] {
+                let mut decoder =
+                    ProtocolTransform::decode_stream_with(&OpenAIChatCompletionsV1).unwrap();
+                let mut accumulator = StreamResponseAccumulator::default();
+                let mut formatter = OpenAIStreamFormatter::new();
+                let mut events = Vec::new();
+                for chunk in upstream.as_bytes().chunks(chunk_size) {
+                    let deltas = decoder.decode_chunk(chunk).unwrap();
+                    accumulator.apply_all(&deltas);
+                    events.extend(formatter.format_deltas(&deltas));
+                }
+                let deltas = decoder.finish().unwrap();
+                accumulator.apply_all(&deltas);
+                events.extend(formatter.format_deltas(&deltas));
+                let wire_usage = events
+                    .iter()
+                    .filter_map(|event| serde_json::from_str::<Value>(&event.data).ok())
+                    .find_map(|event| event.get("usage").cloned())
+                    .unwrap();
+                assert_eq!(wire_usage["prompt_tokens"], 20);
+                assert_eq!(wire_usage["completion_tokens"], 0);
+                assert_eq!(wire_usage["total_tokens"], 20);
+                assert_eq!(wire_usage["prompt_tokens_details"]["cached_tokens"], 5);
+                assert_eq!(
+                    wire_usage["completion_tokens_details"]["reasoning_tokens"],
+                    2
+                );
+                let response = accumulator.into_ai_response();
+                assert!(response.usage.required_components_known);
+                assert_eq!(response.usage.prompt_tokens, 20);
+                assert_eq!(response.usage.completion_tokens, 0);
+                assert_eq!(response.usage.total_tokens, 20);
+                assert_eq!(response.usage.cache_read_tokens, Some(5));
+                assert_eq!(response.usage.reasoning_tokens, Some(2));
+                assert_eq!(response.usage.cache_creation_tokens, None);
+            }
+        }
+    }
+}
+
+#[test]
+fn streaming_optional_usage_revisions_reach_formatter_without_erasing_known_fields() {
+    use crate::accumulator::StreamResponseAccumulator;
+    use crate::codec::openai::compatible::chat_completions::OpenAIChatCompletionsV1;
+    use crate::transform::ProtocolTransform;
+
+    let upstream = [
+        data_sse(r#"{"choices":[],"usage":{"prompt_tokens":20,"completion_tokens":7,"prompt_tokens_details":{"cached_tokens":5},"completion_tokens_details":{"reasoning_tokens":2}}}"#),
+        data_sse(r#"{"choices":[],"usage":{"completion_tokens_details":{"reasoning_tokens":3}}}"#),
+        data_sse(r#"{"choices":[],"usage":{"completion_tokens":0}}"#),
+        data_sse(r#"{"choices":[],"usage":{"prompt_tokens_details":{"cached_tokens":0}}}"#),
+        data_sse(r#"{"choices":[],"usage":{"prompt_tokens":null,"prompt_tokens_details":{"cached_tokens":null},"completion_tokens_details":{"reasoning_tokens":null}}}"#),
+        data_sse("[DONE]"),
+    ].concat();
+    let mut decoder = ProtocolTransform::decode_stream_with(&OpenAIChatCompletionsV1).unwrap();
+    let mut deltas = decoder.decode_chunk(upstream.as_bytes()).unwrap();
+    deltas.extend(decoder.finish().unwrap());
+    let mut accumulator = StreamResponseAccumulator::default();
+    accumulator.apply_all(&deltas);
+    let response = accumulator.into_ai_response();
+    assert!(response.usage.required_components_known);
+    assert_eq!(response.usage.prompt_tokens, 20);
+    assert_eq!(response.usage.completion_tokens, 0);
+    assert_eq!(response.usage.cache_read_tokens, Some(0));
+    assert_eq!(response.usage.reasoning_tokens, Some(3));
+    assert_eq!(response.usage.cache_creation_tokens, None);
+    let events = OpenAIStreamFormatter::new().format_deltas(&deltas);
+    let wire_usage = events
+        .iter()
+        .filter_map(|event| serde_json::from_str::<Value>(&event.data).ok())
+        .find_map(|event| event.get("usage").cloned())
+        .unwrap();
+    assert_eq!(wire_usage["prompt_tokens"], 20);
+    assert_eq!(wire_usage["completion_tokens"], 0);
+    assert_eq!(wire_usage["total_tokens"], 20);
+    assert_eq!(wire_usage["prompt_tokens_details"]["cached_tokens"], 0);
+    assert_eq!(
+        wire_usage["completion_tokens_details"]["reasoning_tokens"],
+        3
+    );
+}
+
+#[test]
+fn streaming_optional_only_usage_does_not_invent_required_wire_counters() {
+    use crate::accumulator::StreamResponseAccumulator;
+    use crate::codec::openai::compatible::chat_completions::OpenAIChatCompletionsV1;
+    use crate::transform::ProtocolTransform;
+
+    for (required, known, expected_input, expected_output, expected_total) in [
+        (serde_json::json!({}), false, None, None, None),
+        (
+            serde_json::json!({"prompt_tokens": 20}),
+            false,
+            Some(20),
+            None,
+            None,
+        ),
+        (
+            serde_json::json!({"completion_tokens": 7}),
+            false,
+            None,
+            Some(7),
+            None,
+        ),
+        (
+            serde_json::json!({"completion_tokens": 0}),
+            false,
+            None,
+            None,
+            None,
+        ),
+        (
+            serde_json::json!({"prompt_tokens": 0, "completion_tokens": 0}),
+            true,
+            Some(0),
+            Some(0),
+            Some(0),
+        ),
+    ] {
+        let upstream = [
+            data_sse(r#"{"choices":[],"usage":{"prompt_tokens_details":{"cached_tokens":5},"completion_tokens_details":{"reasoning_tokens":2}}}"#),
+            data_sse(&serde_json::json!({"choices": [], "usage": required}).to_string()),
+            data_sse(r#"{"choices":[],"usage":{"completion_tokens_details":{"reasoning_tokens":0}}}"#),
+            data_sse("[DONE]"),
+        ].concat();
+        let mut decoder = ProtocolTransform::decode_stream_with(&OpenAIChatCompletionsV1).unwrap();
+        let mut deltas = decoder.decode_chunk(upstream.as_bytes()).unwrap();
+        deltas.extend(decoder.finish().unwrap());
+        let mut accumulator = StreamResponseAccumulator::default();
+        accumulator.apply_all(&deltas);
+        let response = accumulator.into_ai_response();
+        assert_eq!(response.usage.required_components_known, known);
+        assert_eq!(response.usage.cache_read_tokens, Some(5));
+        assert_eq!(response.usage.reasoning_tokens, Some(0));
+        assert_eq!(response.usage.cache_creation_tokens, None);
+        let events = OpenAIStreamFormatter::new().format_deltas(&deltas);
+        let wire_usage = events
+            .iter()
+            .filter_map(|event| serde_json::from_str::<Value>(&event.data).ok())
+            .find_map(|event| event.get("usage").cloned())
+            .unwrap();
+        for (key, expected) in [
+            ("prompt_tokens", expected_input),
+            ("completion_tokens", expected_output),
+            ("total_tokens", expected_total),
+        ] {
+            assert_eq!(wire_usage.get(key).cloned(), expected.map(Value::from));
+        }
+        assert_eq!(wire_usage["prompt_tokens_details"]["cached_tokens"], 5);
+        assert_eq!(
+            wire_usage["completion_tokens_details"]["reasoning_tokens"],
+            0
+        );
+    }
+}
+
+#[test]
 fn invalid_tool_terminal_at_eof_preserves_known_zero_usage_and_is_not_repeated() {
     let mut parser = OpenAIStreamParser::new();
     let mut deltas = parser.parse_chunk(&[
@@ -544,6 +729,7 @@ fn formatters_emit_cached_prompt_token_details() {
     response.usage = Usage {
         prompt_tokens: 100,
         completion_tokens: 20,
+        required_components_known: true,
         cache_read_tokens: Some(80),
         cache_creation_tokens: Some(10),
         reasoning_tokens: Some(0),

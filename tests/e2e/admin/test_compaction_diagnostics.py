@@ -4,7 +4,9 @@ import base64
 import copy
 import hashlib
 import json
+import sqlite3
 import time
+from contextlib import closing
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -123,8 +125,15 @@ class _LocalConversation:
                 if not detail["runs"]:
                     continue
                 newest = max(detail["runs"], key=lambda run: run["started_at"])
-                if newest["status"] in ("completed", "waiting_client"):
-                    return detail
+                finished = [event for event in newest["events"] if event["kind"] == "run_finished"]
+                # Detail reads Run rows before its event page, so a concurrent
+                # finish can appear beside stale projection fields. Require the
+                # forest read made before detail to have seen this terminal event.
+                # It must also belong to this send, not a prior Run's finish.
+                if newest["status"] in ("completed", "waiting_client") and finished:
+                    terminal_sequence = max(event["sequence"] for event in finished)
+                    if before.get(item["id"], 0) < terminal_sequence <= item["last_event_sequence"]:
+                        return detail
             return None
 
         return returned, _wait_for("delivered diagnostic Interaction or merged Run", completed)
@@ -512,20 +521,54 @@ def test_retained_block_before_appended_tool_result_does_not_enable_execution_pa
 @pytest.mark.admin
 def test_candidate_cap_never_reports_the_indexed_subset_as_unique(diagnostic_provider) -> None:
     conversation = diagnostic_provider("candidate-cap")
-    retained, _ = _seed(conversation)
-    # More independent completed conversations than the bounded search can
-    # exhaust. Each has a different semantic source, not repeated retries.
+    retained, source = _seed(conversation)
+    # Independent questions keep Generation roots distinct. Sharing the delivered
+    # answer makes all 129 Runs genuine fingerprint candidates for the cap probe,
+    # although only one full question/answer pair can match it. The original seed
+    # has a different answer and must still be uniquely inferable after saturation.
+    shared_answer = _answer(_text("shared independent cap answer"))
     for number in range(129):
-        messages = [_user(f"independent cap source {number}")]
-        conversation.accepted[_semantic(messages)] = _answer(_text(f"independent answer {number}"))
+        messages = [_user(_text(f"independent cap source {number}"))]
+        conversation.accepted[_semantic(messages)] = shared_answer
         status, body = _proxy(conversation.env, conversation.key, conversation.name, messages)
         assert status == 200, body
-    _wait_for("all candidate sources persisted", lambda: _forest(conversation.env, model=conversation.route_id)["root_total"] >= 130)
-    _, detail = conversation.send([_user("summary after candidate saturation"), *retained, _user("new task despite diagnostic cap")])
+
+    def sources_finished() -> bool:
+        # root_total proves admission, not finish. A late source finish after
+        # send's pre-request watermark could otherwise be mistaken for its result.
+        # Read only lifecycle/index facts, never poll for the diagnostic assertion.
+        with closing(sqlite3.connect(conversation.env["data_dir"] / "db" / "gateway.db")) as connection:
+            completed = connection.execute(
+                "SELECT COUNT(*) FROM inference_run_observations r "
+                "JOIN interaction_observations i ON i.id=r.interaction_id "
+                "JOIN observation_tail_sources s ON s.run_id=r.id "
+                "WHERE r.route_id=? AND r.status='completed' AND EXISTS ("
+                "SELECT 1 FROM observation_events e WHERE e.run_id=r.id "
+                "AND e.kind='run_finished' AND e.sequence<=i.last_event_sequence)",
+                (conversation.route_id,),
+            ).fetchone()[0]
+        return completed == 130
+
+    _wait_for("all candidate sources finished and indexed", sources_finished)
     try:
+        _, detail = conversation.send([_user("summary after candidate saturation"), *retained, _user("new task despite diagnostic cap")])
         event = _diagnostic(conversation, detail, "inferred")
-        assert event["source_interaction_id"] is not None
+        assert event["source_interaction_id"] == source["interaction"]["id"]
+        assert event["source_run_id"] == _newest_run(source)["id"]
         assert _admitted(detail)["grouping_reason"] == "retained_tail_linked"
+
+        # Fingerprint saturation cannot turn the one fully matching indexed pair
+        # into a unique source: the whole 129-candidate search exceeds the budget.
+        _, capped = conversation.send([
+            _user("summary retaining one independent source"),
+            _user(_text("independent cap source 0")), shared_answer,
+            _user("new task after candidate overflow"),
+        ])
+        capped_event = _diagnostic(conversation, capped, "resource_limit")
+        assert capped_event["source_interaction_id"] is None
+        assert capped_event["source_run_id"] is None
+        assert _admitted(capped)["grouping_reason"] == "new_root"
+        assert capped["interaction"]["parent_interaction_id"] is None
     finally:
         status, body = http_request("DELETE", f"{conversation.env['admin']}/api/v1/observations/history", headers=conversation.env["auth"])
         assert status == 200, body

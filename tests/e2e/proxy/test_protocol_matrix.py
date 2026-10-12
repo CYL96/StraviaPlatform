@@ -127,6 +127,30 @@ def _request_headers(ingress: str, api_key: str) -> dict[str, str]:
     return headers
 
 
+def _complete_run_event_pages(
+    proxy_base: str, admin_headers: dict, detail: dict, run: dict,
+) -> None:
+    """Reconstruct one Run's lifecycle at the detail's fixed watermark."""
+    cursor = detail["older_events_cursor"]
+    while cursor is not None:
+        page_status, page_body = http_request(
+            "GET",
+            f"{proxy_base}/api/v1/observations/interactions/{detail['interaction']['id']}"
+            f"/events?before_sequence={cursor}"
+            f"&through_sequence={detail['snapshot_sequence']}",
+            headers=admin_headers,
+        )
+        assert page_status == 200, page_body
+        page = page_body["data"]
+        assert page["snapshot_sequence"] == detail["snapshot_sequence"]
+        for page_run in page["runs"]:
+            if page_run["id"] == run["id"]:
+                run["events"] = page_run["events"] + run["events"]
+        next_cursor = page["next_cursor"]
+        assert next_cursor is None or next_cursor < cursor
+        cursor = next_cursor
+
+
 # ---------------------------------------------------------------------------
 # tests
 # ---------------------------------------------------------------------------
@@ -246,26 +270,50 @@ def test_protocol_matrix(
                 # Detail contains only the latest event page. Check readiness against
                 # the full lifecycle at this fixed watermark, including older pages
                 # when later activity has pushed run_finished out of the latest page.
-                cursor = candidate["older_events_cursor"]
-                while cursor is not None:
-                    page_status, page_body = http_request(
+                _complete_run_event_pages(proxy_base, admin_headers, candidate, run)
+                terminal_sequences = [
+                    event["sequence"]
+                    for event in run["events"]
+                    if event["kind"] == "run_finished"
+                ]
+                if terminal_sequences:
+                    # Detail reads Run projections before its event snapshot. A finish
+                    # committed between those reads can accompany a receipt-only row.
+                    # Re-read only after witnessing the semantic completion barrier;
+                    # never wait for the timestamp assertion itself to become true.
+                    terminal_sequence = max(terminal_sequences)
+                    refreshed_status, refreshed_body = http_request(
                         "GET",
-                        f"{proxy_base}/api/v1/observations/interactions/{candidate['interaction']['id']}"
-                        f"/events?before_sequence={cursor}"
-                        f"&through_sequence={candidate['snapshot_sequence']}",
+                        f"{proxy_base}/api/v1/observations/interactions/{latest['id']}",
                         headers=admin_headers,
                     )
-                    assert page_status == 200, page_body
-                    page = page_body["data"]
-                    assert page["snapshot_sequence"] == candidate["snapshot_sequence"]
-                    for page_run in page["runs"]:
-                        if page_run["id"] == run["id"]:
-                            run["events"] = page_run["events"] + run["events"]
-                    next_cursor = page["next_cursor"]
-                    assert next_cursor is None or next_cursor < cursor
-                    cursor = next_cursor
-                if any(event["kind"] == "run_finished" for event in run["events"]):
-                    observed = candidate
+                    assert refreshed_status == 200, refreshed_body
+                    refreshed = refreshed_body["data"]
+                    if [item["id"] for item in refreshed["runs"]] != [
+                        item["id"] for item in candidate["runs"]
+                    ]:
+                        last_state += " Run set changed after completion barrier"
+                        continue
+                    refreshed_run = refreshed["runs"][-1]
+                    _complete_run_event_pages(
+                        proxy_base, admin_headers, refreshed, refreshed_run,
+                    )
+                    refreshed_terminal_sequences = [
+                        event["sequence"]
+                        for event in refreshed_run["events"]
+                        if event["kind"] == "run_finished"
+                    ]
+                    if (
+                        not refreshed_terminal_sequences
+                        or max(refreshed_terminal_sequences) != terminal_sequence
+                    ):
+                        last_state += " terminal sequence changed after completion barrier"
+                        continue
+                    assert refreshed["snapshot_sequence"] >= terminal_sequence
+                    assert refreshed_run["finished_at"] is not None
+                    assert refreshed_run["status"] != "running"
+                    assert (refreshed_run.get("trace") or {}).get("status") == "complete"
+                    observed = refreshed
                     break
                 last_state += f" run_finished absent at snapshot={candidate['snapshot_sequence']}"
         time.sleep(0.1)
@@ -281,7 +329,10 @@ def test_protocol_matrix(
     kinds = [event["kind"] for event in run["events"]]
     assert kinds.index("target_attempt_started") < kinds.index("target_attempt_finished")
     assert kinds.index("target_attempt_finished") < kinds.index("run_finished")
-    finished = next(event for event in run["events"] if event["kind"] == "run_finished")
+    finished = max(
+        (event for event in run["events"] if event["kind"] == "run_finished"),
+        key=lambda event: event["sequence"],
+    )
     assert finished["payload"]["finished_at"] == run["finished_at"]
     assert finished["payload"]["status"] == run["status"]
     assert run["client_output_committed"] is True

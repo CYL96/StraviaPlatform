@@ -33,9 +33,7 @@ impl ProxyRouterFixture {
             pool.close().await;
         }
         drop(gateway);
-        data_dir
-            .close()
-            .expect("remove temporary gateway directory");
+        crate::proxy::test_cleanup::close_temp_dir(data_dir);
     }
 }
 

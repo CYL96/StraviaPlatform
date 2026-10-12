@@ -34,24 +34,24 @@ impl ProviderStore for PostgresProviderStore {
             anyhow::bail!("unsupported provider auth_mode: {}", input.auth_mode);
         }
         sqlx::query(
-            "INSERT INTO providers (id, name, vendor, protocol, base_url, preset_key, channel, models_source, static_models, api_key, adapter_credentials, vendor_options, auth_mode, use_proxy) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
-        )
-        .bind(&id)
-        .bind(input.name.trim())
-        .bind(vendor)
-        .bind(input.protocol.trim())
-        .bind(input.base_url.trim())
-        .bind(input.preset_key)
-        .bind(input.channel)
-        .bind(models_source)
-        .bind(input.static_models)
-        .bind(input.api_key)
-        .bind(input.adapter_credentials)
-        .bind(input.vendor_options)
-        .bind(input.auth_mode)
-        .bind(input.use_proxy)
-        .execute(&self.pool)
-        .await?;
+    "INSERT INTO providers (id, name, vendor, protocol, base_url, preset_key, channel, models_source, static_models, api_key, adapter_credentials, vendor_options, auth_mode, use_proxy) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
+            )
+            .bind(&id)
+            .bind(input.name.trim())
+            .bind(vendor)
+            .bind(input.protocol.trim())
+            .bind(input.base_url.trim())
+            .bind(input.preset_key)
+            .bind(input.channel)
+            .bind(models_source)
+            .bind(input.static_models)
+            .bind(input.api_key)
+            .bind(input.adapter_credentials)
+            .bind(input.vendor_options)
+            .bind(input.auth_mode)
+            .bind(input.use_proxy)
+            .execute(&self.pool)
+            .await?;
         self.get(&id)
             .await?
             .context("provider missing after create")
@@ -112,27 +112,27 @@ impl ProviderStore for PostgresProviderStore {
         let is_enabled = input.is_enabled.unwrap_or(current.is_enabled);
 
         sqlx::query(
-            "UPDATE providers SET name=$1, vendor=$2, protocol=$3, base_url=$4, preset_key=$5, channel=$6, models_source=$7, static_models=$8, api_key=$9, adapter_credentials=$10, vendor_options=$11, auth_mode=$12, use_proxy=$13, is_enabled=$14, updated_at=CURRENT_TIMESTAMP, revision=revision+1, credential_status = CASE WHEN $15 THEN 'ok' ELSE credential_status END, credential_invalid_at = CASE WHEN $16 THEN NULL ELSE credential_invalid_at END WHERE id=$17",
-        )
-        .bind(name.trim())
-        .bind(vendor)
-        .bind(protocol.trim())
-        .bind(base_url.trim())
-        .bind(preset_key)
-        .bind(channel)
-        .bind(models_source)
-        .bind(static_models)
-        .bind(api_key)
-        .bind(adapter_credentials)
-        .bind(vendor_options)
-        .bind(auth_mode)
-        .bind(use_proxy)
-        .bind(is_enabled)
-        .bind(reset_credential_status)
-        .bind(reset_credential_status)
-        .bind(id)
-        .execute(&self.pool)
-        .await?;
+    "UPDATE providers SET name=$1, vendor=$2, protocol=$3, base_url=$4, preset_key=$5, channel=$6, models_source=$7, static_models=$8, api_key=$9, adapter_credentials=$10, vendor_options=$11, auth_mode=$12, use_proxy=$13, is_enabled=$14, updated_at=CURRENT_TIMESTAMP, revision=revision+1, credential_status = CASE WHEN $15 THEN 'ok' ELSE credential_status END, credential_invalid_at = CASE WHEN $16 THEN NULL ELSE credential_invalid_at END WHERE id=$17",
+            )
+            .bind(name.trim())
+            .bind(vendor)
+            .bind(protocol.trim())
+            .bind(base_url.trim())
+            .bind(preset_key)
+            .bind(channel)
+            .bind(models_source)
+            .bind(static_models)
+            .bind(api_key)
+            .bind(adapter_credentials)
+            .bind(vendor_options)
+            .bind(auth_mode)
+            .bind(use_proxy)
+            .bind(is_enabled)
+            .bind(reset_credential_status)
+            .bind(reset_credential_status)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
         self.get(id).await?.context("provider missing after update")
     }
 
@@ -145,7 +145,7 @@ impl ProviderStore for PostgresProviderStore {
 
         sqlx::query(
             "DELETE FROM model_backends
-             WHERE provider_id = $1",
+     WHERE provider_id = $1",
         )
         .bind(id)
         .execute(&mut *tx)
@@ -153,9 +153,9 @@ impl ProviderStore for PostgresProviderStore {
 
         sqlx::query(
             "DELETE FROM models
-             WHERE NOT EXISTS (
-                   SELECT 1 FROM model_backends WHERE model_id = models.id
-               )",
+     WHERE NOT EXISTS (
+           SELECT 1 FROM model_backends WHERE model_id = models.id
+       )",
         )
         .execute(&mut *tx)
         .await?;
@@ -172,12 +172,12 @@ impl ProviderStore for PostgresProviderStore {
     async fn exists_by_name(&self, name: &str, exclude_id: Option<&str>) -> anyhow::Result<bool> {
         let row = if let Some(exclude_id) = exclude_id {
             sqlx::query_scalar::<_, String>(
-                "SELECT id FROM providers WHERE lower(trim(name)) = lower(trim($1)) AND id != $2 LIMIT 1",
-            )
-            .bind(name)
-            .bind(exclude_id)
-            .fetch_optional(&self.pool)
-            .await?
+        "SELECT id FROM providers WHERE lower(trim(name)) = lower(trim($1)) AND id != $2 LIMIT 1",
+                    )
+                    .bind(name)
+                    .bind(exclude_id)
+                    .fetch_optional(&self.pool)
+                    .await?
         } else {
             sqlx::query_scalar::<_, String>(
                 "SELECT id FROM providers WHERE lower(trim(name)) = lower(trim($1)) LIMIT 1",
@@ -197,14 +197,14 @@ impl ProviderStore for PostgresProviderStore {
         let _ = result.tested_at;
         // ADR-0073：手动测试成功是恢复路径——上游接受了当前凭据，清除失效。
         sqlx::query(
-            "UPDATE providers SET last_test_success = $1, last_test_at = CURRENT_TIMESTAMP, revision = revision + 1, credential_status = CASE WHEN $2 THEN 'ok' ELSE credential_status END, credential_invalid_at = CASE WHEN $3 THEN NULL ELSE credential_invalid_at END WHERE id = $4",
-        )
-        .bind(result.success)
-        .bind(result.success)
-        .bind(result.success)
-        .bind(provider_id)
-        .execute(&self.pool)
-        .await?;
+    "UPDATE providers SET last_test_success = $1, last_test_at = CURRENT_TIMESTAMP, revision = revision + 1, credential_status = CASE WHEN $2 THEN 'ok' ELSE credential_status END, credential_invalid_at = CASE WHEN $3 THEN NULL ELSE credential_invalid_at END WHERE id = $4",
+            )
+            .bind(result.success)
+            .bind(result.success)
+            .bind(result.success)
+            .bind(provider_id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -313,16 +313,16 @@ impl ProviderStore for PostgresProviderStore {
         // 才把拒绝证据归到当前凭据上，否则放弃标记。
         let result = sqlx::query(
             "UPDATE providers
-             SET credential_status = 'invalid',
-                 credential_invalid_at = COALESCE(credential_invalid_at, CURRENT_TIMESTAMP),
-                 revision = revision + 1
-             WHERE id = $1
-               AND revision = $2
-               AND (($3::int IS NULL AND NOT EXISTS (
-                       SELECT 1 FROM provider_oauth_credentials WHERE provider_id = providers.id))
-                    OR ($3::int IS NOT NULL AND EXISTS (
-                       SELECT 1 FROM provider_oauth_credentials
-                       WHERE provider_id = providers.id AND status_version = $3)))",
+     SET credential_status = 'invalid',
+         credential_invalid_at = COALESCE(credential_invalid_at, CURRENT_TIMESTAMP),
+         revision = revision + 1
+     WHERE id = $1
+       AND revision = $2
+       AND (($3::int IS NULL AND NOT EXISTS (
+               SELECT 1 FROM provider_oauth_credentials WHERE provider_id = providers.id))
+            OR ($3::int IS NOT NULL AND EXISTS (
+               SELECT 1 FROM provider_oauth_credentials
+               WHERE provider_id = providers.id AND status_version = $3)))",
         )
         .bind(id)
         .bind(expected.provider_revision)
@@ -336,11 +336,11 @@ impl ProviderStore for PostgresProviderStore {
         // 仅在失效时落写：周期性的 OAuth 主动刷新不应空转 revision，
         // 否则会让在途请求锁定的凭据代际无故过期、丢弃真实 401 证据。
         sqlx::query(
-            "UPDATE providers SET credential_status = 'ok', credential_invalid_at = NULL, revision = revision + 1 WHERE id = $1 AND credential_status = 'invalid'",
-        )
-        .bind(id)
-        .execute(&self.pool)
-        .await?;
+    "UPDATE providers SET credential_status = 'ok', credential_invalid_at = NULL, revision = revision + 1 WHERE id = $1 AND credential_status = 'invalid'",
+            )
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 

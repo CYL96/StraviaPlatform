@@ -52,16 +52,16 @@ impl ProviderModelStore for PostgresStorage {
     ) -> anyhow::Result<Vec<ProviderModelRecord>> {
         let mut conn = self.pool.acquire().await?;
         let rows = sqlx::query_as::<_, ProviderModelRow>(
-            r#"SELECT provider_id, model_id, source_kind, snapshot_state::text AS snapshot_state, metadata_source_provider_id,
-                      presence, selection_policy, metadata_json::text AS metadata_json,
-                      revision, created_at::text AS created_at, updated_at::text AS updated_at
-               FROM provider_models
-               WHERE provider_id = $1
-               ORDER BY LOWER(COALESCE(name, model_id)), model_id"#,
-        )
-        .bind(provider_id)
-        .fetch_all(&mut *conn)
-        .await?;
+    r#"SELECT provider_id, model_id, source_kind, snapshot_state::text AS snapshot_state, metadata_source_provider_id,
+              presence, selection_policy, metadata_json::text AS metadata_json,
+              revision, created_at::text AS created_at, updated_at::text AS updated_at
+       FROM provider_models
+       WHERE provider_id = $1
+       ORDER BY LOWER(COALESCE(name, model_id)), model_id"#,
+            )
+            .bind(provider_id)
+            .fetch_all(&mut *conn)
+            .await?;
         let rules = load_rules_for_provider(&mut conn, provider_id).await?;
         rows.into_iter()
             .map(|row| {
@@ -89,12 +89,12 @@ impl ProviderModelStore for PostgresStorage {
         let has_writes = !reconciliation.updates.is_empty() || !reconciliation.inserts.is_empty();
         for update in &reconciliation.updates {
             let revision = sqlx::query_scalar::<_, i64>(
-                "SELECT revision FROM provider_models WHERE provider_id = $1 AND model_id = $2 AND source_kind = 'discovered' FOR UPDATE",
-            )
-            .bind(provider_id)
-            .bind(&update.model_id)
-            .fetch_optional(&mut *tx)
-            .await?;
+        "SELECT revision FROM provider_models WHERE provider_id = $1 AND model_id = $2 AND source_kind = 'discovered' FOR UPDATE",
+                    )
+                    .bind(provider_id)
+                    .bind(&update.model_id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
             anyhow::ensure!(
                 revision == Some(update.expected_revision),
                 "Provider Model has changed while synchronizing discovered models"
@@ -119,32 +119,32 @@ impl ProviderModelStore for PostgresStorage {
                 continue;
             }
             let metadata_json = sqlx::query_scalar::<_, String>(
-                "SELECT metadata_json::text FROM provider_models WHERE provider_id = $1 AND model_id = $2 AND source_kind = 'discovered'",
-            )
-            .bind(provider_id)
-            .bind(&update.model_id)
-            .fetch_optional(&mut *tx)
-            .await?;
+        "SELECT metadata_json::text FROM provider_models WHERE provider_id = $1 AND model_id = $2 AND source_kind = 'discovered'",
+                    )
+                    .bind(provider_id)
+                    .bind(&update.model_id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
             let metadata_json =
                 metadata_json.context("Provider Model disappeared during reconciliation")?;
             let mut metadata: ProviderModelMetadata = serde_json::from_str(&metadata_json)
                 .context("decode Provider Model metadata during reconciliation")?;
             metadata.status = update.lifecycle_status.clone();
             let result = sqlx::query(
-                r#"UPDATE provider_models
-                   SET presence = $1, lifecycle_status = $2, metadata_source_provider_id = $3, metadata_json = $4::jsonb,
-                       revision = revision + 1, updated_at = NOW()
-                   WHERE provider_id = $5 AND model_id = $6 AND source_kind = 'discovered' AND revision = $7"#,
-            )
-            .bind(update.presence.as_str())
-            .bind(update.lifecycle_status)
-            .bind(update.metadata_source_provider_id)
-            .bind(serde_json::to_string(&metadata)?)
-            .bind(provider_id)
-            .bind(&update.model_id)
-            .bind(update.expected_revision)
-            .execute(&mut *tx)
-            .await?;
+        r#"UPDATE provider_models
+           SET presence = $1, lifecycle_status = $2, metadata_source_provider_id = $3, metadata_json = $4::jsonb,
+               revision = revision + 1, updated_at = NOW()
+           WHERE provider_id = $5 AND model_id = $6 AND source_kind = 'discovered' AND revision = $7"#,
+                    )
+                    .bind(update.presence.as_str())
+                    .bind(update.lifecycle_status)
+                    .bind(update.metadata_source_provider_id)
+                    .bind(serde_json::to_string(&metadata)?)
+                    .bind(provider_id)
+                    .bind(&update.model_id)
+                    .bind(update.expected_revision)
+                    .execute(&mut *tx)
+                    .await?;
             anyhow::ensure!(
                 result.rows_affected() == 1,
                 "Provider Model has changed while synchronizing discovered models"
@@ -301,8 +301,8 @@ impl ProviderModelStore for PostgresStorage {
         let mut tx = self.pool.begin().await?;
         let result = sqlx::query(
             r#"UPDATE provider_models
-               SET selection_policy = $1, revision = revision + 1, updated_at = NOW()
-               WHERE provider_id = $2 AND model_id = $3 AND revision = $4"#,
+       SET selection_policy = $1, revision = revision + 1, updated_at = NOW()
+       WHERE provider_id = $2 AND model_id = $3 AND revision = $4"#,
         )
         .bind(policy.as_str())
         .bind(provider_id)
@@ -332,12 +332,12 @@ impl ProviderModelStore for PostgresStorage {
     async fn delete_manual(&self, provider_id: &str, model_id: &str) -> anyhow::Result<bool> {
         let mut tx = self.pool.begin().await?;
         let result = sqlx::query(
-            "DELETE FROM provider_models WHERE provider_id = $1 AND model_id = $2 AND source_kind = 'manual'",
-        )
-        .bind(provider_id)
-        .bind(model_id)
-        .execute(&mut *tx)
-        .await?;
+    "DELETE FROM provider_models WHERE provider_id = $1 AND model_id = $2 AND source_kind = 'manual'",
+            )
+            .bind(provider_id)
+            .bind(model_id)
+            .execute(&mut *tx)
+            .await?;
         let deleted = result.rows_affected() == 1;
         if deleted {
             // Removing a manual record changes loose resolution results;

@@ -17,12 +17,12 @@ impl SettingsStore for PostgresSettingsStore {
 
     async fn set(&self, key: &str, value: &str) -> anyhow::Result<()> {
         sqlx::query(
-            "INSERT INTO settings (name, value, updated_at) VALUES ($1, $2, CURRENT_TIMESTAMP) ON CONFLICT(name) DO UPDATE SET value=EXCLUDED.value, updated_at=EXCLUDED.updated_at",
-        )
-        .bind(key)
-        .bind(value)
-        .execute(&self.pool)
-        .await?;
+    "INSERT INTO settings (name, value, updated_at) VALUES ($1, $2, CURRENT_TIMESTAMP) ON CONFLICT(name) DO UPDATE SET value=EXCLUDED.value, updated_at=EXCLUDED.updated_at",
+            )
+            .bind(key)
+            .bind(value)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 }

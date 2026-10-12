@@ -124,8 +124,8 @@ impl SqlTurnChainStore {
 
     async fn remove_unreferenced_contents(&self) -> anyhow::Result<()> {
         const DELETE: &str = "DELETE FROM turn_chain_contents WHERE NOT EXISTS \
-            (SELECT 1 FROM turn_chain_node_contents r WHERE r.principal = turn_chain_contents.principal \
-             AND r.content_id = turn_chain_contents.id)";
+        (SELECT 1 FROM turn_chain_node_contents r WHERE r.principal = turn_chain_contents.principal \
+         AND r.content_id = turn_chain_contents.id)";
         match self {
             Self::Sqlite(pool, gate) => {
                 let _write_gate = gate.lock().await;
@@ -348,29 +348,29 @@ impl TurnChainStore for SqlTurnChainStore {
             .map_err(|error| TurnUnavailable::Storage(error.to_string()))?;
         let principal_key = principal.continuation_key();
         macro_rules! select {
-            ($pool:expr, $db:ty, $depth:expr, $join:expr, $known_start:expr, $known_end:expr) => {{
-                let mut query = sqlx::QueryBuilder::<$db>::new(
-                    "WITH RECURSIVE ancestors(id, parent_id, payload_version, payload, expires_at, depth) AS (SELECT id, parent_id, payload_version, payload, expires_at, ");
-                query.push($depth).push(" FROM turn_chain_nodes WHERE id = ").push_bind(id.as_str())
-                    .push(" AND principal = ").push_bind(&principal_key)
-                    .push(" AND kind = ").push_bind(kind.as_str())
-                    .push(" UNION ALL SELECT node.id, node.parent_id, node.payload_version, node.payload, node.expires_at, ancestors.depth + 1 FROM ")
-                    .push($join).push(" WHERE node.id = ancestors.parent_id AND node.principal = ")
-                    .push_bind(&principal_key).push(" AND node.kind = ").push_bind(kind.as_str());
-                query.push($known_start).push_bind(&known).push($known_end);
-                query.push(") SELECT id, parent_id, payload_version, payload, expires_at, depth FROM ancestors ORDER BY depth DESC");
-                query.build_query_as::<StoredAncestorRow>()
-                    .fetch_all($pool).await
-            }};
-        }
+        ($pool:expr, $db:ty, $depth:expr, $join:expr, $known_start:expr, $known_end:expr) => {{
+            let mut query = sqlx::QueryBuilder::<$db>::new(
+                "WITH RECURSIVE ancestors(id, parent_id, payload_version, payload, expires_at, depth) AS (SELECT id, parent_id, payload_version, payload, expires_at, ");
+            query.push($depth).push(" FROM turn_chain_nodes WHERE id = ").push_bind(id.as_str())
+                .push(" AND principal = ").push_bind(&principal_key)
+                .push(" AND kind = ").push_bind(kind.as_str())
+                .push(" UNION ALL SELECT node.id, node.parent_id, node.payload_version, node.payload, node.expires_at, ancestors.depth + 1 FROM ")
+                .push($join).push(" WHERE node.id = ancestors.parent_id AND node.principal = ")
+                .push_bind(&principal_key).push(" AND node.kind = ").push_bind(kind.as_str());
+            query.push($known_start).push_bind(&known).push($known_end);
+            query.push(") SELECT id, parent_id, payload_version, payload, expires_at, depth FROM ancestors ORDER BY depth DESC");
+            query.build_query_as::<StoredAncestorRow>()
+                .fetch_all($pool).await
+        }};
+    }
         let rows = async {
-            let rows = match self {
-                Self::Sqlite(pool, _) => select!(pool, sqlx::Sqlite, "0", "ancestors CROSS JOIN turn_chain_nodes node", " AND node.id NOT IN (SELECT value FROM json_each(", "))"),
-                Self::Postgres(pool) => select!(pool, sqlx::Postgres, "0::BIGINT", "ancestors CROSS JOIN turn_chain_nodes node", " AND node.id NOT IN (SELECT jsonb_array_elements_text(", "::jsonb))"),
-            }.map_err(|error| TurnUnavailable::Storage(error.to_string()))?;
-            tracing::Span::current().record("node_count", rows.len() as u64);
-            Ok::<_, TurnUnavailable>(rows)
-        }.instrument(tracing::info_span!(target: "stravia::perf", "turn_chain.ancestor.select", node_count = 0_u64)).await?;
+        let rows = match self {
+            Self::Sqlite(pool, _) => select!(pool, sqlx::Sqlite, "0", "ancestors CROSS JOIN turn_chain_nodes node", " AND node.id NOT IN (SELECT value FROM json_each(", "))"),
+            Self::Postgres(pool) => select!(pool, sqlx::Postgres, "0::BIGINT", "ancestors CROSS JOIN turn_chain_nodes node", " AND node.id NOT IN (SELECT jsonb_array_elements_text(", "::jsonb))"),
+        }.map_err(|error| TurnUnavailable::Storage(error.to_string()))?;
+        tracing::Span::current().record("node_count", rows.len() as u64);
+        Ok::<_, TurnUnavailable>(rows)
+    }.instrument(tracing::info_span!(target: "stravia::perf", "turn_chain.ancestor.select", node_count = 0_u64)).await?;
         tracing::Span::current().record("node_count", rows.len() as u64);
         self.finish_context_read(principal, kind, context, rows, std::time::Instant::now())
             .await
@@ -644,35 +644,35 @@ impl TurnChainStore for SqlTurnChainStore {
         let principal = principal.continuation_key();
         let now = chrono::Utc::now().timestamp_millis();
         macro_rules! push_projection {
-            ($builder:ident, $values:expr) => {
-                if let Some(proof) = query.projection.as_ref()
-                    .filter(|proof| proof.version == REUSABLE_PREFIX_PROJECTION_VERSION) {
-                    // Only a complete, known-version proof can exclude a row.
-                    // NULL and unknown versions remain authoritative-read candidates.
-                    $builder.push(" AND (prefix_projection_version IS NULL OR prefix_projection_version <> ")
-                        .push_bind(i64::from(REUSABLE_PREFIX_PROJECTION_VERSION))
-                        .push(" OR prefix_controls_fingerprint IS NULL OR prefix_context_fingerprint IS NULL OR (")
-                        .push("prefix_controls_fingerprint = ").push_bind(&proof.controls_fingerprint);
-                    if proof.context_fingerprints.is_empty() {
-                        $builder.push(" AND 1 = 0");
-                    } else {
-                        $builder.push(" AND (prefix_context_fingerprint, prefix_item_count) IN (").push($values);
-                        for (index, (fingerprint, units)) in proof.context_fingerprints.iter().enumerate() {
-                            if index > 0 { $builder.push(", "); }
-                            $builder.push("(").push_bind(fingerprint).push(", ")
-                                .push_bind(i64::from(*units)).push(")");
-                        }
-                        $builder.push(")");
+        ($builder:ident, $values:expr) => {
+            if let Some(proof) = query.projection.as_ref()
+                .filter(|proof| proof.version == REUSABLE_PREFIX_PROJECTION_VERSION) {
+                // Only a complete, known-version proof can exclude a row.
+                // NULL and unknown versions remain authoritative-read candidates.
+                $builder.push(" AND (prefix_projection_version IS NULL OR prefix_projection_version <> ")
+                    .push_bind(i64::from(REUSABLE_PREFIX_PROJECTION_VERSION))
+                    .push(" OR prefix_controls_fingerprint IS NULL OR prefix_context_fingerprint IS NULL OR (")
+                    .push("prefix_controls_fingerprint = ").push_bind(&proof.controls_fingerprint);
+                if proof.context_fingerprints.is_empty() {
+                    $builder.push(" AND 1 = 0");
+                } else {
+                    $builder.push(" AND (prefix_context_fingerprint, prefix_item_count) IN (").push($values);
+                    for (index, (fingerprint, units)) in proof.context_fingerprints.iter().enumerate() {
+                        if index > 0 { $builder.push(", "); }
+                        $builder.push("(").push_bind(fingerprint).push(", ")
+                            .push_bind(i64::from(*units)).push(")");
                     }
-                    $builder.push("))");
+                    $builder.push(")");
                 }
-            };
-        }
+                $builder.push("))");
+            }
+        };
+    }
         let rows: Vec<(String, i64, i64)> = match self {
             Self::Sqlite(pool, _) => {
                 let mut builder = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
                     "SELECT id, prefix_item_count, prefix_completed_at FROM turn_chain_nodes \
-                     WHERE principal = ",
+                 WHERE principal = ",
                 );
                 builder
                     .push_bind(&principal)
@@ -702,7 +702,7 @@ impl TurnChainStore for SqlTurnChainStore {
             Self::Postgres(pool) => {
                 let mut builder = sqlx::QueryBuilder::<sqlx::Postgres>::new(
                     "SELECT id, prefix_item_count, prefix_completed_at FROM turn_chain_nodes \
-                     WHERE principal = ",
+                 WHERE principal = ",
                 );
                 builder
                     .push_bind(&principal)
@@ -758,59 +758,59 @@ impl TurnChainStore for SqlTurnChainStore {
          ),
     ) -> Result<(), TurnUnavailable> {
         macro_rules! rebuild {
-            ($pool:expr, $restore:ident $(, $gate:expr)?) => {{
-                // SQLite: 持共享池写闸门跨整个事务，直到 commit 完成。
-                $(let _write_gate = $gate.lock().await;)?
-                let mut transaction = $pool.begin().await
+        ($pool:expr, $restore:ident $(, $gate:expr)?) => {{
+            // SQLite: 持共享池写闸门跨整个事务，直到 commit 完成。
+            $(let _write_gate = $gate.lock().await;)?
+            let mut transaction = $pool.begin().await
+                .map_err(|error| TurnUnavailable::Storage(error.to_string()))?;
+            let now = chrono::Utc::now().timestamp_millis();
+            let stale = format!("{namespace_prefix}%");
+            let heads: Vec<(String, String, i64)> = sqlx::query_as(
+                "SELECT id, principal, prefix_completed_at FROM turn_chain_nodes \
+                 WHERE kind = 'response' AND prefix_namespace IS NOT NULL \
+                 AND prefix_namespace NOT LIKE $1 AND expires_at > $2"
+            ).bind(&stale).bind(now).fetch_all(&mut *transaction).await
+                .map_err(|error| TurnUnavailable::Storage(error.to_string()))?;
+            for (id, principal, completed_at) in heads {
+                let rows: Vec<(String, Option<String>, i64, Vec<u8>, i64)> = sqlx::query_as(
+                    "WITH RECURSIVE ancestors(id, parent_id, payload_version, payload, expires_at, depth) AS (\
+                     SELECT id, parent_id, payload_version, payload, expires_at, 0 FROM turn_chain_nodes \
+                     WHERE id = $1 AND principal = $2 AND kind = 'response' \
+                     UNION ALL SELECT node.id, node.parent_id, node.payload_version, node.payload, node.expires_at, ancestors.depth + 1 \
+                     FROM ancestors CROSS JOIN turn_chain_nodes node \
+                     WHERE node.id = ancestors.parent_id AND node.principal = $2 AND node.kind = 'response') \
+                     SELECT id, parent_id, payload_version, payload, expires_at FROM ancestors ORDER BY depth DESC"
+                ).bind(&id).bind(&principal).fetch_all(&mut *transaction).await
                     .map_err(|error| TurnUnavailable::Storage(error.to_string()))?;
-                let now = chrono::Utc::now().timestamp_millis();
-                let stale = format!("{namespace_prefix}%");
-                let heads: Vec<(String, String, i64)> = sqlx::query_as(
-                    "SELECT id, principal, prefix_completed_at FROM turn_chain_nodes \
-                     WHERE kind = 'response' AND prefix_namespace IS NOT NULL \
-                     AND prefix_namespace NOT LIKE $1 AND expires_at > $2"
-                ).bind(&stale).bind(now).fetch_all(&mut *transaction).await
-                    .map_err(|error| TurnUnavailable::Storage(error.to_string()))?;
-                for (id, principal, completed_at) in heads {
-                    let rows: Vec<(String, Option<String>, i64, Vec<u8>, i64)> = sqlx::query_as(
-                        "WITH RECURSIVE ancestors(id, parent_id, payload_version, payload, expires_at, depth) AS (\
-                         SELECT id, parent_id, payload_version, payload, expires_at, 0 FROM turn_chain_nodes \
-                         WHERE id = $1 AND principal = $2 AND kind = 'response' \
-                         UNION ALL SELECT node.id, node.parent_id, node.payload_version, node.payload, node.expires_at, ancestors.depth + 1 \
-                         FROM ancestors CROSS JOIN turn_chain_nodes node \
-                         WHERE node.id = ancestors.parent_id AND node.principal = $2 AND node.kind = 'response') \
-                         SELECT id, parent_id, payload_version, payload, expires_at FROM ancestors ORDER BY depth DESC"
-                    ).bind(&id).bind(&principal).fetch_all(&mut *transaction).await
+                if rows.first().is_none_or(|row| row.1.is_some()) || rows.iter().any(|row| row.4 <= now) {
+                    sqlx::query("UPDATE turn_chain_nodes SET prefix_namespace = NULL, prefix_fingerprint = NULL, prefix_item_count = NULL, prefix_completed_at = NULL, prefix_projection_version = NULL, prefix_controls_fingerprint = NULL, prefix_context_fingerprint = NULL WHERE id = $1 AND principal = $2")
+                        .bind(&id).bind(&principal).execute(&mut *transaction).await
                         .map_err(|error| TurnUnavailable::Storage(error.to_string()))?;
-                    if rows.first().is_none_or(|row| row.1.is_some()) || rows.iter().any(|row| row.4 <= now) {
-                        sqlx::query("UPDATE turn_chain_nodes SET prefix_namespace = NULL, prefix_fingerprint = NULL, prefix_item_count = NULL, prefix_completed_at = NULL, prefix_projection_version = NULL, prefix_controls_fingerprint = NULL, prefix_context_fingerprint = NULL WHERE id = $1 AND principal = $2")
-                            .bind(&id).bind(&principal).execute(&mut *transaction).await
-                            .map_err(|error| TurnUnavailable::Storage(error.to_string()))?;
-                        continue;
-                    }
-                    let mut nodes = rows.into_iter().map(|(id, parent_id, version, payload, _)| {
-                        decode_node(TurnNodeId::new(id), TurnNodeKind::Response, parent_id, version, payload)
-                    }).collect::<Result<Vec<_>, _>>()?;
-                    content::$restore(&mut transaction, &principal, &mut nodes).await
-                        .map_err(|error| TurnUnavailable::Storage(error.to_string()))?;
-                    let Some(prefix) = decode(nodes, completed_at)
-                        .map_err(TurnUnavailable::Storage)? else {
-                        sqlx::query("UPDATE turn_chain_nodes SET prefix_namespace = NULL, prefix_fingerprint = NULL, prefix_item_count = NULL, prefix_completed_at = NULL, prefix_projection_version = NULL, prefix_controls_fingerprint = NULL, prefix_context_fingerprint = NULL WHERE id = $1 AND principal = $2")
-                            .bind(&id).bind(&principal).execute(&mut *transaction).await
-                            .map_err(|error| TurnUnavailable::Storage(error.to_string()))?;
-                        continue;
-                    };
-                    let proof = prefix.projection.as_ref();
-                    sqlx::query("UPDATE turn_chain_nodes SET prefix_namespace = $1, prefix_fingerprint = $2, prefix_item_count = $3, prefix_projection_version = $6, prefix_controls_fingerprint = $7, prefix_context_fingerprint = $8 WHERE id = $4 AND principal = $5")
-                        .bind(&prefix.namespace).bind(&prefix.fingerprint).bind(i64::from(prefix.item_count)).bind(id).bind(principal)
-                        .bind(proof.map(|proof| i64::from(proof.version)))
-                        .bind(proof.map(|proof| proof.controls_fingerprint.as_str()))
-                        .bind(proof.map(|proof| proof.context_fingerprint.as_str()))
-                        .execute(&mut *transaction).await.map_err(|error| TurnUnavailable::Storage(error.to_string()))?;
+                    continue;
                 }
-                transaction.commit().await.map_err(|error| TurnUnavailable::Storage(error.to_string()))?;
-            }};
-        }
+                let mut nodes = rows.into_iter().map(|(id, parent_id, version, payload, _)| {
+                    decode_node(TurnNodeId::new(id), TurnNodeKind::Response, parent_id, version, payload)
+                }).collect::<Result<Vec<_>, _>>()?;
+                content::$restore(&mut transaction, &principal, &mut nodes).await
+                    .map_err(|error| TurnUnavailable::Storage(error.to_string()))?;
+                let Some(prefix) = decode(nodes, completed_at)
+                    .map_err(TurnUnavailable::Storage)? else {
+                    sqlx::query("UPDATE turn_chain_nodes SET prefix_namespace = NULL, prefix_fingerprint = NULL, prefix_item_count = NULL, prefix_completed_at = NULL, prefix_projection_version = NULL, prefix_controls_fingerprint = NULL, prefix_context_fingerprint = NULL WHERE id = $1 AND principal = $2")
+                        .bind(&id).bind(&principal).execute(&mut *transaction).await
+                        .map_err(|error| TurnUnavailable::Storage(error.to_string()))?;
+                    continue;
+                };
+                let proof = prefix.projection.as_ref();
+                sqlx::query("UPDATE turn_chain_nodes SET prefix_namespace = $1, prefix_fingerprint = $2, prefix_item_count = $3, prefix_projection_version = $6, prefix_controls_fingerprint = $7, prefix_context_fingerprint = $8 WHERE id = $4 AND principal = $5")
+                    .bind(&prefix.namespace).bind(&prefix.fingerprint).bind(i64::from(prefix.item_count)).bind(id).bind(principal)
+                    .bind(proof.map(|proof| i64::from(proof.version)))
+                    .bind(proof.map(|proof| proof.controls_fingerprint.as_str()))
+                    .bind(proof.map(|proof| proof.context_fingerprint.as_str()))
+                    .execute(&mut *transaction).await.map_err(|error| TurnUnavailable::Storage(error.to_string()))?;
+            }
+            transaction.commit().await.map_err(|error| TurnUnavailable::Storage(error.to_string()))?;
+        }};
+    }
         match self {
             Self::Sqlite(pool, gate) => rebuild!(pool, restore_sqlite, gate),
             Self::Postgres(pool) => rebuild!(pool, restore_postgres),
@@ -827,8 +827,8 @@ impl TurnChainStore for SqlTurnChainStore {
                     let _write_gate = gate.lock().await;
                     sqlx::query(
                         "DELETE FROM turn_chain_nodes WHERE expires_at <= ? \
-                         AND NOT EXISTS (SELECT 1 FROM turn_chain_nodes child \
-                         WHERE child.parent_id = turn_chain_nodes.id)",
+                     AND NOT EXISTS (SELECT 1 FROM turn_chain_nodes child \
+                     WHERE child.parent_id = turn_chain_nodes.id)",
                     )
                     .bind(now)
                     .execute(pool)
@@ -837,8 +837,8 @@ impl TurnChainStore for SqlTurnChainStore {
                 }
                 Self::Postgres(pool) => sqlx::query(
                     "DELETE FROM turn_chain_nodes node WHERE expires_at <= $1 \
-                     AND NOT EXISTS (SELECT 1 FROM turn_chain_nodes child \
-                     WHERE child.parent_id = node.id)",
+                 AND NOT EXISTS (SELECT 1 FROM turn_chain_nodes child \
+                 WHERE child.parent_id = node.id)",
                 )
                 .bind(now)
                 .execute(pool)

@@ -33,6 +33,8 @@ mod runtime_cache;
 pub mod startup_progress;
 pub mod storage;
 pub(crate) mod storage_codec;
+#[cfg(feature = "test-support")]
+mod storage_test_faults;
 #[cfg(test)]
 mod test_support;
 pub mod thinking;

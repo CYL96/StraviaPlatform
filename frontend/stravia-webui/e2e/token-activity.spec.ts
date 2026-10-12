@@ -26,12 +26,17 @@ async function stubStats(page: Page): Promise<void> {
   await page.route('**/api/v1/stats/series**', async (route) => {
     const url = new URL(route.request().url())
     const bucketMs = Number(url.searchParams.get('bucket') ?? '3600') * 1000
-    const tzOffsetMs = Number(url.searchParams.get('tz_offset') ?? '0') * 1000
-    const align = (t: number) => Math.floor((t + tzOffsetMs) / bucketMs) * bucketMs - tzOffsetMs
+    const startAt = Number(url.searchParams.get('start_at'))
+    const endAt = Number(url.searchParams.get('end_at'))
+    expect(url.searchParams.has('hours')).toBe(false)
+    expect(url.searchParams.has('tz_offset')).toBe(false)
+    expect(startAt % 900_000).toBe(0)
+    expect(endAt % 900_000).toBe(0)
     const data = []
-    for (let i = 0; i < 12; i++) {
-      const start = align(now - i * bucketMs)
+    for (let i = 0; i < Math.min(12, Math.ceil((endAt - startAt) / bucketMs)); i++) {
+      const start = endAt - (i + 1) * bucketMs
       data.push({
+        bucket_ms: bucketMs,
         bucket_start: start,
         request_count: 4 + i,
         error_count: i === 3 ? 1 : 0,
@@ -49,18 +54,17 @@ async function stubStats(page: Page): Promise<void> {
   })
 }
 
-// 粒度跟随范围选择器：6h→15 分钟，24h→1 小时，3 天→6 小时，7 天→1 天。
-// 列数由容器宽度决定：网格向前延伸整列填满区域宽度但不溢出，行数仍由粒度决定。
-test('token activity grid fills the section width at each granularity', async ({ page }) => {
+// Each selected interval supplies exactly its own buckets; layout must not invent older cells.
+test('token activity grid stays within the selected interval at each granularity', async ({ page }) => {
   await prepareApp(page)
   await stubStats(page)
   await page.setViewportSize({ width: 1280, height: 900 })
 
   const ranges = [
-    { label: 'Last 6h', rows: 4, currentRows: 1 },
-    { label: 'Last 24h', rows: 6, currentRows: 3 },
-    { label: 'Last 3d', rows: 4, currentRows: 2 },
-    { label: 'Last 7d', rows: 7, currentRows: 4 },
+    { label: 'Last 6h', cells: 24 },
+    { label: 'Last 24h', cells: 24 },
+    { label: 'Last 3d', cells: 12 },
+    { label: 'Last 7d', cells: 7 },
   ]
   await page.goto('/stats')
 
@@ -75,20 +79,13 @@ test('token activity grid fills the section width at each granularity', async ({
     await expect(async () => {
       const metrics = await grid.evaluate((el) => {
         const wrapper = el.parentElement!.parentElement!
-        const cell = el.querySelector('.token-activity-cell')!.getBoundingClientRect().width
-        const gridWidth = el.getBoundingClientRect().width
         return {
-          cols: Math.floor((wrapper.clientWidth + 4) / (cell + 4)),
           cells: el.querySelectorAll('.token-activity-cell').length,
-          leftover: wrapper.clientWidth - gridWidth,
-          pitch: cell + 4,
           scrolls: wrapper.scrollWidth > wrapper.clientWidth + 1 || wrapper.scrollHeight > wrapper.clientHeight + 1,
         }
       })
       expect(metrics.scrolls).toBe(false)
-      expect(metrics.leftover).toBeGreaterThanOrEqual(0)
-      expect(metrics.leftover).toBeLessThan(metrics.pitch)
-      expect(metrics.cells).toBe((metrics.cols - 1) * range.rows + range.currentRows)
+      expect(metrics.cells).toBe(range.cells)
     }).toPass()
   }
 })

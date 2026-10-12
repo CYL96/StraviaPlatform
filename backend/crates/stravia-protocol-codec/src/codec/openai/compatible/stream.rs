@@ -278,11 +278,22 @@ pub fn client_history_output_item(resp: &AiResponse) -> AiItem {
 }
 
 fn openai_usage_json(usage: &Usage) -> Value {
-    let mut value = serde_json::json!({
-        "prompt_tokens": usage.prompt_tokens,
-        "completion_tokens": usage.completion_tokens,
-        "total_tokens": usage.prompt_tokens + usage.completion_tokens,
-    });
+    // Incomplete IR usage can still prove positive counters independently;
+    // only a complete report distinguishes a zero from a numeric default.
+    let input =
+        (usage.required_components_known || usage.prompt_tokens > 0).then_some(usage.prompt_tokens);
+    let output = (usage.required_components_known || usage.completion_tokens > 0)
+        .then_some(usage.completion_tokens);
+    let mut value = serde_json::json!({});
+    if let Some(input) = input {
+        value["prompt_tokens"] = input.into();
+    }
+    if let Some(output) = output {
+        value["completion_tokens"] = output.into();
+    }
+    if let Some((input, output)) = input.zip(output) {
+        value["total_tokens"] = (input + output).into();
+    }
     if let Some(cache_read_tokens) = usage.cache_read_tokens {
         value["prompt_tokens_details"] = serde_json::json!({
             "cached_tokens": cache_read_tokens
@@ -308,6 +319,11 @@ pub struct OpenAIStreamParser {
     reasoning_source: Option<Arc<str>>,
     saw_tool_call: bool,
     pending_tool_terminal_error: bool,
+    usage_input: Option<u64>,
+    usage_output: Option<u64>,
+    usage_cache_read: Option<u32>,
+    usage_cache_write: Option<u32>,
+    usage_reasoning: Option<u32>,
 }
 
 impl Default for OpenAIStreamParser {
@@ -328,6 +344,11 @@ impl OpenAIStreamParser {
             reasoning_source: None,
             saw_tool_call: false,
             pending_tool_terminal_error: false,
+            usage_input: None,
+            usage_output: None,
+            usage_cache_read: None,
+            usage_cache_write: None,
+            usage_reasoning: None,
         }
     }
 
@@ -398,6 +419,38 @@ impl OpenAIStreamParser {
         });
     }
 
+    fn emit_usage(&mut self, chunk: &Value, deltas: &mut Vec<AiStreamDelta>) {
+        let (mut usage, input, output) = extract_usage_report(chunk);
+        if input.is_none()
+            && output.is_none()
+            && usage.cache_read_tokens.is_none()
+            && usage.cache_creation_tokens.is_none()
+            && usage.reasoning_tokens.is_none()
+        {
+            return;
+        }
+        // OpenAI-compatible usage frames revise cumulative counters. Preserve
+        // per-field presence here: the common IR completeness flag alone cannot
+        // distinguish an omitted required component from a reported zero.
+        self.usage_input = input.or(self.usage_input);
+        self.usage_output = output.or(self.usage_output);
+        self.usage_cache_read = usage.cache_read_tokens.or(self.usage_cache_read);
+        self.usage_cache_write = usage.cache_creation_tokens.or(self.usage_cache_write);
+        self.usage_reasoning = usage.reasoning_tokens.or(self.usage_reasoning);
+        usage.cache_read_tokens = self.usage_cache_read;
+        usage.cache_creation_tokens = self.usage_cache_write;
+        usage.reasoning_tokens = self.usage_reasoning;
+        usage.prompt_tokens = self.usage_input.unwrap_or(0) as u32;
+        usage.completion_tokens = self.usage_output.unwrap_or(0) as u32;
+        usage.total_tokens = self
+            .usage_input
+            .zip(self.usage_output)
+            .map(|(input, output)| input.saturating_add(output))
+            .unwrap_or(0) as u32;
+        usage.required_components_known = self.usage_input.is_some() && self.usage_output.is_some();
+        deltas.push(AiStreamDelta::Usage(usage));
+    }
+
     fn parse_openai_chunk(&mut self, chunk: &Value, deltas: &mut Vec<AiStreamDelta>) -> Result<()> {
         if let Some(error) = chunk.get("error").filter(|error| !error.is_null()) {
             deltas.extend(self.flush_pending_text());
@@ -433,10 +486,7 @@ impl OpenAIStreamParser {
             .and_then(|v| v.as_array())
             .and_then(|a| a.first())
         else {
-            let u = extract_usage(chunk);
-            if u.required_components_known || u.prompt_tokens > 0 || u.completion_tokens > 0 {
-                deltas.push(AiStreamDelta::Usage(u));
-            }
+            self.emit_usage(chunk, deltas);
             return Ok(());
         };
 
@@ -506,10 +556,7 @@ impl OpenAIStreamParser {
             }
         }
 
-        let u = extract_usage(chunk);
-        if u.required_components_known || u.prompt_tokens > 0 || u.completion_tokens > 0 {
-            deltas.push(AiStreamDelta::Usage(u));
-        }
+        self.emit_usage(chunk, deltas);
         Ok(())
     }
 
@@ -734,9 +781,13 @@ impl OpenAIStreamFormatter {
 }
 
 fn extract_usage(v: &Value) -> Usage {
+    extract_usage_report(v).0
+}
+
+fn extract_usage_report(v: &Value) -> (Usage, Option<u64>, Option<u64>) {
     let usage = v.get("usage").or_else(|| v.get("usageMetadata"));
     let Some(u) = usage else {
-        return Usage::default();
+        return (Usage::default(), None, None);
     };
 
     let input = first_u64(
@@ -791,19 +842,23 @@ fn extract_usage(v: &Value) -> Usage {
         .and_then(Value::as_u64)
         .or_else(|| first_u64(u, &["completion_thinking_tokens"]));
 
-    Usage {
-        prompt_tokens: input.unwrap_or(0) as u32,
-        completion_tokens: output.unwrap_or(0) as u32,
-        total_tokens: input
-            .zip(output)
-            .map(|(input, output)| input.saturating_add(output))
-            .unwrap_or(0) as u32,
-        required_components_known: input.is_some() && output.is_some(),
-        cache_read_tokens: cache_read.map(|v| v as u32),
-        cache_creation_tokens: cache_write.map(|v| v as u32),
-        reasoning_tokens: reasoning.map(|v| v as u32),
-        ..Usage::default()
-    }
+    (
+        Usage {
+            prompt_tokens: input.unwrap_or(0) as u32,
+            completion_tokens: output.unwrap_or(0) as u32,
+            total_tokens: input
+                .zip(output)
+                .map(|(input, output)| input.saturating_add(output))
+                .unwrap_or(0) as u32,
+            required_components_known: input.is_some() && output.is_some(),
+            cache_read_tokens: cache_read.map(|v| v as u32),
+            cache_creation_tokens: cache_write.map(|v| v as u32),
+            reasoning_tokens: reasoning.map(|v| v as u32),
+            ..Usage::default()
+        },
+        input,
+        output,
+    )
 }
 
 fn first_u64(obj: &Value, keys: &[&str]) -> Option<u64> {

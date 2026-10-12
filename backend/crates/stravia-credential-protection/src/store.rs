@@ -7,6 +7,7 @@ use super::RedactionError;
 use stravia_runtime_contract::Principal;
 
 const PENDING_RETENTION: Duration = Duration::from_secs(60 * 60);
+
 const PUBLISHED_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 // Intentionally no Debug: mapping plaintext must never enter diagnostics.
@@ -52,10 +53,6 @@ pub enum SqlMappingStore {
     Postgres(sqlx::PgPool),
 }
 
-fn storage(_: sqlx::Error) -> RedactionError {
-    RedactionError::Storage
-}
-
 fn now() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
@@ -71,6 +68,10 @@ impl SqlMappingStore {
 
     pub fn postgres(pool: sqlx::PgPool) -> Self {
         Self::Postgres(pool)
+    }
+
+    fn storage(&self, _error: sqlx::Error) -> RedactionError {
+        RedactionError::Storage
     }
 
     async fn retain(
@@ -94,11 +95,11 @@ impl SqlMappingStore {
         };
         match self {
             Self::Sqlite(pool) => {
-                let mut connection = pool.acquire().await.map_err(storage)?;
+                let mut connection = pool.acquire().await.map_err(|error| self.storage(error))?;
                 let mut transaction = connection
                     .begin_with("BEGIN IMMEDIATE")
                     .await
-                    .map_err(storage)?;
+                    .map_err(|error| self.storage(error))?;
                 let now = now();
                 let expires_at = after(now, retention);
                 // Match the 400-key IN batches used by durable history storage.
@@ -130,18 +131,21 @@ impl SqlMappingStore {
                         .build()
                         .execute(&mut *transaction)
                         .await
-                        .map_err(storage)?;
+                        .map_err(|error| self.storage(error))?;
                 }
-                transaction.commit().await.map_err(storage)?;
+                transaction
+                    .commit()
+                    .await
+                    .map_err(|error| self.storage(error))?;
             }
             Self::Postgres(pool) => {
-                let mut transaction = pool.begin().await.map_err(storage)?;
+                let mut transaction = pool.begin().await.map_err(|error| self.storage(error))?;
                 // The same principal lock as intern makes lifecycle decisions after any writer wait.
                 sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
                     .bind(&principal)
                     .execute(&mut *transaction)
                     .await
-                    .map_err(storage)?;
+                    .map_err(|error| self.storage(error))?;
                 let now = now();
                 let expires_at = after(now, retention);
                 for references in references.chunks(400) {
@@ -172,9 +176,12 @@ impl SqlMappingStore {
                         .build()
                         .execute(&mut *transaction)
                         .await
-                        .map_err(storage)?;
+                        .map_err(|error| self.storage(error))?;
                 }
-                transaction.commit().await.map_err(storage)?;
+                transaction
+                    .commit()
+                    .await
+                    .map_err(|error| self.storage(error))?;
             }
         }
         Ok(())
@@ -194,7 +201,7 @@ impl MappingStore for SqlMappingStore {
             .bind(now())
             .fetch_all(pool)
             .await
-            .map_err(storage),
+            .map_err(|error| self.storage(error)),
             Self::Postgres(pool) => sqlx::query_as::<_, Mapping>(
                 "SELECT reference, secret, expires_at FROM reversible_redaction_mappings \
                  WHERE principal = $1 AND expires_at > $2 ORDER BY reference",
@@ -203,7 +210,7 @@ impl MappingStore for SqlMappingStore {
             .bind(now())
             .fetch_all(pool)
             .await
-            .map_err(storage),
+            .map_err(|error| self.storage(error)),
         }
     }
 
@@ -225,11 +232,11 @@ impl MappingStore for SqlMappingStore {
         // Secrets can be arbitrarily long (e.g. private keys), so do not B-tree index them.
         match self {
             Self::Sqlite(pool) => {
-                let mut connection = pool.acquire().await.map_err(storage)?;
+                let mut connection = pool.acquire().await.map_err(|error| self.storage(error))?;
                 let mut transaction = connection
                     .begin_with("BEGIN IMMEDIATE")
                     .await
-                    .map_err(storage)?;
+                    .map_err(|error| self.storage(error))?;
                 let now = now();
                 for secret in secrets {
                     let existing = sqlx::query_as::<_, Mapping>(
@@ -241,7 +248,7 @@ impl MappingStore for SqlMappingStore {
                     .bind(now)
                     .fetch_optional(&mut *transaction)
                     .await
-                    .map_err(storage)?;
+                    .map_err(|error| self.storage(error))?;
                     let mapping = match existing {
                         Some(mapping) => mapping,
                         None => {
@@ -253,7 +260,7 @@ impl MappingStore for SqlMappingStore {
                                  VALUES (?, ?, ?, ?, ?, ?)",
                             ).bind(&reference).bind(&principal).bind(secret).bind(now).bind(now)
                                 .bind(after(now, PENDING_RETENTION))
-                                .execute(&mut *transaction).await.map_err(storage)?;
+                                .execute(&mut *transaction).await.map_err(|error| self.storage(error))?;
                             Mapping {
                                 reference,
                                 secret: secret.clone(),
@@ -263,15 +270,18 @@ impl MappingStore for SqlMappingStore {
                     };
                     mappings.push(mapping);
                 }
-                transaction.commit().await.map_err(storage)?;
+                transaction
+                    .commit()
+                    .await
+                    .map_err(|error| self.storage(error))?;
             }
             Self::Postgres(pool) => {
-                let mut transaction = pool.begin().await.map_err(storage)?;
+                let mut transaction = pool.begin().await.map_err(|error| self.storage(error))?;
                 sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
                     .bind(&principal)
                     .execute(&mut *transaction)
                     .await
-                    .map_err(storage)?;
+                    .map_err(|error| self.storage(error))?;
                 let now = now();
                 for secret in secrets {
                     let existing = sqlx::query_as::<_, Mapping>(
@@ -283,7 +293,7 @@ impl MappingStore for SqlMappingStore {
                     .bind(now)
                     .fetch_optional(&mut *transaction)
                     .await
-                    .map_err(storage)?;
+                    .map_err(|error| self.storage(error))?;
                     let mapping = match existing {
                         Some(mapping) => mapping,
                         None => {
@@ -295,7 +305,7 @@ impl MappingStore for SqlMappingStore {
                                  VALUES ($1, $2, $3, $4, $4, $5)",
                             ).bind(&reference).bind(&principal).bind(secret).bind(now)
                                 .bind(after(now, PENDING_RETENTION))
-                                .execute(&mut *transaction).await.map_err(storage)?;
+                                .execute(&mut *transaction).await.map_err(|error| self.storage(error))?;
                             Mapping {
                                 reference,
                                 secret: secret.clone(),
@@ -305,7 +315,10 @@ impl MappingStore for SqlMappingStore {
                     };
                     mappings.push(mapping);
                 }
-                transaction.commit().await.map_err(storage)?;
+                transaction
+                    .commit()
+                    .await
+                    .map_err(|error| self.storage(error))?;
             }
         }
         Ok(InternedMappings { mappings, created })
@@ -337,7 +350,7 @@ impl MappingStore for SqlMappingStore {
                     .execute(pool)
                     .await
                     .map(|result| result.rows_affected())
-                    .map_err(storage)
+                    .map_err(|error| self.storage(error))
             }
             Self::Postgres(pool) => {
                 sqlx::query("DELETE FROM reversible_redaction_mappings WHERE expires_at <= $1")
@@ -345,7 +358,7 @@ impl MappingStore for SqlMappingStore {
                     .execute(pool)
                     .await
                     .map(|result| result.rows_affected())
-                    .map_err(storage)
+                    .map_err(|error| self.storage(error))
             }
         }
     }

@@ -326,147 +326,147 @@ impl PluginStore {
         resets: &[ProviderReset],
     ) -> Result<(), PluginStorageError> {
         macro_rules! install {
-            ($pool:expr, $begin:literal) => {{
-                let mut connection = $pool.acquire().await.map_err(storage_error)?;
-                let mut tx = connection.begin_with($begin).await.map_err(storage_error)?;
-                let changed = if let Some(expected) = expected_revision {
-                    sqlx::query(
-                        "UPDATE vendor_plugins SET version=$2, source=$3, digest=$4, revision=$5, data_epoch=$6, installed_at=$7, descriptor=$9 WHERE vendor_id=$1 AND revision=$8",
-                    )
-                    .bind(&next.vendor_id)
-                    .bind(&next.version)
-                    .bind(&next.source)
-                    .bind(&next.digest)
-                    .bind(next.revision)
-                    .bind(next.data_epoch)
-                    .bind(next.installed_at)
-                    .bind(expected)
-                    .bind(&next.descriptor)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(storage_error)?
-                    .rows_affected()
-                } else {
-                    sqlx::query(
-                        "INSERT INTO vendor_plugins (vendor_id,version,source,digest,revision,data_epoch,installed_at,descriptor) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(vendor_id) DO NOTHING",
-                    )
-                    .bind(&next.vendor_id)
-                    .bind(&next.version)
-                    .bind(&next.source)
-                    .bind(&next.digest)
-                    .bind(next.revision)
-                    .bind(next.data_epoch)
-                    .bind(next.installed_at)
-                    .bind(&next.descriptor)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(storage_error)?
-                    .rows_affected()
-                };
-                if changed != 1 {
-                    return Err(PluginStorageError::Changed);
-                }
-                for reset in resets {
-                    let impact = &reset.impact;
-                    let owner: Option<String> =
-                        sqlx::query_scalar("SELECT vendor FROM providers WHERE id=$1")
-                            .bind(&impact.provider_id)
-                            .fetch_optional(&mut *tx)
-                            .await
-                            .map_err(storage_error)?
-                            .flatten();
-                    if owner.as_deref() != Some(reset.expected_vendor.as_str()) {
-                        return Err(PluginStorageError::Changed);
-                    }
-                    if impact.options {
-                        sqlx::query("UPDATE providers SET vendor_options=$2 WHERE id=$1")
-                            .bind(&impact.provider_id)
-                            .bind(&reset.retained_options)
-                            .execute(&mut *tx)
-                            .await
-                            .map_err(storage_error)?;
-                    }
-                    if impact.options || impact.credentials {
-                        sqlx::query("UPDATE providers SET adapter_credentials=$2 WHERE id=$1")
-                            .bind(&impact.provider_id)
-                            .bind(&reset.retained_adapter_credentials)
-                            .execute(&mut *tx)
-                            .await
-                            .map_err(storage_error)?;
-                    }
-                    if impact.credentials {
-                        sqlx::query("UPDATE providers SET api_key='' WHERE id=$1")
-                            .bind(&impact.provider_id)
-                            .execute(&mut *tx)
-                            .await
-                            .map_err(storage_error)?;
-                        sqlx::query("DELETE FROM provider_oauth_credentials WHERE provider_id=$1")
-                            .bind(&impact.provider_id)
-                            .execute(&mut *tx)
-                            .await
-                            .map_err(storage_error)?;
-                    }
-                    if impact.models {
-                        let models: Vec<(
-                            String,
-                            String,
-                            String,
-                            sqlx::types::Json<ProviderModelMetadata>,
-                        )> = sqlx::query_as(
-                            "SELECT model_id, source_kind, presence, metadata_json FROM provider_models WHERE provider_id=$1",
-                        )
-                            .bind(&impact.provider_id)
-                            .fetch_all(&mut *tx)
-                            .await
-                            .map_err(storage_error)?;
-                        for (model_id, source_kind, presence, mut metadata) in models {
-                            if !clear_plugin_model_metadata(&mut metadata.0) {
-                                continue;
-                            }
-                            let presence = if source_kind == "discovered" {
-                                "missing"
-                            } else {
-                                presence.as_str()
-                            };
-                            sqlx::query(
-                                "UPDATE provider_models SET metadata_json=$3, lifecycle_status=NULL, presence=$4, revision=revision+1 WHERE provider_id=$1 AND model_id=$2",
-                            )
-                            .bind(&impact.provider_id)
-                            .bind(model_id)
-                            .bind(metadata)
-                            .bind(presence)
-                            .execute(&mut *tx)
-                            .await
-                            .map_err(storage_error)?;
-                        }
-                    }
-                    if impact.private_state {
-                        sqlx::query("DELETE FROM vendor_private_state WHERE provider_id=$1 AND vendor_id=$2")
-                            .bind(&impact.provider_id)
-                            .bind(&reset.expected_vendor)
-                            .execute(&mut *tx)
-                            .await
-                            .map_err(storage_error)?;
-                    }
-                    for (kind, reset) in [
-                        ("options", impact.options),
-                        ("credentials", impact.credentials),
-                        ("models", impact.models),
-                    ] {
-                        if reset {
-                            sqlx::query("INSERT INTO vendor_data_recovery (provider_id,data_kind) VALUES ($1,$2) ON CONFLICT(provider_id,data_kind) DO NOTHING")
-                                .bind(&impact.provider_id)
-                                .bind(kind)
-                                .execute(&mut *tx)
-                                .await
-                                .map_err(storage_error)?;
-                        }
-                    }
-                }
-                tx.commit().await.map_err(storage_error)?;
-                Ok(())
-            }};
+    ($pool:expr, $begin:literal) => {{
+        let mut connection = $pool.acquire().await.map_err(storage_error)?;
+        let mut tx = connection.begin_with($begin).await.map_err(storage_error)?;
+        let changed = if let Some(expected) = expected_revision {
+            sqlx::query(
+                "UPDATE vendor_plugins SET version=$2, source=$3, digest=$4, revision=$5, data_epoch=$6, installed_at=$7, descriptor=$9 WHERE vendor_id=$1 AND revision=$8",
+            )
+            .bind(&next.vendor_id)
+            .bind(&next.version)
+            .bind(&next.source)
+            .bind(&next.digest)
+            .bind(next.revision)
+            .bind(next.data_epoch)
+            .bind(next.installed_at)
+            .bind(expected)
+            .bind(&next.descriptor)
+            .execute(&mut *tx)
+            .await
+            .map_err(storage_error)?
+            .rows_affected()
+        } else {
+            sqlx::query(
+                "INSERT INTO vendor_plugins (vendor_id,version,source,digest,revision,data_epoch,installed_at,descriptor) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(vendor_id) DO NOTHING",
+            )
+            .bind(&next.vendor_id)
+            .bind(&next.version)
+            .bind(&next.source)
+            .bind(&next.digest)
+            .bind(next.revision)
+            .bind(next.data_epoch)
+            .bind(next.installed_at)
+            .bind(&next.descriptor)
+            .execute(&mut *tx)
+            .await
+            .map_err(storage_error)?
+            .rows_affected()
+        };
+        if changed != 1 {
+            return Err(PluginStorageError::Changed);
         }
+        for reset in resets {
+            let impact = &reset.impact;
+            let owner: Option<String> =
+                sqlx::query_scalar("SELECT vendor FROM providers WHERE id=$1")
+                    .bind(&impact.provider_id)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(storage_error)?
+                    .flatten();
+            if owner.as_deref() != Some(reset.expected_vendor.as_str()) {
+                return Err(PluginStorageError::Changed);
+            }
+            if impact.options {
+                sqlx::query("UPDATE providers SET vendor_options=$2 WHERE id=$1")
+                    .bind(&impact.provider_id)
+                    .bind(&reset.retained_options)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(storage_error)?;
+            }
+            if impact.options || impact.credentials {
+                sqlx::query("UPDATE providers SET adapter_credentials=$2 WHERE id=$1")
+                    .bind(&impact.provider_id)
+                    .bind(&reset.retained_adapter_credentials)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(storage_error)?;
+            }
+            if impact.credentials {
+                sqlx::query("UPDATE providers SET api_key='' WHERE id=$1")
+                    .bind(&impact.provider_id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(storage_error)?;
+                sqlx::query("DELETE FROM provider_oauth_credentials WHERE provider_id=$1")
+                    .bind(&impact.provider_id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(storage_error)?;
+            }
+            if impact.models {
+                let models: Vec<(
+                    String,
+                    String,
+                    String,
+                    sqlx::types::Json<ProviderModelMetadata>,
+                )> = sqlx::query_as(
+                    "SELECT model_id, source_kind, presence, metadata_json FROM provider_models WHERE provider_id=$1",
+                )
+                    .bind(&impact.provider_id)
+                    .fetch_all(&mut *tx)
+                    .await
+                    .map_err(storage_error)?;
+                for (model_id, source_kind, presence, mut metadata) in models {
+                    if !clear_plugin_model_metadata(&mut metadata.0) {
+                        continue;
+                    }
+                    let presence = if source_kind == "discovered" {
+                        "missing"
+                    } else {
+                        presence.as_str()
+                    };
+                    sqlx::query(
+                        "UPDATE provider_models SET metadata_json=$3, lifecycle_status=NULL, presence=$4, revision=revision+1 WHERE provider_id=$1 AND model_id=$2",
+                    )
+                    .bind(&impact.provider_id)
+                    .bind(model_id)
+                    .bind(metadata)
+                    .bind(presence)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(storage_error)?;
+                }
+            }
+            if impact.private_state {
+                sqlx::query("DELETE FROM vendor_private_state WHERE provider_id=$1 AND vendor_id=$2")
+                    .bind(&impact.provider_id)
+                    .bind(&reset.expected_vendor)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(storage_error)?;
+            }
+            for (kind, reset) in [
+                ("options", impact.options),
+                ("credentials", impact.credentials),
+                ("models", impact.models),
+            ] {
+                if reset {
+                    sqlx::query("INSERT INTO vendor_data_recovery (provider_id,data_kind) VALUES ($1,$2) ON CONFLICT(provider_id,data_kind) DO NOTHING")
+                        .bind(&impact.provider_id)
+                        .bind(kind)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(storage_error)?;
+                }
+            }
+        }
+        tx.commit().await.map_err(storage_error)?;
+        Ok(())
+    }};
+            }
         match &self.backend {
             PluginStoreBackend::Memory(store) => {
                 install_memory(store, next, expected_revision, resets).await
@@ -522,10 +522,10 @@ impl PluginStore {
         payload: &[u8],
     ) -> Result<(), PluginStorageError> {
         const SQL: &str = "INSERT INTO vendor_private_state (provider_id,vendor_id,format_version,payload,updated_at)
-            SELECT p.id,p.vendor,$4,$5,$6 FROM providers p
-            JOIN vendor_plugins v ON v.vendor_id=COALESCE((SELECT d.vendor_id FROM vendor_plugins d WHERE d.vendor_id=p.vendor),'base')
-            WHERE p.id=$1 AND p.vendor=$2 AND v.data_epoch=$3
-            ON CONFLICT(provider_id) DO UPDATE SET vendor_id=excluded.vendor_id,format_version=excluded.format_version,payload=excluded.payload,updated_at=excluded.updated_at";
+    SELECT p.id,p.vendor,$4,$5,$6 FROM providers p
+    JOIN vendor_plugins v ON v.vendor_id=COALESCE((SELECT d.vendor_id FROM vendor_plugins d WHERE d.vendor_id=p.vendor),'base')
+    WHERE p.id=$1 AND p.vendor=$2 AND v.data_epoch=$3
+    ON CONFLICT(provider_id) DO UPDATE SET vendor_id=excluded.vendor_id,format_version=excluded.format_version,payload=excluded.payload,updated_at=excluded.updated_at";
         macro_rules! write {
             ($pool:expr, $begin:literal, $lock:literal) => {{
                 let mut connection = $pool.acquire().await.map_err(storage_error)?;

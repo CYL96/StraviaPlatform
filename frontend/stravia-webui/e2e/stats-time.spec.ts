@@ -1,0 +1,408 @@
+import { expect, test, type Page, type Route } from '@playwright/test'
+
+import { prepareApp } from './prepare-app'
+
+const HOUR = 3_600_000
+const NOW = Date.UTC(2026, 9, 11, 12, 7)
+const LIVE_END = Date.UTC(2026, 9, 11, 12, 15)
+const overview = (requests = 12) => ({
+  total_requests: requests,
+  error_count: 0,
+  total_input_tokens: 600,
+  total_output_tokens: 86,
+  total_cache_read_tokens: 320,
+  total_cache_write_tokens: 12,
+  total_reasoning_tokens: null,
+  avg_duration_ms: 120,
+  avg_first_token_ms: 40,
+  avg_output_tps: 25,
+})
+
+type Window = { start: number; end: number }
+
+async function fixture(page: Page, intercept?: (route: Route, url: URL) => Promise<boolean>) {
+  await prepareApp(page)
+  const requests: URL[] = []
+  await page.route('**/api/v1/stats/**', async (route) => {
+    const url = new URL(route.request().url())
+    requests.push(url)
+    if (intercept && (await intercept(route, url))) return
+    const endpoint = url.pathname.split('/').at(-1)
+    if (endpoint === 'overview') {
+      await route.fulfill({ json: { data: overview() } })
+    } else if (endpoint === 'series') {
+      const bucketMs = Number(url.searchParams.get('bucket')) * 1000
+      await route.fulfill({
+        json: {
+          data: [
+            {
+              bucket_ms: bucketMs,
+              bucket_start: Number(url.searchParams.get('start_at')),
+              request_count: 12,
+              error_count: 0,
+              total_input_tokens: 600,
+              total_output_tokens: 86,
+              total_cache_read_tokens: 320,
+              total_cache_write_tokens: 12,
+              total_reasoning_tokens: null,
+              avg_duration_ms: 120,
+              avg_first_token_ms: 40,
+              avg_output_tps: 25,
+            },
+          ],
+        },
+      })
+    } else {
+      await route.fulfill({ json: { data: [] } })
+    }
+  })
+  return requests
+}
+
+async function expectWindow(requests: URL[], window: Window) {
+  await expect
+    .poll(() => {
+      const matching = requests.filter(
+        (url) =>
+          Number(url.searchParams.get('start_at')) === window.start &&
+          Number(url.searchParams.get('end_at')) === window.end,
+      )
+      return [...new Set(matching.map((url) => url.pathname.split('/').at(-1)))].sort()
+    })
+    .toEqual(['api-keys', 'models', 'overview', 'providers', 'series'])
+  for (const url of requests) {
+    expect(url.searchParams.has('start_at')).toBe(true)
+    expect(url.searchParams.has('end_at')).toBe(true)
+    expect(url.searchParams.has('hours')).toBe(false)
+    expect(url.searchParams.has('tz_offset')).toBe(false)
+    expect(Number(url.searchParams.get('start_at')) % 900_000).toBe(0)
+    expect(Number(url.searchParams.get('end_at')) % 900_000).toBe(0)
+  }
+}
+
+async function chooseRange(page: Page, start: string, end: string) {
+  await page.getByRole('button', { name: 'Date and time range', exact: true }).click()
+  const dialog = page.getByRole('dialog')
+  await dialog.getByLabel('Start', { exact: true }).fill(start)
+  await dialog.getByLabel('End', { exact: true }).fill(end)
+  return dialog
+}
+
+test.describe('statistics absolute time windows', () => {
+  test.use({ timezoneId: 'UTC' })
+
+  test('all six views share each preset and the current accumulating quarter', async ({ page }) => {
+    await page.clock.setFixedTime(NOW)
+    const requests = await fixture(page)
+    await page.goto('/stats')
+    for (const [label, hours, bucket] of [
+      ['Last 6h', 6, '900'],
+      ['Last 24h', 24, '3600'],
+      ['Last 3d', 72, '21600'],
+      ['Last 7d', 168, '86400'],
+    ] as const) {
+      await page.locator('[data-slot="select-trigger"]').click()
+      await page.getByRole('option', { name: label, exact: true }).click()
+      const window = { start: LIVE_END - hours * HOUR, end: LIVE_END }
+      await expectWindow(requests, window)
+      const series = requests.filter(
+        (url) => url.pathname.endsWith('/series') && Number(url.searchParams.get('start_at')) === window.start,
+      )
+      expect(series.some((url) => url.searchParams.get('bucket') === bucket)).toBe(true)
+      expect(series.some((url) => url.searchParams.get('bucket') === '3600')).toBe(true)
+      await expect(page.getByRole('status').filter({ hasText: 'Current bucket is still accumulating' })).toBeVisible()
+    }
+  })
+
+  test('previous and next move a fixed span, refresh does not drift it, and return live advances', async ({ page }) => {
+    // install() starts a running clock; pause at a later instant before the app creates timers.
+    await page.clock.install({ time: NOW - HOUR })
+    await page.clock.pauseAt(NOW)
+    const requests = await fixture(page)
+    const selectWindow = async (window: Window, action: () => Promise<unknown>, cachedGeneration?: URL[]) => {
+      const before = requests.length
+      // At 24h both series views use bucket=3600 and share one TanStack query/request.
+      // Register response boundaries before acting. A fresh cache revisit instead uses the
+      // completed generation retained below, coupled to the exact selected-window DOM.
+      const responses = (cachedGeneration ? [] : ['overview', 'series', 'models', 'providers', 'api-keys']).map(
+        (endpoint) =>
+          page.waitForResponse((response) => {
+            const url = new URL(response.url())
+            return (
+              url.pathname === `/api/v1/stats/${endpoint}` &&
+              Number(url.searchParams.get('start_at')) === window.start &&
+              Number(url.searchParams.get('end_at')) === window.end &&
+              (endpoint !== 'series' || url.searchParams.get('bucket') === '3600')
+            )
+          }),
+      )
+      await action()
+      for (const response of await Promise.all(responses)) {
+        expect(response.ok()).toBe(true)
+        expect(await response.finished()).toBeNull()
+      }
+      const currentRequests = requests.slice(before)
+      const generation = cachedGeneration ?? currentRequests
+      await expectWindow(generation, window)
+      for (const url of [...generation, ...currentRequests]) {
+        expect(Number(url.searchParams.get('start_at'))).toBe(window.start)
+        expect(Number(url.searchParams.get('end_at'))).toBe(window.end)
+      }
+      // Check the always-visible selected interval without opening an animated dialog:
+      // its close transition cannot finish while this test deliberately pauses the clock.
+      const visibleTime = (value: number) => {
+        const date = new Date(value)
+        return `${date.getUTCMonth() + 1}/${date.getUTCDate()}/${date.getUTCFullYear()} ${date.toISOString().slice(11, 19)}`
+      }
+      await expect(
+        page
+          .getByRole('status')
+          .getByText(`${visibleTime(window.start)} – ${visibleTime(window.end)}`, { exact: true }),
+      ).toBeVisible()
+      return generation
+    }
+    await selectWindow({ start: LIVE_END - 24 * HOUR, end: LIVE_END }, () => page.goto('/stats'))
+    await expect(page.getByRole('button', { name: 'Next window', exact: true })).toBeDisabled()
+    const previous = { start: LIVE_END - 48 * HOUR, end: LIVE_END - 24 * HOUR }
+    await selectWindow(previous, () => page.getByRole('button', { name: 'Previous window', exact: true }).click())
+    await expect(page.getByText('Fixed historical window', { exact: true }).first()).toBeVisible()
+    const refreshedPrevious = await selectWindow(previous, () => page.clock.fastForward(HOUR))
+    await expect(page.getByText('Fixed historical window', { exact: true }).first()).toBeVisible()
+    await selectWindow({ start: LIVE_END - 72 * HOUR, end: LIVE_END - 48 * HOUR }, () =>
+      page.getByRole('button', { name: 'Previous window', exact: true }).click(),
+    )
+    // The shared QueryClient keeps this just-refreshed key fresh for 10s; paused time
+    // means Next legitimately renders that completed generation without another request.
+    await selectWindow(
+      previous,
+      () => page.getByRole('button', { name: 'Next window', exact: true }).click(),
+      refreshedPrevious,
+    )
+    await selectWindow({ start: LIVE_END - 23 * HOUR, end: LIVE_END + HOUR }, () =>
+      page.getByRole('button', { name: 'Return to live', exact: true }).click(),
+    )
+    await expect(page.getByRole('status').filter({ hasText: 'Current bucket is still accumulating' })).toBeVisible()
+  })
+
+  test('custom ranges exceed 24 hours and reject unaligned or reversed boundaries without querying', async ({
+    page,
+  }) => {
+    await page.clock.setFixedTime(NOW)
+    const requests = await fixture(page)
+    await page.goto('/stats')
+    await expectWindow(requests, { start: LIVE_END - 24 * HOUR, end: LIVE_END })
+    const dialog = await chooseRange(page, '2026-10-01T00:00', '2026-10-04T00:15')
+    await dialog.getByRole('button', { name: 'Apply range', exact: true }).click()
+    const window = { start: Date.UTC(2026, 9, 1), end: Date.UTC(2026, 9, 4, 0, 15) }
+    await expectWindow(requests, window)
+    await expect(dialog).not.toBeVisible()
+    const invalid = await chooseRange(page, '2026-10-01T00:01', '2026-10-04T00:15')
+    const before = requests.length
+    await expect(invalid.getByRole('button', { name: 'Apply range', exact: true })).toBeDisabled()
+    await expect(invalid.getByRole('alert')).toBeVisible()
+    expect(requests).toHaveLength(before)
+    await invalid.getByLabel('Start', { exact: true }).fill('2026-10-04T00:15')
+    await expect(invalid.getByRole('button', { name: 'Apply range', exact: true })).toBeDisabled()
+    await expect(invalid.getByRole('alert')).toBeVisible()
+    expect(requests).toHaveLength(before)
+    await invalid.getByLabel('Start', { exact: true }).fill('2026-10-05T00:15')
+    await expect(invalid.getByRole('button', { name: 'Apply range', exact: true })).toBeDisabled()
+    await expect(invalid.getByRole('alert')).toBeVisible()
+    expect(requests).toHaveLength(before)
+  })
+
+  test('two-year custom window uses effective coarse buckets without truncating coverage', async ({ page }) => {
+    await page.clock.setFixedTime(NOW)
+    const start = Date.UTC(2024, 0, 1)
+    const end = Date.UTC(2026, 0, 1)
+    const bucketMs = 2 * 24 * HOUR
+    const requests = await fixture(page, async (route, url) => {
+      if (Number(url.searchParams.get('start_at')) !== start || Number(url.searchParams.get('end_at')) !== end)
+        return false
+      if (url.pathname.endsWith('/overview')) {
+        await route.fulfill({ json: { data: { ...overview(366), total_input_tokens: 366, total_output_tokens: 366 } } })
+        return true
+      }
+      if (!url.pathname.endsWith('/series')) return false
+      await route.fulfill({
+        json: {
+          data: Array.from({ length: 366 }, (_, index) => ({
+            bucket_start: start + index * bucketMs,
+            bucket_ms: bucketMs,
+            request_count: 1,
+            error_count: 0,
+            total_input_tokens: 1,
+            total_output_tokens: 1,
+            total_cache_read_tokens: 0,
+            total_cache_write_tokens: 0,
+            total_reasoning_tokens: null,
+            avg_duration_ms: 1000,
+            avg_first_token_ms: 500,
+            avg_output_tps: 1,
+          })),
+        },
+      })
+      return true
+    })
+    await page.goto('/stats')
+    const dialog = await chooseRange(page, '2024-01-01T00:00', '2026-01-01T00:00')
+    await dialog.getByRole('button', { name: 'Apply range', exact: true }).click()
+    await expectWindow(requests, { start, end })
+    await expect(page.getByLabel('Latency and speed chart', { exact: true })).toBeVisible()
+    const cells = page.getByRole('group', { name: 'Token activity' }).locator('.token-activity-cell')
+    await expect(cells).toHaveCount(366)
+    expect(await cells.count()).toBeLessThanOrEqual(512)
+    await expect(page.locator('.route-metric-strip__item').filter({ hasText: 'Total requests' })).toContainText('366')
+    await expect(page.locator('.route-metric-strip__item').filter({ hasText: 'Input Tokens' })).toContainText('366')
+  })
+
+  test('deleted and recreated resources with the same name remain distinct and non-actionable', async ({ page }) => {
+    await page.clock.setFixedTime(NOW)
+    await page.setViewportSize({ width: 1280, height: 900 })
+    await fixture(page, async (route, url) => {
+      const endpoint = url.pathname.split('/').at(-1)
+      const identities = [
+        { suffix: 'old', deleted: true, requests: 11 },
+        { suffix: 'new', deleted: false, requests: 22 },
+      ]
+      let data: Record<string, unknown>[]
+      if (endpoint === 'models') {
+        data = identities.map(({ suffix, deleted, requests }) => ({
+          model_id: `model-${suffix}`,
+          model: 'Reused model name',
+          deleted,
+          request_count: requests,
+          total_input_tokens: requests,
+          total_output_tokens: requests,
+          total_reasoning_tokens: null,
+          avg_duration_ms: 1000,
+        }))
+      } else if (endpoint === 'providers') {
+        data = identities.map(({ suffix, deleted, requests }) => ({
+          provider_id: `provider-${suffix}`,
+          provider: 'Reused service name',
+          deleted,
+          request_count: requests,
+          error_count: 0,
+          avg_output_tps: 1,
+        }))
+      } else if (endpoint === 'api-keys') {
+        data = identities.map(({ suffix, deleted, requests }) => ({
+          api_key_id: `key-${suffix}`,
+          api_key_name: 'Reused key name',
+          deleted,
+          request_count: requests,
+          total_input_tokens: requests,
+          total_output_tokens: requests,
+          cache_read_tokens: 0,
+          cache_write_tokens: 0,
+          reasoning_tokens: null,
+          last_used_at: NOW,
+        }))
+      } else return false
+      await route.fulfill({ json: { data } })
+      return true
+    })
+    await page.goto('/stats')
+    const models = page.getByRole('region', { name: 'Models', exact: true })
+    const modelItems = models.getByRole('listitem')
+    await expect(modelItems).toHaveCount(2)
+    const deletedModel = modelItems.filter({ hasText: /Reused model name.*Deleted/i })
+    const liveModel = modelItems.filter({ hasText: 'Reused model name' }).filter({ hasNotText: /Deleted/i })
+    await expect(deletedModel).toHaveCount(1)
+    await expect(liveModel).toHaveCount(1)
+    await expect(deletedModel).toContainText('33.33%')
+    await expect(liveModel).toContainText('66.67%')
+    await expect(deletedModel.getByRole('link')).toHaveCount(0)
+    await expect(deletedModel.getByRole('button')).toHaveCount(0)
+
+    for (const [tableName, resourceName] of [
+      ['Model services', 'Reused service name'],
+      ['API Key usage', 'Reused key name'],
+    ] as const) {
+      const table = page.getByRole('table', { name: tableName, exact: true })
+      const rows = table.getByRole('row').filter({ hasText: resourceName })
+      await expect(rows).toHaveCount(2)
+      const deletedRow = rows.filter({ hasText: /Deleted/i })
+      const liveRow = rows.filter({ hasNotText: /Deleted/i })
+      await expect(deletedRow).toHaveCount(1)
+      await expect(liveRow).toHaveCount(1)
+      await expect(deletedRow.getByRole('cell', { name: '11', exact: true }).first()).toBeVisible()
+      await expect(liveRow.getByRole('cell', { name: '22', exact: true }).first()).toBeVisible()
+      await expect(deletedRow.getByRole('link')).toHaveCount(0)
+      await expect(deletedRow.getByRole('button')).toHaveCount(0)
+    }
+  })
+
+  test('delayed old-window responses cannot overwrite a newer preset', async ({ page }) => {
+    await page.clock.setFixedTime(NOW)
+    let release!: () => void
+    const held = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    let signalHeld!: () => void
+    const started = new Promise<void>((resolve) => {
+      signalHeld = resolve
+    })
+    const requests = await fixture(page, async (route, url) => {
+      const span = Number(url.searchParams.get('end_at')) - Number(url.searchParams.get('start_at'))
+      if (!url.pathname.endsWith('/overview') || span !== 6 * HOUR) return false
+      signalHeld()
+      await held
+      await route.fulfill({ json: { data: overview(999) } })
+      return true
+    })
+    await page.goto('/stats')
+    await expect(page.locator('.route-metric-strip__item').filter({ hasText: 'Total requests' })).toContainText('12')
+    await page.locator('[data-slot="select-trigger"]').click()
+    await page.getByRole('option', { name: 'Last 6h', exact: true }).click()
+    await started
+    await page.locator('[data-slot="select-trigger"]').click()
+    await page.getByRole('option', { name: 'Last 3d', exact: true }).click()
+    await expectWindow(requests, { start: LIVE_END - 72 * HOUR, end: LIVE_END })
+    const response = page.waitForResponse(
+      (r) =>
+        r.url().includes('/stats/overview') &&
+        Number(new URL(r.url()).searchParams.get('end_at')) - Number(new URL(r.url()).searchParams.get('start_at')) ===
+          6 * HOUR,
+    )
+    release()
+    await response
+    await expect(page.locator('[data-slot="select-trigger"]')).toContainText('Last 3d')
+    await expect(page.locator('.route-metric-strip__item').filter({ hasText: 'Total requests' })).toContainText('12')
+    await expect(page.getByText('999', { exact: true })).toHaveCount(0)
+  })
+})
+
+test.describe('statistics local time across DST', () => {
+  test.use({ timezoneId: 'America/New_York' })
+
+  test('cross-midnight spring-forward selection sends the exact absolute interval', async ({ page }) => {
+    await page.clock.setFixedTime(NOW)
+    const requests = await fixture(page)
+    await page.goto('/stats')
+    const dialog = await chooseRange(page, '2026-03-07T23:45', '2026-03-09T00:00')
+    await dialog.getByRole('button', { name: 'Apply range', exact: true }).click()
+    await expectWindow(requests, { start: Date.UTC(2026, 2, 8, 4, 45), end: Date.UTC(2026, 2, 9, 4) })
+    await page.getByRole('button', { name: 'Date and time range', exact: true }).click()
+    await expect(page.getByRole('dialog').getByLabel('Start', { exact: true })).toHaveValue('2026-03-07T23:45')
+    await expect(page.getByRole('dialog').getByLabel('End', { exact: true })).toHaveValue('2026-03-09T00:00')
+  })
+
+  for (const [name, start, end] of [
+    ['nonexistent spring-forward time', '2026-03-08T02:15', '2026-03-08T04:00'],
+    ['ambiguous fall-back time', '2026-11-01T01:15', '2026-11-01T03:00'],
+  ] as const) {
+    test(`rejects ${name} rather than silently changing the interval`, async ({ page }) => {
+      await page.clock.setFixedTime(Date.UTC(2026, 10, 2, 12, 7))
+      const requests = await fixture(page)
+      await page.goto('/stats')
+      await expect.poll(() => requests.length).toBeGreaterThanOrEqual(5)
+      const dialog = await chooseRange(page, start, end)
+      const before = requests.length
+      await expect(dialog.getByRole('button', { name: 'Apply range', exact: true })).toBeDisabled()
+      await expect(dialog.getByRole('alert')).toBeVisible()
+      expect(requests).toHaveLength(before)
+    })
+  }
+})

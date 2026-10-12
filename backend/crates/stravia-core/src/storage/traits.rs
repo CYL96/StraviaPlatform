@@ -8,8 +8,8 @@ use async_trait::async_trait;
 use crate::db::models::{
     ApiKeyStats, ApiKeyWithBindings, CreateApiKey, CreateProviderRecord, CreateWebProvider,
     ModelStats, OAuthCredential, Provider, ProviderCredentialVersion, ProviderStats, PutRoute,
-    RouteConfig, StatsOverview, StatsSeries, UpdateApiKey, UpdateProvider, UpdateWebProvider,
-    UpsertOAuthCredential, WebAccessSettings, WebProvider,
+    RouteConfig, StatsOverview, StatsSeries, StatsWindow, UpdateApiKey, UpdateProvider,
+    UpdateWebProvider, UpsertOAuthCredential, WebAccessSettings, WebProvider,
 };
 use crate::provider_models::{
     NewProviderModelRecord, ProviderModelMutation, ProviderModelReconciliation,
@@ -459,20 +459,17 @@ pub struct RouteSchedulingUsage {
 #[async_trait]
 pub trait UsageStatsStore: Send + Sync {
     async fn route_scheduling_snapshot(&self) -> RouteSchedulingUsage;
-    async fn stats_overview(&self, hours: Option<i64>) -> anyhow::Result<StatsOverview>;
-    /// Buckets are aligned to the caller's wall clock: `tz_offset_ms` is added to
-    /// `started_at` before integer bucket division and subtracted back, so a day
-    /// bucket boundary lands on local midnight while `bucket_start` stays a real
-    /// instant.
+    async fn stats_overview(&self, window: StatsWindow) -> anyhow::Result<StatsOverview>;
+    /// Coarsen UTC base buckets over the complete selected interval to at most
+    /// 512 presentation buckets, aligned to its start when explicitly selected.
     async fn stats_series(
         &self,
-        hours: i64,
+        window: StatsWindow,
         bucket_ms: i64,
-        tz_offset_ms: i64,
     ) -> anyhow::Result<Vec<StatsSeries>>;
-    async fn stats_by_model(&self, hours: Option<i64>) -> anyhow::Result<Vec<ModelStats>>;
-    async fn stats_by_provider(&self, hours: Option<i64>) -> anyhow::Result<Vec<ProviderStats>>;
-    async fn stats_by_api_key(&self, hours: Option<i64>) -> anyhow::Result<Vec<ApiKeyStats>>;
+    async fn stats_by_model(&self, window: StatsWindow) -> anyhow::Result<Vec<ModelStats>>;
+    async fn stats_by_provider(&self, window: StatsWindow) -> anyhow::Result<Vec<ProviderStats>>;
+    async fn stats_by_api_key(&self, window: StatsWindow) -> anyhow::Result<Vec<ApiKeyStats>>;
 }
 
 #[async_trait]

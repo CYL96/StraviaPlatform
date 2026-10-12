@@ -44,6 +44,28 @@ async fn persisted_records(handle: &TraceHandle) -> Vec<TraceRecord> {
 }
 
 #[tokio::test]
+async fn actual_wire_capture_limit_is_partial() {
+    let directory = tempfile::tempdir().expect("trace directory");
+    let manager = TraceManager::new(directory.path().to_owned()).expect("trace manager");
+    // Exercise the production cap without changing process-wide environment.
+    let handle = manager.create();
+    let oversized = "x".repeat(WIRE_CAPTURE_LIMIT_BYTES + 1);
+    assert_eq!(
+        handle.record(wire_record(1, "body", Value::String(oversized))),
+        TraceWriteOutcome::Partial(WIRE_CAPTURE_LIMIT)
+    );
+    assert_eq!(
+        handle.record(wire_record(2, "body", Value::String("survives".into()))),
+        TraceWriteOutcome::Queued
+    );
+    let manifest = handle.finish().await;
+    assert_eq!(manifest.status, "partial");
+    assert_eq!(manifest.reasons, [WIRE_CAPTURE_LIMIT]);
+    assert_eq!(persisted_records(&handle).await.len(), 1);
+    manager.shutdown().await;
+}
+
+#[tokio::test]
 async fn manifest_directory_created_before_trace_writer_preserves_wire_capture() {
     let directory = tempfile::tempdir().expect("trace directory");
     let manager = TraceManager::new(directory.path().to_owned()).expect("trace manager");

@@ -38,7 +38,7 @@ _避免使用_：Agent Turn、Model Turn、Inference Run、Agent Loop
 
 ## Interaction Observation
 
-Interaction Observation 是管理面用于查看 Connect Client Interaction 及其 Inference Run、Model Turn、工具调用、Target attempt、交付状态和 Confirmed Upstream Usage 的可持久化诊断投影。它可以实时变化并保留失败、取消或断线记录，但不是推理执行、Generation Chain 或模型历史的事实源；观察记录失败或丢失不得改变请求结果。
+Interaction Observation 是管理面用于查看 Connect Client Interaction 及其 Inference Run、Model Turn、工具调用、Target attempt、交付状态和 Confirmed Upstream Usage 的可持久化诊断投影。它可以实时变化并保留失败、取消或断线记录，但不是推理执行、Generation Chain 或模型历史的事实源；观察记录失败或丢失只影响相关诊断任务，不改变推理结果，也不终止实例。
 _避免使用_：Generation Chain、Request Log、Execution State Store
 
 ## 失败的请求（Failed Request）
@@ -90,6 +90,11 @@ _避免使用_：完整抓包（当存在未捕获或不完整的 Inference Run�
 
 Confirmed Upstream Usage 是上游在某次模型调用中明确报告、Stravia 已收到的 token 用量。Connect Client Interaction 的用量是其中所有 Inference Run、隐藏 Model Turn、重试和 Target failover 已报告用量的累计值；尚未报告或永不报告的消耗保持未知，但不遮蔽其他已确认用量，累计值与各项用量的报告覆盖程度分别表达，不能把未知记为零或用本地估算冒充精确值。
 _避免使用_：Agent Token、Estimated Usage、仅最终回答 Token
+
+## 用量统计汇总（Stats Usage）
+
+用量统计汇总是独立于对话历史与请求诊断记录、长期保留的 Token 用量、请求数、失败数及性能指标统计，其中 Token 用量以 Confirmed Upstream Usage 为依据。它不保留可逐对话查询的计量明细，不因历史手动删除或到期回收而减少；归属的 API Key、模型或 Provider 删除后仍保留各自的历史统计身份，同名重建不合并身份。
+_避免使用_：对话历史、逐对话账单、Provider Allowance、上游额度快照
 
 ## Net Input Tokens
 

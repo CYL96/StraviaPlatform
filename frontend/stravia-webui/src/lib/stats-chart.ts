@@ -9,13 +9,8 @@ type TokenStats = Pick<
 const HOUR_MS = 3_600_000
 const DAY_MS = 86_400_000
 
-/** 后端按「本地墙面时间」对齐 bucket；此偏移与其使用的 tz_offset 参数一致。 */
-export function localTzOffsetMs(): number {
-  return -new Date().getTimezoneOffset() * 60 * 1000
-}
-
 export interface LatencyChartPoint {
-  /** Bucket 起点的真实时刻，作为时间轴坐标；显示文案由轴刻度与 tooltip 按需本地化格式化。 */
+  /** Bucket 起点的真实时刻；显示文案由轴刻度与 tooltip 按需本地化格式化。 */
   bucket: Date
   firstToken: number | null
   outputTps: number | null
@@ -44,7 +39,7 @@ export function buildLatencyChart(rows: readonly LatencyStats[], bucketMs: numbe
 }
 
 export interface ActivityCell {
-  /** Bucket 起点时刻（本地边界对齐后的真实 epoch ms）。 */
+  /** Bucket 起点的真实 epoch ms；不按本地墙面时间重新对齐。 */
   start: number
   /** null 表示该时段有请求但 Token 用量未知；无请求为 0。 */
   tokens: number | null
@@ -55,116 +50,54 @@ export interface ActivityCell {
 
 export interface ActivityGridModel {
   cells: ActivityCell[]
-  /** 每列父周期的起点时刻，用于列标签。 */
+  /** 每列首个 bucket 的真实时刻，用于本地化列标签。 */
   colStarts: number[]
   colCount: number
   rowCount: number
   bucketMs: number
 }
 
-/** 与后端一致的本地对齐 bucket 起点。 */
-function alignBucketStart(timeMs: number, bucketMs: number, tzOffsetMs: number): number {
-  return Math.floor((timeMs + tzOffsetMs) / bucketMs) * bucketMs - tzOffsetMs
-}
-
-/** 每列父周期的长度上限：日格=本地周；6h 格=本地日；小时格=本地 6h 段；亚小时格=本地小时。 */
-export function activityColumnMs(bucketMs: number): number {
+/** 每列的目标跨度；列只包含完整粒度的 bucket，不以本地日历定义身份。 */
+function activityColumnMs(bucketMs: number): number {
   if (bucketMs >= DAY_MS) return 7 * DAY_MS
   if (bucketMs >= 6 * HOUR_MS) return DAY_MS
   if (bucketMs >= HOUR_MS) return 6 * HOUR_MS
   return HOUR_MS
 }
 
-/** 每列的子序号行数，与 columnOf 的行分配一致。 */
-export function activityRowCount(bucketMs: number): number {
-  if (bucketMs >= DAY_MS) return 7
-  if (bucketMs >= 6 * HOUR_MS) return 4
-  if (bucketMs >= HOUR_MS) return 6
-  return Math.max(1, Math.round(HOUR_MS / bucketMs))
-}
-
-/**
- * 方格归属：列 = 父周期，行 = 父周期内的子序号。
- * 日格列=本地周（周一起）；6h 格列=本地日；小时格列=本地 6h 段；亚小时格列=本地小时。
- */
-function columnOf(start: number, bucketMs: number): { key: number; row: number } {
-  const d = new Date(start)
-  const dayStart = () => new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime()
-  if (bucketMs >= DAY_MS) {
-    const row = (d.getDay() + 6) % 7
-    return { key: new Date(d.getFullYear(), d.getMonth(), d.getDate() - row).getTime(), row }
-  }
-  if (bucketMs >= 6 * HOUR_MS) {
-    return { key: dayStart(), row: Math.floor(d.getHours() / 6) }
-  }
-  if (bucketMs >= HOUR_MS) {
-    const row = d.getHours() % 6
-    return { key: new Date(d.getFullYear(), d.getMonth(), d.getDate(), d.getHours() - row).getTime(), row }
-  }
-  const perHour = Math.max(1, Math.round(HOUR_MS / bucketMs))
-  const row = Math.min(Math.floor(d.getMinutes() / (bucketMs / 60_000)), perHour - 1)
-  return { key: new Date(d.getFullYear(), d.getMonth(), d.getDate(), d.getHours()).getTime(), row }
-}
-
 function tokenTotal(row: TokenStats): number | null {
   // 管理输入已扣除缓存读取；缓存分项不再加回输入与输出的合计。
-  const parts = [row.total_input_tokens, row.total_output_tokens]
-  if (parts.every((value) => value == null)) return null
-  return parts.reduce<number>((sum, value) => sum + (value ?? 0), 0)
+  if (row.total_input_tokens == null && row.total_output_tokens == null) return null
+  return (row.total_input_tokens ?? 0) + (row.total_output_tokens ?? 0)
 }
 
 /**
- * 把序列行展开为覆盖整个窗口的方格矩阵：无数据的 bucket 也占位，
- * 行 = 父周期内子序号、列 = 父周期，时间自上而下再向右流动。
- * minCols 以最新列（含 endMs）为右端向前补足整列，让网格填满容器宽度。
+ * 展开绝对窗口 [startMs, endMs)：无数据的 bucket 占位，但不补窗口之外的边缘格。
+ * 时间从选定起点自上而下再向右流动；本地标签重复不会合并 bucket。
+ * 调用方选择有效 bucketMs，使整个窗口不超过 512 个 bucket。
  */
 export function buildActivityGrid(
   rows: readonly TokenStats[],
-  opts: { endMs: number; spanMs: number; bucketMs: number; tzOffsetMs: number; minCols?: number },
+  opts: { startMs: number; endMs: number; bucketMs: number },
 ): ActivityGridModel {
-  const { endMs, spanMs, bucketMs, tzOffsetMs, minCols = 0 } = opts
+  const { startMs, endMs, bucketMs } = opts
   const totals = new Map<number, number | null>()
   for (const row of rows) totals.set(row.bucket_start, tokenTotal(row))
 
-  const endStart = alignBucketStart(endMs, bucketMs, tzOffsetMs)
-  let windowStart = alignBucketStart(endMs - spanMs, bucketMs, tzOffsetMs)
-  if (minCols > 0) {
-    let firstKey = columnOf(endStart, bucketMs).key
-    for (let i = 1; i < minCols; i++) firstKey = columnOf(firstKey - 1, bucketMs).key
-    let extended = alignBucketStart(firstKey, bucketMs, tzOffsetMs)
-    while (columnOf(extended, bucketMs).key !== firstKey) extended += bucketMs
-    windowStart = Math.min(windowStart, extended)
-  }
-
-  const colIndex = new Map<number, number>()
+  // Even grains that do not divide an hour/day/week use distinct integer positions.
+  const rowsPerColumn = Math.max(1, Math.ceil(activityColumnMs(bucketMs) / bucketMs))
   const colStarts: number[] = []
   const rawCells: Omit<ActivityCell, 'level'>[] = []
   let rowCount = 0
   let max = 0
-  for (let start = windowStart; start <= endStart; start += bucketMs) {
-    const { key, row } = columnOf(start, bucketMs)
-    let col = colIndex.get(key)
-    if (col == null) {
-      col = colStarts.length
-      colIndex.set(key, col)
-      colStarts.push(key)
-    }
+  for (let start = startMs, index = 0; start < endMs; start += bucketMs, index++) {
+    const col = Math.floor(index / rowsPerColumn)
+    const row = index % rowsPerColumn
+    if (row === 0) colStarts.push(start)
     rowCount = Math.max(rowCount, row + 1)
     const tokens = totals.has(start) ? totals.get(start)! : 0
     if (tokens != null) max = Math.max(max, tokens)
     rawCells.push({ start, tokens, col, row })
-  }
-
-  // 只补齐窗口边缘列中已开始的时段，不为未来 bucket 生成方格；
-  // 列内 bucket 连续，起点 = 列起点 + 行号 × 粒度；有序列数据时取真实值。
-  const occupied = new Set(rawCells.map((cell) => cell.col * rowCount + cell.row))
-  for (let col = 0; col < colStarts.length; col++) {
-    for (let row = 0; row < rowCount; row++) {
-      if (occupied.has(col * rowCount + row)) continue
-      const start = colStarts[col] + row * bucketMs
-      if (start > endStart) break
-      rawCells.push({ start, tokens: totals.has(start) ? totals.get(start)! : 0, col, row })
-    }
   }
 
   const cells = rawCells.map((cell): ActivityCell => ({

@@ -76,6 +76,9 @@ impl ModelTurnExecutor for LiveModelTurnExecutor {
         fields(status)
     )]
     async fn execute(&self, mut input: TurnInput) -> Result<ModelTurn, ModelTurnError> {
+        if input.cancellation.is_cancelled() {
+            return Err(interruption_error(&input.deadline));
+        }
         if !input.attachments_normalized {
             tokio::select! {
                 biased;
@@ -646,6 +649,9 @@ fn execute_inner(
         let mut last_error: Option<AttemptFailure> = None;
         let mut excluded = std::collections::HashSet::new();
         'targets: loop {
+            if input.cancellation.is_cancelled() {
+                return Err(interruption_error(&input.deadline));
+            }
             let mut attempts =
                 match select_with_rpm(&executor, &route, &input, routing_estimate, &excluded).await
                 {
@@ -676,6 +682,9 @@ fn execute_inner(
             };
             let mut transport_preference = TransportPreference::Automatic;
             loop {
+                if input.cancellation.is_cancelled() {
+                    return Err(interruption_error(&input.deadline));
+                }
                 // The target may have been re-cooled by another request while this
                 // one prepared or backed off; never send on a stale generation.
                 if !attempts.retry_current() {
@@ -696,6 +705,9 @@ fn execute_inner(
                     // Preparation awaits storage/protocol work; another request may
                     // have cooled the target meanwhile — recheck right before the
                     // upstream send, not only before the backoff sleep.
+                    Ok(_) if input.cancellation.is_cancelled() => {
+                        return Err(interruption_error(&input.deadline));
+                    }
                     Ok(_) if !attempts.retry_current() => break,
                     Ok(mut prepared) => {
                         sent = Some(prepared.sent.clone());
@@ -731,6 +743,9 @@ fn execute_inner(
                     }
                     Err(failure) => Err(failure),
                 };
+                if input.cancellation.is_cancelled() {
+                    return Err(interruption_error(&input.deadline));
+                }
                 let mut failure = match result {
                     Ok(turn) => {
                         attempts.accept_current();
@@ -822,7 +837,14 @@ fn execute_inner(
                         if retry_over_http {
                             transport_preference = TransportPreference::HttpOnly;
                         }
-                        tokio::time::sleep(delay).await;
+                        tokio::select! {
+                            biased;
+                            _ = input.cancellation.cancelled() => return Err(interruption_error(&input.deadline)),
+                            _ = input.deadline.wait() => return Err(interruption_error(&input.deadline)),
+                            _ = async {
+                                tokio::time::sleep(delay).await;
+                            } => {}
+                        }
                     }
                     AttemptFailureDisposition::TryNextTarget => {
                         last_error = Some(failure);
@@ -1800,7 +1822,7 @@ async fn begin_attempt(
         .try_reserve_owned()
         .expect("new vendor output queue has terminal capacity");
     let (ready_tx, mut ready_rx) = tokio::sync::oneshot::channel();
-    let operation_cancellation = stravia_runtime_contract::CancellationToken::new();
+    let operation_cancellation = input.cancellation.child_token();
     let driver_cancellation = operation_cancellation.clone();
     let driver_gateway = gateway.clone();
     let driver_route_id = route.id.to_string();
@@ -1942,6 +1964,10 @@ async fn drive_vendor_attempt(
     let mut stripped_protected_reasoning: Option<Vec<[u8; 32]>> = None;
 
     loop {
+        if parent_cancellation.is_cancelled() || operation_cancellation.is_cancelled() {
+            operation_cancellation.cancel();
+            return;
+        }
         let attempt = AttemptObservation::new(
             failure_observer.clone(),
             prepared.model_turn_id.clone(),
@@ -1958,6 +1984,10 @@ async fn drive_vendor_attempt(
             .run(&mut prepared, &attempt, &mut first_token_ms)
             .instrument(attempt.span())
             .await;
+        if parent_cancellation.is_cancelled() || operation_cancellation.is_cancelled() {
+            operation_cancellation.cancel();
+            return;
+        }
         let outcome = if let Some(error) = prepared.send_failure.lock().take() {
             let error = error.model_error();
             let mut failure = AttemptFailure::terminal(&error.code, &error.message);

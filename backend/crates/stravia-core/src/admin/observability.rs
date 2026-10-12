@@ -114,62 +114,55 @@ impl AdminService {
 
     // ── Stats ──
 
-    fn normalize_hours(hours: Option<i32>) -> Option<i32> {
-        hours.and_then(|value| (value > 0).then_some(value))
-    }
-
-    pub async fn get_stats_overview(&self, hours: Option<i32>) -> anyhow::Result<StatsOverview> {
-        self.gw
-            .storage
-            .usage_stats()
-            .stats_overview(Self::normalize_hours(hours).map(i64::from))
-            .await
+    pub async fn get_stats_overview(&self, window: StatsWindow) -> anyhow::Result<StatsOverview> {
+        window.validate()?;
+        self.gw.storage.usage_stats().stats_overview(window).await
     }
 
     pub async fn get_stats_series(
         &self,
-        hours: i32,
-        bucket_seconds: i32,
-        tz_offset_seconds: i32,
+        window: StatsWindow,
+        bucket_seconds: Option<i64>,
     ) -> anyhow::Result<Vec<StatsSeries>> {
+        window.validate()?;
+        let seconds = bucket_seconds.unwrap_or(900);
+        if seconds < 900 || seconds % 900 != 0 {
+            return Err(
+                StatsQueryError("bucket must be a positive multiple of 900 seconds").into(),
+            );
+        }
+        let bucket_ms = seconds
+            .checked_mul(1_000)
+            .ok_or(StatsQueryError("bucket is too large"))?;
         self.gw
             .storage
             .usage_stats()
-            .stats_series(
-                i64::from(hours.max(1)),
-                i64::from(bucket_seconds.clamp(60, 86_400)) * 1_000,
-                i64::from(tz_offset_seconds.clamp(-50_400, 50_400)) * 1_000,
-            )
+            .stats_series(window, bucket_ms)
             .await
     }
 
-    pub async fn get_stats_by_model(&self, hours: Option<i32>) -> anyhow::Result<Vec<ModelStats>> {
-        self.gw
-            .storage
-            .usage_stats()
-            .stats_by_model(Self::normalize_hours(hours).map(i64::from))
-            .await
+    pub async fn get_stats_by_model(&self, window: StatsWindow) -> anyhow::Result<Vec<ModelStats>> {
+        window.validate()?;
+        self.gw.storage.usage_stats().stats_by_model(window).await
     }
 
     pub async fn get_stats_by_provider(
         &self,
-        hours: Option<i32>,
+        window: StatsWindow,
     ) -> anyhow::Result<Vec<ProviderStats>> {
+        window.validate()?;
         self.gw
             .storage
             .usage_stats()
-            .stats_by_provider(Self::normalize_hours(hours).map(i64::from))
+            .stats_by_provider(window)
             .await
     }
 
     pub async fn get_stats_by_api_key(
         &self,
-        hours: Option<i32>,
+        window: StatsWindow,
     ) -> anyhow::Result<Vec<ApiKeyStats>> {
-        self.gw
-            .storage
-            .usage_stats()
-            .stats_by_api_key(Self::normalize_hours(hours).map(i64::from))
-            .await
+        window.validate()?;
+        self.gw.storage.usage_stats().stats_by_api_key(window).await
     }
 }

@@ -318,6 +318,9 @@ async fn serve(
                 Message::Text(text) => {
                     let request_context =
                         RequestContext::new(OPEN_RESPONSES_2026_04_24, RUN_DEADLINE);
+                    if request_context.cancellation.is_cancelled() {
+                        break;
+                    }
                     request_context
                         .extensions
                         .insert(connection_observation.clone());

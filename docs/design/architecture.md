@@ -264,6 +264,8 @@ graph TD
 
 Chrome 按需启动，运行时持有浏览器 context，最后一个所有者释放时回收 target、进程和临时 profile。CDP 自动附加页面、iframe 和 worker：导航前注入含 UA metadata 的隐身补丁，worker 恢复前完成初始化；页面提取在隔离世界执行。脚本固定移植自 OMP commit `daf07999c2fee9b22edc7bf8fea1fb6272e0df5e` 并保留 MIT 许可，指纹缓解不构成“不可检测”的承诺。下载拒绝；Chrome 保持操作系统沙箱，不使用 `--no-sandbox`。
 
+渲染取消或超时时，已取得页面 session 的清理先尝试 `Page.stopLoading`。仅当 Chromium 返回 `-32000 / Not attached to an active page` 时，再执行一次无 execution-context 依赖的 `Runtime.getIsolateId` renderer 回合：原生导航期间 CDP 会暂存该命令，待导航提交或中止并重新绑定当前宿主后才恢复派发。随后只尝试一次 `Target.closeTarget`；停止、settlement 和关闭共用原单次 CDP 调用的绝对清理期限，不刷新预算。尚未取得 session 的 target 直接关闭；出站拦截、Cookie/context 隔离、请求期限以及进程和临时 profile 回收策略不变。
+
 浏览器 HTTP 与 WebSocket 出站经过同一 EgressProxy；Search、静态 Fetch、渲染及子资源共用构造期代理快照。出口策略检查公共地址、直连 DNS 地址固定和上游代理转发，不进行 TLS 中间人解密；显式代理保持远端 DNS 语义。页面、重定向、iframe 和 worker 均不能绕过出口。
 
 Desktop 与 Server 在 Local 服务编辑器提供浏览器路径配置；Desktop 使用系统文件选择器，Server 输入服务器本机路径。手动设置优先于 `STRAVIA_CHROME_PATH`，后者优先于自动探测；显式无效路径不回退。管理认证保护 `GET/PUT /api/v1/web-access/browser`：GET 只检查路径而不启动浏览器，PUT 接受 `{path: string|null}`，先校验并原子保存，再激活；`null` 清除手动设置。配置保存在 `web-access-browser.json`，缺失时迁移旧 `desktop-browser.json`；读盘损坏显式报告。缺少浏览器时不得新增 Local 来源，已保存 Local 可移除或保持，执行时跳过 Local 并保留远程来源。Web Access 仍只管理来源与优先级，公开联网搜索仍由唯一的 Web Search 总开关控制；远程 Exa/Zhipu 不依赖本地浏览器。
@@ -343,7 +345,8 @@ Ingress shell（proxy/ingress/<family>/）
 inference_run::execute(RunInput)（一次性 crate-private interface）
     ├─ 准入时 IngressObserver::admit → RunObserver；独立快照进程 Debug 开关
     ├─ 通过单一 typed event seam 记录 Run / Model Turn / Target attempt / tool / projection / delivery
-    ├─ Observation/Trace/SSE/export 失败仅产生 gap/partial，绝不改变推理、选路或交付
+    ├─ 普通 Observation/Trace/SSE/export 缺口仅产生 gap/partial，不改变推理、选路或交付
+    ├─ 存储失败只失败所属请求或任务，独立诊断保留 gap/partial，实例继续运行（约束见 §4.10）
     ├─ Interaction grouping 在 Observation writer 内完成，不反写 Generation Chain
     ├─ Phase 状态机约束 Request → Selecting → Calling → Inspecting
     │                         → HiddenRound / SemanticComplete → AwaitingDelivery → Finished
@@ -590,9 +593,30 @@ Codex HTTP 推理实际发送 `stream=true` 时，Vendor 显式选择既有 SSE 
 
 `interaction_observation` 是 Generation Chain 外部的 crate-private deep module。一个 Connect Client Interaction 通常从新的 canonical User item 开始，并容纳其客户端工具续接的 Inference Run tree。同一 Principal 下精确续接 Generation Chain parent 时，无新增 User、提交父历史中待完成工具调用的结果，或 ingress 接收时间位于父响应完整交付后 `[0, 2000]` 毫秒内，均继续原 Interaction；后两项允许夹带新增 User，工具续接不限时间，快速续接允许重新激活已完成 Interaction。其余新增 User 创建 child Interaction。归并理由只用于诊断，不证明输入来自 harness，不改变模型输入、权限或执行父边。无 parent 的失败 root 仅在同 Principal、exact canonical fingerprint、未 Client Output Commit、无并发相同 Run、两分钟内等全部条件满足时在进程内推断重试归组。推断边绝不写回 Generation Chain。
 
-普通 Observation 使用有界非阻塞事件 seam，writer 在数据库事务中先提交 event 与 projection，再广播同一单调 sequence。forest snapshot 返回 `snapshot_sequence`，authenticated fetch SSE 从 `after` 续接；游标已超出保留范围时发送明确 `reset_required`。记录失败产生 `observation_gap`，Debug 写入失败产生带稳定 reason 的 `partial`，两者均不能改变 inference、Target retry/selection、Client Output Commit、Delivery 或 Generation Chain。
+普通 Observation 使用有界非阻塞事件 seam，writer 在数据库事务中先提交 event 与 projection，再广播同一单调 sequence。forest snapshot 返回 `snapshot_sequence`，authenticated fetch SSE 从 `after` 续接；游标已超出保留范围时发送明确 `reset_required`。普通记录失败产生 `observation_gap`，普通 Debug 写入失败产生带稳定 reason 的 `partial`，两者均不能改变 inference、Target retry/selection、Client Output Commit、Delivery 或 Generation Chain。
 
-SQLite 与 PostgreSQL 的 Interaction usage 汇总从该 Interaction 的索引 Run 集合关联 Target attempts，避免每次确认 usage 扫描全局历史。仍对全部所属 attempts 执行 `SUM`，保留未知值、显式零、失败 attempt 和仅首次确认入账的语义，不增加索引或修改 schema。
+数据库、事务日志或实例文件存储失败（包括容量耗尽）按用户直接修订的 [ADR-0060](../adr/0060-own-interaction-observation-outside-generation-chain.md#存储失败只影响所属请求或任务) 只影响实际操作所属请求或任务。关键同步操作沿已有 Result 失败当前请求；Observation/Debug 等独立异步写入失败归诊断任务并保留 gap/partial，不改变推理或取消无关执行。Server/Desktop 继续运行；不新增全局 fatal 广播、全入口故障 scope、全局降级、健康检查或自动重试。错误报告不依赖再次写入故障存储；不补造用量、不自动重放调用，汇总未可靠持久化时相关破坏性清理仍必须失败。该局部策略已实现；真实宿主持续服务验收见下文，不以旧终止验收作为证据。
+
+SQLite 与 PostgreSQL 的 Interaction usage 汇总从该 Interaction 的索引 Run 集合关联 Target attempts，避免每次确认 usage 扫描全局历史。仍对全部所属 attempts 执行 `SUM`，保留未知值、显式零、失败 attempt 和仅首次确认入账的语义；这一诊断汇总与长期管理统计是不同读取边界。
+
+**存储局部故障验收边界：** `tests/e2e/storage/test_storage_failures.py` 已通过真实宿主/HTTP 验收，使用 Server SQLite/PostgreSQL 与真实 Desktop SQLite。覆盖所属同步请求错误、Observation durable gap/Debug partial、在途与后续请求成功、已交付后的真实后台 Media 任务、队列/Trace 限额对照，以及双库 Stats 写失败后清理返回 503 且应计事实保留。真实错误与类型注入证据分开记录，不以进程存活或假的继续服务函数代替实际行为证据；该专项与完整本地测试矩阵均已通过，运行记录见[本地规格](../../.scratch/independent-usage-statistics/spec.md)。以下隔离控制仅用于测试，不作为生产配置或公开管理 API，不填满开发机磁盘，也不调用外部上游。
+
+|测试控制|实际边界与限制|
+|---|---|
+|`STRAVIA_TEST_STORAGE_FAULT`、`STRAVIA_TEST_STORAGE_FAULT_KIND`、`STRAVIA_TEST_STORAGE_FAULT_ARM_FILE`|仅在 test-support 构建选择 Observation、Debug 或 Artifact 的真实持久化路径；消费隔离 ARM_FILE 后单次注入容量错误或普通 I/O 对照，沿所属操作的本地错误路径返回，不发布全局 fatal 信号。`sqlite-full` 在临时内存 SQLite 库上以受控 `max_page_count` 产生真实驱动 `SQLITE_FULL`，再沿所属操作返回，不是物理磁盘耗尽；PostgreSQL 对照使用真实 SQLSTATE `53100`。|
+|固定 Stats-write 故障 harness|仅在隔离测试中使实际 Stats 写入失败；PostgreSQL 使用固定 trigger，不接受任意 SQL 或变成生产故障控制接口。双库经真实 HTTP 验证相关清理 503、应计事实保留及无关请求继续成功。|
+|`STRAVIA_TEST_OBSERVATION_QUEUE_CAPACITY`、`STRAVIA_TEST_OBSERVATION_QUEUE_HOLD_ADDR`|用 loopback TCP 屏障暂停真实有界 writer，制造真实队列满；释放并排空后验证新的推理仍可完成。|
+|`STRAVIA_TEST_TRACE_WIRE_CAPTURE_LIMIT_BYTES`|仅可降低、不可提高既有 64 MiB Wire 捕获上限，定向触发真实限额分支；原有生产大小边界测试继续保留。|
+
+原生 Desktop 场景在全部 WebDriver 场景清理完成后串行运行，无需等待其他无依赖的套件；持有实际宿主进程并检查故障后仍运行、业务端口仍服务、无关在途任务未取消及新无关请求成功；关键同步请求错误与独立诊断 gap/partial 分别验收；真实宿主验收已验证新局部契约。统一入口为每个并行 Rust/存储 worker 分配独立 PostgreSQL 数据库；迁移失败与恢复用例另外创建临时数据库，测试角色需要 `CREATEDB`，避免其他 schema 的数据库级迁移锁把排队时间混入固定失败边界。实际迁移锁、超时和测试覆盖保持不变。`test_usage_upgrade.py` 则用测试 harness 的 `STRAVIA_STORAGE_USAGE_UPGRADE_FIXTURE` 准备真实受支持的 `0017` 空库或保留历史；实际 Server 启动迁移后经公开 Stats API 验证回填、清理和重启不重复累计，补充低层事务中断回滚测试。
+
+**独立长期 Stats Usage：** Core 沿用 `UsageStatsStore` 与 `AdminService`，从现有数据库的 15 分钟绝对时间基础桶读取管理分析；Server/Desktop 只是薄适配，WebUI 不重新计算计量事实。SQLite/PostgreSQL 配对迁移 `0018_stats_usage.sql` 以来源视图和触发器把 Observation 请求、拒绝请求、Model Turn、Target attempt 的源 INSERT/UPDATE，与旧贡献扣除、新贡献计入及 checkpoint 替换放在同一事务。源 DELETE 只回收 checkpoint，不扣减长期桶；工作元数据只活到源事实删除，不建立永久逐请求计量账本。汇总写入失败不能让清理先成功删掉应计事实，清理仍保护活动记录。当前进程对携带统计事实的持久化失败保留仅限清理的粘性标记，无法证明待处理事实已汇总时清理明确失败；不为普通正文/Debug/工具诊断缺口阻止清理，也不新增正常推理阻塞或重试。该标记不跨重启保存；重启保持已提交来源与汇总一致，但不能恢复丢弃的未保存事实，不承诺完整会计账本。管理端本地聊天、服务端历史、Debug 清理、保留期调整、配置删除或重启都不减少已确认汇总；长期桶无自动过期，空间按时间桶和维度增长。
+
+长期汇总保存指标的已知计数、有效样本和分子/分母，保留未知、明确零、净输入及成功 attempt Token 口径；跨桶重新计算平均值和加权 TPS，不平均均值。全局与 Provider 保留请求级去重，模型和 API Key 保留 Model Turn 级计数；跨 Provider 分类不必可加为全局请求数。维度以稳定内部身份和非秘密展示快照归属，无配置级联外键；更名不拆分、同名重建不合并，删除后标记 `deleted`，历史 `model_id`/`provider_id` 可空，不保留凭据或失效编辑能力。无法证明旧实体归属时不按名称猜测。
+
+升级在同一 SQLx 迁移事务安装结构并回填仍存在且可判定的事实，迁移成功后才开放统计源；中断回滚后可重入，不存在异步补账窗口。已删除或从未保存的历史不可恢复，不能补零、解析 Debug 或调用上游重放；清理后不能由汇总追溯已删对话或恢复秒级分布。详细来源/checkpoint 生命周期与统计页操作见 [Interaction Observation 设计](interaction-observation.md#611-独立长期-stats-usage)。
+
+管理 `StatsWindow` 采用正的 Unix 毫秒 `[start_at, end_at)`，边界成对且对齐 `900000` 毫秒，省略两者表示全部累计；移除 `hours`/`tz_offset`。统计页保留 6h/24h/3d/7d 预设，实时模式包括当前未满桶，固定历史按跨度翻页，本地自定义范围要求整刻钟且可超过 24 小时。序列 `bucket` 为 900 倍数的秒数，自动粗化保证最多 512 点，响应 `bucket_ms` 是实际粒度；粗化不改变所选范围总数。该长期契约不替代下述请求记录的精确秒级 24 小时筛选，也不替代 Route Scheduling 原始 24h/1h 短窗口。
 
 Request Records 以显式 Unix 毫秒 `[start_at, end_at)` 查询完整 root DAG：两个边界必须同时提供且 `0 < end_at - start_at <= 86400000`，优先于兼容保留的 `anchor_at/window_index`。实时预设按 5、10、30 分钟及 1、4、12、24 小时滚动；自定义本地日期时间范围应用后保持固定边界，最长 24 小时。Interaction forest、Rejected Requests 与 Failed Requests 共用该约束；root 按最新 activity 决定成员资格，cursor 分批加载 root，filter 保留整棵因果上下文并标记命中节点，不按时间截断上下文或详情。工具栏支持请求记录全屏切换，Esc 可退出，全屏保留筛选与选中详情。WebUI 以自动布局的无限 canvas 展示 forest：root 横向排列、因果向下、共享祖先只出现一次；右侧 inspector 按时间保持 Run、Model Turn、Target attempt、Platform Tool、client handoff 与 Delivery 层级。窄屏 inspector 全屏；canvas 支持 pan/zoom、fit all、minimap、键盘与触控。Interaction card 分别预览脱敏用户输入开头与 Client Projection 输出尾部，悬停、聚焦或点按预览框可查看更多；完整 canonical 不进入 Debug Trace；原始应用协议 payload 只通过 Debug Bundle 提供，不在 Run inspector 中展开。
 

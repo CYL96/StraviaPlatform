@@ -45,8 +45,8 @@ impl LocalArtifactStore {
 
     async fn object_row(&self, id: &ArtifactId) -> Result<ObjectRow, ArtifactError> {
         let row = match &self.database {
-            ArtifactDatabase::Sqlite(pool) => sqlx::query_as::<_, ObjectRow>("SELECT principal,mime_type,size,backend_key,expires_at,storage_backend,storage_endpoint,storage_bucket FROM artifacts WHERE id=? AND state='ready'").bind(id.as_str()).fetch_optional(pool).await,
-            ArtifactDatabase::Postgres(pool) => sqlx::query_as::<_, ObjectRow>("SELECT principal,mime_type,size,backend_key,expires_at,storage_backend,storage_endpoint,storage_bucket FROM artifacts WHERE id=$1 AND state='ready'").bind(id.as_str()).fetch_optional(pool).await,
+    ArtifactDatabase::Sqlite(pool) => sqlx::query_as::<_, ObjectRow>("SELECT principal,mime_type,size,backend_key,expires_at,storage_backend,storage_endpoint,storage_bucket FROM artifacts WHERE id=? AND state='ready'").bind(id.as_str()).fetch_optional(pool).await,
+    ArtifactDatabase::Postgres(pool) => sqlx::query_as::<_, ObjectRow>("SELECT principal,mime_type,size,backend_key,expires_at,storage_backend,storage_endpoint,storage_bucket FROM artifacts WHERE id=$1 AND state='ready'").bind(id.as_str()).fetch_optional(pool).await,
         }.map_err(storage_error)?;
         row.ok_or(ArtifactError::NotFound)
     }
@@ -78,7 +78,7 @@ impl LocalArtifactStore {
                 .await
                 .map_err(storage_error)?
                 .map_err(storage_error)?;
-                Ok(Arc::new(file))
+                Ok(Arc::new(file) as Arc<dyn ArtifactReadGuard>)
             }
             ArtifactDatabase::Postgres(_) => {
                 let mut transaction = self
@@ -93,7 +93,7 @@ impl LocalArtifactStore {
                     .execute(&mut *transaction)
                     .await
                     .map_err(storage_error)?;
-                Ok(Arc::new(Mutex::new(transaction)))
+                Ok(Arc::new(Mutex::new(transaction)) as Arc<dyn ArtifactReadGuard>)
             }
         }
     }
@@ -181,8 +181,8 @@ impl LocalArtifactStore {
         }
         let hash = sha256_hex(token.as_bytes());
         let id: Option<String> = match &self.database {
-            ArtifactDatabase::Sqlite(pool) => sqlx::query_scalar("SELECT artifact_id FROM artifact_download_grants WHERE token_hash=? AND expires_at>?").bind(&hash).bind(self.now()).fetch_optional(pool).await,
-            ArtifactDatabase::Postgres(pool) => sqlx::query_scalar("SELECT artifact_id FROM artifact_download_grants WHERE token_hash=$1 AND expires_at>$2").bind(&hash).bind(self.now()).fetch_optional(pool).await,
+    ArtifactDatabase::Sqlite(pool) => sqlx::query_scalar("SELECT artifact_id FROM artifact_download_grants WHERE token_hash=? AND expires_at>?").bind(&hash).bind(self.now()).fetch_optional(pool).await,
+    ArtifactDatabase::Postgres(pool) => sqlx::query_scalar("SELECT artifact_id FROM artifact_download_grants WHERE token_hash=$1 AND expires_at>$2").bind(&hash).bind(self.now()).fetch_optional(pool).await,
         }.map_err(storage_error)?;
         id.map(ArtifactId::new).ok_or(ArtifactError::Unauthorized)
     }
@@ -257,19 +257,19 @@ impl LocalArtifactStore {
         };
         let hash = sha256_hex(token.as_bytes());
         let affected = match &self.database {
-            ArtifactDatabase::Sqlite(pool) => {
-                let pool = pool.clone();
-                let id = id.clone();
-                let principal_key = principal.continuation_key();
-                let now = self.now();
-                Self::complete_guarded(async move {
-                    let _guard = _guard;
-                    sqlx::query("INSERT INTO artifact_download_grants(token_hash,artifact_id,expires_at) SELECT ?,id,? FROM artifacts WHERE id=? AND principal=? AND state='ready' AND expires_at>?")
-                        .bind(&hash).bind(expires_at).bind(id.as_str()).bind(principal_key).bind(now)
-                        .execute(&pool).await.map(|result| result.rows_affected()).map_err(storage_error)
-                }).await
-            }
-            ArtifactDatabase::Postgres(pool) => sqlx::query("INSERT INTO artifact_download_grants(token_hash,artifact_id,expires_at) SELECT $1,id,$2 FROM artifacts WHERE id=$3 AND principal=$4 AND state='ready' AND expires_at>$5").bind(&hash).bind(expires_at).bind(id.as_str()).bind(principal.continuation_key()).bind(self.now()).execute(pool).await.map(|result| result.rows_affected()).map_err(storage_error),
+    ArtifactDatabase::Sqlite(pool) => {
+        let pool = pool.clone();
+        let id = id.clone();
+        let principal_key = principal.continuation_key();
+        let now = self.now();
+        Self::complete_guarded(async move {
+            let _guard = _guard;
+            sqlx::query("INSERT INTO artifact_download_grants(token_hash,artifact_id,expires_at) SELECT ?,id,? FROM artifacts WHERE id=? AND principal=? AND state='ready' AND expires_at>?")
+                .bind(&hash).bind(expires_at).bind(id.as_str()).bind(principal_key).bind(now)
+                .execute(&pool).await.map(|result| result.rows_affected()).map_err(storage_error)
+        }).await
+    }
+    ArtifactDatabase::Postgres(pool) => sqlx::query("INSERT INTO artifact_download_grants(token_hash,artifact_id,expires_at) SELECT $1,id,$2 FROM artifacts WHERE id=$3 AND principal=$4 AND state='ready' AND expires_at>$5").bind(&hash).bind(expires_at).bind(id.as_str()).bind(principal.continuation_key()).bind(self.now()).execute(pool).await.map(|result| result.rows_affected()).map_err(storage_error),
         }?;
         if affected != 1 {
             return Err(ArtifactError::NotFound);
@@ -316,47 +316,47 @@ impl LocalArtifactStore {
             )
             .await?;
         let result = async {
-            let part = self
-                .upload_part(principal, &upload.upload_id, &upload.upload_token, 1, bytes)
-                .await?;
-            if size.is_none() {
-                match &self.database {
-                    ArtifactDatabase::Sqlite(pool) => {
-                        let mut transaction = pool.begin().await.map_err(storage_error)?;
-                        sqlx::query("UPDATE artifact_uploads SET declared_size=? WHERE id=?")
-                            .bind(part.size as i64)
-                            .bind(&upload.upload_id)
-                            .execute(&mut *transaction)
-                            .await
-                            .map_err(storage_error)?;
-                        sqlx::query("UPDATE artifacts SET size=? WHERE id=(SELECT artifact_id FROM artifact_uploads WHERE id=?)")
-                            .bind(part.size as i64)
-                            .bind(&upload.upload_id)
-                            .execute(&mut *transaction)
-                            .await
-                            .map_err(storage_error)?;
-                        transaction.commit().await.map_err(storage_error)?;
-                    }
-                    ArtifactDatabase::Postgres(pool) => {
-                        let mut transaction = pool.begin().await.map_err(storage_error)?;
-                        sqlx::query("UPDATE artifact_uploads SET declared_size=$1 WHERE id=$2")
-                            .bind(part.size as i64)
-                            .bind(&upload.upload_id)
-                            .execute(&mut *transaction)
-                            .await
-                            .map_err(storage_error)?;
-                        sqlx::query("UPDATE artifacts SET size=$1 WHERE id=(SELECT artifact_id FROM artifact_uploads WHERE id=$2)")
-                            .bind(part.size as i64)
-                            .bind(&upload.upload_id)
-                            .execute(&mut *transaction)
-                            .await
-                            .map_err(storage_error)?;
-                        transaction.commit().await.map_err(storage_error)?;
-                    }
-                }
+    let part = self
+        .upload_part(principal, &upload.upload_id, &upload.upload_token, 1, bytes)
+        .await?;
+    if size.is_none() {
+        match &self.database {
+            ArtifactDatabase::Sqlite(pool) => {
+                let mut transaction = pool.begin().await.map_err(storage_error)?;
+                sqlx::query("UPDATE artifact_uploads SET declared_size=? WHERE id=?")
+                    .bind(part.size as i64)
+                    .bind(&upload.upload_id)
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(storage_error)?;
+                sqlx::query("UPDATE artifacts SET size=? WHERE id=(SELECT artifact_id FROM artifact_uploads WHERE id=?)")
+                    .bind(part.size as i64)
+                    .bind(&upload.upload_id)
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(storage_error)?;
+                transaction.commit().await.map_err(storage_error)?;
             }
-            self.complete_upload(principal, &upload.upload_id, &upload.upload_token, &[part])
-                .await
+            ArtifactDatabase::Postgres(pool) => {
+                let mut transaction = pool.begin().await.map_err(storage_error)?;
+                sqlx::query("UPDATE artifact_uploads SET declared_size=$1 WHERE id=$2")
+                    .bind(part.size as i64)
+                    .bind(&upload.upload_id)
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(storage_error)?;
+                sqlx::query("UPDATE artifacts SET size=$1 WHERE id=(SELECT artifact_id FROM artifact_uploads WHERE id=$2)")
+                    .bind(part.size as i64)
+                    .bind(&upload.upload_id)
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(storage_error)?;
+                transaction.commit().await.map_err(storage_error)?;
+            }
+        }
+    }
+    self.complete_upload(principal, &upload.upload_id, &upload.upload_token, &[part])
+        .await
         }
         .await;
         if let Err(original) = &result {

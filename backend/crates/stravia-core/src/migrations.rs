@@ -614,6 +614,124 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sqlite_usage_backfill_recovers_interrupted_supported_upgrade() {
+        let pool = sqlite_pool().await;
+        let prefix = Migrator::with_migrations(
+            super::SQLITE_MIGRATOR
+                .iter()
+                .filter(|m| m.version <= 17)
+                .cloned()
+                .collect(),
+        );
+        prefix.run(&pool).await.unwrap();
+        sqlx::raw_sql("INSERT INTO interaction_observations(id,principal,api_key_id,api_key_name,root_id,root_run_id,first_route_id,status,started_at,last_active_at,expires_at) VALUES ('historical','owner','deleted-key','Old Key','historical','historical','deleted-model','completed',900000,900100,1);\nINSERT INTO inference_run_observations(id,interaction_id,ingress_protocol,route_id,status,debug_enabled,started_at,last_active_at,finished_at,expires_at) VALUES ('historical','historical','responses','deleted-model','completed',FALSE,900000,900100,900100,1);\nINSERT INTO model_turn_observations(id,run_id,interaction_id,route_id,model_display_name,api_key_id,api_key_name,status,started_at,finished_at,last_event_sequence) VALUES ('turn','historical','historical','deleted-model','Old Model','deleted-key','Old Key','completed',1800000,1800200,1);\nINSERT INTO target_attempt_observations(id,model_turn_id,run_id,interaction_id,target_id,provider_id,provider_name,upstream_model,protocol,status,started_at,duration_ms,input_tokens,output_tokens,cache_read_tokens,last_event_sequence) VALUES ('known','turn','historical','historical','target','deleted-provider','Old Provider','upstream','responses','completed',1800000,100,10,0,2,1), ('unknown','turn','historical','historical','target','deleted-provider','Old Provider','upstream','responses','completed',1800000,NULL,NULL,NULL,NULL,2);\nINSERT INTO rejected_request_observations(id,occurred_at,method,path,ingress_protocol,stage,code,status_code,debug_enabled,last_event_sequence,expires_at) VALUES ('rejected',900000,'POST','/v1/responses','responses','admission','invalid_request',400,FALSE,3,1);").execute(&pool).await.unwrap();
+        let mut interrupted = pool.begin().await.unwrap();
+        sqlx::raw_sql(include_str!("../migrations/sqlite/0018_stats_usage.sql"))
+            .execute(&mut *interrupted)
+            .await
+            .unwrap();
+        interrupted.rollback().await.unwrap();
+        migrate_sqlite(&pool, None).await.unwrap();
+        migrate_sqlite(&pool, None).await.unwrap();
+        let totals: (i64,i64,i64,i64,i64,i64) = sqlx::query_as("SELECT CAST(SUM(request_count) AS BIGINT),CAST(SUM(error_count) AS BIGINT),CAST(SUM(input_tokens_sum) AS BIGINT),CAST(SUM(output_tokens_sum) AS BIGINT),CAST(SUM(output_tokens_known) AS BIGINT),CAST(SUM(successful_attempt_count) AS BIGINT) FROM stats_usage_buckets WHERE scope='global'")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(totals, (2, 1, 8, 0, 1, 2));
+        let historical: Vec<(String,String)> = sqlx::query_as("SELECT entity_id,label FROM stats_usage_buckets WHERE scope='model' ORDER BY identity,bucket_start")
+            .fetch_all(&pool).await.unwrap();
+        assert_eq!(
+            historical,
+            vec![("deleted-model".into(), "Old Model".into())]
+        );
+        sqlx::query("DELETE FROM interaction_observations WHERE id='historical'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM rejected_request_observations WHERE id='rejected'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let after: (i64,i64,i64,i64,i64,i64) = sqlx::query_as("SELECT CAST(SUM(request_count) AS BIGINT),CAST(SUM(error_count) AS BIGINT),CAST(SUM(input_tokens_sum) AS BIGINT),CAST(SUM(output_tokens_sum) AS BIGINT),CAST(SUM(output_tokens_known) AS BIGINT),CAST(SUM(successful_attempt_count) AS BIGINT) FROM stats_usage_buckets WHERE scope='global'")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(after, totals);
+        let checkpoints: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM stats_usage_checkpoints")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(checkpoints, 0);
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn postgres_usage_backfill_recovers_interrupted_supported_upgrade_when_configured() {
+        let Some(url) = std::env::var("DB_URL")
+            .ok()
+            .or_else(|| std::env::var("DATABASE_URL").ok())
+        else {
+            return;
+        };
+        let admin = sqlx::PgPool::connect(&url).await.unwrap();
+        let schema = format!("stravia_usage_upgrade_{}", uuid::Uuid::new_v4().simple());
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
+            .execute(&admin)
+            .await
+            .unwrap();
+        let options: sqlx::postgres::PgConnectOptions = url.parse().unwrap();
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect_with(options.options([("search_path", schema.as_str())]))
+            .await
+            .unwrap();
+        let prefix = Migrator::with_migrations(
+            super::POSTGRES_MIGRATOR
+                .iter()
+                .filter(|m| m.version <= 17)
+                .cloned()
+                .collect(),
+        );
+        prefix.run(&pool).await.unwrap();
+        sqlx::raw_sql("INSERT INTO interaction_observations(id,principal,api_key_id,api_key_name,root_id,root_run_id,first_route_id,status,started_at,last_active_at,expires_at) VALUES ('historical','owner','deleted-key','Old Key','historical','historical','deleted-model','completed',900000,900100,1);\nINSERT INTO inference_run_observations(id,interaction_id,ingress_protocol,route_id,status,debug_enabled,started_at,last_active_at,finished_at,expires_at) VALUES ('historical','historical','responses','deleted-model','completed',FALSE,900000,900100,900100,1);\nINSERT INTO model_turn_observations(id,run_id,interaction_id,route_id,model_display_name,api_key_id,api_key_name,status,started_at,finished_at,last_event_sequence) VALUES ('turn','historical','historical','deleted-model','Old Model','deleted-key','Old Key','completed',1800000,1800200,1);\nINSERT INTO target_attempt_observations(id,model_turn_id,run_id,interaction_id,target_id,provider_id,provider_name,upstream_model,protocol,status,started_at,duration_ms,input_tokens,output_tokens,cache_read_tokens,last_event_sequence) VALUES ('known','turn','historical','historical','target','deleted-provider','Old Provider','upstream','responses','completed',1800000,100,10,0,2,1), ('unknown','turn','historical','historical','target','deleted-provider','Old Provider','upstream','responses','completed',1800000,NULL,NULL,NULL,NULL,2);\nINSERT INTO rejected_request_observations(id,occurred_at,method,path,ingress_protocol,stage,code,status_code,debug_enabled,last_event_sequence,expires_at) VALUES ('rejected',900000,'POST','/v1/responses','responses','admission','invalid_request',400,FALSE,3,1);").execute(&pool).await.unwrap();
+        let mut interrupted = pool.begin().await.unwrap();
+        sqlx::raw_sql(include_str!("../migrations/postgres/0018_stats_usage.sql"))
+            .execute(&mut *interrupted)
+            .await
+            .unwrap();
+        interrupted.rollback().await.unwrap();
+        migrate_postgres(&pool, None).await.unwrap();
+        migrate_postgres(&pool, None).await.unwrap();
+        let totals: (i64,i64,i64,i64,i64,i64) = sqlx::query_as("SELECT CAST(SUM(request_count) AS BIGINT),CAST(SUM(error_count) AS BIGINT),CAST(SUM(input_tokens_sum) AS BIGINT),CAST(SUM(output_tokens_sum) AS BIGINT),CAST(SUM(output_tokens_known) AS BIGINT),CAST(SUM(successful_attempt_count) AS BIGINT) FROM stats_usage_buckets WHERE scope='global'")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(totals, (2, 1, 8, 0, 1, 2));
+        let historical: Vec<(String,String)> = sqlx::query_as("SELECT entity_id,label FROM stats_usage_buckets WHERE scope='model' ORDER BY identity,bucket_start")
+            .fetch_all(&pool).await.unwrap();
+        assert_eq!(
+            historical,
+            vec![("deleted-model".into(), "Old Model".into())]
+        );
+        sqlx::query("DELETE FROM interaction_observations WHERE id='historical'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM rejected_request_observations WHERE id='rejected'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let after: (i64,i64,i64,i64,i64,i64) = sqlx::query_as("SELECT CAST(SUM(request_count) AS BIGINT),CAST(SUM(error_count) AS BIGINT),CAST(SUM(input_tokens_sum) AS BIGINT),CAST(SUM(output_tokens_sum) AS BIGINT),CAST(SUM(output_tokens_known) AS BIGINT),CAST(SUM(successful_attempt_count) AS BIGINT) FROM stats_usage_buckets WHERE scope='global'")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(after, totals);
+        let checkpoints: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM stats_usage_checkpoints")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(checkpoints, 0);
+        pool.close().await;
+        sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+            .execute(&admin)
+            .await
+            .unwrap();
+        admin.close().await;
+    }
+
+    #[tokio::test]
     async fn sqlite_baseline_applies_to_empty_database_and_is_idempotent() {
         let pool = sqlite_pool().await;
         migrate_sqlite(&pool, None).await.expect("fresh baseline");
@@ -1029,18 +1147,40 @@ mod tests {
         else {
             return;
         };
-        let admin = sqlx::PgPool::connect(&url).await.unwrap();
-        let schema = format!("stravia_baseline_test_{}", uuid::Uuid::new_v4().simple());
-        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
-            .execute(&admin)
-            .await
-            .unwrap();
         let options: sqlx::postgres::PgConnectOptions = url.parse().unwrap();
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(2)
-            .connect_with(options.options([("search_path", schema.as_str())]))
+        let admin = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect_with(options.clone())
             .await
             .unwrap();
+        // SQLx's migration advisory lock is database-wide, not search_path-scoped.
+        // This deadline tests failure/lock cleanup, so unrelated schema migrations
+        // must not consume its ten-second window.
+        let database = format!("stravia_baseline_test_{}", uuid::Uuid::new_v4().simple());
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "CREATE DATABASE \"{database}\" WITH TEMPLATE template0 ENCODING 'UTF8'"
+        )))
+        .execute(&admin)
+        .await
+        .expect("create isolated migration test database (requires CREATEDB)");
+        let pool_result = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect_with(options.database(&database))
+            .await;
+        let pool = match pool_result {
+            Ok(pool) => pool,
+            Err(error) => {
+                sqlx::query(sqlx::AssertSqlSafe(format!("DROP DATABASE \"{database}\"")))
+                    .execute(&admin)
+                    .await
+                    .expect("clean up migration test database after connection failure");
+                panic!("connect isolated migration test database: {error}");
+            }
+        };
+        // Preserve cleanup even when a migration or assertion panics.
+        let scenario_pool = pool.clone();
+        let result = tokio::spawn(async move {
+        let pool = scenario_pool;
         super::POSTGRES_MIGRATOR
             .run_to(1, &pool)
             .await
@@ -1197,11 +1337,19 @@ mod tests {
                 .await
                 .is_err()
         );
+        })
+        .await;
         pool.close().await;
-        sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+        sqlx::query(sqlx::AssertSqlSafe(format!("DROP DATABASE \"{database}\"")))
             .execute(&admin)
             .await
-            .unwrap();
+            .expect("remove isolated migration test database");
         admin.close().await;
+        if let Err(error) = result {
+            if error.is_panic() {
+                std::panic::resume_unwind(error.into_panic());
+            }
+            panic!("migration test task failed: {error}");
+        }
     }
 }

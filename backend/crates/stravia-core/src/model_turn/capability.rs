@@ -145,6 +145,11 @@ impl Gateway {
         request: VendorRequest,
         context: VendorCallContext,
     ) -> anyhow::Result<VendorRouteExecution> {
+        let cancellation = context.cancellation.clone();
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => Err(RuntimeError::Cancelled.into()),
+            result = async {
         let (capability, operation) = match &request {
             VendorRequest::Search(_) => (Capability::Search, Operation::Search),
             VendorRequest::MediaImage(_) => (Capability::MediaImage, Operation::MediaImage),
@@ -237,6 +242,9 @@ impl Gateway {
             };
             let mut prepared: Option<PreparedVendorExecution> = None;
             loop {
+                if context.cancellation.is_cancelled() {
+                    return Err(RuntimeError::Cancelled.into());
+                }
                 if !policy.retry_current() {
                     break;
                 }
@@ -309,6 +317,9 @@ impl Gateway {
                 } else {
                     None
                 };
+                if context.cancellation.is_cancelled() {
+                    return Err(RuntimeError::Cancelled.into());
+                }
                 if !policy.retry_current() {
                     break;
                 }
@@ -480,6 +491,8 @@ impl Gateway {
         Err(last_error
             .map(|failure| failure.error)
             .unwrap_or_else(|| anyhow::anyhow!("Route has no eligible Target")))
+            } => result,
+        }
     }
 
     async fn execute_independent_attempt(

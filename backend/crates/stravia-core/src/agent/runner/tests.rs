@@ -726,6 +726,82 @@ async fn before_commit_failure_does_not_leave_a_durable_agent_turn() {
 }
 
 #[tokio::test]
+async fn cancellation_after_before_commit_starts_still_commits_agent_turn() {
+    struct PausedBeforeCommit {
+        entered: Mutex<Option<tokio::sync::oneshot::Sender<AgentTurnId>>>,
+        release: tokio::sync::Semaphore,
+    }
+
+    #[async_trait]
+    impl AgentOutputValidator for PausedBeforeCommit {
+        async fn validate(
+            &self,
+            _context: &AgentOutputValidationContext,
+            _transcript: &[AiItem],
+            output: Value,
+        ) -> Result<Value, AgentRunError> {
+            Ok(output)
+        }
+
+        async fn before_commit(
+            &self,
+            context: &AgentOutputValidationContext,
+            _transcript: &[AiItem],
+            _output: &Value,
+        ) -> Result<(), AgentRunError> {
+            self.entered
+                .lock()
+                .take()
+                .expect("pre-commit runs once")
+                .send(context.turn_id.clone())
+                .expect("announce pre-commit start");
+            let _permit = self.release.acquire().await.expect("release pre-commit");
+            Ok(())
+        }
+    }
+
+    let (entered, started) = tokio::sync::oneshot::channel();
+    let validator = Arc::new(PausedBeforeCommit {
+        entered: Mutex::new(Some(entered)),
+        release: tokio::sync::Semaphore::new(0),
+    });
+    let mut response = AiResponse::new("response-1", "model-1");
+    response.push_output_text(r#"{"answer":"verified"}"#);
+    let turns: Arc<dyn TurnChainStore> = Arc::new(crate::turn_chain::test_store().await);
+    let runner = AgentRunner::new(
+        enabled_registry().await,
+        Arc::new(crate::agent::InMemoryModelTurnExecutor::scripted([
+            response,
+        ])),
+        vec![Arc::new(EchoTool)],
+        Arc::clone(&turns),
+    )
+    .expect("Agent Runner")
+    .with_output_validator(AgentDefinitionId::new("research"), 1, validator.clone());
+    let principal = Principal::new("owner");
+    let cancellation = CancellationToken::new();
+    let stream = runner.run(AgentInput {
+        principal: principal.clone(),
+        definition_id: AgentDefinitionId::new("research"),
+        parent_turn_id: None,
+        prompt: "question".into(),
+        artifacts: Vec::new(),
+        cancellation: cancellation.clone(),
+    });
+    let run = tokio::spawn(async move { stream.collect::<Vec<_>>().await });
+    let turn_id = started.await.expect("pre-commit has started");
+    cancellation.cancel();
+    validator.release.add_permits(1);
+    let events = run.await.expect("Agent Run completes");
+    let chain = turns
+        .materialize(&principal, TurnNodeKind::Agent, &turn_id)
+        .await
+        .expect("started pre-commit must finish its durable Agent Turn commit");
+    assert_eq!(chain.len(), 1);
+    assert!(matches!(events.last(), Some(AgentEvent::Completed(_))));
+}
+
+#[tokio::test]
 async fn live_authorization_failure_prevents_tool_execution() {
     let mut tool_response = AiResponse::new("response-1", "model-1");
     tool_response.extend_tool_calls(vec![ToolCall {

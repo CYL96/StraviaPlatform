@@ -37,6 +37,8 @@ impl GatewayLifecycle {
         }
     }
 
+    /// Request cooperative shutdown and join every tracked task. Started finite
+    /// operations drain normally.
     pub(super) async fn shutdown(&self) {
         self.cancellation.cancel();
         let tasks = {
@@ -58,5 +60,40 @@ impl Drop for GatewayLifecycle {
         for task in tasks.drain(..) {
             task.abort();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn ordinary_shutdown_finishes_started_task_before_returning() {
+        let lifecycle = GatewayLifecycle::new();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
+        lifecycle.spawn(async move {
+            entered_tx.send(()).expect("announce started operation");
+            release_rx.await.expect("release started operation");
+            completed_tx.send(()).expect("record completed operation");
+        });
+        entered_rx.await.expect("operation has started");
+        let mut shutdown = Box::pin(lifecycle.shutdown());
+        // Poll shutdown through cancellation and into joining the blocked task.
+        // This is a controlled barrier, not a scheduler delay or timing assumption.
+        std::future::poll_fn(|cx| {
+            assert!(shutdown.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert!(lifecycle.cancellation.is_cancelled());
+        release_tx
+            .send(())
+            .expect("ordinary shutdown preserves operation");
+        shutdown.await;
+        completed_rx
+            .await
+            .expect("operation completes before shutdown returns");
     }
 }

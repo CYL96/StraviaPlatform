@@ -121,6 +121,73 @@ def test_failed_request_projection_survives_restart_and_clear(
 
 @pytest.mark.e2e
 @pytest.mark.storage
+@pytest.mark.parametrize("backend", ["sqlite", "postgres"], ids=["sqlite", "postgres"])
+def test_usage_statistics_survive_clear_and_restart(
+    stravia_binary: Path, storage_runtime: dict[str, object], tmp_path: Path, backend: str,
+) -> None:
+    pg_url = storage_runtime["pg_url"]
+    schema = None
+    database = {"backend": "sqlite"}
+    if backend == "postgres":
+        schema = storage_runtime["make_isolated_schema"]("stravia_usage_history")
+        storage_runtime["run_schema_action"]("create", pg_url=pg_url, schema=schema)
+        database = {"backend": "postgres", "url": storage_runtime["postgres_dsn_for_schema"](pg_url, schema)}
+    mock, _ = minimal_mock_provider(find_free_port())
+    port = find_free_port()
+    base = f"http://127.0.0.1:{port}"
+    args = ["--data-dir", str(tmp_path), "--host", "127.0.0.1", "--port", str(port)]
+    args += storage_runtime["server_args"](backend)
+    process = None
+    logs = []
+    try:
+        process, logs = start_stravia_server(stravia_binary=stravia_binary, args=args)
+        wait_until_ready(f"{base}/api/v1/auth/state")
+        session = initialize_server(base, wait_for_setup_token(logs, process), database)
+        env = {"admin": base, "proxy": base, "auth": session.auth_headers(),
+               "mock": f"http://127.0.0.1:{mock.server_port}"}
+        model = "durable-usage-history"
+        _route_id, key = _create_route(env, model)
+        status, body = _proxy(env, key, model, [{"role": "user", "content": "known usage"}])
+        assert status == 200, body
+        # History clear is the public durability barrier, not a timed stats poll.
+        status, body = http_request("DELETE", f"{base}/api/v1/observations/history", headers=env["auth"])
+        assert status == 200, body
+        status, body = http_request("GET", f"{base}/api/v1/stats/overview", headers=env["auth"])
+        assert status == 200, body
+        before = body["data"]
+        assert before["total_requests"] == 1, before
+        assert before["error_count"] == 0, before
+        assert before["total_input_tokens"] is None, before
+        assert before["total_output_tokens"] == 2, before
+        assert before["total_cache_read_tokens"] is None, before
+        assert before["total_cache_write_tokens"] is None, before
+        stop_stravia_server(process, logs)
+        process = None
+        process, logs = start_stravia_server(stravia_binary=stravia_binary, args=args)
+        wait_until_ready(f"{base}/api/v1/auth/state")
+        session = WebSession(base)
+        status, body = session.request("POST", "/api/v1/auth/login", {
+            "username": "admin", "password": "correct horse battery staple",
+        })
+        assert status == 200, body
+        env["auth"] = session.auth_headers()
+        for _ in range(2):
+            status, body = http_request("DELETE", f"{base}/api/v1/observations/history", headers=env["auth"])
+            assert status == 200, body
+            status, body = http_request("GET", f"{base}/api/v1/stats/overview", headers=env["auth"])
+            assert status == 200, body
+            assert body["data"] == before
+    finally:
+        if process is not None:
+            stop_stravia_server(process, logs)
+        mock.shutdown()
+        mock.server_close()
+        if schema is not None:
+            storage_runtime["run_schema_action"]("drop", pg_url=pg_url, schema=schema)
+
+
+@pytest.mark.e2e
+@pytest.mark.storage
 def test_sqlite_rejects_incompatible_migration_history(
     stravia_binary: Path, tmp_path: Path
 ) -> None:

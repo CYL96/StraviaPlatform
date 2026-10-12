@@ -247,6 +247,7 @@ for (const routePath of ['/stats']) {
     await page.clock.setFixedTime(new Date(start + 24 * 3_600_000 + 5 * 60_000))
     await page.route('**/api/v1/stats/series**', async (route) => {
       const data = Array.from({ length: 25 }, (_, hour) => ({
+        bucket_ms: 3_600_000,
         bucket_start: start + hour * 3_600_000,
         request_count: 1,
         error_count: 0,
@@ -262,6 +263,8 @@ for (const routePath of ['/stats']) {
       await route.fulfill({ json: { data } })
     })
     await page.goto(routePath)
+    await page.locator('[data-slot="select-trigger"]').click()
+    await page.getByRole('option', { name: 'Last 3d', exact: true }).click()
 
     const chart = page.getByLabel('Latency and speed chart', { exact: true })
     await expect(chart).toBeVisible()
@@ -326,7 +329,7 @@ test('Usage analytics preserves range choices and hourly latency buckets', async
       return
     }
     queries.push(query)
-    const hours = Number(query.searchParams.get('hours'))
+    const hours = (Number(query.searchParams.get('end_at')) - Number(query.searchParams.get('start_at'))) / 3_600_000
     await route.fulfill({
       json: { data: [latencyBucket(Math.floor(Date.now() / 3_600_000) * 3_600_000, 0, hours * 1000, hours * 10)] },
     })
@@ -350,7 +353,19 @@ test('Usage analytics preserves range choices and hourly latency buckets', async
     const speed = page.getByRole('tooltip').locator('dd').nth(1)
     await expect.poll(async () => parseFloat((await speed.innerText()).replaceAll(',', ''))).toBe(hours * 10)
     await expect(speed).toContainText('tok/s')
-    expect(queries.some((query) => Number(query.searchParams.get('hours')) === hours)).toBe(true)
+    expect(
+      queries.some((query) => {
+        const start = Number(query.searchParams.get('start_at'))
+        const end = Number(query.searchParams.get('end_at'))
+        return (
+          end - start === hours * 3_600_000 &&
+          start % 900_000 === 0 &&
+          end % 900_000 === 0 &&
+          !query.searchParams.has('hours') &&
+          !query.searchParams.has('tz_offset')
+        )
+      }),
+    ).toBe(true)
   }
 })
 
@@ -362,7 +377,8 @@ for (const routePath of ['/stats']) {
     let overviewReads = 0
     let seriesReads = 0
     await page.route('**/api/v1/stats/overview**', async (route) => {
-      if (new URL(route.request().url()).searchParams.get('hours') !== '24') {
+      const query = new URL(route.request().url()).searchParams
+      if (Number(query.get('end_at')) - Number(query.get('start_at')) !== 86_400_000) {
         await route.fallback()
         return
       }
@@ -745,6 +761,7 @@ function latencyOverview(firstToken: number | null, tps: number | null) {
 
 function latencyBucket(start: number, hour: number, firstToken: number | null, tps: number | null) {
   return {
+    bucket_ms: 3_600_000,
     bucket_start: start + hour * 3_600_000,
     request_count: 1,
     error_count: 0,
@@ -909,7 +926,10 @@ async function stubTraffic(page: Page, counts: { requests: number; errors: numbe
       json: {
         data: [
           {
-            bucket_start: Date.UTC(2026, 7, 26),
+            bucket_ms: Number(new URL(route.request().url()).searchParams.get('bucket')) * 1000,
+            bucket_start:
+              Number(new URL(route.request().url()).searchParams.get('end_at')) -
+              Number(new URL(route.request().url()).searchParams.get('bucket')) * 1000,
             request_count: counts.requests,
             error_count: counts.errors,
             total_input_tokens: 600,
@@ -930,6 +950,8 @@ async function stubTraffic(page: Page, counts: { requests: number; errors: numbe
       json: {
         data: [
           {
+            model_id: 'model-1',
+            deleted: false,
             model: 'gpt-5',
             request_count: counts.requests,
             total_input_tokens: 600,
@@ -947,6 +969,7 @@ async function stubTraffic(page: Page, counts: { requests: number; errors: numbe
         data: [
           {
             api_key_id: 'key-1',
+            deleted: false,
             api_key_name: 'Desktop client',
             request_count: counts.requests,
             total_input_tokens: 600,

@@ -1,7 +1,5 @@
-use std::sync::LazyLock;
-
 use crate::{
-    interaction_observation::{FAILED_SELECT, REQUEST_SELECT},
+    db::models::{StatsQueryError, StatsWindow},
     storage::RouteSchedulingUsage,
 };
 
@@ -14,12 +12,14 @@ pub(super) struct SqliteUsageStatsStore {
         Arc<parking_lot::RwLock<Vec<crate::router::TargetSchedulingSnapshot>>>,
 }
 
-fn cutoff_ms(hours: Option<i64>) -> Option<i64> {
-    hours.map(|hours| {
-        chrono::Utc::now()
-            .timestamp_millis()
-            .saturating_sub(hours.saturating_mul(60 * 60 * 1_000))
-    })
+const BASE_BUCKET_MS: i64 = 900_000;
+
+// Display buckets start at the selected boundary and retain the final partial bucket.
+fn display_bucket_ms(start: i64, end: i64, requested: i64) -> i64 {
+    let span = i128::from(end) - i128::from(start);
+    let minimum = ((span + 511) / 512).max(i128::from(requested));
+    (((minimum + i128::from(BASE_BUCKET_MS) - 1) / i128::from(BASE_BUCKET_MS))
+        * i128::from(BASE_BUCKET_MS)) as i64
 }
 
 #[async_trait]
@@ -30,20 +30,20 @@ impl UsageStatsStore for SqliteUsageStatsStore {
         let day_ago = now.saturating_sub(24 * 60 * 60 * 1_000);
         let result = sqlx::query_as::<_, crate::router::TargetSchedulingSnapshot>(
             "SELECT provider_id || ':' || upstream_model AS target_key,
-                    CASE WHEN COUNT(*) > 0 AND COUNT(input_tokens) = COUNT(*) THEN SUM(input_tokens) END AS input_tokens_24h,
-                    CASE WHEN COUNT(*) > 0 AND COUNT(output_tokens) = COUNT(*) THEN SUM(output_tokens) END AS output_tokens_24h,
-                    CASE WHEN COUNT(*) > 0 AND COUNT(cache_read_tokens) = COUNT(*) THEN SUM(cache_read_tokens) END AS cache_read_tokens_24h,
-                    CASE WHEN COUNT(*) > 0 AND COUNT(cache_write_tokens) = COUNT(*) THEN SUM(cache_write_tokens) END AS cache_write_tokens_24h,
-                    SUM(CASE WHEN started_at >= ? THEN 1 ELSE 0 END) AS attempts_1h,
-                    SUM(CASE WHEN started_at >= ? AND status = 'completed' THEN 1 ELSE 0 END) AS successes_1h,
-                    CASE WHEN SUM(CASE WHEN started_at >= ? AND status = 'completed' THEN 1 ELSE 0 END) > 0
-                               AND SUM(CASE WHEN started_at >= ? AND status = 'completed' AND output_tokens IS NULL THEN 1 ELSE 0 END) = 0
-                         THEN SUM(CASE WHEN started_at >= ? AND status = 'completed' THEN output_tokens END) END AS successful_output_tokens_1h,
-                    CASE WHEN SUM(CASE WHEN started_at >= ? AND status = 'completed' THEN 1 ELSE 0 END) > 0
-                               AND SUM(CASE WHEN started_at >= ? AND status = 'completed' AND duration_ms IS NULL THEN 1 ELSE 0 END) = 0
-                         THEN SUM(CASE WHEN started_at >= ? AND status = 'completed' THEN duration_ms END) END AS successful_upstream_ms_1h,
-                    NULL AS cost_input, NULL AS cost_output,
-                    NULL AS cost_cache_read, NULL AS cost_cache_write
+        CASE WHEN COUNT(*) > 0 AND COUNT(input_tokens) = COUNT(*) THEN SUM(input_tokens) END AS input_tokens_24h,
+        CASE WHEN COUNT(*) > 0 AND COUNT(output_tokens) = COUNT(*) THEN SUM(output_tokens) END AS output_tokens_24h,
+        CASE WHEN COUNT(*) > 0 AND COUNT(cache_read_tokens) = COUNT(*) THEN SUM(cache_read_tokens) END AS cache_read_tokens_24h,
+        CASE WHEN COUNT(*) > 0 AND COUNT(cache_write_tokens) = COUNT(*) THEN SUM(cache_write_tokens) END AS cache_write_tokens_24h,
+        SUM(CASE WHEN started_at >= ? THEN 1 ELSE 0 END) AS attempts_1h,
+        SUM(CASE WHEN started_at >= ? AND status = 'completed' THEN 1 ELSE 0 END) AS successes_1h,
+        CASE WHEN SUM(CASE WHEN started_at >= ? AND status = 'completed' THEN 1 ELSE 0 END) > 0
+                   AND SUM(CASE WHEN started_at >= ? AND status = 'completed' AND output_tokens IS NULL THEN 1 ELSE 0 END) = 0
+             THEN SUM(CASE WHEN started_at >= ? AND status = 'completed' THEN output_tokens END) END AS successful_output_tokens_1h,
+        CASE WHEN SUM(CASE WHEN started_at >= ? AND status = 'completed' THEN 1 ELSE 0 END) > 0
+                   AND SUM(CASE WHEN started_at >= ? AND status = 'completed' AND duration_ms IS NULL THEN 1 ELSE 0 END) = 0
+             THEN SUM(CASE WHEN started_at >= ? AND status = 'completed' THEN duration_ms END) END AS successful_upstream_ms_1h,
+        NULL AS cost_input, NULL AS cost_output,
+        NULL AS cost_cache_read, NULL AS cost_cache_write
              FROM target_attempt_observations
              WHERE started_at >= ?
                AND provider_id <> '' AND upstream_model <> ''
@@ -79,198 +79,112 @@ impl UsageStatsStore for SqliteUsageStatsStore {
         }
     }
 
-    async fn stats_overview(&self, hours: Option<i64>) -> anyhow::Result<StatsOverview> {
-        let cutoff = cutoff_ms(hours);
-        static SQL: LazyLock<String> = LazyLock::new(|| {
-            format!(
-            "WITH failures AS ({FAILED_SELECT}), requests AS ({REQUEST_SELECT}), turns AS (
-                 SELECT * FROM model_turn_observations WHERE (?1 IS NULL OR started_at >= ?1)
-             ), attempts AS (
-                 SELECT a.* FROM target_attempt_observations a JOIN turns t ON t.id = a.model_turn_id
-                 WHERE a.status = 'completed'
-             )
-             SELECT
-                 (SELECT COUNT(*) FROM requests WHERE expires_at > ?2
-                    AND (?1 IS NULL OR started_at >= ?1)) AS total_requests,
-                 (SELECT SUM(CASE WHEN input_tokens IS NOT NULL AND cache_read_tokens IS NOT NULL THEN CASE WHEN input_tokens>cache_read_tokens THEN input_tokens-cache_read_tokens ELSE 0 END END) FROM attempts) AS total_input_tokens,
-                 (SELECT SUM(output_tokens) FROM attempts) AS total_output_tokens,
-                 (SELECT SUM(cache_read_tokens) FROM attempts) AS total_cache_read_tokens,
-                 (SELECT SUM(cache_write_tokens) FROM attempts) AS total_cache_write_tokens,
-                 (SELECT SUM(reasoning_tokens) FROM attempts) AS total_reasoning_tokens,
-                 (SELECT AVG(finished_at - started_at) FROM turns WHERE finished_at IS NOT NULL) AS avg_duration_ms,
-                 (SELECT AVG(first_token_ms) FROM attempts) AS avg_first_token_ms,
-                 (SELECT CASE WHEN COUNT(*) > 0
-                                   AND COUNT(output_tokens) = COUNT(*)
-                                   AND COUNT(duration_ms) = COUNT(*)
-                                   AND SUM(duration_ms) > 0
-                              THEN SUM(output_tokens) * 1000.0 / SUM(duration_ms)
-                         END FROM attempts) AS avg_output_tps,
-                 (SELECT COUNT(*) FROM failures WHERE expires_at > ?2
-                    AND (?1 IS NULL OR started_at >= ?1)) AS error_count"
+    async fn stats_overview(&self, window: StatsWindow) -> anyhow::Result<StatsOverview> {
+        window.validate()?;
+        Ok(sqlx::query_as::<_, StatsOverview>(
+            "SELECT COALESCE(SUM(request_count), 0) AS total_requests,
+       COALESCE(SUM(error_count), 0) AS error_count,
+       CASE WHEN SUM(input_tokens_known) > 0 THEN SUM(input_tokens_sum) END AS total_input_tokens,
+       CASE WHEN SUM(output_tokens_known) > 0 THEN SUM(output_tokens_sum) END AS total_output_tokens,
+       CASE WHEN SUM(cache_read_tokens_known) > 0 THEN SUM(cache_read_tokens_sum) END AS total_cache_read_tokens,
+       CASE WHEN SUM(cache_write_tokens_known) > 0 THEN SUM(cache_write_tokens_sum) END AS total_cache_write_tokens,
+       CASE WHEN SUM(reasoning_tokens_known) > 0 THEN SUM(reasoning_tokens_sum) END AS total_reasoning_tokens,
+       SUM(duration_ms_sum) * 1.0 / NULLIF(SUM(duration_ms_count), 0) AS avg_duration_ms,
+       SUM(first_token_ms_sum) * 1.0 / NULLIF(SUM(first_token_ms_count), 0) AS avg_first_token_ms,
+       CASE WHEN SUM(successful_attempt_count) > 0 AND SUM(successful_output_known_count) = SUM(successful_attempt_count) AND SUM(successful_duration_known_count) = SUM(successful_attempt_count) AND SUM(successful_duration_sum) > 0 THEN SUM(successful_output_sum) * 1000.0 / SUM(successful_duration_sum) END AS avg_output_tps FROM stats_usage_buckets WHERE scope = 'global' AND bucket_start >= COALESCE(?1, -9223372036854775808) AND bucket_start < COALESCE(?2, 9223372036854775807)",
         )
-        });
-        Ok(sqlx::query_as::<_, StatsOverview>(&**SQL)
-            .bind(cutoff)
-            .bind(chrono::Utc::now().timestamp_millis())
-            .fetch_one(&self.pool)
-            .await?)
+        .bind(window.start_at)
+        .bind(window.end_at)
+        .fetch_one(&self.pool)
+        .await?)
     }
 
     async fn stats_series(
         &self,
-        hours: i64,
+        window: StatsWindow,
         bucket_ms: i64,
-        tz_offset_ms: i64,
     ) -> anyhow::Result<Vec<StatsSeries>> {
-        let cutoff = cutoff_ms(Some(hours));
-        let bucket_ms = bucket_ms.max(1);
-        static SQL: LazyLock<String> = LazyLock::new(|| {
-            format!(
-            "WITH failures AS ({FAILED_SELECT}), requests AS ({REQUEST_SELECT}), request_stats AS (
-                 SELECT (started_at + ?2) / ?3 * ?3 - ?2 AS bucket_start,
-                        COUNT(*) AS request_count
-                 FROM requests WHERE started_at >= ?1 AND expires_at > ?4
-                 GROUP BY bucket_start
-             ), error_stats AS (
-                 SELECT (started_at + ?2) / ?3 * ?3 - ?2 AS bucket_start,
-                        COUNT(*) AS error_count
-                 FROM failures WHERE started_at >= ?1 AND expires_at > ?4
-                 GROUP BY bucket_start
-             ), turns AS (
-                 SELECT *, (started_at + ?2) / ?3 * ?3 - ?2 AS bucket_start
-                 FROM model_turn_observations WHERE started_at >= ?1
-             ), turn_stats AS (
-                 SELECT bucket_start,
-                        AVG(CASE WHEN finished_at IS NOT NULL THEN finished_at - started_at END) AS avg_duration_ms
-                 FROM turns GROUP BY bucket_start
-             ), attempt_stats AS (
-                 SELECT t.bucket_start,
-                        SUM(CASE WHEN a.input_tokens IS NOT NULL AND a.cache_read_tokens IS NOT NULL THEN CASE WHEN a.input_tokens>a.cache_read_tokens THEN a.input_tokens-a.cache_read_tokens ELSE 0 END END) AS total_input_tokens,
-                        SUM(a.output_tokens) AS total_output_tokens,
-                        SUM(a.cache_read_tokens) AS total_cache_read_tokens,
-                        SUM(a.cache_write_tokens) AS total_cache_write_tokens,
-                        SUM(a.reasoning_tokens) AS total_reasoning_tokens,
-                        AVG(a.first_token_ms) AS avg_first_token_ms,
-                        CASE WHEN COUNT(*) > 0
-                                  AND COUNT(a.output_tokens) = COUNT(*)
-                                  AND COUNT(a.duration_ms) = COUNT(*)
-                                  AND SUM(a.duration_ms) > 0
-                             THEN SUM(a.output_tokens) * 1000.0 / SUM(a.duration_ms)
-                        END AS avg_output_tps
-                 FROM turns t JOIN target_attempt_observations a ON a.model_turn_id = t.id AND a.status = 'completed' GROUP BY t.bucket_start
-             ), buckets AS (
-                 SELECT bucket_start FROM turn_stats UNION SELECT bucket_start FROM request_stats
-             )
-             SELECT b.bucket_start, COALESCE(r.request_count, 0) AS request_count,
-                    COALESCE(e.error_count, 0) AS error_count,
-                    a.total_input_tokens, a.total_output_tokens, a.total_cache_read_tokens,
-                    a.total_cache_write_tokens, a.total_reasoning_tokens,
-                    t.avg_duration_ms, a.avg_first_token_ms, a.avg_output_tps
-             FROM buckets b
-             LEFT JOIN request_stats r ON r.bucket_start = b.bucket_start
-             LEFT JOIN turn_stats t ON t.bucket_start = b.bucket_start
-             LEFT JOIN attempt_stats a ON a.bucket_start = b.bucket_start
-             LEFT JOIN error_stats e ON e.bucket_start = b.bucket_start
-             ORDER BY b.bucket_start ASC"
+        window.validate()?;
+        if bucket_ms < BASE_BUCKET_MS || bucket_ms % BASE_BUCKET_MS != 0 {
+            return Err(
+                StatsQueryError("bucket must be a positive multiple of 900 seconds").into(),
+            );
+        }
+        let (start, end) = match (window.start_at, window.end_at) {
+            (Some(start), Some(end)) => (start, end),
+            _ => {
+                let (start, end): (Option<i64>, Option<i64>) = sqlx::query_as(
+                            "SELECT MIN(bucket_start), MAX(bucket_start) FROM stats_usage_buckets WHERE scope = 'global'",
+                        ).fetch_one(&self.pool).await?;
+                let (Some(start), Some(end)) = (start, end) else {
+                    return Ok(Vec::new());
+                };
+                (start, end.saturating_add(BASE_BUCKET_MS))
+            }
+        };
+        let bucket_ms = display_bucket_ms(start, end, bucket_ms);
+        Ok(sqlx::query_as::<_, StatsSeries>(
+            "SELECT (bucket_start - ?4) / ?3 * ?3 + ?4 AS bucket_start, ?3 AS bucket_ms, COALESCE(SUM(request_count), 0) AS request_count,
+       COALESCE(SUM(error_count), 0) AS error_count,
+       CASE WHEN SUM(input_tokens_known) > 0 THEN SUM(input_tokens_sum) END AS total_input_tokens,
+       CASE WHEN SUM(output_tokens_known) > 0 THEN SUM(output_tokens_sum) END AS total_output_tokens,
+       CASE WHEN SUM(cache_read_tokens_known) > 0 THEN SUM(cache_read_tokens_sum) END AS total_cache_read_tokens,
+       CASE WHEN SUM(cache_write_tokens_known) > 0 THEN SUM(cache_write_tokens_sum) END AS total_cache_write_tokens,
+       CASE WHEN SUM(reasoning_tokens_known) > 0 THEN SUM(reasoning_tokens_sum) END AS total_reasoning_tokens,
+       SUM(duration_ms_sum) * 1.0 / NULLIF(SUM(duration_ms_count), 0) AS avg_duration_ms,
+       SUM(first_token_ms_sum) * 1.0 / NULLIF(SUM(first_token_ms_count), 0) AS avg_first_token_ms,
+       CASE WHEN SUM(successful_attempt_count) > 0 AND SUM(successful_output_known_count) = SUM(successful_attempt_count) AND SUM(successful_duration_known_count) = SUM(successful_attempt_count) AND SUM(successful_duration_sum) > 0 THEN SUM(successful_output_sum) * 1000.0 / SUM(successful_duration_sum) END AS avg_output_tps FROM stats_usage_buckets WHERE scope = 'global' AND bucket_start >= COALESCE(?1, -9223372036854775808) AND bucket_start < COALESCE(?2, 9223372036854775807) GROUP BY (bucket_start - ?4) / ?3 * ?3 + ?4 ORDER BY bucket_start",
         )
-        });
-        Ok(sqlx::query_as::<_, StatsSeries>(&**SQL)
-            .bind(cutoff)
-            .bind(tz_offset_ms)
-            .bind(bucket_ms)
-            .bind(chrono::Utc::now().timestamp_millis())
-            .fetch_all(&self.pool)
-            .await?)
-    }
-
-    async fn stats_by_model(&self, hours: Option<i64>) -> anyhow::Result<Vec<ModelStats>> {
-        let cutoff = cutoff_ms(hours);
-        Ok(sqlx::query_as::<_, ModelStats>(
-            "WITH turns AS (
-                 SELECT *, COALESCE(NULLIF(model_display_name, ''), route_id) AS model
-                 FROM model_turn_observations WHERE (? IS NULL OR started_at >= ?)
-             ), turn_stats AS (
-                 SELECT model, COUNT(*) AS request_count,
-                        AVG(CASE WHEN finished_at IS NOT NULL THEN finished_at - started_at END) AS avg_duration_ms
-                 FROM turns GROUP BY model
-             ), attempt_stats AS (
-                 SELECT t.model,
-                        SUM(CASE WHEN a.input_tokens IS NOT NULL AND a.cache_read_tokens IS NOT NULL THEN CASE WHEN a.input_tokens>a.cache_read_tokens THEN a.input_tokens-a.cache_read_tokens ELSE 0 END END) AS total_input_tokens,
-                        SUM(a.output_tokens) AS total_output_tokens,
-                        SUM(a.reasoning_tokens) AS total_reasoning_tokens
-                 FROM turns t JOIN target_attempt_observations a ON a.model_turn_id = t.id AND a.status = 'completed' GROUP BY t.model
-             )
-             SELECT t.model, t.request_count, a.total_input_tokens, a.total_output_tokens,
-                    a.total_reasoning_tokens, t.avg_duration_ms
-             FROM turn_stats t LEFT JOIN attempt_stats a ON a.model = t.model
-             ORDER BY t.request_count DESC",
-        )
-        .bind(cutoff)
-        .bind(cutoff)
+        .bind(start)
+        .bind(end)
+        .bind(bucket_ms)
+        .bind(start)
         .fetch_all(&self.pool)
         .await?)
     }
 
-    async fn stats_by_provider(&self, hours: Option<i64>) -> anyhow::Result<Vec<ProviderStats>> {
-        let cutoff = cutoff_ms(hours);
-        static SQL: LazyLock<String> = LazyLock::new(|| {
-            format!(
-            "WITH failures AS ({FAILED_SELECT}), requests AS ({REQUEST_SELECT}), request_stats AS (
-                 SELECT COALESCE(NULLIF(a.provider_name, ''), a.provider_id) AS provider,
-                        COUNT(DISTINCT r.id) AS request_count,
-                        COUNT(DISTINCT f.id) AS error_count
-                 FROM requests r JOIN target_attempt_observations a ON a.run_id = r.run_id
-                 LEFT JOIN failures f ON f.kind = r.kind AND f.id = r.id
-                 WHERE r.expires_at > ?2 AND (?1 IS NULL OR r.started_at >= ?1)
-                 GROUP BY COALESCE(NULLIF(a.provider_name, ''), a.provider_id)
-             ), attempt_stats AS (
-             SELECT COALESCE(NULLIF(provider_name, ''), provider_id) AS provider,
-                    AVG(duration_ms) AS avg_duration_ms,
-                    CASE WHEN SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) > 0
-                              AND SUM(CASE WHEN status = 'completed' AND (output_tokens IS NULL OR duration_ms IS NULL)
-                                           THEN 1 ELSE 0 END) = 0
-                              AND SUM(CASE WHEN status = 'completed' THEN duration_ms END) > 0
-                         THEN SUM(CASE WHEN status = 'completed' THEN output_tokens END) * 1000.0
-                              / SUM(CASE WHEN status = 'completed' THEN duration_ms END)
-                    END AS avg_output_tps
-             FROM target_attempt_observations
-             WHERE (?1 IS NULL OR started_at >= ?1)
-             GROUP BY COALESCE(NULLIF(provider_name, ''), provider_id)
-             )
-             SELECT a.provider, COALESCE(r.request_count, 0) AS request_count,
-                    COALESCE(r.error_count, 0) AS error_count,
-                    a.avg_duration_ms, a.avg_output_tps
-             FROM attempt_stats a LEFT JOIN request_stats r ON r.provider = a.provider
-             ORDER BY request_count DESC"
+    async fn stats_by_model(&self, window: StatsWindow) -> anyhow::Result<Vec<ModelStats>> {
+        window.validate()?;
+        Ok(sqlx::query_as::<_, ModelStats>(
+            "SELECT entity_id AS model_id, MAX(label) AS model, NOT EXISTS (SELECT 1 FROM models live WHERE live.id = b.entity_id) AS deleted, COALESCE(SUM(request_count), 0) AS request_count,
+       CASE WHEN SUM(input_tokens_known) > 0 THEN SUM(input_tokens_sum) END AS total_input_tokens,
+       CASE WHEN SUM(output_tokens_known) > 0 THEN SUM(output_tokens_sum) END AS total_output_tokens,
+       CASE WHEN SUM(reasoning_tokens_known) > 0 THEN SUM(reasoning_tokens_sum) END AS total_reasoning_tokens,
+       SUM(duration_ms_sum) * 1.0 / NULLIF(SUM(duration_ms_count), 0) AS avg_duration_ms FROM stats_usage_buckets b WHERE scope = 'model' AND bucket_start >= COALESCE(?1, -9223372036854775808) AND bucket_start < COALESCE(?2, 9223372036854775807) GROUP BY identity, entity_id ORDER BY request_count DESC, identity",
         )
-        });
-        Ok(sqlx::query_as::<_, ProviderStats>(&**SQL)
-            .bind(cutoff)
-            .bind(chrono::Utc::now().timestamp_millis())
-            .fetch_all(&self.pool)
-            .await?)
+        .bind(window.start_at)
+        .bind(window.end_at)
+        .fetch_all(&self.pool)
+        .await?)
     }
 
-    async fn stats_by_api_key(&self, hours: Option<i64>) -> anyhow::Result<Vec<ApiKeyStats>> {
-        let cutoff = cutoff_ms(hours);
-        Ok(sqlx::query_as::<_, ApiKeyStats>(
-            "SELECT t.api_key_id,
-                    COALESCE(MAX(NULLIF(t.api_key_name, '')), t.api_key_id) AS api_key_name,
-                    COUNT(DISTINCT t.id) AS request_count,
-                    SUM(CASE WHEN a.input_tokens IS NOT NULL AND a.cache_read_tokens IS NOT NULL THEN CASE WHEN a.input_tokens>a.cache_read_tokens THEN a.input_tokens-a.cache_read_tokens ELSE 0 END END) AS total_input_tokens,
-                    SUM(a.output_tokens) AS total_output_tokens,
-                    SUM(a.cache_read_tokens) AS cache_read_tokens,
-                    SUM(a.cache_write_tokens) AS cache_write_tokens,
-                    SUM(a.reasoning_tokens) AS reasoning_tokens,
-                    MAX(t.started_at) AS last_used_at
-             FROM model_turn_observations t
-             LEFT JOIN target_attempt_observations a ON a.model_turn_id = t.id AND a.status = 'completed'
-             WHERE t.api_key_id IS NOT NULL AND t.api_key_id <> ''
-               AND (? IS NULL OR t.started_at >= ?)
-             GROUP BY t.api_key_id ORDER BY request_count DESC",
+    async fn stats_by_provider(&self, window: StatsWindow) -> anyhow::Result<Vec<ProviderStats>> {
+        window.validate()?;
+        Ok(sqlx::query_as::<_, ProviderStats>(
+            "SELECT entity_id AS provider_id, MAX(label) AS provider, NOT EXISTS (SELECT 1 FROM providers live WHERE live.id = b.entity_id) AS deleted, COALESCE(SUM(request_count), 0) AS request_count,
+       COALESCE(SUM(error_count), 0) AS error_count,
+       SUM(duration_ms_sum) * 1.0 / NULLIF(SUM(duration_ms_count), 0) AS avg_duration_ms,
+       CASE WHEN SUM(successful_attempt_count) > 0 AND SUM(successful_output_known_count) = SUM(successful_attempt_count) AND SUM(successful_duration_known_count) = SUM(successful_attempt_count) AND SUM(successful_duration_sum) > 0 THEN SUM(successful_output_sum) * 1000.0 / SUM(successful_duration_sum) END AS avg_output_tps FROM stats_usage_buckets b WHERE scope = 'provider' AND bucket_start >= COALESCE(?1, -9223372036854775808) AND bucket_start < COALESCE(?2, 9223372036854775807) GROUP BY identity, entity_id ORDER BY request_count DESC, identity",
         )
-        .bind(cutoff)
-        .bind(cutoff)
+        .bind(window.start_at)
+        .bind(window.end_at)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    async fn stats_by_api_key(&self, window: StatsWindow) -> anyhow::Result<Vec<ApiKeyStats>> {
+        window.validate()?;
+        Ok(sqlx::query_as::<_, ApiKeyStats>(
+            "SELECT COALESCE(entity_id, '') AS api_key_id, MAX(label) AS api_key_name, NOT EXISTS (SELECT 1 FROM api_keys live WHERE live.id = b.entity_id) AS deleted, COALESCE(SUM(request_count), 0) AS request_count,
+       CASE WHEN SUM(input_tokens_known) > 0 THEN SUM(input_tokens_sum) END AS total_input_tokens,
+       CASE WHEN SUM(output_tokens_known) > 0 THEN SUM(output_tokens_sum) END AS total_output_tokens,
+       CASE WHEN SUM(cache_read_tokens_known) > 0 THEN SUM(cache_read_tokens_sum) END AS cache_read_tokens,
+       CASE WHEN SUM(cache_write_tokens_known) > 0 THEN SUM(cache_write_tokens_sum) END AS cache_write_tokens,
+       CASE WHEN SUM(reasoning_tokens_known) > 0 THEN SUM(reasoning_tokens_sum) END AS reasoning_tokens,
+       MAX(last_used_at) AS last_used_at FROM stats_usage_buckets b WHERE scope = 'api_key' AND bucket_start >= COALESCE(?1, -9223372036854775808) AND bucket_start < COALESCE(?2, 9223372036854775807) GROUP BY identity, entity_id ORDER BY request_count DESC, identity",
+        )
+        .bind(window.start_at)
+        .bind(window.end_at)
         .fetch_all(&self.pool)
         .await?)
     }
@@ -279,6 +193,15 @@ impl UsageStatsStore for SqliteUsageStatsStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn window(hours: i64) -> StatsWindow {
+        let end = chrono::Utc::now().timestamp_millis() / BASE_BUCKET_MS * BASE_BUCKET_MS
+            + BASE_BUCKET_MS;
+        StatsWindow {
+            start_at: Some(end - hours * 3_600_000),
+            end_at: Some(end),
+        }
+    }
 
     async fn insert_turn(
         pool: &SqlitePool,
@@ -331,7 +254,7 @@ mod tests {
         .bind(id)
         .bind(id)
         .bind(id)
-        .bind("route")
+        .bind(model)
         .bind(model)
         .bind(api_key_id)
         .bind("Test key")
@@ -536,34 +459,49 @@ mod tests {
             pool: pool.clone(),
             last_route_snapshot: Arc::new(parking_lot::RwLock::new(Vec::new())),
         };
-        assert_eq!(store.stats_overview(Some(1)).await?.error_count, 3);
-        assert_eq!(store.stats_overview(Some(1)).await?.total_requests, 11);
-        assert_eq!(store.stats_overview(None).await?.error_count, 4);
-        assert_eq!(store.stats_overview(None).await?.total_requests, 12);
-        let series = store.stats_series(1, 60_000, 0).await?;
+        assert_eq!(store.stats_overview(window(1)).await?.error_count, 4);
+        assert_eq!(store.stats_overview(window(1)).await?.total_requests, 12);
+        assert_eq!(
+            store
+                .stats_overview(StatsWindow::default())
+                .await?
+                .error_count,
+            5
+        );
+        assert_eq!(
+            store
+                .stats_overview(StatsWindow::default())
+                .await?
+                .total_requests,
+            13
+        );
+        let series = store.stats_series(window(1), 900_000).await?;
         assert_eq!(
             series.iter().map(|bucket| bucket.error_count).sum::<i64>(),
-            3
+            4
         );
         assert_eq!(
             series
                 .iter()
                 .map(|bucket| bucket.request_count)
                 .sum::<i64>(),
-            11
+            12
         );
         assert_eq!(
             series
                 .iter()
-                .find(|bucket| bucket.bucket_start == (now - 1_800_000) / 60_000 * 60_000)
+                .find(|bucket| bucket.bucket_start == (now - 1_800_000) / 900_000 * 900_000)
                 .unwrap()
                 .error_count,
             1
         );
-        let providers = store.stats_by_provider(Some(1)).await?;
-        assert_eq!(providers[0].error_count, 2);
-        assert_eq!(providers[0].request_count, 8);
-        assert_eq!(store.stats_by_provider(None).await?[0].error_count, 3);
+        let providers = store.stats_by_provider(window(1)).await?;
+        assert_eq!(providers[0].error_count, 3);
+        assert_eq!(providers[0].request_count, 9);
+        assert_eq!(
+            store.stats_by_provider(StatsWindow::default()).await?[0].error_count,
+            4
+        );
         pool.close().await;
         Ok(())
     }
@@ -580,12 +518,12 @@ mod tests {
             pool: pool.clone(),
             last_route_snapshot: Arc::new(parking_lot::RwLock::new(Vec::new())),
         };
-        assert_eq!(store.stats_overview(Some(3)).await?.avg_output_tps, None);
+        assert_eq!(store.stats_overview(window(3)).await?.avg_output_tps, None);
         assert_eq!(
-            store.stats_overview(Some(3)).await?.avg_first_token_ms,
+            store.stats_overview(window(3)).await?.avg_first_token_ms,
             None
         );
-        assert!(store.stats_series(3, 3_600_000, 0).await?.is_empty());
+        assert!(store.stats_series(window(3), 3_600_000).await?.is_empty());
         let now = chrono::Utc::now().timestamp_millis();
         let recent = now / 3_600_000 * 3_600_000 - 5_400_000;
         let old = now - 4 * 60 * 60 * 1_000;
@@ -616,7 +554,7 @@ mod tests {
         sqlx::query("UPDATE target_attempt_observations SET duration_ms=NULL,provider_id='old-provider',provider_name='Old Provider' WHERE id='old-a'")
             .execute(&pool).await?;
 
-        let overview = store.stats_overview(Some(3)).await?;
+        let overview = store.stats_overview(window(3)).await?;
         assert_eq!(overview.total_input_tokens, Some(7));
         assert_eq!(overview.total_output_tokens, Some(50));
         assert_eq!(overview.total_reasoning_tokens, Some(2));
@@ -624,13 +562,13 @@ mod tests {
         assert_eq!(overview.avg_first_token_ms, Some(4900.0));
         assert_eq!(overview.avg_duration_ms, Some(10.0));
         // 未知字段只跳过该 attempt，不遮蔽其他已确认用量；全部未报告的字段保持 null。
-        let all_time = store.stats_overview(None).await?;
+        let all_time = store.stats_overview(StatsWindow::default()).await?;
         assert_eq!(all_time.total_input_tokens, Some(7));
         assert_eq!(all_time.total_output_tokens, Some(53));
         assert_eq!(all_time.total_cache_write_tokens, None);
         assert_eq!(all_time.avg_output_tps, None);
 
-        let series = store.stats_series(3, 3_600_000, 0).await?;
+        let series = store.stats_series(window(3), 3_600_000).await?;
         assert_eq!(series.len(), 1);
         assert_eq!(series[0].total_input_tokens, Some(7));
         assert_eq!(series[0].total_output_tokens, Some(50));
@@ -638,41 +576,67 @@ mod tests {
         assert_eq!(series[0].avg_output_tps, Some(5.0));
         assert_eq!(series[0].avg_first_token_ms, Some(4900.0));
         assert_eq!(series[0].avg_duration_ms, Some(10.0));
-        assert_eq!(series[0].bucket_start % 3_600_000, 0);
+        assert!(series[0].bucket_start >= window(3).start_at.unwrap());
 
-        let quarter = store.stats_series(3, 900_000, 0).await?;
+        let quarter = store.stats_series(window(3), 900_000).await?;
         assert_eq!(quarter.len(), 1);
         assert_eq!(quarter[0].bucket_start % 900_000, 0);
 
-        let day = store.stats_series(3, 86_400_000, 8 * 3_600_000).await?;
+        let day = store.stats_series(window(3), 86_400_000).await?;
         assert_eq!(day.len(), 1);
-        // UTC+8 日桶边界对齐本地零点（即 UTC 16:00），bucket_start 仍是真实 UTC 时刻。
-        assert_eq!(day[0].bucket_start % 86_400_000, 16 * 3_600_000);
+        // Display buckets begin at the absolute selected start, independent of browser timezone.
+        assert_eq!(day[0].bucket_start, window(3).start_at.unwrap());
 
-        let models = store.stats_by_model(Some(3)).await?;
+        let models = store.stats_by_model(window(3)).await?;
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].total_input_tokens, Some(7));
         assert_eq!(models[0].total_output_tokens, Some(50));
         assert_eq!(models[0].total_reasoning_tokens, Some(2));
 
-        let api_keys = store.stats_by_api_key(Some(3)).await?;
+        let api_keys = store.stats_by_api_key(window(3)).await?;
         assert_eq!(api_keys.len(), 1);
         assert_eq!(api_keys[0].total_input_tokens, Some(7));
         assert_eq!(api_keys[0].total_output_tokens, Some(50));
         assert_eq!(api_keys[0].reasoning_tokens, Some(2));
 
-        let providers = store.stats_by_provider(Some(3)).await?;
-        assert_eq!(providers.len(), 2);
+        let providers = store.stats_by_provider(window(3)).await?;
+        // Two successful attempts belong to one request; the old turn's recent attempt
+        // does not move its provider contribution into the recent window.
         assert_eq!(
             providers
                 .iter()
-                .find(|provider| provider.provider == "Provider")
-                .unwrap()
-                .avg_output_tps,
-            Some(5.0)
+                .map(|provider| (
+                    provider.provider_id.as_deref(),
+                    provider.provider.as_str(),
+                    provider.request_count,
+                    provider.error_count,
+                    provider.avg_output_tps,
+                ))
+                .collect::<Vec<_>>(),
+            vec![(Some("provider"), "Provider", 1, 1, Some(5.0))]
+        );
+        let old_bucket = old / BASE_BUCKET_MS * BASE_BUCKET_MS;
+        let old_providers = store
+            .stats_by_provider(StatsWindow {
+                start_at: Some(old_bucket),
+                end_at: Some(old_bucket + BASE_BUCKET_MS),
+            })
+            .await?;
+        assert_eq!(
+            old_providers
+                .iter()
+                .map(|provider| (
+                    provider.provider_id.as_deref(),
+                    provider.provider.as_str(),
+                    provider.request_count,
+                    provider.error_count,
+                    provider.avg_output_tps,
+                ))
+                .collect::<Vec<_>>(),
+            vec![(Some("old-provider"), "Old Provider", 1, 0, None)]
         );
         let old_model = store
-            .stats_by_model(None)
+            .stats_by_model(StatsWindow::default())
             .await?
             .into_iter()
             .find(|model| model.model == "unknown-cache")
@@ -722,7 +686,7 @@ mod tests {
             ))).execute(&pool).await?;
             assert_eq!(
                 store
-                    .stats_by_provider(Some(3))
+                    .stats_by_provider(window(3))
                     .await?
                     .into_iter()
                     .find(|provider| provider.provider == "Provider")
@@ -731,12 +695,12 @@ mod tests {
                 expected_tps,
                 "{change}"
             );
-            let overview = store.stats_overview(Some(3)).await?;
+            let overview = store.stats_overview(window(3)).await?;
             assert_eq!(overview.avg_output_tps, expected_tps, "{change}");
             assert_eq!(overview.total_output_tokens, expected_output, "{change}");
             assert_eq!(overview.avg_first_token_ms, expected_first, "{change}");
             assert_eq!(overview.total_input_tokens, expected_input, "{change}");
-            let series = store.stats_series(3, 3_600_000, 0).await?;
+            let series = store.stats_series(window(3), 3_600_000).await?;
             assert_eq!(series.len(), 1);
             assert_eq!(series[0].avg_output_tps, expected_tps, "{change}");
             assert_eq!(series[0].total_output_tokens, expected_output, "{change}");
@@ -772,19 +736,19 @@ mod tests {
             .execute(&pool)
             .await?;
             assert_eq!(
-                store.stats_overview(Some(3)).await?.total_input_tokens,
+                store.stats_overview(window(3)).await?.total_input_tokens,
                 expected
             );
             assert_eq!(
-                store.stats_series(3, 3_600_000, 0).await?[0].total_input_tokens,
+                store.stats_series(window(3), 3_600_000).await?[0].total_input_tokens,
                 expected
             );
             assert_eq!(
-                store.stats_by_model(Some(3)).await?[0].total_input_tokens,
+                store.stats_by_model(window(3)).await?[0].total_input_tokens,
                 expected
             );
             assert_eq!(
-                store.stats_by_api_key(Some(3)).await?[0].total_input_tokens,
+                store.stats_by_api_key(window(3)).await?[0].total_input_tokens,
                 expected
             );
         }
@@ -797,17 +761,167 @@ mod tests {
         sqlx::query("UPDATE target_attempt_observations SET model_turn_id='next',run_id='next',interaction_id='next' WHERE id='recent-b'")
             .execute(&pool).await?;
         assert_eq!(
-            store.stats_overview(Some(3)).await?.avg_output_tps,
+            store.stats_overview(window(3)).await?.avg_output_tps,
             Some(5.0)
         );
-        let series = store.stats_series(3, 3_600_000, 0).await?;
+        let series = store.stats_series(window(3), 3_600_000).await?;
         assert_eq!(series.len(), 2);
-        assert_eq!(series[0].bucket_start, recent - 1_800_000);
-        assert_eq!(series[1].bucket_start, next - 1_800_000);
+        assert!(series[0].bucket_start >= window(3).start_at.unwrap());
+        assert_eq!(series[1].bucket_start - series[0].bucket_start, 3_600_000);
         assert_eq!(series[0].avg_output_tps, Some(20.0));
         assert!((series[1].avg_output_tps.unwrap() - 10.0 / 3.0).abs() < 1e-12);
         assert_eq!(series[0].avg_first_token_ms, Some(900.0));
         assert_eq!(series[1].avg_first_token_ms, Some(8900.0));
+        pool.close().await;
+        Ok(())
+    }
+
+    async fn verify_fixed_range_survives_detail_cleanup(pool: &SqlitePool) -> anyhow::Result<()> {
+        let start = 9_900_000;
+        let end = start + 513 * BASE_BUCKET_MS;
+        let selected = StatsWindow {
+            start_at: Some(start),
+            end_at: Some(end),
+        };
+        for (id, at, route) in [
+            ("durable-first", start, "historical-a"),
+            ("durable-last", end - BASE_BUCKET_MS, "historical-b"),
+            ("durable-excluded", end, "historical-a"),
+        ] {
+            insert_turn(pool, id, at, "Same name", id).await?;
+            sqlx::query("UPDATE model_turn_observations SET route_id=? WHERE id=?")
+                .bind(route)
+                .bind(id)
+                .execute(pool)
+                .await?;
+            insert_attempt(pool, id, id, at, 12, Some(5)).await?;
+        }
+        sqlx::query("UPDATE target_attempt_observations SET output_tokens=CASE id WHEN 'durable-first' THEN 20 ELSE 30 END, duration_ms=CASE id WHEN 'durable-first' THEN 1000 ELSE 9000 END, first_token_ms=CASE id WHEN 'durable-first' THEN 0 ELSE 100 END WHERE id IN ('durable-first','durable-last')")
+            .execute(pool).await?;
+        let store = SqliteUsageStatsStore {
+            pool: pool.clone(),
+            last_route_snapshot: Arc::new(parking_lot::RwLock::new(Vec::new())),
+        };
+        let overview = store.stats_overview(selected).await?;
+        assert_eq!(overview.total_requests, 2);
+        assert_eq!(overview.total_input_tokens, Some(14));
+        assert_eq!(overview.total_output_tokens, Some(50));
+        assert_eq!(overview.avg_output_tps, Some(5.0));
+        assert_eq!(overview.avg_first_token_ms, Some(50.0));
+        assert_eq!(overview.avg_duration_ms, Some(10.0));
+        assert_eq!(overview.total_cache_write_tokens, None);
+        let series = store.stats_series(selected, BASE_BUCKET_MS).await?;
+        assert_eq!(series.len(), 2);
+        assert!(series.iter().all(|point| point.bucket_ms > BASE_BUCKET_MS));
+        assert_eq!(
+            series.iter().map(|point| point.request_count).sum::<i64>(),
+            2
+        );
+        assert_eq!(
+            series
+                .iter()
+                .filter_map(|point| point.total_output_tokens)
+                .sum::<i64>(),
+            50
+        );
+        assert_eq!(series[0].avg_output_tps, Some(20.0));
+        assert!((series[1].avg_output_tps.unwrap() - 10.0 / 3.0).abs() < 1e-12);
+        // Quarter-hour start intentionally differs from epoch hour alignment.
+        // The 513-quarter range ends with a single-quarter partial hour bucket.
+        let hourly = store.stats_series(selected, 3_600_000).await?;
+        assert_eq!(hourly.len(), 2);
+        assert_eq!(hourly[0].bucket_start, 9_900_000);
+        assert_eq!(hourly[1].bucket_start, 470_700_000);
+        assert_eq!(hourly[0].bucket_ms, 3_600_000);
+        assert_eq!(hourly[1].bucket_ms, 3_600_000);
+        assert_eq!(hourly[0].request_count, 1);
+        assert_eq!(hourly[1].request_count, 1);
+        assert_eq!(hourly[0].total_output_tokens, Some(20));
+        assert_eq!(hourly[1].total_output_tokens, Some(30));
+        assert_eq!(
+            hourly
+                .iter()
+                .filter_map(|point| point.total_output_tokens)
+                .sum::<i64>(),
+            50
+        );
+        let models = store.stats_by_model(selected).await?;
+        assert_eq!(models.len(), 2);
+        assert!(
+            models
+                .iter()
+                .all(|model| model.model == "Same name" && model.deleted)
+        );
+        assert_ne!(models[0].model_id, models[1].model_id);
+        assert!(store.stats_series(selected, 60_000).await.is_err());
+        assert!(store.stats_series(selected, 1_000_000).await.is_err());
+        sqlx::query("DELETE FROM interaction_observations WHERE id IN ('durable-first','durable-last','durable-excluded')")
+            .execute(pool).await?;
+        let retained = store.stats_overview(selected).await?;
+        assert_eq!(retained.total_requests, 2);
+        assert_eq!(retained.total_input_tokens, Some(14));
+        assert_eq!(retained.total_output_tokens, Some(50));
+        assert_eq!(retained.avg_output_tps, Some(5.0));
+        assert_eq!(store.stats_by_model(selected).await?.len(), 2);
+        assert_eq!(store.stats_by_api_key(selected).await?.len(), 2);
+        // Legacy/internal turns can legitimately have no API key attribution.
+        insert_turn(
+            pool,
+            "durable-unknown-key",
+            start + BASE_BUCKET_MS,
+            "Same name",
+            "temporary-key",
+        )
+        .await?;
+        sqlx::query("UPDATE model_turn_observations SET api_key_id=NULL,api_key_name='' WHERE id='durable-unknown-key'")
+            .execute(pool).await?;
+        insert_attempt(
+            pool,
+            "durable-unknown-key",
+            "durable-unknown-key",
+            start + BASE_BUCKET_MS,
+            12,
+            Some(5),
+        )
+        .await?;
+        sqlx::query(
+            "UPDATE target_attempt_observations SET output_tokens=0 WHERE id='durable-unknown-key'",
+        )
+        .execute(pool)
+        .await?;
+        let keys = store.stats_by_api_key(selected).await?;
+        assert_eq!(keys.len(), 3);
+        let unknown = keys.iter().find(|key| key.api_key_id.is_empty()).unwrap();
+        assert!(unknown.deleted);
+        assert_eq!(unknown.api_key_name, "Unknown API Key");
+        assert_eq!(unknown.request_count, 1);
+        assert_eq!(unknown.total_input_tokens, Some(7));
+        assert_eq!(unknown.total_output_tokens, Some(0));
+        assert_eq!(unknown.cache_write_tokens, None);
+        sqlx::query("DELETE FROM interaction_observations WHERE id='durable-unknown-key'")
+            .execute(pool)
+            .await?;
+        let retained_keys = store.stats_by_api_key(selected).await?;
+        assert_eq!(retained_keys.len(), 3);
+        let retained_unknown = retained_keys
+            .iter()
+            .find(|key| key.api_key_id.is_empty())
+            .unwrap();
+        assert_eq!(retained_unknown.request_count, 1);
+        assert_eq!(retained_unknown.total_input_tokens, Some(7));
+        assert_eq!(retained_unknown.total_output_tokens, Some(0));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fixed_long_range_keeps_weighted_metrics_and_deleted_identities() -> anyhow::Result<()>
+    {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await?;
+        crate::migrations::migrate_sqlite(&pool, None).await?;
+        verify_fixed_range_survives_detail_cleanup(&pool).await?;
         pool.close().await;
         Ok(())
     }

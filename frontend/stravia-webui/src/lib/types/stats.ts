@@ -1,3 +1,9 @@
+export interface StatsWindow {
+  /** Paired UTC epoch milliseconds, covering [start_at, end_at). */
+  start_at: number
+  end_at: number
+}
+
 export interface GatewayStatus {
   status: string
   version: string
@@ -18,7 +24,9 @@ export interface StatsOverview {
 }
 
 export interface StatsSeries {
-  /** Bucket 起点（epoch ms），已按 bucket 粒度与调用方时区对齐。 */
+  /** Effective presentation grain after whole-range coarsening, in milliseconds. */
+  bucket_ms: number
+  /** Absolute presentation bucket start (epoch ms), anchored to the selected start. */
   bucket_start: number
   request_count: number
   error_count: number
@@ -34,6 +42,8 @@ export interface StatsSeries {
 }
 
 export interface ModelStats {
+  model_id: string | null
+  deleted: boolean
   model: string
   request_count: number
   total_input_tokens: number | null
@@ -43,6 +53,8 @@ export interface ModelStats {
 }
 
 export interface ProviderStats {
+  provider_id: string | null
+  deleted: boolean
   provider: string
   request_count: number
   error_count: number
@@ -52,6 +64,7 @@ export interface ProviderStats {
 }
 
 export interface ApiKeyStats {
+  deleted: boolean
   api_key_id: string
   api_key_name: string
   request_count: number

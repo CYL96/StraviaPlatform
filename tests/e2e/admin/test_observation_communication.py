@@ -164,11 +164,21 @@ def test_root_delta_idempotence_and_expired_snapshot_recovery(admin_env: dict[st
     assert _proxy(admin_env, key, "observation-root-delta-http", [{"role": "user", "content": "synthetic delta"}])[0] == 200
     def completed_root() -> dict[str, Any] | None:
         page = _forest(admin_env)
-        return page if any(
-            item["status"] == "completed"
-            for root in page["roots"] for item in root["interactions"]
-            if item["first_route_id"] == route
-        ) else None
+        for root in page["roots"]:
+            for item in root["interactions"]:
+                if item["first_route_id"] != route or item["status"] != "completed":
+                    continue
+                detail = _detail(admin_env, item["id"])
+                # A receipt can mark the summary completed before Run/trace
+                # finalization advances its watermark. Only assert unchanged
+                # deltas against a forest snapshot that includes that terminal.
+                terminal_events = [
+                    event for run in detail["runs"] for event in run["events"]
+                    if event["kind"] == "run_finished"
+                ]
+                if terminal_events and max(event["sequence"] for event in terminal_events) <= item["last_event_sequence"]:
+                    return page
+        return None
 
     forest = _wait_for("completed delta root", completed_root)
     root = next(root for root in forest["roots"] if any(item["first_route_id"] == route for item in root["interactions"]))

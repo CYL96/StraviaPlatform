@@ -31,6 +31,7 @@ from tests.common.helpers import (
 from tests.e2e.admin.test_observations import (
     _create_route,
     _detail,
+    _finished_detail,
     _forest,
     _proxy,
     _route_interactions,
@@ -208,8 +209,9 @@ def test_trace_storage_failure_is_partial_without_changing_inference_or_continua
                 assert immediate_debug_state["data"]["partial_trace_count"] >= 1
                 failed_detail = _wait_for(
                     "completed Run after partial Trace",
-                    lambda: (lambda detail: detail if detail["runs"][0]["status"] == "completed" else None)(
-                        _detail(env, failed_interaction["id"])
+                    lambda: (lambda detail: detail if detail is not None
+                        and detail["runs"][0]["status"] == "completed" else None)(
+                        _finished_detail(env, failed_interaction["id"])
                     ),
                 )
                 assert failed_detail["runs"][0]["client_output_committed"] is True
@@ -249,8 +251,9 @@ def test_trace_storage_failure_is_partial_without_changing_inference_or_continua
                 )
                 child_detail = _wait_for(
                     "continued Run terminal state",
-                    lambda: (lambda detail: detail if detail["runs"][0]["status"] == "completed" else None)(
-                        _detail(env, child["id"])
+                    lambda: (lambda detail: detail if detail is not None
+                        and detail["runs"][0]["status"] == "completed" else None)(
+                        _finished_detail(env, child["id"])
                     ),
                 )
                 assert child_detail["runs"][0]["client_output_committed"] is True

@@ -603,7 +603,7 @@ async fn missing_upstream_usage_remains_unknown() {
         .app
         .gateway
         .admin()
-        .get_stats_overview(None)
+        .get_stats_overview(crate::db::models::StatsWindow::default())
         .await
         .unwrap();
     assert_eq!(stats.total_requests, 1);
@@ -781,7 +781,10 @@ async fn generation_reports_usage_and_preserves_raw_media_in_debug_exports() {
     .await;
     assert_ne!(result.is_error, Some(true), "{result:?}");
     admin.observation_flush().await.unwrap();
-    let stats = admin.get_stats_overview(None).await.unwrap();
+    let stats = admin
+        .get_stats_overview(crate::db::models::StatsWindow::default())
+        .await
+        .unwrap();
     assert_eq!(
         (
             stats.total_requests,

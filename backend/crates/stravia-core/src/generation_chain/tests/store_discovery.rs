@@ -5,6 +5,7 @@ struct ControlledDiscoveryTurnChainStore {
     inner: crate::turn_chain::SqlTurnChainStore,
     blocked: parking_lot::Mutex<std::collections::HashSet<String>>,
     deadlines: parking_lot::Mutex<HashMap<String, std::time::Instant>>,
+    materialized_deadlines: parking_lot::Mutex<HashMap<String, std::time::Instant>>,
 }
 
 impl ControlledDiscoveryTurnChainStore {
@@ -13,6 +14,7 @@ impl ControlledDiscoveryTurnChainStore {
             inner,
             blocked: Default::default(),
             deadlines: Default::default(),
+            materialized_deadlines: Default::default(),
         }
     }
     fn block(&self, id: &str) {
@@ -61,6 +63,9 @@ impl TurnChainStore for ControlledDiscoveryTurnChainStore {
         if let Some(expiry) = expiry {
             chain.expires_at = chain.expires_at.min(expiry);
         }
+        self.materialized_deadlines
+            .lock()
+            .insert(id.as_str().to_owned(), chain.expires_at);
         Ok(chain)
     }
     async fn commit(&self, commit: TurnCommit) -> Result<TurnNodeId, TurnCommitError> {
@@ -1888,14 +1893,25 @@ async fn shared_materialization_cache_preserves_arcs_deadlines_and_rebuilds_on_m
 
 #[tokio::test]
 async fn materialization_cache_does_not_outlive_the_generation_ttl() {
+    let pool = crate::test_support::migrated_sqlite_pool()
+        .await
+        .expect("SQLite database");
+    let cache = crate::runtime_cache::RuntimeCache::tinyufo(16 * 1024 * 1024);
+    let backend = Arc::new(ControlledDiscoveryTurnChainStore::new(
+        crate::turn_chain::SqlTurnChainStore::sqlite(
+            pool.clone(),
+            Arc::new(tokio::sync::Mutex::new(())),
+        ),
+    ));
     let store = GenerationChainStore::from_turn_chain(
-        Arc::new(crate::turn_chain::test_store().await),
+        backend.clone(),
         Duration::from_secs(1),
-        crate::runtime_cache::RuntimeCache::tinyufo(16 * 1024 * 1024),
+        cache.clone(),
     );
     let owner = principal("owner");
     let mut response = AiResponse::new("upstream", "model");
     response.push_output_text("answer");
+    let before_save = chrono::Utc::now().timestamp_millis();
     store
         .save(GenerationChainCommit {
             principal: owner.clone(),
@@ -1910,7 +1926,26 @@ async fn materialization_cache_does_not_outlive_the_generation_ttl() {
         .await
         .expect("save response");
 
-    tokio::time::sleep(Duration::from_millis(700)).await;
+    let after_save = chrono::Utc::now().timestamp_millis();
+    let id = TurnNodeId::new("resp_expiring");
+    let committed_expiry: i64 =
+        sqlx::query_scalar("SELECT expires_at FROM turn_chain_nodes WHERE id = ?")
+            .bind(id.as_str())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!((before_save + 1000..=after_save + 1000).contains(&committed_expiry));
+
+    // Control the durable fixture deadline before filling the cache; initial
+    // materialization must not race the configured one-second retention window.
+    let durable_expiry = chrono::Utc::now().timestamp_millis() + 60_000;
+    let live_rows = sqlx::query("UPDATE turn_chain_nodes SET expires_at = ? WHERE id = ?")
+        .bind(durable_expiry)
+        .bind(id.as_str())
+        .execute(&pool)
+        .await
+        .expect("set controlled durable deadline");
+    assert_eq!(live_rows.rows_affected(), 1);
     let mut cached = responses_request(vec![user_message("follow up")]);
     let Some(ProtocolExt::OpenResponses(extension)) = cached.ext.as_mut() else {
         unreachable!();
@@ -1921,7 +1956,68 @@ async fn materialization_cache_does_not_outlive_the_generation_ttl() {
         .await
         .expect("materialize cached response");
 
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    let key = super::super::store::generation_cache_key(&owner.continuation_key(), &id, None);
+    let materialized = cache
+        .get::<MaterializedGeneration>("generation.materialized", &key)
+        .await
+        .expect("initial parent materialization must fill the cache");
+    assert_eq!(
+        materialized.expires_at,
+        *backend
+            .materialized_deadlines
+            .lock()
+            .get(id.as_str())
+            .expect("SQL must supply the initial materialization certificate"),
+        "the cache must inherit the durable generation deadline exactly"
+    );
+    assert!(materialized.expires_at > std::time::Instant::now());
+    assert!(items_equal(
+        &materialized.client_items,
+        &[user_message("question"), AiItem::output_text("answer")]
+    ));
+
+    // Advance both expiry certificates explicitly rather than racing a one-second
+    // TTL against scheduler delays. Keep the stale entry resident so this exercises
+    // the consumer's expiry check, not merely the cache backend's eviction.
+    let expired_materialization = MaterializedGeneration {
+        root_id: materialized.root_id.clone(),
+        compaction_record_ids: materialized.compaction_record_ids.clone(),
+        effective_items: materialized.effective_items.clone(),
+        client_items: materialized.client_items.clone(),
+        effective_request: materialized.effective_request.clone(),
+        effective_system: materialized.effective_system.clone(),
+        upstream_response_id: materialized.upstream_response_id.clone(),
+        effective_state: materialized.effective_state.clone(),
+        media_turn_messages: materialized.media_turn_messages.clone(),
+        client_history: materialized.client_history.clone(),
+        client_item_units: materialized.client_item_units,
+        payload_version: materialized.payload_version,
+        expires_at: std::time::Instant::now(),
+    };
+    let bytes = super::super::materialize::serialized_size_bytes(&expired_materialization);
+    let expired_rows = sqlx::query("UPDATE turn_chain_nodes SET expires_at = 0 WHERE id = ?")
+        .bind(id.as_str())
+        .execute(&pool)
+        .await
+        .expect("expire durable generation");
+    assert_eq!(expired_rows.rows_affected(), 1);
+    cache
+        .put(
+            "generation.materialized",
+            &key,
+            Arc::new(expired_materialization),
+            bytes,
+            Duration::from_secs(60),
+        )
+        .await;
+    assert!(
+        cache
+            .get::<MaterializedGeneration>("generation.materialized", &key)
+            .await
+            .expect("expired certificate must still be resident before resolution")
+            .expires_at
+            <= std::time::Instant::now()
+    );
     let mut expired = responses_request(vec![user_message("follow up")]);
     let Some(ProtocolExt::OpenResponses(extension)) = expired.ext.as_mut() else {
         unreachable!();

@@ -111,12 +111,16 @@ impl SqlAgentDefinitionStore {
     }
 }
 
+fn storage_error(error: impl std::error::Error + 'static) -> AgentDefinitionError {
+    AgentDefinitionError::Storage(error.to_string())
+}
+
 fn encode_spec(spec: &AgentDefinitionSpec) -> Result<String, AgentDefinitionError> {
-    serde_json::to_string(spec).map_err(|error| AgentDefinitionError::Storage(error.to_string()))
+    serde_json::to_string(spec).map_err(storage_error)
 }
 
 fn decode_spec(value: String) -> Result<AgentDefinitionSpec, AgentDefinitionError> {
-    serde_json::from_str(&value).map_err(|error| AgentDefinitionError::Storage(error.to_string()))
+    serde_json::from_str(&value).map_err(storage_error)
 }
 
 fn same_revision(
@@ -130,10 +134,8 @@ fn same_revision(
     }
     // serde_json feature unification can change object key order between hosts.
     // Compare content without rewriting any previously persisted revision.
-    let existing: serde_json::Value = serde_json::from_str(existing_json)
-        .map_err(|error| AgentDefinitionError::Storage(error.to_string()))?;
-    let current: serde_json::Value = serde_json::from_str(spec_json)
-        .map_err(|error| AgentDefinitionError::Storage(error.to_string()))?;
+    let existing: serde_json::Value = serde_json::from_str(existing_json).map_err(storage_error)?;
+    let current: serde_json::Value = serde_json::from_str(spec_json).map_err(storage_error)?;
     Ok(existing == current)
 }
 
@@ -148,10 +150,7 @@ impl AgentDefinitionStore for SqlAgentDefinitionStore {
         let now = chrono::Utc::now().timestamp_millis();
         match self {
             Self::Sqlite(pool) => {
-                let mut transaction = pool
-                    .begin()
-                    .await
-                    .map_err(|error| AgentDefinitionError::Storage(error.to_string()))?;
+                let mut transaction = pool.begin().await.map_err(storage_error)?;
                 sqlx::query(
                     "INSERT OR IGNORE INTO agent_definition_revisions \
                      (definition_id, slug, version, spec_hash, spec_json, created_at) \
@@ -165,7 +164,7 @@ impl AgentDefinitionStore for SqlAgentDefinitionStore {
                 .bind(now)
                 .execute(&mut *transaction)
                 .await
-                .map_err(|error| AgentDefinitionError::Storage(error.to_string()))?;
+                .map_err(storage_error)?;
                 let (existing_hash, existing_json): (String, String) = sqlx::query_as(
                     "SELECT spec_hash, spec_json FROM agent_definition_revisions \
                      WHERE definition_id = ? AND version = ?",
@@ -174,7 +173,7 @@ impl AgentDefinitionStore for SqlAgentDefinitionStore {
                 .bind(i64::from(spec.revision))
                 .fetch_one(&mut *transaction)
                 .await
-                .map_err(|error| AgentDefinitionError::Storage(error.to_string()))?;
+                .map_err(storage_error)?;
                 if !same_revision(&existing_hash, &existing_json, spec_hash, &spec_json)? {
                     return Err(revision_mismatch(spec));
                 }
@@ -186,7 +185,7 @@ impl AgentDefinitionStore for SqlAgentDefinitionStore {
                 .bind(now)
                 .execute(&mut *transaction)
                 .await
-                .map_err(|error| AgentDefinitionError::Storage(error.to_string()))?;
+                .map_err(storage_error)?;
                 let (enabled, model_id, thinking_level): (bool, Option<String>, Option<String>) =
                     sqlx::query_as(
                         "SELECT enabled, model_id, thinking_level FROM agent_definition_configs \
@@ -195,11 +194,8 @@ impl AgentDefinitionStore for SqlAgentDefinitionStore {
                     .bind(spec.id.as_str())
                     .fetch_one(&mut *transaction)
                     .await
-                    .map_err(|error| AgentDefinitionError::Storage(error.to_string()))?;
-                transaction
-                    .commit()
-                    .await
-                    .map_err(|error| AgentDefinitionError::Storage(error.to_string()))?;
+                    .map_err(storage_error)?;
+                transaction.commit().await.map_err(storage_error)?;
                 Ok(AgentDefinitionConfig {
                     enabled,
                     model_id,
@@ -207,10 +203,7 @@ impl AgentDefinitionStore for SqlAgentDefinitionStore {
                 })
             }
             Self::Postgres(pool) => {
-                let mut transaction = pool
-                    .begin()
-                    .await
-                    .map_err(|error| AgentDefinitionError::Storage(error.to_string()))?;
+                let mut transaction = pool.begin().await.map_err(storage_error)?;
                 sqlx::query(
                     "INSERT INTO agent_definition_revisions \
                      (definition_id, slug, version, spec_hash, spec_json, created_at) \
@@ -225,7 +218,7 @@ impl AgentDefinitionStore for SqlAgentDefinitionStore {
                 .bind(now)
                 .execute(&mut *transaction)
                 .await
-                .map_err(|error| AgentDefinitionError::Storage(error.to_string()))?;
+                .map_err(storage_error)?;
                 let (existing_hash, existing_json): (String, String) = sqlx::query_as(
                     "SELECT spec_hash, spec_json FROM agent_definition_revisions \
                      WHERE definition_id = $1 AND version = $2 FOR UPDATE",
@@ -234,7 +227,7 @@ impl AgentDefinitionStore for SqlAgentDefinitionStore {
                 .bind(i64::from(spec.revision))
                 .fetch_one(&mut *transaction)
                 .await
-                .map_err(|error| AgentDefinitionError::Storage(error.to_string()))?;
+                .map_err(storage_error)?;
                 if !same_revision(&existing_hash, &existing_json, spec_hash, &spec_json)? {
                     return Err(revision_mismatch(spec));
                 }
@@ -247,7 +240,7 @@ impl AgentDefinitionStore for SqlAgentDefinitionStore {
                 .bind(now)
                 .execute(&mut *transaction)
                 .await
-                .map_err(|error| AgentDefinitionError::Storage(error.to_string()))?;
+                .map_err(storage_error)?;
                 let (enabled, model_id, thinking_level): (bool, Option<String>, Option<String>) =
                     sqlx::query_as(
                         "SELECT enabled, model_id, thinking_level FROM agent_definition_configs \
@@ -256,11 +249,8 @@ impl AgentDefinitionStore for SqlAgentDefinitionStore {
                     .bind(spec.id.as_str())
                     .fetch_one(&mut *transaction)
                     .await
-                    .map_err(|error| AgentDefinitionError::Storage(error.to_string()))?;
-                transaction
-                    .commit()
-                    .await
-                    .map_err(|error| AgentDefinitionError::Storage(error.to_string()))?;
+                    .map_err(storage_error)?;
+                transaction.commit().await.map_err(storage_error)?;
                 Ok(AgentDefinitionConfig {
                     enabled,
                     model_id,
@@ -297,7 +287,7 @@ impl AgentDefinitionStore for SqlAgentDefinitionStore {
                 .await
             }
         }
-        .map_err(|error| AgentDefinitionError::Storage(error.to_string()))?;
+        .map_err(storage_error)?;
         row.map(|(spec, hash)| decode_spec(spec).map(|spec| (spec, hash)))
             .transpose()
     }
@@ -336,7 +326,7 @@ impl AgentDefinitionStore for SqlAgentDefinitionStore {
             .await
             .map(|result| result.rows_affected()),
         }
-        .map_err(|error| AgentDefinitionError::Storage(error.to_string()))?;
+        .map_err(storage_error)?;
         if rows == 0 {
             return Err(AgentDefinitionError::NotFound);
         }

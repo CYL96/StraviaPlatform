@@ -37,7 +37,7 @@ Latency Preference 的输出 tok/s 为一小时内成功 attempt 的 `Σoutput_t
 ## Consequences
 
 - 管理面必须能显式设置 Target Priority 与失败旋钮，不能再用列表 `index+1` 当优先级。
-- 选路通过 `UsageStatsStore` 读取 `target_attempt_observations` 的 24h/1h Confirmed Upstream Usage 聚合，并叠加进行中占位；共享连续失败计数与冷却状态保持进程内。存储查询失败时沿用进程内最后一次成功快照并标记 stale；尚无快照或 Observation gap 导致数据缺失时，以无历史用量的既有调度 fallback 继续选路，不能让观测失败阻断推理。
+- 选路通过 `UsageStatsStore` 读取 `target_attempt_observations` 的 24h/1h Confirmed Upstream Usage 聚合，并叠加进行中占位；共享连续失败计数与冷却状态保持进程内。存储普通查询错误时沿用进程内最后一次成功快照并标记 stale；尚无快照或 Observation gap 导致数据缺失时，以无历史用量的既有调度 fallback 继续选路，不能让普通观测失败阻断推理。存储失败按用户修订的 ADR-0060 只影响所属请求或任务，不再触发实例终止；这里已有有效缓存与 stale/fallback 的正常调度语义保持不变，不新增存储健康模式或改变选路、重试预算。长期管理 Stats Usage 的 15 分钟汇总不替代选路所需的原始 24h/1h 短窗口。
 - 529 / QuotaExceeded 与 HTTP `is_retryable(status)` 必须对齐到三档处置，不能再两套判定。
 - Target Priority 的合法范围由 ADR-0036 改为有符号 32 位全区间；本 ADR 的分层选择顺序不变。
 - 管理面用优先级泳道表达这些组，见 ADR-0037；已禁用 Target 见 ADR-0035。

@@ -535,41 +535,38 @@ mod tests {
 
         async fn stats_overview(
             &self,
-            hours: Option<i64>,
+            window: crate::db::models::StatsWindow,
         ) -> anyhow::Result<crate::db::models::StatsOverview> {
-            self.delegate.stats_overview(hours).await
+            self.delegate.stats_overview(window).await
         }
 
         async fn stats_series(
             &self,
-            hours: i64,
+            window: crate::db::models::StatsWindow,
             bucket_ms: i64,
-            tz_offset_ms: i64,
         ) -> anyhow::Result<Vec<crate::db::models::StatsSeries>> {
-            self.delegate
-                .stats_series(hours, bucket_ms, tz_offset_ms)
-                .await
+            self.delegate.stats_series(window, bucket_ms).await
         }
 
         async fn stats_by_model(
             &self,
-            hours: Option<i64>,
+            window: crate::db::models::StatsWindow,
         ) -> anyhow::Result<Vec<crate::db::models::ModelStats>> {
-            self.delegate.stats_by_model(hours).await
+            self.delegate.stats_by_model(window).await
         }
 
         async fn stats_by_provider(
             &self,
-            hours: Option<i64>,
+            window: crate::db::models::StatsWindow,
         ) -> anyhow::Result<Vec<crate::db::models::ProviderStats>> {
-            self.delegate.stats_by_provider(hours).await
+            self.delegate.stats_by_provider(window).await
         }
 
         async fn stats_by_api_key(
             &self,
-            hours: Option<i64>,
+            window: crate::db::models::StatsWindow,
         ) -> anyhow::Result<Vec<crate::db::models::ApiKeyStats>> {
-            self.delegate.stats_by_api_key(hours).await
+            self.delegate.stats_by_api_key(window).await
         }
     }
 

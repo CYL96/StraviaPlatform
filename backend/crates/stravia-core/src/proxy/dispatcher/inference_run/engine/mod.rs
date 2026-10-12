@@ -19,6 +19,8 @@ mod leg;
 mod projection;
 mod settlement;
 mod stream;
+#[cfg(test)]
+pub(super) use stream::TerminalReceiptRecoveryGate;
 mod util;
 use self::completion::*;
 use self::delivery::{

@@ -439,11 +439,47 @@ impl Drop for Page {
         }
         let cdp = self.cdp.clone();
         let target = std::mem::take(&mut self.target);
+        let session = std::mem::take(&mut self.session);
+        let deadline = tokio::time::Instant::now() + cdp::CALL_TIMEOUT;
         self.cdp.cleanup(async move {
-            if let Err(error) = cdp
-                .call(None, "Target.closeTarget", json!({"targetId": target}))
+            if !session.is_empty() {
+                let stopped = tokio::time::timeout_at(
+                    deadline,
+                    cdp.call(Some(&session), "Page.stopLoading", json!({})),
+                )
                 .await
-            {
+                .map_err(anyhow::Error::from)
+                .and_then(|result| result);
+                if let Err(error) = stopped {
+                    tracing::warn!("stopping dropped Chrome page loading failed");
+                    if error
+                        .downcast_ref::<cdp::ProtocolError>()
+                        .is_some_and(cdp::ProtocolError::is_inactive_page)
+                    {
+                        // Chromium queues renderer commands until the pending native
+                        // navigation commits or aborts and the current host is rebound.
+                        // This scalar probe needs no execution context or Runtime.enable.
+                        let settled = tokio::time::timeout_at(
+                            deadline,
+                            cdp.call(Some(&session), "Runtime.getIsolateId", json!({})),
+                        )
+                        .await;
+                        if !matches!(settled, Ok(Ok(_))) {
+                            tracing::warn!(
+                                "settling dropped Chrome page navigation failed; closing target"
+                            );
+                        }
+                    }
+                }
+            }
+            let result = tokio::time::timeout_at(
+                deadline,
+                cdp.call(None, "Target.closeTarget", json!({"targetId": target})),
+            )
+            .await
+            .map_err(anyhow::Error::from)
+            .and_then(|result| result);
+            if let Err(error) = result {
                 tracing::debug!(%error, "dropped Chrome target cleanup failed");
             }
         });
@@ -838,7 +874,7 @@ mod tests {
         assert!(page.html.contains("Understanding unusual traffic"));
     }
 
-    async fn wait_for_no_pages(browser: &Chrome) {
+    async fn wait_for_no_pages(browser: &Chrome, phase: &str) {
         tokio::time::timeout(Duration::from_secs(15), async {
             loop {
                 let targets = browser
@@ -858,7 +894,7 @@ mod tests {
             }
         })
         .await
-        .expect("canceled page must close");
+        .unwrap_or_else(|error| panic!("canceled page must close: phase={phase}; {error}"));
     }
 
     #[tokio::test]
@@ -913,6 +949,9 @@ mod tests {
         let runtime = BrowserRuntime::new(fixture.config.clone());
         let browser = runtime.browser().await.unwrap();
         let profile = browser.process.as_ref().unwrap().profile.clone();
+        let cleanup = browser.process.as_ref().unwrap().cleanup.clone();
+        let owned_process = cleanup.lock().clone();
+        let last_owner = Arc::downgrade(&browser);
         let page = browser.page().await.unwrap();
         page.navigate_and_render("http://93.184.216.34/worlds", "body#ready", None)
             .await
@@ -996,7 +1035,7 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("timed out"));
-        wait_for_no_pages(&browser).await;
+        wait_for_no_pages(&browser, "render timeout").await;
         let clone = runtime.clone();
         let pending = tokio::spawn(async move {
             clone
@@ -1006,15 +1045,27 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
         pending.abort();
         let _ = pending.await;
-        wait_for_no_pages(&browser).await;
+        wait_for_no_pages(&browser, "abort after 200ms").await;
         drop(browser);
         drop(runtime);
+        assert_eq!(
+            last_owner.strong_count(),
+            0,
+            "canceled render must release the last Chrome owner"
+        );
         tokio::time::timeout(Duration::from_secs(30), async {
             while tokio::fs::try_exists(&profile).await.unwrap() {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
         })
         .await
-        .expect("last runtime owner must reap Chrome and remove profile");
+        .unwrap_or_else(|error| {
+            panic!(
+                "last runtime owner must reap Chrome and remove profile: {error}; \
+                 {owned_process}; owned_profile={}; cleanup={}",
+                profile.file_name().unwrap().to_string_lossy(),
+                cleanup.lock()
+            )
+        });
     }
 }

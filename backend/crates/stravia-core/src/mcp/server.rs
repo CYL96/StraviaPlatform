@@ -145,14 +145,14 @@ impl ServerHandler for StraviaMcpServer {
     ) -> Result<CallToolResponse, McpError> {
         let context = mcp_context(&context)?;
         let arguments = Value::Object(request.arguments.unwrap_or_default());
-        match crate::rpm::scope_root_request(
+        let outcome = crate::rpm::scope_root_request(
             crate::rpm::RootRequest::default(),
             self.gateway
                 .mcp_registry
                 .call(request.name.as_ref(), arguments, &context),
         )
-        .await
-        {
+        .await;
+        match outcome {
             Ok(output) => {
                 let mut result = if output.is_error {
                     CallToolResult::structured_error(output.structured_content)

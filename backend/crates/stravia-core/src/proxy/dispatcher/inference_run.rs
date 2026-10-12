@@ -414,12 +414,29 @@ struct TerminalDelivery {
 struct GuardedVendorPublications {
     _guards: Vec<tokio::sync::OwnedRwLockReadGuard<()>>,
     publications: Vec<crate::plugin::VendorPublicationFence>,
+    confirmed_sent: std::sync::atomic::AtomicBool,
 }
 
 impl GuardedVendorPublications {
     fn ensure_current(&self) -> anyhow::Result<()> {
         for publication in &self.publications {
             publication.ensure_current()?;
+        }
+        Ok(())
+    }
+
+    fn ensure_for_settlement(&self) -> anyhow::Result<()> {
+        if !self
+            .confirmed_sent
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return self.ensure_current();
+        }
+        // Sent was strictly validated synchronously at the body poll. A later
+        // caller drop or deadline cannot undo delivered bytes, but provider
+        // generation revocation still suppresses every result-derived write.
+        for publication in &self.publications {
+            publication.ensure_generation_current()?;
         }
         Ok(())
     }
@@ -940,6 +957,9 @@ impl RunTerminalContext {
             // The read locks fence epoch revocation; caller/deadline validity
             // must also remain true at the actual synchronous Sent boundary.
             if guards.ensure_current().is_ok() {
+                guards
+                    .confirmed_sent
+                    .store(true, std::sync::atomic::Ordering::Release);
                 self.publish_client_completion(&observer, delivered_at);
             }
         }

@@ -1,6 +1,8 @@
 mod attribution;
 mod bundle;
 mod codec;
+#[cfg(test)]
+mod durable_usage_hard_cases_tests;
 mod grouping;
 mod live;
 mod manifest_index;
@@ -17,7 +19,6 @@ pub(crate) mod upgrade;
 mod writer;
 
 pub(crate) use attribution::AdmissionFacts;
-pub(crate) use query::failed::{FAILED_SELECT, REQUEST_SELECT};
 pub(crate) use redaction::{ProtectedSecrets, redact_text, redact_url, redact_value};
 pub(crate) use trace::optimize_trace_directory;
 pub use types::*;
@@ -622,8 +623,7 @@ impl InteractionObservation {
             .map_err(|_| anyhow::anyhow!("observation writer unavailable"))?;
         receiver
             .await
-            .map_err(|_| anyhow::anyhow!("observation writer unavailable"))?;
-        Ok(())
+            .map_err(|_| anyhow::anyhow!("observation writer unavailable"))?
     }
     pub(crate) fn stop_background(&self) {
         crate::performance::set_debug(&self.inner.debug, false);
@@ -1487,14 +1487,15 @@ impl RunObserver {
                 event,
             }
         };
-        if self
-            .inner
-            .observation
-            .inner
-            .writer
-            .try_send(command)
-            .is_err()
-        {
+        if let Err(error) = self.inner.observation.inner.writer.try_send(command) {
+            #[cfg(feature = "test-support")]
+            if matches!(&error, mpsc::error::TrySendError::Full(_))
+                && std::env::var_os("STRAVIA_TEST_OBSERVATION_QUEUE_HOLD_ADDR").is_some()
+            {
+                println!("STRAVIA_TEST_OBSERVATION_QUEUE_FULL");
+            }
+            #[cfg(not(feature = "test-support"))]
+            let _ = error;
             *queued = None;
             self.inner.gap.store(true, Ordering::Release);
             let observation = &self.inner.observation.inner;
@@ -1853,6 +1854,189 @@ mod snapshot_tests {
             generation_root_id: None,
             generation_parent_id: None,
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn asynchronous_usage_failure_blocks_public_clear_but_diagnostic_gap_does_not()
+    -> anyhow::Result<()> {
+        for stats_bearing in [true, false] {
+            let directory = tempfile::tempdir()?;
+            let pool = crate::test_support::migrated_sqlite_pool().await?;
+            let observation = test_observation(&pool, directory.path(), false).await;
+            let run = test_run(&observation, "async-summary", facts(Vec::new()));
+            run.record(RunEvent::ModelTurnStarted {
+                model_turn_id: "async-turn".into(),
+                route_id: "route".into(),
+                model_display_name: None,
+                estimated_input_tokens: None,
+            });
+            run.record(RunEvent::TargetAttemptStarted {
+                model_turn_id: "async-turn".into(),
+                attempt_id: "async-attempt".into(),
+                target_id: "target".into(),
+                provider_id: "provider".into(),
+                provider_name: "Provider".into(),
+                upstream_model: "model".into(),
+                protocol: "responses".into(),
+                upstream_url: "http://localhost".into(),
+            });
+            run.record(RunEvent::TargetAttemptFinished {
+                model_turn_id: "async-turn".into(),
+                attempt_id: "async-attempt".into(),
+                status: "completed".into(),
+                status_code: None,
+                error_code: None,
+                error: None,
+                duration_ms: 100,
+                first_token_ms: None,
+                usage: Some(ConfirmedUsage {
+                    input_tokens: Some(10),
+                    output_tokens: Some(7),
+                    cache_read_tokens: Some(0),
+                    cache_write_tokens: None,
+                    reasoning_tokens: None,
+                    coverage: None,
+                }),
+            });
+            observation.flush().await?;
+            sqlx::raw_sql("UPDATE inference_run_observations SET status='completed',finished_at=started_at+100 WHERE id='async-summary'; UPDATE model_turn_observations SET status='completed',finished_at=started_at+100 WHERE id='async-turn'; UPDATE interaction_observations SET status='completed' WHERE root_run_id='async-summary';")
+                .execute(&pool).await?;
+            if stats_bearing {
+                sqlx::raw_sql("CREATE TRIGGER async_summary_fault BEFORE UPDATE ON stats_usage_buckets BEGIN SELECT RAISE(ABORT,'summary unavailable'); END;")
+                    .execute(&pool).await?;
+                run.record(RunEvent::UsageConfirmed {
+                    model_turn_id: "async-turn".into(),
+                    attempt_id: "async-attempt".into(),
+                    usage: ConfirmedUsage {
+                        input_tokens: None,
+                        output_tokens: Some(99),
+                        cache_read_tokens: None,
+                        cache_write_tokens: None,
+                        reasoning_tokens: None,
+                        coverage: None,
+                    },
+                });
+                // Public cleanup's barrier must observe the failed asynchronous transaction.
+                assert!(observation.clear_history().await.is_err());
+                let retained: (i64, bool) = sqlx::query_as("SELECT (SELECT output_tokens FROM target_attempt_observations WHERE id='async-attempt'),observation_gap FROM interaction_observations WHERE root_run_id='async-summary'")
+                    .fetch_one(&pool).await?;
+                assert_eq!(retained, (7, true));
+                sqlx::query("DROP TRIGGER async_summary_fault")
+                    .execute(&pool)
+                    .await?;
+                // Removing the storage fault cannot reconstruct the discarded confirmed revision.
+                assert!(observation.clear_history().await.is_err());
+                assert!(observation.sweep().await.is_err());
+            } else {
+                sqlx::raw_sql("CREATE TRIGGER async_diagnostic_fault BEFORE INSERT ON observation_events BEGIN SELECT RAISE(ABORT,'diagnostic unavailable'); END;")
+                    .execute(&pool).await?;
+                run.record(visible_item("diagnostic-only", "text"));
+                observation.flush().await?;
+                sqlx::query("DROP TRIGGER async_diagnostic_fault")
+                    .execute(&pool)
+                    .await?;
+                observation.clear_history().await?;
+                let retained: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM interaction_observations WHERE root_run_id='async-summary'")
+                    .fetch_one(&pool).await?;
+                assert_eq!(retained, 0);
+            }
+            observation.stop_background();
+            drop(run);
+            drop(observation);
+            pool.close().await;
+        }
+        for diagnostic_first in [true, false] {
+            let directory = tempfile::tempdir()?;
+            let pool = crate::test_support::migrated_sqlite_pool().await?;
+            let observation = test_observation(&pool, directory.path(), false).await;
+            let run = test_run(&observation, "mixed-batch", facts(Vec::new()));
+            run.record(RunEvent::ModelTurnStarted {
+                model_turn_id: "mixed-turn".into(),
+                route_id: "route".into(),
+                model_display_name: None,
+                estimated_input_tokens: None,
+            });
+            run.record(RunEvent::TargetAttemptStarted {
+                model_turn_id: "mixed-turn".into(),
+                attempt_id: "mixed-attempt".into(),
+                target_id: "target".into(),
+                provider_id: "provider".into(),
+                provider_name: "Provider".into(),
+                upstream_model: "model".into(),
+                protocol: "responses".into(),
+                upstream_url: "http://localhost".into(),
+            });
+            run.record(RunEvent::TargetAttemptFinished {
+                model_turn_id: "mixed-turn".into(),
+                attempt_id: "mixed-attempt".into(),
+                status: "completed".into(),
+                status_code: None,
+                error_code: None,
+                error: None,
+                duration_ms: 100,
+                first_token_ms: None,
+                usage: Some(ConfirmedUsage {
+                    input_tokens: Some(10),
+                    output_tokens: Some(7),
+                    cache_read_tokens: Some(0),
+                    cache_write_tokens: None,
+                    reasoning_tokens: None,
+                    coverage: None,
+                }),
+            });
+            observation.flush().await?;
+            sqlx::raw_sql("CREATE TRIGGER mixed_diagnostic_fault BEFORE INSERT ON observation_events WHEN NEW.kind='credential_mappings_created' BEGIN SELECT RAISE(ABORT,'diagnostic unavailable'); END;")
+                .execute(&pool).await?;
+            let diagnostic = RunEvent::CredentialMappingsCreated {
+                discoveries: vec![CredentialDiscovery {
+                    rule_ids: vec!["rule".into()],
+                    source_types: vec!["user_message".into()],
+                }],
+            };
+            let usage = RunEvent::UsageConfirmed {
+                model_turn_id: "mixed-turn".into(),
+                attempt_id: "mixed-attempt".into(),
+                usage: ConfirmedUsage {
+                    input_tokens: None,
+                    output_tokens: Some(99),
+                    cache_read_tokens: None,
+                    cache_write_tokens: None,
+                    reasoning_tokens: None,
+                    coverage: None,
+                },
+            };
+            // No await between these sends: on this current-thread runtime both
+            // commands are queued before the real writer can collect either one.
+            if diagnostic_first {
+                run.record(diagnostic);
+                run.record(usage);
+            } else {
+                run.record(usage);
+                run.record(diagnostic);
+            }
+            let flushed = observation.flush().await;
+            let retained: (i64, bool) = sqlx::query_as("SELECT (SELECT output_tokens FROM target_attempt_observations WHERE id='mixed-attempt'),observation_gap FROM interaction_observations WHERE root_run_id='mixed-batch'")
+                .fetch_one(&pool).await?;
+            sqlx::query("DROP TRIGGER mixed_diagnostic_fault")
+                .execute(&pool)
+                .await?;
+            let cleared = observation.clear_history().await;
+            observation.stop_background();
+            drop(run);
+            drop(observation);
+            pool.close().await;
+
+            assert_eq!(retained, (99, true), "diagnostic_first={diagnostic_first}");
+            assert!(
+                flushed.is_ok(),
+                "diagnostic loss must not poison usage durability"
+            );
+            assert!(
+                cleared.is_ok(),
+                "diagnostic loss must not block history cleanup"
+            );
+        }
+        Ok(())
     }
 
     type RunRow = (String, String, Option<String>, String, Option<String>);

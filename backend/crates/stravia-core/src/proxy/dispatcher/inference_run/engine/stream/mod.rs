@@ -30,6 +30,13 @@ use super::{
     render_leg_failure, report_projected_delivery, settle,
 };
 
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct TerminalReceiptRecoveryGate {
+    pub(crate) entered: Arc<tokio::sync::Notify>,
+    pub(crate) release: Arc<tokio::sync::Notify>,
+}
+
 pub(super) struct ModelTurnStreamInput {
     pub(super) turn: ModelTurn,
     pub(super) executor: Arc<dyn ModelTurnExecutor>,
@@ -253,8 +260,19 @@ pub(super) async fn handle_model_turn_stream(input: ModelTurnStreamInput) -> Rou
 
             if !(aborted || transport.disrupted()) {
                 let commit = ops.client_commit(&projection);
-                let advance = leg
-                    .advance(
+                let advance = tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => {
+                        transport.cancelled = true;
+                        #[cfg(feature = "test-support")]
+                        println!("STRAVIA_TEST_LIVE_ADVANCE_CANCELLED");
+                        None
+                    }
+                    _ = receiver_watch.closed() => {
+                        transport.receiver_closed = true;
+                        None
+                    }
+                    advance = leg.advance(
                         &mut ops,
                         LegParts {
                             request: &mut request,
@@ -270,10 +288,11 @@ pub(super) async fn handle_model_turn_stream(input: ModelTurnStreamInput) -> Rou
                             generation: &mut generation,
                             fixed_media_plan: fixed_media_plan.as_ref(),
                         },
-                    )
-                    .await;
+                    ) => Some(advance),
+                };
                 match advance {
-                    LegAdvance::Ready(prepared) => {
+                    None => {}
+                    Some(LegAdvance::Ready(prepared)) => {
                         let PreparedDelivery {
                             response: prepared_response,
                             staged_delivery: prepared_staged,
@@ -287,11 +306,11 @@ pub(super) async fn handle_model_turn_stream(input: ModelTurnStreamInput) -> Rou
                         started_executions = prepared_started;
                         staged_delivery = Some(prepared_staged);
                     }
-                    LegAdvance::NextLeg(next) => {
+                    Some(LegAdvance::NextLeg(next)) => {
                         turn = *next;
                         continue 'model_legs;
                     }
-                    LegAdvance::HookResponse(plan) => {
+                    Some(LegAdvance::HookResponse(plan)) => {
                         let HookResponsePlan {
                             response: hook_response,
                             staged_delivery: hook_marker_delivery,
@@ -369,7 +388,7 @@ pub(super) async fn handle_model_turn_stream(input: ModelTurnStreamInput) -> Rou
                             staged_delivery = Some(hook_marker_delivery);
                         }
                     }
-                    LegAdvance::StreamError(error) => {
+                    Some(LegAdvance::StreamError(error)) => {
                         let error = [AiStreamDelta::StreamError { error }];
                         if delivery.send_deltas(&error).await == DeliveryProgress::Sent
                             && delivery.finish_stream("failed".into()).await
@@ -379,11 +398,11 @@ pub(super) async fn handle_model_turn_stream(input: ModelTurnStreamInput) -> Rou
                         }
                         aborted = true;
                     }
-                    LegAdvance::Outcome(outcome) => {
+                    Some(LegAdvance::Outcome(outcome)) => {
                         preflight_failure = Some(outcome);
                         aborted = true;
                     }
-                    LegAdvance::Failed(failure) => {
+                    Some(LegAdvance::Failed(failure)) => {
                         aborted = true;
                         terminal_failure.get_or_insert_with(|| failure.public_stream_error());
                         // A commit already reached the wire, so there is no
@@ -397,11 +416,11 @@ pub(super) async fn handle_model_turn_stream(input: ModelTurnStreamInput) -> Rou
                             });
                         }
                     }
-                    LegAdvance::Disrupted(progress) => {
+                    Some(LegAdvance::Disrupted(progress)) => {
                         apply_delivery_progress(progress, &mut transport);
                         aborted = true;
                     }
-                    LegAdvance::Aborted => aborted = true,
+                    Some(LegAdvance::Aborted) => aborted = true,
                 }
             }
             if aborted && let Some(partial_response) = leg.take_partial_response() {
@@ -642,19 +661,39 @@ pub(super) async fn handle_model_turn_stream(input: ModelTurnStreamInput) -> Rou
             } else if !aborted
                 && !preflight_failed
                 && !transport.disrupted()
-                && delivery
+            {
+                let progress = delivery
                     .finish_stream(
                         response
                             .stop_reason
                             .clone()
                             .unwrap_or_else(|| "stop".into()),
                     )
-                    .await
-                    == DeliveryProgress::Sent
-            {
-                delivery_completed_at = delivery.wait_for_terminal_delivery().await;
+                    .await;
+                match progress {
+                    DeliveryProgress::Sent => {
+                        delivery_completed_at = delivery.wait_for_terminal_delivery().await;
+                    }
+                    progress => apply_delivery_progress(progress, &mut transport),
+                }
             }
 
+            #[cfg(test)]
+            if let Some(gate) = request_context.extensions.get::<TerminalReceiptRecoveryGate>() {
+                gate.entered.notify_one();
+                gate.release.notified().await;
+            }
+            if delivery_completed_at.is_none()
+                && !aborted
+                && !preflight_failed
+                && !committed_failure_delivered
+                && !transport.protocol_failed
+            {
+                // A protocol terminal may already have reached the caller while
+                // finish_stream observes the subsequent body drop. Preserve that
+                // actual receipt; transport closure cannot undo delivered output.
+                delivery_completed_at = delivery.take_confirmed_terminal_delivery();
+            }
             if delivery_completed_at.is_some() {
                 settle(
                     &gateway,

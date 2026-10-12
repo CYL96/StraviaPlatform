@@ -30,6 +30,76 @@ pub(super) struct AdmitPayload {
 }
 
 pub(super) const QUEUE_CAPACITY: usize = 2048;
+
+/// Host-only gate: accepting a loopback socket holds the actual bounded
+/// consumer until that socket closes. No synthetic queue errors are injected.
+#[cfg(feature = "test-support")]
+struct TestQueueHold {
+    listener: Option<tokio::net::TcpListener>,
+    held: Option<tokio::net::TcpStream>,
+    draining: bool,
+}
+
+#[cfg(feature = "test-support")]
+impl TestQueueHold {
+    fn new() -> Self {
+        let listener = std::env::var("STRAVIA_TEST_OBSERVATION_QUEUE_HOLD_ADDR")
+            .ok()
+            .map(|value| {
+                let address: std::net::SocketAddr = value.parse().expect("test queue hold address");
+                assert!(
+                    address.ip().is_loopback(),
+                    "test queue gate must be loopback"
+                );
+                let listener = std::net::TcpListener::bind(address).expect("bind test queue gate");
+                listener
+                    .set_nonblocking(true)
+                    .expect("nonblocking test queue gate");
+                tokio::net::TcpListener::from_std(listener).expect("test queue gate runtime")
+            });
+        Self {
+            listener,
+            held: None,
+            draining: false,
+        }
+    }
+
+    async fn recv(&mut self, rx: &mut mpsc::Receiver<WriterCommand>) -> Option<WriterCommand> {
+        use tokio::io::AsyncReadExt;
+        loop {
+            if let Some(stream) = &mut self.held {
+                // The outer writer timers may cancel this read. Keep the socket
+                // in the gate state so cancellation never resumes consumption.
+                let mut byte = [0];
+                match stream.read(&mut byte).await {
+                    Ok(0) | Err(_) => {
+                        self.held = None;
+                        self.draining = true;
+                        println!("STRAVIA_TEST_OBSERVATION_QUEUE_RELEASED");
+                    }
+                    Ok(_) => {}
+                }
+                continue;
+            }
+            if self.draining && rx.is_empty() {
+                self.draining = false;
+                println!("STRAVIA_TEST_OBSERVATION_QUEUE_DRAINED");
+            }
+            let Some(listener) = &self.listener else {
+                return rx.recv().await;
+            };
+            tokio::select! {
+                accepted = listener.accept() => {
+                    let (stream, _) = accepted.expect("accept test queue gate");
+                    self.held = Some(stream);
+                    println!("STRAVIA_TEST_OBSERVATION_QUEUE_HELD");
+                }
+                command = rx.recv() => return command,
+            }
+        }
+    }
+}
+
 pub(super) const LIVE_COALESCE_BYTES: usize = 16 * 1024;
 
 pub(super) enum WriterCommand {
@@ -93,7 +163,7 @@ pub(super) enum WriterCommand {
         interaction_id: String,
         done: oneshot::Sender<()>,
     },
-    Barrier(oneshot::Sender<()>),
+    Barrier(oneshot::Sender<anyhow::Result<()>>),
     Shutdown(oneshot::Sender<()>),
 }
 
@@ -136,7 +206,17 @@ pub(super) fn spawn(
         live,
         generation_chains,
     } = deps;
-    let (tx, mut rx) = mpsc::channel(QUEUE_CAPACITY);
+    #[cfg(feature = "test-support")]
+    let capacity = std::env::var("STRAVIA_TEST_OBSERVATION_QUEUE_CAPACITY")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|capacity| (1..=QUEUE_CAPACITY).contains(capacity))
+        .unwrap_or(QUEUE_CAPACITY);
+    #[cfg(not(feature = "test-support"))]
+    let capacity = QUEUE_CAPACITY;
+    #[cfg(feature = "test-support")]
+    let mut queue_hold = TestQueueHold::new();
+    let (tx, mut rx) = mpsc::channel(capacity);
     let handle = tokio::spawn(async move {
         let mut attribution =
             RunAttribution::new(ObservationEvidence::new(store.clone(), generation_chains));
@@ -157,6 +237,9 @@ pub(super) fn spawn(
         let mut deferred = None;
         let mut maintenance = tokio::time::Instant::now();
         let mut next_live_publish = tokio::time::Instant::now() + Duration::from_millis(100);
+        // A discarded stats-bearing transaction cannot be declared summarized by a later barrier.
+        // Keep cleanup blocked for this runtime; ordinary diagnostic gaps do not set this state.
+        let mut incomplete_usage = false;
         let context = WriterContext {
             store: &store,
             debug_trace_index: &debug_trace_index,
@@ -205,7 +288,12 @@ pub(super) fn spawn(
                         .await;
                         continue;
                     },
-                    command = rx.recv() => command,
+                    command = async {
+                        #[cfg(feature = "test-support")]
+                        { queue_hold.recv(&mut rx).await }
+                        #[cfg(not(feature = "test-support"))]
+                        { rx.recv().await }
+                    } => command,
                 }
             };
             let command = match command {
@@ -324,6 +412,10 @@ pub(super) fn spawn(
                     expired_before,
                     done,
                 }) => {
+                    if let Err(error) = ensure_usage_complete(incomplete_usage) {
+                        let _ = done.send(Err(error));
+                        continue;
+                    }
                     // Delete and invalidate grouping in the same writer turn, before another admission.
                     let result = match expired_before {
                         Some(at) => store.purge_expired_rows(at).await,
@@ -373,6 +465,7 @@ pub(super) fn spawn(
                         Ok(Some(event)) => publish(&updates, &trace_sequence, event),
                         Ok(None) => {}
                         Err(error) => {
+                            incomplete_usage = true;
                             tracing::warn!(%run_id, cause=%redacted_persist_cause(&error), "client completion persistence failed");
                             pending_gaps.insert(interaction.to_owned(), at);
                         }
@@ -549,6 +642,7 @@ pub(super) fn spawn(
                             }
                         }
                         Err(error) => {
+                            incomplete_usage = true;
                             unpersisted_gaps.lock().record(&start.id, now);
                             tracing::warn!(run_id=%start.id, %error, "observation admission persistence failed")
                         }
@@ -634,6 +728,9 @@ pub(super) fn spawn(
                 }
                 Some(WriterCommand::Event { run_id, event }) => {
                     let block_id = canonical_block_id(&event);
+                    // Optional diagnostic writes must not roll back usage facts in
+                    // the same transaction and poison their durability barrier.
+                    let usage_bearing = affects_usage(&event);
                     let mut batch = vec![(event, block_id, now())];
                     while batch.len() < 64 {
                         match rx.try_recv() {
@@ -641,6 +738,7 @@ pub(super) fn spawn(
                                 run_id: next_run,
                                 event,
                             }) if next_run == run_id
+                                && affects_usage(&event) == usage_bearing
                                 && !matches!(
                                     event,
                                     RunEvent::ClientVisibleContentDelta { .. }
@@ -708,6 +806,9 @@ pub(super) fn spawn(
                                 }
                             }
                             Err(error) => {
+                                if batch.iter().any(|(event, _, _)| affects_usage(event)) {
+                                    incomplete_usage = true;
+                                }
                                 unpersisted_gaps.lock().record(&run_id, at);
                                 pending_gaps.insert(interaction.to_owned(), at);
                                 live.emit(ObservationUpdate::LiveGap {
@@ -757,6 +858,7 @@ pub(super) fn spawn(
                         }
                     }
                     persist_finish(
+                        &mut incomplete_usage,
                         &context,
                         &mut attribution,
                         &mut pending_text,
@@ -793,6 +895,7 @@ pub(super) fn spawn(
                             publish(&updates, &trace_sequence, value);
                         }
                         Err(error) => {
+                            incomplete_usage = true;
                             tracing::warn!(rejection_id=%ingress.id,%error,"rejection observation persistence failed")
                         }
                     }
@@ -870,6 +973,7 @@ pub(super) fn spawn(
                                 }
                             }
                             persist_finish(
+                                &mut incomplete_usage,
                                 &context,
                                 &mut attribution,
                                 &mut pending_text,
@@ -981,7 +1085,7 @@ pub(super) fn spawn(
                         None,
                     )
                     .await;
-                    let _ = done.send(());
+                    let _ = done.send(ensure_usage_complete(incomplete_usage));
                 }
                 Some(WriterCommand::Shutdown(done)) => {
                     pending_text.publish_live();
@@ -1093,7 +1197,29 @@ fn manifests_match(left: &TraceManifest, right: &TraceManifest) -> bool {
         && left.reasons == right.reasons
 }
 
+fn affects_usage(event: &RunEvent) -> bool {
+    matches!(
+        event,
+        RunEvent::ModelTurnStarted { .. }
+            | RunEvent::ModelTurnFinished { .. }
+            | RunEvent::TargetAttemptStarted { .. }
+            | RunEvent::TargetAttemptFinished { .. }
+            | RunEvent::UsageConfirmed { .. }
+            | RunEvent::DeliveryFinished { .. }
+            | RunEvent::ClientOutputCommitted
+    )
+}
+
+fn ensure_usage_complete(incomplete_usage: bool) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !incomplete_usage,
+        "usage statistics could not be reliably persisted; request history cleanup is blocked"
+    );
+    Ok(())
+}
+
 async fn persist_finish(
+    incomplete_usage: &mut bool,
     context: &WriterContext<'_>,
     attribution: &mut RunAttribution<ObservationEvidence>,
     pending_text: &mut TextBuffer,
@@ -1124,6 +1250,7 @@ async fn persist_finish(
                 publish(context.updates, context.trace_sequence, value);
             }
             Err(error) => {
+                *incomplete_usage = true;
                 pending_text.gaps.lock().record(run_id, at);
                 if let Err(error) = context.store.mark_observation_gap(interaction).await {
                     tracing::debug!(%run_id, %error, "failed to mark Interaction observation gap");

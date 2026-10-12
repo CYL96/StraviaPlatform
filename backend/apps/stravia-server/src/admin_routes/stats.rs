@@ -1,80 +1,85 @@
 use super::*;
 
-// ── Stats ──
-
-#[derive(Deserialize, Default)]
-pub(super) struct StatsRangeParams {
-    hours: Option<i32>,
-}
-
 pub(super) async fn stats_overview(
     State(gw): State<Gateway>,
-    Query(params): Query<StatsRangeParams>,
+    Query(window): Query<StatsWindow>,
 ) -> impl IntoResponse {
-    match gw.admin().get_stats_overview(params.hours).await {
+    match gw.admin().get_stats_overview(window).await {
         Ok(v) => Json(serde_json::json!({ "data": v })).into_response(),
-        Err(e) => err(e),
+        Err(e) => stats_error(e),
     }
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct SeriesParams {
-    #[serde(default = "default_hours")]
-    hours: i32,
-    #[serde(default = "default_bucket")]
-    bucket: i32,
-    #[serde(default)]
-    tz_offset: i32,
-}
-
-pub(super) fn default_hours() -> i32 {
-    24
-}
-
-pub(super) fn default_bucket() -> i32 {
-    3600
+    start_at: Option<i64>,
+    end_at: Option<i64>,
+    bucket: Option<i64>,
 }
 
 pub(super) async fn stats_series(
     State(gw): State<Gateway>,
     Query(params): Query<SeriesParams>,
 ) -> impl IntoResponse {
-    match gw
-        .admin()
-        .get_stats_series(params.hours, params.bucket, params.tz_offset)
-        .await
-    {
+    let window = StatsWindow {
+        start_at: params.start_at,
+        end_at: params.end_at,
+    };
+    match gw.admin().get_stats_series(window, params.bucket).await {
         Ok(v) => Json(serde_json::json!({ "data": v })).into_response(),
-        Err(e) => err(e),
+        Err(e) => stats_error(e),
     }
 }
 
 pub(super) async fn stats_by_model(
     State(gw): State<Gateway>,
-    Query(params): Query<StatsRangeParams>,
+    Query(window): Query<StatsWindow>,
 ) -> impl IntoResponse {
-    match gw.admin().get_stats_by_model(params.hours).await {
+    match gw.admin().get_stats_by_model(window).await {
         Ok(v) => Json(serde_json::json!({ "data": v })).into_response(),
-        Err(e) => err(e),
+        Err(e) => stats_error(e),
     }
 }
 
 pub(super) async fn stats_by_provider(
     State(gw): State<Gateway>,
-    Query(params): Query<StatsRangeParams>,
+    Query(window): Query<StatsWindow>,
 ) -> impl IntoResponse {
-    match gw.admin().get_stats_by_provider(params.hours).await {
+    match gw.admin().get_stats_by_provider(window).await {
         Ok(v) => Json(serde_json::json!({ "data": v })).into_response(),
-        Err(e) => err(e),
+        Err(e) => stats_error(e),
     }
 }
 
 pub(super) async fn stats_by_api_key(
     State(gw): State<Gateway>,
-    Query(params): Query<StatsRangeParams>,
+    Query(window): Query<StatsWindow>,
 ) -> impl IntoResponse {
-    match gw.admin().get_stats_by_api_key(params.hours).await {
+    match gw.admin().get_stats_by_api_key(window).await {
         Ok(v) => Json(serde_json::json!({ "data": v })).into_response(),
-        Err(e) => err(e),
+        Err(e) => stats_error(e),
     }
+}
+
+fn stats_error(error: anyhow::Error) -> axum::response::Response {
+    if let Some(error) = error.downcast_ref::<StatsQueryError>() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": error.to_string(),
+                "code": "invalid_stats_query",
+            })),
+        )
+            .into_response();
+    }
+    tracing::warn!("usage statistics query failed");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({
+            "error": "Usage statistics could not be loaded",
+            "code": "stats_query_failed",
+        })),
+    )
+        .into_response()
 }

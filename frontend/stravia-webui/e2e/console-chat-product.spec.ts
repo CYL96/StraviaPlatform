@@ -369,24 +369,81 @@ test('real gateway accepts original images and persisted reasoning replay under 
             return interactions
           })
           .map(record)
-        const completed = interactions.find(
+        // A new User input normally starts a new Interaction; an exact replay
+        // sent within the rapid-continuation window may instead share one.
+        // Verify both delivered answers and their accounting independently of
+        // the browser reload's incidental timing relative to that boundary.
+        const completed = interactions.filter(
           (item) =>
             item.status === 'completed' &&
             typeof item.visible_tail === 'string' &&
-            item.visible_tail.includes('First real gateway answer') &&
-            item.visible_tail.includes('Second real gateway answer'),
+            (item.visible_tail.includes('First real gateway answer') ||
+              item.visible_tail.includes('Second real gateway answer')),
         )
-        if (!completed) return null
-        const usage = record(completed.usage)
-        return {
-          attempts: record(usage.coverage).attempt_count,
-          inputTokens: usage.input_tokens,
-          outputTokens: usage.output_tokens,
+        const tails = completed.map((item) => item.visible_tail as string)
+        if (
+          !tails.some((tail) => tail.includes('First real gateway answer')) ||
+          !tails.some((tail) => tail.includes('Second real gateway answer'))
+        )
+          return null
+        const total = { attempts: 0, inputTokens: 0, outputTokens: 0 }
+        for (const item of completed) {
+          const usage = record(item.usage)
+          const attempts = record(usage.coverage).attempt_count
+          const inputTokens = usage.input_tokens
+          const outputTokens = usage.output_tokens
+          if (typeof attempts !== 'number' || typeof inputTokens !== 'number' || typeof outputTokens !== 'number') {
+            return null
+          }
+          total.attempts += attempts
+          total.inputTokens += inputTokens
+          total.outputTokens += outputTokens
         }
+        return total
       })
       .toEqual({ attempts: 2, inputTokens: 24, outputTokens: 18 })
     const otherForest = record(await api(`/observations/interactions?${query}&api_key=${otherKeyId}`))
     expect(otherForest.roots).toEqual([])
+
+    // Keep one consumed conversation after deleting another so clear-all also
+    // proves removal of real local history, rather than an already empty list.
+    await page.getByRole('button', { name: 'New conversation', exact: true }).click()
+    await page.getByRole('textbox', { name: 'Message', exact: true }).fill('Conversation to delete locally')
+    await page.getByRole('button', { name: 'Send', exact: true }).click()
+    await expect(page.getByRole('article', { name: 'Assistant response' })).toContainText('Second real gateway answer')
+    await expect(page.getByRole('button', { name: 'Stop', exact: true })).toHaveCount(0)
+    const statsEnd = Math.floor(Date.now() / 900_000) * 900_000 + 900_000
+    const statsQuery = `start_at=${statsEnd - 86_400_000}&end_at=${statsEnd}`
+    const expectedUsage = {
+      total_requests: 3,
+      total_input_tokens: 36,
+      total_output_tokens: 27,
+      total_cache_read_tokens: 15,
+      total_reasoning_tokens: 9,
+      error_count: 0,
+    }
+    await expect
+      .poll(async () => {
+        const stats = record(await api(`/stats/overview?${statsQuery}`))
+        return Object.fromEntries(Object.keys(expectedUsage).map((key) => [key, stats[key]]))
+      })
+      .toEqual(expectedUsage)
+    const baseline = await api(`/stats/overview?${statsQuery}`)
+    await page.getByRole('main').getByRole('button', { name: 'Conversation actions', exact: true }).click()
+    await page.getByRole('menuitem', { name: 'Delete', exact: true }).click()
+    await page.getByRole('alertdialog').getByRole('button', { name: 'Delete', exact: true }).click()
+    await expect(page.getByRole('article', { name: 'Your message' })).toHaveCount(0)
+    expect(await api(`/stats/overview?${statsQuery}`)).toEqual(baseline)
+    await page.goto(`${origin}/conversations`)
+    await expect(page.getByRole('main').getByRole('link', { name: 'First real question', exact: true })).toBeVisible()
+    await page.getByRole('button', { name: 'Clear all conversations', exact: true }).click()
+    await page.getByRole('alertdialog').getByRole('button', { name: 'Clear all conversations', exact: true }).click()
+    await page.reload()
+    await expect(
+      page.getByRole('main').getByRole('link', { name: 'Start new conversation', exact: true }),
+    ).toBeVisible()
+    await expect(page.getByRole('main').getByRole('link', { name: 'First real question', exact: true })).toHaveCount(0)
+    expect(await api(`/stats/overview?${statsQuery}`)).toEqual(baseline)
   } finally {
     try {
       await context.close()

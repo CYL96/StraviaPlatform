@@ -12,11 +12,21 @@ pub(super) struct Process {
     shutdown: Option<oneshot::Sender<()>>,
     #[cfg(test)]
     pub(super) profile: PathBuf,
+    // Only owned-resource lifecycle data: no page, proxy, endpoint or Chrome stderr.
+    #[cfg(test)]
+    pub(super) cleanup: std::sync::Arc<parking_lot::Mutex<String>>,
 }
 
 impl Drop for Process {
     fn drop(&mut self) {
         if let Some(shutdown) = self.shutdown.take() {
+            #[cfg(test)]
+            {
+                let mut cleanup = self.cleanup.lock();
+                if cleanup.starts_with("running owned Chrome") {
+                    *cleanup = "shutdown requested".into();
+                }
+            }
             let _ = shutdown.send(());
         }
     }
@@ -199,9 +209,18 @@ impl Process {
             }
         });
         let (shutdown, stop) = oneshot::channel();
+        #[cfg(test)]
+        let cleanup = std::sync::Arc::new(parking_lot::Mutex::new(format!(
+            "running owned Chrome pid={:?}",
+            child.id()
+        )));
+        #[cfg(test)]
+        let supervisor_cleanup = cleanup.clone();
         tokio::spawn(async move {
             tokio::select! {
                 _ = stop => {
+                    #[cfg(test)]
+                    { *supervisor_cleanup.lock() = "reaping owned Chrome".into(); }
                     if let Err(error) = child.kill().await {
                         tracing::debug!(%error, "Chrome process termination failed");
                     }
@@ -216,14 +235,45 @@ impl Process {
                 }
             }
             stderr_task.abort();
+            #[cfg(test)]
+            {
+                *supervisor_cleanup.lock() = "shutting down owned egress proxy".into();
+            }
             proxy.shutdown().await;
             // Windows 子进程可能短暂持有 profile 文件，退出后异步重试清理。
             let path = profile.keep();
             for attempt in 0..40 {
+                #[cfg(test)]
+                {
+                    *supervisor_cleanup.lock() =
+                        format!("removing owned profile, attempt={attempt}");
+                }
                 match tokio::fs::remove_dir_all(&path).await {
-                    Ok(()) => return,
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+                    Ok(()) => {
+                        #[cfg(test)]
+                        {
+                            *supervisor_cleanup.lock() =
+                                "owned process reaped and profile removed".into();
+                        }
+                        return;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        #[cfg(test)]
+                        {
+                            *supervisor_cleanup.lock() =
+                                "owned process reaped and profile absent".into();
+                        }
+                        return;
+                    }
                     Err(error) if attempt == 39 => {
+                        #[cfg(test)]
+                        {
+                            *supervisor_cleanup.lock() = format!(
+                                "owned profile removal failed: kind={:?}, os_error={:?}",
+                                error.kind(),
+                                error.raw_os_error()
+                            );
+                        }
                         tracing::warn!(%error, path = %path.display(), "Chrome profile cleanup failed")
                     }
                     Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
@@ -235,6 +285,8 @@ impl Process {
             shutdown: Some(shutdown),
             #[cfg(test)]
             profile: profile_path.clone(),
+            #[cfg(test)]
+            cleanup,
         };
         let endpoint = tokio::time::timeout(Duration::from_secs(20), ready)
             .await
