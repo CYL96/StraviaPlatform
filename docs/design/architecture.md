@@ -572,6 +572,8 @@ SQLite 与 PostgreSQL 的候选查询仍将 `(prefix_fingerprint, prefix_item_co
 
 历史指纹与精确前缀核验复用完整消息语义投影：忽略应用 `metadata`、`internal_chat_message_metadata_passthrough` 和交付身份字段，不忽略角色顺序、内容块、工具关联、推理密文、原生压缩状态或未分类协议扩展。原始 wire 字段继续保留。Gateway 初始化时按版本重建旧 Generation 前缀索引，只更新派生列；缺失祖先或过期历史撤销不可用索引，不重写原始节点或父边。
 
+SQLite 与 PostgreSQL 的启动重建在同一事务内先去重旧索引 head 的祖先元数据，校验完整、同 Principal、未过期的 Response 祖先链，再按父节点优先顺序逐节点读取、恢复和解码一次。`TurnChainStore::rebuild_prefixes` 的可变回调接收单个 `TurnNode` 与可选的原完成时间；无索引祖先仍参与折叠，但不新增索引，已有当前版本的祖先索引保持不变。Generation 折叠只保留每节点的客户端 context 哈希与 canonical 单元数，Append 延续父摘要，Replace 从空摘要重新计算，分支互不污染；不为每个 head 重新物化完整祖先历史，也不保留完整正文缓存。只有旧索引更新派生列，成功重建保留原完成时间；解码或存储失败回滚整个索引事务。
+
 Hook、Vendor Plugin 协议选择与 representability gate 完成后，dispatcher 才对完整 Effective Model Request 查找 Reusable Response Prefix。索引只保存已完整交付、upstream terminal 为 `completed` 且 UpstreamResponse/ClientOutput Hook 未改变输出的节点；匹配以完整 `AiItem` 边界进行，并要求 Principal、精确 Target、Provider 账号/配置、resolved model、egress protocol、instructions、tools、reasoning、response format 和其它请求控制严格一致。最长前缀优先；同长度按完成时间与节点 ID 确定性排序。无安全候选、当前 Target 不可续接或全请求相同时发送完整历史，不构造空自动 delta。
 
 OpenAI direct 与 Codex OAuth 的 generation Target 由各自 Vendor Plugin 通过同一个受控 host transport seam 使用上游 Responses WebSocket；客户端协议与 stream/non-stream 交付模式不影响选择，Embeddings 保持 HTTP。连接按 Target namespace、affinity、URL、认证和握手参数隔离，记录最新成功完成的 upstream response ID，同一 socket 一次只有一个 in-flight response，硬性 max-age 为 60 分钟。`store=false` 续接必须原子取得匹配 tip 的可用 socket；分支占用、tip 前移、断线或淘汰时，不先发送旧 ID，而是直接使用 Executor 已保留的完整历史，不消耗恢复预算。Codex 连接身份由 affinity 派生，轮次 ID 留在消息中。上游明确返回 `previous_response_not_found` 或 Codex 无 code 的 ``Invalid `previous_response_id`.`` 时，只有实际请求了续接、尚无模型响应事件且恢复预算允许，才清除 tip 并最多全量回放一次。普通 400、已开始响应和未知接受状态不获得该重放许可。

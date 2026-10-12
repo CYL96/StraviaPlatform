@@ -33,7 +33,7 @@ use stravia_runtime_contract::turn_chain::TurnUnavailable;
 mod continuation;
 pub(crate) use continuation::GenerationParentTarget;
 mod materialize;
-pub(crate) use materialize::rebuilt_prefix;
+pub(crate) use materialize::PrefixRebuild;
 mod pending;
 mod project;
 mod store;

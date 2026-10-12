@@ -183,6 +183,76 @@ fn decode_node(
     })
 }
 
+struct PrefixRebuildNode {
+    id: String,
+    principal: String,
+    parent_id: Option<String>,
+    completed_at: Option<i64>,
+    stale: bool,
+    state: PrefixRebuildVisit,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PrefixRebuildVisit {
+    Unseen,
+    Visiting,
+    Ready,
+    Unavailable,
+}
+
+/// Validate complete chains before reading any payload. Shared ancestors enter
+/// the parent-first order only once; unavailable heads never enter it.
+fn prefix_rebuild_order(nodes: &mut [PrefixRebuildNode]) -> Vec<usize> {
+    let by_id: std::collections::HashMap<_, _> = nodes
+        .iter()
+        .enumerate()
+        .map(|(index, node)| (node.id.as_str(), index))
+        .collect();
+    let mut states = vec![PrefixRebuildVisit::Unseen; nodes.len()];
+    let mut order = Vec::new();
+    let mut path = Vec::new();
+    for head in 0..nodes.len() {
+        if !nodes[head].stale || states[head] != PrefixRebuildVisit::Unseen {
+            continue;
+        }
+        path.clear();
+        let mut current = head;
+        let valid = loop {
+            match states[current] {
+                PrefixRebuildVisit::Ready => break true,
+                PrefixRebuildVisit::Visiting | PrefixRebuildVisit::Unavailable => break false,
+                PrefixRebuildVisit::Unseen => {}
+            }
+            states[current] = PrefixRebuildVisit::Visiting;
+            path.push(current);
+            let Some(parent_id) = nodes[current].parent_id.as_ref() else {
+                break true;
+            };
+            let Some(&parent) = by_id.get(parent_id.as_str()) else {
+                break false;
+            };
+            if nodes[parent].principal != nodes[current].principal {
+                break false;
+            }
+            current = parent;
+        };
+        for &index in path.iter().rev() {
+            states[index] = if valid {
+                PrefixRebuildVisit::Ready
+            } else {
+                PrefixRebuildVisit::Unavailable
+            };
+            if valid {
+                order.push(index);
+            }
+        }
+    }
+    for (node, state) in nodes.iter_mut().zip(states) {
+        node.state = state;
+    }
+    order
+}
+
 #[async_trait]
 impl TurnChainStore for SqlTurnChainStore {
     async fn materialize(
@@ -751,11 +821,10 @@ impl TurnChainStore for SqlTurnChainStore {
     async fn rebuild_prefixes(
         &self,
         namespace_prefix: &str,
-        decode: &(
-             dyn Fn(Vec<TurnNode>, i64) -> Result<Option<ReusablePrefixMetadata>, String>
-                 + Send
-                 + Sync
-         ),
+        decode: &mut (
+                 dyn FnMut(TurnNode, Option<i64>) -> Result<Option<ReusablePrefixMetadata>, String>
+                     + Send
+             ),
     ) -> Result<(), TurnUnavailable> {
         macro_rules! rebuild {
         ($pool:expr, $restore:ident $(, $gate:expr)?) => {{
@@ -765,44 +834,64 @@ impl TurnChainStore for SqlTurnChainStore {
                 .map_err(|error| TurnUnavailable::Storage(error.to_string()))?;
             let now = chrono::Utc::now().timestamp_millis();
             let stale = format!("{namespace_prefix}%");
-            let heads: Vec<(String, String, i64)> = sqlx::query_as(
-                "SELECT id, principal, prefix_completed_at FROM turn_chain_nodes \
+            // UNION (not UNION ALL) deduplicates shared ancestors and terminates
+            // corrupt cycles. Keep payloads out of this closure query.
+            let rows: Vec<(String, String, Option<String>, Option<i64>, i32)> = sqlx::query_as(
+                "WITH RECURSIVE ancestors(id, principal, parent_id, prefix_completed_at, stale) AS (\
+                 SELECT id, principal, parent_id, prefix_completed_at, 1 FROM turn_chain_nodes \
                  WHERE kind = 'response' AND prefix_namespace IS NOT NULL \
-                 AND prefix_namespace NOT LIKE $1 AND expires_at > $2"
+                 AND prefix_namespace NOT LIKE $1 AND expires_at > $2 \
+                 UNION SELECT node.id, node.principal, node.parent_id, \
+                 CASE WHEN node.prefix_namespace IS NOT NULL THEN node.prefix_completed_at ELSE NULL END, \
+                 CASE WHEN node.prefix_namespace IS NOT NULL AND node.prefix_namespace NOT LIKE $1 THEN 1 ELSE 0 END \
+                 FROM ancestors JOIN turn_chain_nodes node ON node.id = ancestors.parent_id \
+                 AND node.principal = ancestors.principal \
+                 WHERE node.kind = 'response' AND node.expires_at > $2) \
+                 SELECT id, principal, parent_id, prefix_completed_at, stale FROM ancestors"
             ).bind(&stale).bind(now).fetch_all(&mut *transaction).await
                 .map_err(|error| TurnUnavailable::Storage(error.to_string()))?;
-            for (id, principal, completed_at) in heads {
-                let rows: Vec<(String, Option<String>, i64, Vec<u8>, i64)> = sqlx::query_as(
-                    "WITH RECURSIVE ancestors(id, parent_id, payload_version, payload, expires_at, depth) AS (\
-                     SELECT id, parent_id, payload_version, payload, expires_at, 0 FROM turn_chain_nodes \
-                     WHERE id = $1 AND principal = $2 AND kind = 'response' \
-                     UNION ALL SELECT node.id, node.parent_id, node.payload_version, node.payload, node.expires_at, ancestors.depth + 1 \
-                     FROM ancestors CROSS JOIN turn_chain_nodes node \
-                     WHERE node.id = ancestors.parent_id AND node.principal = $2 AND node.kind = 'response') \
-                     SELECT id, parent_id, payload_version, payload, expires_at FROM ancestors ORDER BY depth DESC"
-                ).bind(&id).bind(&principal).fetch_all(&mut *transaction).await
+            let mut nodes: Vec<_> = rows.into_iter().map(
+                |(id, principal, parent_id, completed_at, stale)| PrefixRebuildNode {
+                    id, principal, parent_id, completed_at, stale: stale != 0, state: PrefixRebuildVisit::Unseen,
+                }
+            ).collect();
+            let order = prefix_rebuild_order(&mut nodes);
+            for node in nodes.iter().filter(|node| node.stale && node.state == PrefixRebuildVisit::Unavailable) {
+                sqlx::query("UPDATE turn_chain_nodes SET prefix_namespace = NULL, prefix_fingerprint = NULL, prefix_item_count = NULL, prefix_completed_at = NULL, prefix_projection_version = NULL, prefix_controls_fingerprint = NULL, prefix_context_fingerprint = NULL WHERE id = $1 AND principal = $2")
+                    .bind(&node.id).bind(&node.principal).execute(&mut *transaction).await
                     .map_err(|error| TurnUnavailable::Storage(error.to_string()))?;
-                if rows.first().is_none_or(|row| row.1.is_some()) || rows.iter().any(|row| row.4 <= now) {
-                    sqlx::query("UPDATE turn_chain_nodes SET prefix_namespace = NULL, prefix_fingerprint = NULL, prefix_item_count = NULL, prefix_completed_at = NULL, prefix_projection_version = NULL, prefix_controls_fingerprint = NULL, prefix_context_fingerprint = NULL WHERE id = $1 AND principal = $2")
-                        .bind(&id).bind(&principal).execute(&mut *transaction).await
-                        .map_err(|error| TurnUnavailable::Storage(error.to_string()))?;
+            }
+            for index in order {
+                let metadata = &nodes[index];
+                let (version, payload): (i64, Vec<u8>) = sqlx::query_as(
+                    "SELECT payload_version, payload FROM turn_chain_nodes \
+                     WHERE id = $1 AND principal = $2 AND kind = 'response'"
+                ).bind(&metadata.id).bind(&metadata.principal)
+                    .fetch_one(&mut *transaction).await
+                    .map_err(|error| TurnUnavailable::Storage(error.to_string()))?;
+                let mut restored = [decode_node(
+                    TurnNodeId::new(metadata.id.clone()), TurnNodeKind::Response,
+                    metadata.parent_id.clone(), version, payload,
+                )?];
+                content::$restore(&mut transaction, &metadata.principal, &mut restored).await
+                    .map_err(|error| TurnUnavailable::Storage(error.to_string()))?;
+                let [node] = restored;
+                let prefix = decode(node, metadata.completed_at)
+                    .map_err(TurnUnavailable::Storage)?;
+                // Current/no-index ancestors only populate the decoder's domain
+                // state. Their existing index and completion time stay untouched.
+                if !metadata.stale {
                     continue;
                 }
-                let mut nodes = rows.into_iter().map(|(id, parent_id, version, payload, _)| {
-                    decode_node(TurnNodeId::new(id), TurnNodeKind::Response, parent_id, version, payload)
-                }).collect::<Result<Vec<_>, _>>()?;
-                content::$restore(&mut transaction, &principal, &mut nodes).await
-                    .map_err(|error| TurnUnavailable::Storage(error.to_string()))?;
-                let Some(prefix) = decode(nodes, completed_at)
-                    .map_err(TurnUnavailable::Storage)? else {
+                let Some(prefix) = prefix else {
                     sqlx::query("UPDATE turn_chain_nodes SET prefix_namespace = NULL, prefix_fingerprint = NULL, prefix_item_count = NULL, prefix_completed_at = NULL, prefix_projection_version = NULL, prefix_controls_fingerprint = NULL, prefix_context_fingerprint = NULL WHERE id = $1 AND principal = $2")
-                        .bind(&id).bind(&principal).execute(&mut *transaction).await
+                        .bind(&metadata.id).bind(&metadata.principal).execute(&mut *transaction).await
                         .map_err(|error| TurnUnavailable::Storage(error.to_string()))?;
                     continue;
                 };
                 let proof = prefix.projection.as_ref();
                 sqlx::query("UPDATE turn_chain_nodes SET prefix_namespace = $1, prefix_fingerprint = $2, prefix_item_count = $3, prefix_projection_version = $6, prefix_controls_fingerprint = $7, prefix_context_fingerprint = $8 WHERE id = $4 AND principal = $5")
-                    .bind(&prefix.namespace).bind(&prefix.fingerprint).bind(i64::from(prefix.item_count)).bind(id).bind(principal)
+                    .bind(&prefix.namespace).bind(&prefix.fingerprint).bind(i64::from(prefix.item_count)).bind(&metadata.id).bind(&metadata.principal)
                     .bind(proof.map(|proof| i64::from(proof.version)))
                     .bind(proof.map(|proof| proof.controls_fingerprint.as_str()))
                     .bind(proof.map(|proof| proof.context_fingerprint.as_str()))

@@ -166,16 +166,15 @@ impl stravia_runtime_contract::turn_chain::TurnChainStore for CommitBarrierStore
     async fn rebuild_prefixes(
         &self,
         namespace_prefix: &str,
-        decode: &(
-             dyn Fn(
-            Vec<stravia_runtime_contract::turn_chain::TurnNode>,
-            i64,
+        decode: &mut (
+                 dyn FnMut(
+            stravia_runtime_contract::turn_chain::TurnNode,
+            Option<i64>,
         ) -> Result<
             Option<stravia_runtime_contract::turn_chain::ReusablePrefixMetadata>,
             String,
         > + Send
-                 + Sync
-         ),
+             ),
     ) -> Result<(), stravia_runtime_contract::turn_chain::TurnUnavailable> {
         self.inner.rebuild_prefixes(namespace_prefix, decode).await
     }

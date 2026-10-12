@@ -268,25 +268,86 @@ pub(super) fn materialize_discovery_nodes(
     )
 }
 
-pub(crate) fn rebuilt_prefix(
-    nodes: Vec<stravia_runtime_contract::turn_chain::TurnNode>,
-    completed_at: i64,
-) -> Result<Option<ReusablePrefixMetadata>, String> {
-    let materialized = materialize_generation_nodes(nodes, std::time::Instant::now())?;
-    let Some(history) = materialized.client_history else {
-        return Ok(None);
-    };
-    Ok(Some(ReusablePrefixMetadata {
-        namespace: history.reusable_namespace(),
-        fingerprint: history
-            .session_fingerprint
-            .clone()
-            .unwrap_or(history.context_fingerprint.clone()),
-        item_count: u32::try_from(materialized.client_item_units)
-            .map_err(|error| error.to_string())?,
-        completed_at,
-        projection: Some(history.reusable_projection()),
-    }))
+#[derive(Clone, Copy)]
+struct RebuiltClientContext {
+    hash: [u8; 32],
+    units: u32,
+}
+
+pub(crate) struct PrefixRebuild {
+    contexts: HashMap<TurnNodeId, RebuiltClientContext>,
+    empty: RebuiltClientContext,
+}
+
+impl Default for PrefixRebuild {
+    fn default() -> Self {
+        Self {
+            contexts: HashMap::new(),
+            empty: RebuiltClientContext {
+                hash: stravia_runtime_contract::protocol::ir::canonical::history_context_hash(&[]),
+                units: 0,
+            },
+        }
+    }
+}
+
+impl PrefixRebuild {
+    pub(crate) fn decode(
+        &mut self,
+        node: stravia_runtime_contract::turn_chain::TurnNode,
+        completed_at: Option<i64>,
+    ) -> Result<Option<ReusablePrefixMetadata>, String> {
+        let mut context = match node.parent_id.as_ref() {
+            Some(parent) => *self
+                .contexts
+                .get(parent)
+                .ok_or_else(|| "generation parent was not rebuilt".to_string())?,
+            None => self.empty,
+        };
+        let (id, mut persisted) = decode_response_node(node)?;
+        let (replace, input) = owned_mutation(persisted.client_history_mutation.take())
+            .unwrap_or((false, persisted.client_delta.messages));
+        if replace {
+            context = self.empty;
+        }
+        let output = persisted
+            .client_output
+            .take()
+            .unwrap_or_else(|| generic_client_history_output(&persisted.effective_output));
+        // 只折叠此节点的客户端增量；分支复制固定大小的父摘要，不物化或保留祖先正文。
+        for item in input.iter().chain(&output) {
+            let values =
+                stravia_runtime_contract::protocol::ir::canonical::history_item_values(item);
+            context.units = context
+                .units
+                .checked_add(u32::try_from(values.len()).map_err(|error| error.to_string())?)
+                .ok_or_else(|| "generation history exceeds prefix item count".to_string())?;
+            for value in values {
+                context.hash =
+                    stravia_runtime_contract::protocol::ir::canonical::append_history_value_hash(
+                        context.hash,
+                        value,
+                    );
+            }
+        }
+        self.contexts.insert(id, context);
+        let (Some(mut history), Some(completed_at)) = (persisted.client_history, completed_at)
+        else {
+            return Ok(None);
+        };
+        history.context_fingerprint =
+            stravia_runtime_contract::protocol::ir::canonical::hash_hex(&context.hash);
+        Ok(Some(ReusablePrefixMetadata {
+            namespace: history.reusable_namespace(),
+            fingerprint: history
+                .session_fingerprint
+                .clone()
+                .unwrap_or_else(|| history.context_fingerprint.clone()),
+            item_count: context.units,
+            completed_at,
+            projection: Some(history.reusable_projection()),
+        }))
+    }
 }
 
 pub(super) fn serialized_size_bytes(value: &impl serde::Serialize) -> usize {

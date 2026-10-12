@@ -501,17 +501,21 @@ pub trait TurnChainStore: Send + Sync {
     /// Rebuild derived prefix indexes for stored nodes whose namespace falls
     /// outside `namespace_prefix`. A change to projection semantics must bump
     /// that namespace generation so retained client history rebuilds the proof.
-    /// `decode` maps one chain's nodes and its completion time to fresh metadata;
-    /// returning `None` clears both the prefix index and its optional projection.
+    /// Visit their complete, unexpired, principal-scoped ancestor closure once,
+    /// parents before children. `decode` can retain derived parent state for
+    /// incremental folding; payloads must not be retained by the store.
+    /// Ancestors without an index have no completion time. Only stale indexes
+    /// are changed: `None` clears the prefix and its optional projection.
+    /// Unavailable ancestry clears its stale indexes without calling `decode`.
+    /// A decode/storage failure rolls back all index changes in this invocation.
     /// Stores without derived prefix indexes keep the default no-op.
     async fn rebuild_prefixes(
         &self,
         namespace_prefix: &str,
-        decode: &(
-             dyn Fn(Vec<TurnNode>, i64) -> Result<Option<ReusablePrefixMetadata>, String>
-                 + Send
-                 + Sync
-         ),
+        decode: &mut (
+                 dyn FnMut(TurnNode, Option<i64>) -> Result<Option<ReusablePrefixMetadata>, String>
+                     + Send
+             ),
     ) -> Result<(), TurnUnavailable> {
         let _ = (namespace_prefix, decode);
         Ok(())

@@ -1476,6 +1476,167 @@ async fn cancelled_pending_commit_releases_waiter_without_publishing_a_node() {
 }
 
 #[tokio::test]
+async fn prefix_rebuild_preserves_branch_mutations_and_unindexed_ancestor_context() {
+    let owner = principal("rebuild-branches");
+    let seed_backend = Arc::new(crate::turn_chain::test_store().await);
+    let seed = GenerationChainStore::from_turn_chain(
+        seed_backend.clone(),
+        Duration::from_secs(60),
+        crate::runtime_cache::RuntimeCache::tinyufo(1),
+    );
+    let root_input = responses_request(vec![user_message("root question")]);
+    let mut root_output = AiResponse::new("upstream-root", "model");
+    root_output.push_output_text("root answer");
+    seed.save(GenerationChainCommit {
+        principal: owner.clone(),
+        id: "rebuild-root".into(),
+        parent: &ActiveGenerationChain::default(),
+        request_delta: &root_input,
+        effective_request: None,
+        response: root_output,
+        upstream_response_id: None,
+        effective_state: GenerationChainState::default(),
+    })
+    .await
+    .unwrap();
+
+    // Persist genuine generation commits: one ordinary append and one
+    // replacement on the same parent, as produced by a compaction boundary.
+    for (id, input, answer, replace) in [
+        ("rebuild-append", "append question", "append answer", false),
+        (
+            "rebuild-replace",
+            "replacement question",
+            "replacement answer",
+            true,
+        ),
+    ] {
+        let mut request = continuation_to("rebuild-root", vec![user_message(input)]);
+        let mut parent = seed.materialize_parent(&owner, &mut request).await.unwrap();
+        if replace {
+            parent.replace_effective_history = true;
+            parent.replacement_client_items = Some(vec![user_message(input)]);
+        }
+        let delta = responses_request(vec![user_message(input)]);
+        let mut output = AiResponse::new(id, "model");
+        output.push_output_text(answer);
+        seed.save_with_effective(GenerationChainCommit {
+            principal: owner.clone(),
+            id: id.into(),
+            parent: &parent,
+            request_delta: &delta,
+            effective_request: Some(if replace { &delta } else { &request }),
+            response: output,
+            upstream_response_id: None,
+            effective_state: GenerationChainState::default(),
+        })
+        .await
+        .unwrap();
+    }
+
+    let backend = Arc::new(crate::turn_chain::test_store().await);
+    for id in ["rebuild-root", "rebuild-append", "rebuild-replace"] {
+        let mut node = seed_backend
+            .materialize(&owner, TurnNodeKind::Response, &TurnNodeId::new(id))
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        // Legacy ancestors without client_history are not reusable heads, but
+        // their retained client input/output still contributes to descendants.
+        let prefix = if id == "rebuild-root" {
+            node.payload
+                .as_object_mut()
+                .unwrap()
+                .remove("client_history");
+            None
+        } else {
+            Some(ReusablePrefixMetadata {
+                namespace: "previous-generation-projection".into(),
+                fingerprint: id.into(),
+                item_count: 1,
+                completed_at: 123,
+                projection: None,
+            })
+        };
+        backend
+            .commit(TurnCommit {
+                principal: owner.clone(),
+                id: node.id,
+                kind: node.kind,
+                parent_id: node.parent_id,
+                payload_version: node.payload_version,
+                payload: node.payload,
+                idle_ttl: Duration::from_secs(60),
+                reusable_prefix: prefix,
+            })
+            .await
+            .unwrap();
+    }
+    let mut before = Vec::new();
+    for id in ["rebuild-append", "rebuild-replace"] {
+        before.push(
+            backend
+                .materialize(&owner, TurnNodeKind::Response, &TurnNodeId::new(id))
+                .await
+                .unwrap(),
+        );
+    }
+    let chain = GenerationChain::from_turn_chain(
+        backend.clone(),
+        Duration::from_secs(60),
+        None,
+        crate::runtime_cache::RuntimeCache::tinyufo(1),
+    );
+    chain.rebuild_prefixes().await.unwrap();
+
+    for (index, (id, history)) in [
+        (
+            "rebuild-append",
+            vec![
+                user_message("root question"),
+                AiItem::output_text("root answer"),
+                user_message("append question"),
+                AiItem::output_text("append answer"),
+            ],
+        ),
+        (
+            "rebuild-replace",
+            vec![
+                user_message("replacement question"),
+                AiItem::output_text("replacement answer"),
+            ],
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let after = backend
+            .materialize(&owner, TurnNodeKind::Response, &TurnNodeId::new(id))
+            .await
+            .unwrap();
+        assert_eq!(after.len(), before[index].len());
+        for (old, new) in before[index].iter().zip(&after) {
+            assert_eq!(new.id, old.id);
+            assert_eq!(new.parent_id, old.parent_id);
+            assert_eq!(new.payload_version, old.payload_version);
+            assert_eq!(new.payload, old.payload);
+        }
+        let mut continuation = history;
+        continuation.push(user_message("continue"));
+        let resumed = chain
+            .begin(owner.clone(), responses_request(continuation))
+            .await
+            .unwrap();
+        assert_eq!(resumed.parent_id(), Some(id));
+        assert!(items_equal(
+            &resumed.request_delta().items,
+            &[user_message("continue")],
+        ));
+    }
+}
+
+#[tokio::test]
 async fn reasoning_tracking_metadata_does_not_fork_generation_history() {
     let backend = Arc::new(crate::turn_chain::test_store().await);
     let chain = GenerationChain::from_turn_chain(
@@ -1532,8 +1693,11 @@ async fn reasoning_tracking_metadata_does_not_fork_generation_history() {
         sqlx::query("UPDATE turn_chain_nodes SET prefix_namespace = 'old-controls', prefix_fingerprint = 'old-projection', prefix_item_count = 99, prefix_projection_version = 999, prefix_controls_fingerprint = 'stale-controls', prefix_context_fingerprint = 'stale-context' WHERE id = ?")
             .bind(b.id()).execute(pool).await.unwrap();
     }
+    let mut rebuild = PrefixRebuild::default();
     backend
-        .rebuild_prefixes(GENERATION_PREFIX_NAMESPACE, &rebuilt_prefix)
+        .rebuild_prefixes(GENERATION_PREFIX_NAMESPACE, &mut |node, completed_at| {
+            rebuild.decode(node, completed_at)
+        })
         .await
         .unwrap();
     let restarted = GenerationChain::from_turn_chain(
@@ -1628,8 +1792,11 @@ async fn reasoning_tracking_metadata_does_not_fork_generation_history() {
             .unwrap()
             .contains("internal_chat_message_metadata_passthrough")
     );
+    let mut rebuild = PrefixRebuild::default();
     backend
-        .rebuild_prefixes(GENERATION_PREFIX_NAMESPACE, &rebuilt_prefix)
+        .rebuild_prefixes(GENERATION_PREFIX_NAMESPACE, &mut |node, completed_at| {
+            rebuild.decode(node, completed_at)
+        })
         .await
         .unwrap();
     sqlx::query("UPDATE turn_chain_nodes SET expires_at = 0 WHERE id = ?")
@@ -1650,8 +1817,11 @@ async fn reasoning_tracking_metadata_does_not_fork_generation_history() {
             .fetch_one(pool)
             .await
             .unwrap();
+    let mut rebuild = PrefixRebuild::default();
     backend
-        .rebuild_prefixes(GENERATION_PREFIX_NAMESPACE, &rebuilt_prefix)
+        .rebuild_prefixes(GENERATION_PREFIX_NAMESPACE, &mut |node, completed_at| {
+            rebuild.decode(node, completed_at)
+        })
         .await
         .unwrap();
     let unavailable: (Option<String>, Option<String>, Vec<u8>) = sqlx::query_as(

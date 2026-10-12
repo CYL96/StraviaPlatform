@@ -461,11 +461,13 @@ impl GenerationChainStore {
     }
 
     /// Rebuild derived Generation prefix indexes before accepting requests.
-    /// The TurnChainStore walks stale chains; `rebuilt_prefix` supplies the
-    /// Generation-history-specific decode.
+    /// The store visits each ancestor once; the fold retains only its hash and count.
     pub(super) async fn rebuild_prefixes(&self) -> Result<(), TurnUnavailable> {
+        let mut rebuild = PrefixRebuild::default();
         self.turn_chain
-            .rebuild_prefixes(GENERATION_PREFIX_NAMESPACE, &rebuilt_prefix)
+            .rebuild_prefixes(GENERATION_PREFIX_NAMESPACE, &mut |node, completed_at| {
+                rebuild.decode(node, completed_at)
+            })
             .await
     }
 

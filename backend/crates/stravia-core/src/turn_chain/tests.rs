@@ -572,6 +572,7 @@ async fn postgres_reusable_prefix_store_contract_when_configured() {
         .await
         .expect("PostgreSQL migrations");
     let store = SqlTurnChainStore::postgres(pool.clone());
+    assert_prefix_rebuild_decodes_shared_ancestors_once(&store).await;
     assert_reusable_prefix_store_contract(Arc::new(store.clone())).await;
     assert_request_context_contract(&store).await;
     assert_expired_query_cutoff_proof_falls_back_to_current_facts(&store).await;
@@ -1373,12 +1374,12 @@ async fn assert_projection_proofs_exclude_only_known_mismatches_and_rebuild_old_
         "incomplete known-version projections cannot exclude rows, even when controls differ"
     );
     store
-        .rebuild_prefixes("current", &|_, completed_at| {
+        .rebuild_prefixes("current", &mut |_, completed_at| {
             Ok(Some(ReusablePrefixMetadata {
                 namespace: "current".into(),
                 fingerprint: "hash".into(),
                 item_count: 1,
-                completed_at,
+                completed_at: completed_at.unwrap(),
                 projection: Some(proof.clone()),
             }))
         })
@@ -1396,7 +1397,7 @@ async fn assert_projection_proofs_exclude_only_known_mismatches_and_rebuild_old_
             .is_empty()
     );
     store
-        .rebuild_prefixes("next", &|_, _| Ok(None))
+        .rebuild_prefixes("next", &mut |_, _| Ok(None))
         .await
         .unwrap();
     let query = ReusablePrefixQuery {
@@ -1418,6 +1419,108 @@ async fn projection_proofs_exclude_only_known_mismatches_and_rebuild_old_indexes
         &test_store().await,
     )
     .await;
+}
+
+#[tokio::test]
+async fn prefix_rebuild_decodes_shared_ancestors_once() {
+    assert_prefix_rebuild_decodes_shared_ancestors_once(&test_store().await).await;
+}
+
+async fn assert_prefix_rebuild_decodes_shared_ancestors_once(store: &SqlTurnChainStore) {
+    let owner = principal("rebuild-owner");
+    for (id, parent) in [
+        ("root", None),
+        ("middle", Some("root")),
+        ("left", Some("middle")),
+        ("right", Some("middle")),
+    ] {
+        store
+            .commit(TurnCommit {
+                id: TurnNodeId::new(id),
+                kind: TurnNodeKind::Response,
+                parent_id: parent.map(TurnNodeId::new),
+                principal: owner.clone(),
+                payload_version: 1,
+                payload: serde_json::json!({"items": ["retained content ".repeat(100)]}),
+                idle_ttl: Duration::from_secs(3600),
+                reusable_prefix: Some(ReusablePrefixMetadata {
+                    namespace: "previous".into(),
+                    fingerprint: id.into(),
+                    item_count: 1,
+                    completed_at: 123,
+                    projection: None,
+                }),
+            })
+            .await
+            .unwrap();
+    }
+    let mut decoded = std::collections::HashMap::<String, usize>::new();
+    let mut visited = std::collections::HashSet::new();
+    store
+        .rebuild_prefixes("current", &mut |node, completed_at| {
+            if let Some(parent) = node.parent_id.as_ref() {
+                assert!(
+                    visited.contains(parent.as_str()),
+                    "parents must decode before children",
+                );
+            }
+            visited.insert(node.id.to_string());
+            *decoded.entry(node.id.to_string()).or_default() += 1;
+            assert_eq!(
+                node.payload,
+                serde_json::json!({"items": ["retained content ".repeat(100)]}),
+            );
+            Ok(Some(ReusablePrefixMetadata {
+                namespace: "current".into(),
+                fingerprint: node.id.to_string(),
+                item_count: 1,
+                completed_at: completed_at.unwrap(),
+                projection: None,
+            }))
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        decoded,
+        std::collections::HashMap::from([
+            ("root".into(), 1),
+            ("middle".into(), 1),
+            ("left".into(), 1),
+            ("right".into(), 1),
+        ]),
+        "startup must not decode shared history again for each stale head",
+    );
+    let candidates = store
+        .find_reusable_prefixes(
+            &owner,
+            TurnNodeKind::Response,
+            &ReusablePrefixQuery {
+                namespace: "current".into(),
+                fingerprints: vec![("left".into(), 1), ("right".into(), 1)],
+                projection: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        candidates
+            .iter()
+            .map(|candidate| candidate.node_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["right", "left"],
+    );
+    assert!(
+        candidates
+            .iter()
+            .all(|candidate| candidate.completed_at == 123)
+    );
+    let retained = store
+        .materialize(&owner, TurnNodeKind::Response, &TurnNodeId::new("left"))
+        .await
+        .unwrap();
+    assert!(retained.iter().all(
+        |node| node.payload == serde_json::json!({"items": ["retained content ".repeat(100)]})
+    ));
 }
 
 async fn overwrite_context_content(store: &SqlTurnChainStore, owner: &Principal, bytes: Vec<u8>) {
@@ -1791,9 +1894,12 @@ async fn sqlite_0007_upgrade_and_generation_v3_rebuild_find_existing_history() {
         .materialize(&owner, TurnNodeKind::Response, &id)
         .await
         .unwrap();
-    let expected = crate::generation_chain::rebuilt_prefix(nodes.clone(), 123)
-        .unwrap()
-        .unwrap();
+    let mut rebuild = crate::generation_chain::PrefixRebuild::default();
+    let mut expected = None;
+    for node in nodes.clone() {
+        expected = rebuild.decode(node, Some(123)).unwrap();
+    }
+    let expected = expected.unwrap();
     assert!(
         expected
             .namespace

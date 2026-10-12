@@ -38,6 +38,7 @@
 
 ### Fixed
 
+- Fixed Desktop/Server startup spending excessive time rebuilding old Generation history indexes. SQLite/PostgreSQL now decode shared ancestors once in parent-first order and fold client-history hashes incrementally, without rewriting immutable history, changing expiry or retaining full-history caches. The Rust `TurnChainStore::rebuild_prefixes` callback now receives one node and its optional original completion time; stale-index updates remain atomic.
 - Canceled or timed-out Chrome renders now attempt to stop loading before their single target-close attempt. If Chromium rejects the stop during a native main-frame transition, one context-independent renderer round-trip waits for navigation commit or abort before closing, within the original shared cleanup budget. Proxy guards, Cookie/context isolation, request deadlines, and process/profile-reaping policy remain unchanged.
 - Diagnostic-event failures no longer roll back adjacent usage updates in the Observation writer. Genuine usage persistence loss still blocks related destructive history cleanup; storage errors remain local to the owning request or task, including capacity exhaustion.
 - OpenAI-compatible streaming usage now preserves omitted counters while applying later reported values, including explicit zero. Partial corrections and duplicate cumulative reports no longer leave stale output usage in observations or durable statistics. Rebuild and re-import affected standalone Vendor plugins to receive the parser fix.
