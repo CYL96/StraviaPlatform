@@ -1151,39 +1151,45 @@ async fn custom_provider_resync_fills_bare_discovered_canonical_templates() -> a
         .await?;
     gw.storage
         .provider_models()
-        .create(NewProviderModelRecord {
-            provider_id: provider.id.clone(),
-            model_id: "glm-5.1".to_string(),
-            source_kind: ProviderModelSourceKind::Discovered,
-            snapshot_state: SnapshotState::Unregistered,
-            metadata_source_provider_id: None,
-            presence: ProviderModelPresence::Present,
-            selection_policy: ProviderModelSelectionPolicy::Auto,
-            metadata: ProviderModelMetadata {
-                limit: Some(stravia_core::provider_models::ModelLimit {
-                    context: Some(256 * 1024),
-                }),
-                reasoning_efforts: Some(vec!["low".into(), "high".into()]),
-                ..ProviderModelMetadata::bare("glm-5.1")
+        .create(
+            NewProviderModelRecord {
+                provider_id: provider.id.clone(),
+                model_id: "glm-5.1".to_string(),
+                source_kind: ProviderModelSourceKind::Discovered,
+                snapshot_state: SnapshotState::Unregistered,
+                metadata_source_provider_id: None,
+                presence: ProviderModelPresence::Present,
+                selection_policy: ProviderModelSelectionPolicy::Auto,
+                metadata: ProviderModelMetadata {
+                    limit: Some(stravia_core::provider_models::ModelLimit {
+                        context: Some(256 * 1024),
+                    }),
+                    reasoning_efforts: Some(vec!["low".into(), "high".into()]),
+                    ..ProviderModelMetadata::bare("glm-5.1")
+                },
             },
-        })
+            None,
+        )
         .await?;
     gw.storage
         .provider_models()
-        .create(NewProviderModelRecord {
-            provider_id: provider.id.clone(),
-            model_id: "legacy-unmatched".to_string(),
-            source_kind: ProviderModelSourceKind::Discovered,
-            snapshot_state: SnapshotState::Edited { source: None },
-            metadata_source_provider_id: None,
-            presence: ProviderModelPresence::Present,
-            selection_policy: ProviderModelSelectionPolicy::Auto,
-            metadata: ProviderModelMetadata {
-                id: Some("legacy-unmatched".to_string()),
-                name: Some("legacy-unmatched".to_string()),
-                ..ProviderModelMetadata::default()
+        .create(
+            NewProviderModelRecord {
+                provider_id: provider.id.clone(),
+                model_id: "legacy-unmatched".to_string(),
+                source_kind: ProviderModelSourceKind::Discovered,
+                snapshot_state: SnapshotState::Edited { source: None },
+                metadata_source_provider_id: None,
+                presence: ProviderModelPresence::Present,
+                selection_policy: ProviderModelSelectionPolicy::Auto,
+                metadata: ProviderModelMetadata {
+                    id: Some("legacy-unmatched".to_string()),
+                    name: Some("legacy-unmatched".to_string()),
+                    ..ProviderModelMetadata::default()
+                },
             },
-        })
+            None,
+        )
         .await?;
 
     let listed = gw
@@ -1770,6 +1776,351 @@ async fn catalog_marker_on_a_consuming_channel_still_propagates_catalog_failures
         "unexpected error: {error:#}"
     );
     gw.shutdown().await;
+    drop(gw);
+    data_dir.close()?;
+    Ok(())
+}
+
+async fn inventory_runtime_fixture() -> anyhow::Result<(
+    tempfile::TempDir,
+    Gateway,
+    String,
+    tokio::sync::mpsc::Receiver<tokio::net::TcpStream>,
+    tokio::task::JoinHandle<()>,
+)> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let (requests, received) = tokio::sync::mpsc::channel(8);
+    let upstream = tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let mut bytes = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let Ok(size) = socket.read(&mut buffer).await else {
+                    return;
+                };
+                if size == 0 {
+                    return;
+                }
+                bytes.extend_from_slice(&buffer[..size]);
+                if bytes.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            if requests.send(socket).await.is_err() {
+                return;
+            }
+        }
+    });
+    let storage = Arc::new(MemoryStorage::new(Vec::new(), Vec::new(), Vec::new()));
+    let provider = storage
+        .providers()
+        .create(CreateProviderRecord {
+            name: "scheduled-loopback".into(),
+            vendor: Some("custom".into()),
+            protocol: "openai-compatible".into(),
+            base_url: format!("http://{address}/v1"),
+            preset_key: None,
+            channel: Some("default".into()),
+            models_source: Some(format!("http://{address}/v1/models")),
+            static_models: None,
+            api_key: "synthetic-key".into(),
+            adapter_credentials: r#"{"apiKey":"synthetic-key"}"#.into(),
+            vendor_options: "{}".into(),
+            auth_mode: "apikey".into(),
+            use_proxy: false,
+        })
+        .await?;
+    let data_dir = tempfile::tempdir()?;
+    let config = GatewayConfig {
+        data_dir: data_dir.path().to_path_buf(),
+        catalog_background_refresh: false,
+        config_poll_interval: Duration::ZERO,
+        ..Default::default()
+    };
+    let gw = Gateway::from_storage(config, storage).await?;
+    Ok((data_dir, gw, provider.id, received, upstream))
+}
+
+async fn answer_inventory(socket: &mut tokio::net::TcpStream, model: &str) -> anyhow::Result<()> {
+    let body = serde_json::json!({"data":[{"id":model}]}).to_string();
+    socket.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes()).await?;
+    Ok(())
+}
+
+async fn confirmed_inventory_check(
+    gw: &Gateway,
+    id: &str,
+) -> anyhow::Result<stravia_core::provider_models::ProviderModelSyncSummary> {
+    // Keep the controlled runtime runnable while the real loopback plugin completes.
+    // No timer is advanced and no private scheduler state is inspected.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while std::time::Instant::now() < deadline {
+        let state = gw.admin().provider_model_sync_state(id).await?;
+        if !state.in_progress {
+            if let Some(summary) = state.last_check {
+                return Ok(summary);
+            }
+        }
+        tokio::task::yield_now().await;
+    }
+    anyhow::bail!("loopback discovery did not publish a completed check")
+}
+
+#[tokio::test]
+async fn inventory_runtime_startup_hourly_boundary_and_manual_join() -> anyhow::Result<()> {
+    use stravia_core::provider_models::{
+        ModelChangeQuery, ModelChangeSource, UpdateProviderModelSyncState,
+    };
+    tokio::time::pause();
+    let clock_guard = tokio::spawn(async {
+        loop {
+            tokio::task::yield_now().await;
+        }
+    });
+    let (data_dir, gw, id, mut requests, upstream) = inventory_runtime_fixture().await?;
+    // 时钟暂停后显式驱动 Tokio 首个毫秒 timer tick，避免守卫阻止
+    // 启动时立即到期的 interval 被 timer wheel 唤醒。
+    tokio::time::advance(Duration::from_millis(1)).await;
+    let mut startup = requests
+        .recv()
+        .await
+        .expect("startup discovers saved connection");
+    assert!(gw.admin().provider_model_sync_state(&id).await?.in_progress);
+    let admin = gw.admin();
+    let mut manual = Box::pin(admin.sync_provider_models(&id));
+    std::future::poll_fn(|cx| {
+        assert!(std::future::Future::poll(manual.as_mut(), cx).is_pending());
+        std::task::Poll::Ready(())
+    })
+    .await;
+    answer_inventory(&mut startup, "runtime-first").await?;
+    let joined = manual.await?;
+    assert_eq!(joined.source, ModelChangeSource::AutomaticSync);
+    assert_eq!(joined.added, 1);
+    let state = gw.admin().provider_model_sync_state(&id).await?;
+    assert_eq!(state.last_check.as_ref(), Some(&joined));
+    let record = gw
+        .admin()
+        .get_model_change(
+            joined
+                .record_id
+                .as_deref()
+                .expect("startup records additions"),
+        )
+        .await?;
+    assert!(record.initial_sync);
+    assert_eq!(record.changes[0].model_id, "runtime-first");
+    assert!(
+        requests.try_recv().is_err(),
+        "manual join must not send another Discover"
+    );
+
+    tokio::time::advance(Duration::from_secs(3599)).await;
+    for _ in 0..32 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        requests.try_recv().is_err(),
+        "no discovery before the one-hour boundary"
+    );
+    tokio::time::advance(Duration::from_secs(1)).await;
+    let mut hourly = requests
+        .recv()
+        .await
+        .expect("hourly discovery at the boundary");
+    answer_inventory(&mut hourly, "runtime-second").await?;
+    let hourly = confirmed_inventory_check(&gw, &id).await?;
+    assert_eq!(hourly.source, ModelChangeSource::AutomaticSync);
+    assert_eq!((hourly.added, hourly.missing), (1, 1));
+    assert_ne!(hourly.record_id, joined.record_id);
+    gw.admin()
+        .update_provider_model_sync_state(
+            &id,
+            UpdateProviderModelSyncState {
+                automatic_sync: false,
+            },
+        )
+        .await?;
+    tokio::time::advance(Duration::from_secs(3600)).await;
+    for _ in 0..32 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        requests.try_recv().is_err(),
+        "disabled preference skips scheduled discovery"
+    );
+    assert!(
+        gw.admin()
+            .provider_model_sync_state(&id)
+            .await?
+            .pause_reason
+            .is_some()
+    );
+    let manual = gw.admin();
+    let id_copy = id.clone();
+    let manual = tokio::spawn(async move { manual.sync_provider_models(&id_copy).await });
+    let mut request = requests
+        .recv()
+        .await
+        .expect("disabled preference does not block manual discovery");
+    answer_inventory(&mut request, "runtime-second").await?;
+    let unchanged = manual.await??;
+    assert_eq!(unchanged.source, ModelChangeSource::ManualSync);
+    assert!(unchanged.record_id.is_none());
+    let history = gw
+        .admin()
+        .list_model_changes(ModelChangeQuery {
+            provider_id: Some(id),
+            ..Default::default()
+        })
+        .await?;
+    assert_eq!(history.records.len(), 2);
+    gw.admin()
+        .update_provider(
+            history.records[0].provider_id.as_str(),
+            UpdateProvider {
+                is_enabled: Some(false),
+                ..Default::default()
+            },
+        )
+        .await?;
+    gw.admin()
+        .update_provider_model_sync_state(
+            history.records[0].provider_id.as_str(),
+            UpdateProviderModelSyncState {
+                automatic_sync: true,
+            },
+        )
+        .await?;
+    tokio::time::advance(Duration::from_secs(3600)).await;
+    for _ in 0..32 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        requests.try_recv().is_err(),
+        "disabled Provider skips automatic discovery even with enabled preference"
+    );
+    let disabled = gw
+        .admin()
+        .provider_model_sync_state(history.records[0].provider_id.as_str())
+        .await?;
+    assert_eq!(disabled.last_check.as_ref(), Some(&unchanged));
+    assert_eq!(
+        disabled.pause_reason.as_deref(),
+        Some("Provider is disabled")
+    );
+    gw.shutdown().await;
+    clock_guard.abort();
+    upstream.abort();
+    drop(gw);
+    data_dir.close()?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn inventory_runtime_shutdown_closes_discovery_network() -> anyhow::Result<()> {
+    let (data_dir, gw, id, mut requests, upstream) = inventory_runtime_fixture().await?;
+    let mut pending = requests
+        .recv()
+        .await
+        .expect("startup reaches loopback upstream");
+    assert!(gw.admin().provider_model_sync_state(&id).await?.in_progress);
+    gw.request_shutdown();
+    let mut buffer = [0_u8; 1];
+    assert_eq!(
+        timeout(Duration::from_secs(2), pending.read(&mut buffer)).await??,
+        0,
+        "shutdown request must close discovery before the HTTP host drains"
+    );
+    gw.shutdown().await;
+    assert!(!gw.admin().provider_model_sync_state(&id).await?.in_progress);
+    upstream.abort();
+    drop(gw);
+    data_dir.close()?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn inventory_runtime_stale_edit_preserves_manual_specification() -> anyhow::Result<()> {
+    use stravia_core::provider_models::{
+        ModelChangeOutcome, ModelChangeQuery, ProviderModelSyncFailure,
+    };
+    let (data_dir, gw, id, mut requests, upstream) = inventory_runtime_fixture().await?;
+    let mut startup = requests.recv().await.expect("startup discovery");
+    answer_inventory(&mut startup, "runtime-edited").await?;
+    confirmed_inventory_check(&gw, &id).await?;
+    let detail = gw.admin().get_provider_model(&id, "runtime-edited").await?;
+    let admin = gw.admin();
+    let provider_id = id.clone();
+    let sync = tokio::spawn(async move { admin.sync_provider_models(&provider_id).await });
+    let mut request = requests
+        .recv()
+        .await
+        .expect("manual discovery snapshots inventory");
+    gw.admin()
+        .update_provider_model(
+            &id,
+            "runtime-edited",
+            UpdateProviderModel {
+                metadata: serde_json::json!({"id":"runtime-edited","name":"My owned specification",
+            "limit":{"context":4096},"reasoning_efforts":["low"]}),
+                revision: detail.revision,
+            },
+        )
+        .await?;
+    answer_inventory(&mut request, "runtime-edited").await?;
+    let error = sync
+        .await?
+        .expect_err("discovery must not commit over an intervening model edit");
+    let failure = error
+        .downcast_ref::<ProviderModelSyncFailure>()
+        .expect("persisted typed failure");
+    assert_eq!(failure.summary.outcome, ModelChangeOutcome::Failure);
+    assert_eq!(failure.summary.added, 0);
+    let record = gw
+        .admin()
+        .get_model_change(
+            failure
+                .summary
+                .record_id
+                .as_deref()
+                .expect("failure has actual saved identity"),
+        )
+        .await?;
+    assert_eq!(record.outcome, ModelChangeOutcome::Failure);
+    assert!(record.changes.is_empty());
+    let retained = gw.admin().get_provider_model(&id, "runtime-edited").await?;
+    assert_eq!(
+        retained.metadata.name.as_deref(),
+        Some("My owned specification")
+    );
+    assert_eq!(
+        retained
+            .metadata
+            .limit
+            .as_ref()
+            .and_then(|limit| limit.context),
+        Some(4096)
+    );
+    assert!(matches!(
+        retained.snapshot_state,
+        SnapshotState::Edited { .. }
+    ));
+    let history = gw
+        .admin()
+        .list_model_changes(ModelChangeQuery {
+            provider_id: Some(id),
+            ..Default::default()
+        })
+        .await?;
+    assert_eq!(
+        history.records.len(),
+        2,
+        "ordinary metadata edit creates no timeline entry and stale sync creates no success"
+    );
+    gw.shutdown().await;
+    upstream.abort();
     drop(gw);
     data_dir.close()?;
     Ok(())

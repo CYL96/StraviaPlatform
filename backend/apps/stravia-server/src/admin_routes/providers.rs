@@ -294,6 +294,51 @@ pub(super) async fn sync_provider_models_handler(
     }
 }
 
+pub(super) async fn provider_model_sync_state_handler(
+    State(gw): State<Gateway>,
+    Path(id): Path<String>,
+) -> axum::response::Response {
+    match gw.admin().provider_model_sync_state(&id).await {
+        Ok(state) => Json(serde_json::json!({ "data": state })).into_response(),
+        Err(error) => provider_model_err(error),
+    }
+}
+
+pub(super) async fn update_provider_model_sync_state_handler(
+    State(gw): State<Gateway>,
+    Path(id): Path<String>,
+    Json(input): Json<UpdateProviderModelSyncState>,
+) -> axum::response::Response {
+    match gw
+        .admin()
+        .update_provider_model_sync_state(&id, input)
+        .await
+    {
+        Ok(state) => Json(serde_json::json!({ "data": state })).into_response(),
+        Err(error) => provider_model_err(error),
+    }
+}
+
+pub(super) async fn list_model_changes_handler(
+    State(gw): State<Gateway>,
+    Query(query): Query<ModelChangeQuery>,
+) -> axum::response::Response {
+    match gw.admin().list_model_changes(query).await {
+        Ok(page) => Json(serde_json::json!({ "data": page })).into_response(),
+        Err(error) => provider_model_err(error),
+    }
+}
+
+pub(super) async fn get_model_change_handler(
+    State(gw): State<Gateway>,
+    Path(id): Path<String>,
+) -> axum::response::Response {
+    match gw.admin().get_model_change(&id).await {
+        Ok(record) => Json(serde_json::json!({ "data": record })).into_response(),
+        Err(error) => provider_model_err(error),
+    }
+}
+
 pub(super) async fn prepare_provider_model_handler(
     State(gw): State<Gateway>,
     Path(id): Path<String>,

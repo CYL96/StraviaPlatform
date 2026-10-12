@@ -40,6 +40,7 @@ struct FakeCatalogState {
     canonical: Value,
     canonical_status: u16,
     scopes: HashMap<String, (u16, Value)>,
+    inventory: Value,
 }
 
 impl FakeCatalog {
@@ -54,16 +55,14 @@ impl FakeCatalog {
             }),
             canonical_status: 200,
             scopes: HashMap::new(),
+            inventory: json!({"data": [{"id": "glm-5.3"}]}),
         }));
         let app = Router::new()
             .route("/version.json", get(version))
             .route("/providers.json", get(index))
             .route("/models.json", get(canonical))
             .route("/providers/{id}/models.json", get(scope))
-            .route(
-                "/v1/models",
-                get(|| async { Json(json!({"data": [{"id": "glm-5.3"}]})) }),
-            )
+            .route("/v1/models", get(discovery))
             .with_state(Arc::clone(&state));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let base_url = format!("http://{}", listener.local_addr()?);
@@ -141,6 +140,10 @@ async fn scope(
             .into_response(),
         None => axum::http::StatusCode::NOT_FOUND.into_response(),
     }
+}
+
+async fn discovery(State(state): State<Arc<RwLock<FakeCatalogState>>>) -> Json<Value> {
+    Json(state.read().await.inventory.clone())
 }
 
 fn catalog_entry(id: &str, name: &str, npm: &str, api: Option<&str>) -> Value {
@@ -329,22 +332,25 @@ async fn unlinked_provider_recovers_catalog_metadata_without_overwriting_edits()
         }
         gw.storage
             .provider_models()
-            .create(NewProviderModelRecord {
-                provider_id: provider.id.clone(),
-                model_id: model_id.to_owned(),
-                source_kind: ProviderModelSourceKind::Discovered,
-                snapshot_state: if edited {
-                    SnapshotState::Edited {
-                        source: Some(source),
-                    }
-                } else {
-                    SnapshotState::Imported { source }
+            .create(
+                NewProviderModelRecord {
+                    provider_id: provider.id.clone(),
+                    model_id: model_id.to_owned(),
+                    source_kind: ProviderModelSourceKind::Discovered,
+                    snapshot_state: if edited {
+                        SnapshotState::Edited {
+                            source: Some(source),
+                        }
+                    } else {
+                        SnapshotState::Imported { source }
+                    },
+                    metadata_source_provider_id: None,
+                    presence: ProviderModelPresence::Present,
+                    selection_policy: ProviderModelSelectionPolicy::Auto,
+                    metadata: ProviderModelMetadata::from_value(model_id, metadata)?,
                 },
-                metadata_source_provider_id: None,
-                presence: ProviderModelPresence::Present,
-                selection_policy: ProviderModelSelectionPolicy::Auto,
-                metadata: ProviderModelMetadata::from_value(model_id, metadata)?,
-            })
+                None,
+            )
             .await?;
     }
     gw.admin().sync_provider_models(&provider.id).await?;
@@ -373,6 +379,139 @@ async fn unlinked_provider_recovers_catalog_metadata_without_overwriting_edits()
         stravia_core::thinking::visible_levels(&edited.thinking_level_map),
         [ThinkingLevel::High]
     );
+    gw.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_catalog_enrichment_preserves_specs_lifecycle_and_reimport_source()
+-> anyhow::Result<()> {
+    let catalog = reasoning_catalog().await?;
+    {
+        let mut state = catalog.state.write().await;
+        state.canonical = json!({
+            "zhipuai/glm-5.3": {
+                "id": "zhipuai/glm-5.3", "name": "Canonical fallback",
+                "limit": {"context": 8192},
+                "cost": {"input": 0.1, "output": 0.2}
+            }
+        });
+        state.inventory = json!({"data": [
+            {"id": "glm-5.3"}, {"id": "glm-4.6v"}, {"id": "new-source"}
+        ]});
+    }
+    catalog
+        .set_scope("zhipuai-coding-plan", 500, json!({"error": "unavailable"}))
+        .await;
+    let directory = tempfile::tempdir()?;
+    let gw = fixture_gateway(catalog.base_url(), directory.path()).await?;
+    gw.catalog_sync.refresh().await?;
+    let provider = gw
+        .storage
+        .providers()
+        .create(CreateProviderRecord {
+            name: "previously imported".to_owned(),
+            vendor: Some("zhipuai-coding-plan".to_owned()),
+            protocol: "openai-compatible".to_owned(),
+            base_url: format!("{}/v1", catalog.base_url()),
+            preset_key: None,
+            channel: Some("default".to_owned()),
+            models_source: Some(format!("{}/v1/models", catalog.base_url())),
+            static_models: None,
+            api_key: String::new(),
+            adapter_credentials: "{}".to_owned(),
+            vendor_options: "{}".to_owned(),
+            auth_mode: "apikey".to_owned(),
+            use_proxy: false,
+        })
+        .await?;
+    let mut prior_models = Vec::new();
+    for (model_id, edited) in [("glm-5.3", false), ("glm-4.6v", true)] {
+        let source = SourceStamp::ProviderCatalog {
+            provider_id: "zhipuai-coding-plan".to_owned(),
+        };
+        let metadata = ProviderModelMetadata::from_value(
+            model_id,
+            json!({
+                "id": model_id, "name": format!("Preserved {model_id}"),
+                "limit": {"context": 131072},
+                "modalities": {"input": ["text", "image"], "output": ["text"]},
+                "reasoning_efforts": ["high"],
+                "cost": {"input": 12, "output": 24}, "status": "deprecated"
+            }),
+        )?;
+        gw.storage
+            .provider_models()
+            .create(
+                NewProviderModelRecord {
+                    provider_id: provider.id.clone(),
+                    model_id: model_id.to_owned(),
+                    source_kind: ProviderModelSourceKind::Discovered,
+                    snapshot_state: if edited {
+                        SnapshotState::Edited {
+                            source: Some(source),
+                        }
+                    } else {
+                        SnapshotState::Imported { source }
+                    },
+                    metadata_source_provider_id: Some("zhipuai-coding-plan".to_owned()),
+                    presence: ProviderModelPresence::Missing,
+                    selection_policy: ProviderModelSelectionPolicy::Auto,
+                    metadata,
+                },
+                None,
+            )
+            .await?;
+        prior_models.push(
+            gw.admin()
+                .get_provider_model(&provider.id, model_id)
+                .await?,
+        );
+    }
+    let summary = gw.admin().sync_provider_models(&provider.id).await?;
+    assert_eq!(summary.added, 1);
+    assert_eq!(summary.restored, 2);
+    assert_eq!(summary.deprecation_cleared, 0);
+    assert_eq!(summary.specification_updated, 0);
+    for before in prior_models {
+        let after = gw
+            .admin()
+            .get_provider_model(&provider.id, &before.id)
+            .await?;
+        assert_eq!(after.snapshot_state, before.snapshot_state);
+        assert_eq!(after.metadata.name, before.metadata.name);
+        assert_eq!(after.metadata.limit, before.metadata.limit);
+        assert_eq!(after.metadata.modalities, before.metadata.modalities);
+        assert_eq!(
+            after.metadata.reasoning_efforts,
+            before.metadata.reasoning_efforts
+        );
+        assert_eq!(after.metadata.cost, before.metadata.cost);
+        assert_eq!(after.metadata.status.as_deref(), Some("deprecated"));
+        assert!(!after.available);
+        assert!(after.can_reimport);
+    }
+    assert!(
+        gw.admin()
+            .get_provider_model(&provider.id, "new-source")
+            .await?
+            .available
+    );
+    catalog.state.write().await.inventory = json!({"data": [
+        {"id": "glm-5.3", "status": null},
+        {"id": "glm-4.6v", "status": "beta"},
+        {"id": "new-source"}
+    ]});
+    let summary = gw.admin().sync_provider_models(&provider.id).await?;
+    assert_eq!(summary.deprecation_cleared, 2);
+    for model_id in ["glm-5.3", "glm-4.6v"] {
+        let model = gw
+            .admin()
+            .get_provider_model(&provider.id, model_id)
+            .await?;
+        assert!(model.available);
+        assert!(model.can_reimport);
+    }
     gw.shutdown().await;
     Ok(())
 }

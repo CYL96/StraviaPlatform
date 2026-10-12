@@ -12,8 +12,9 @@ use crate::db::models::{
     UpdateWebProvider, UpsertOAuthCredential, WebAccessSettings, WebProvider,
 };
 use crate::provider_models::{
-    NewProviderModelRecord, ProviderModelMutation, ProviderModelReconciliation,
-    ProviderModelRecord, ProviderModelReimport, ProviderModelSelectionPolicy,
+    ModelChangePage, ModelChangeQuery, ModelChangeRecord, NewProviderModelRecord,
+    ProviderModelMutation, ProviderModelReconciliation, ProviderModelRecord, ProviderModelReimport,
+    ProviderModelSelectionPolicy, ProviderModelSyncState, ProviderModelSyncSummary,
     ReimportProviderModel, model_id_match_key,
 };
 
@@ -392,7 +393,11 @@ pub trait ProviderModelStore: Send + Sync {
         provider_id: &str,
         reconciliation: ProviderModelReconciliation,
     ) -> anyhow::Result<()>;
-    async fn create(&self, input: NewProviderModelRecord) -> anyhow::Result<ProviderModelMutation>;
+    async fn create(
+        &self,
+        input: NewProviderModelRecord,
+        change_record: Option<ModelChangeRecord>,
+    ) -> anyhow::Result<ProviderModelMutation>;
     async fn update_metadata(
         &self,
         provider_id: &str,
@@ -419,7 +424,23 @@ pub trait ProviderModelStore: Send + Sync {
         model_id: &str,
         policy: ProviderModelSelectionPolicy,
         expected_revision: i64,
+        change_record: Option<ModelChangeRecord>,
     ) -> anyhow::Result<ProviderModelMutation>;
+    async fn sync_state(&self, provider_id: &str) -> anyhow::Result<ProviderModelSyncState>;
+    async fn set_automatic_sync(
+        &self,
+        provider_id: &str,
+        enabled: bool,
+    ) -> anyhow::Result<ProviderModelSyncState>;
+    async fn save_sync_failure(
+        &self,
+        provider_id: &str,
+        summary: ProviderModelSyncSummary,
+        record: ModelChangeRecord,
+    ) -> anyhow::Result<()>;
+    async fn list_changes(&self, query: ModelChangeQuery) -> anyhow::Result<ModelChangePage>;
+    async fn get_change(&self, id: &str) -> anyhow::Result<Option<ModelChangeRecord>>;
+    async fn prune_changes(&self, before: &str) -> anyhow::Result<()>;
     async fn delete_manual(&self, provider_id: &str, model_id: &str) -> anyhow::Result<bool>;
 }
 

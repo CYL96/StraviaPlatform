@@ -616,8 +616,9 @@ mod tests {
         async fn create(
             &self,
             input: NewProviderModelRecord,
+            change_record: Option<crate::provider_models::ModelChangeRecord>,
         ) -> anyhow::Result<ProviderModelMutation> {
-            ProviderModelStore::create(&self.delegate, input).await
+            ProviderModelStore::create(&self.delegate, input, change_record).await
         }
 
         async fn update_metadata(
@@ -664,6 +665,7 @@ mod tests {
             model_id: &str,
             policy: ProviderModelSelectionPolicy,
             expected_revision: i64,
+            change_record: Option<crate::provider_models::ModelChangeRecord>,
         ) -> anyhow::Result<ProviderModelMutation> {
             ProviderModelStore::update_selection_policy(
                 &self.delegate,
@@ -671,12 +673,57 @@ mod tests {
                 model_id,
                 policy,
                 expected_revision,
+                change_record,
             )
             .await
         }
 
         async fn delete_manual(&self, provider_id: &str, model_id: &str) -> anyhow::Result<bool> {
             ProviderModelStore::delete_manual(&self.delegate, provider_id, model_id).await
+        }
+
+        async fn sync_state(
+            &self,
+            provider_id: &str,
+        ) -> anyhow::Result<crate::provider_models::ProviderModelSyncState> {
+            self.delegate.sync_state(provider_id).await
+        }
+
+        async fn set_automatic_sync(
+            &self,
+            provider_id: &str,
+            enabled: bool,
+        ) -> anyhow::Result<crate::provider_models::ProviderModelSyncState> {
+            self.delegate.set_automatic_sync(provider_id, enabled).await
+        }
+
+        async fn save_sync_failure(
+            &self,
+            provider_id: &str,
+            summary: crate::provider_models::ProviderModelSyncSummary,
+            record: crate::provider_models::ModelChangeRecord,
+        ) -> anyhow::Result<()> {
+            self.delegate
+                .save_sync_failure(provider_id, summary, record)
+                .await
+        }
+
+        async fn list_changes(
+            &self,
+            query: crate::provider_models::ModelChangeQuery,
+        ) -> anyhow::Result<crate::provider_models::ModelChangePage> {
+            self.delegate.list_changes(query).await
+        }
+
+        async fn get_change(
+            &self,
+            id: &str,
+        ) -> anyhow::Result<Option<crate::provider_models::ModelChangeRecord>> {
+            self.delegate.get_change(id).await
+        }
+
+        async fn prune_changes(&self, before: &str) -> anyhow::Result<()> {
+            self.delegate.prune_changes(before).await
         }
     }
 
@@ -1459,21 +1506,24 @@ mod tests {
         for provider in ["cache_read_heavy", "output_heavy"] {
             let applied = storage
                 .provider_models()
-                .create(NewProviderModelRecord {
-                    provider_id: provider.into(),
-                    model_id: "model".into(),
-                    source_kind: ProviderModelSourceKind::Discovered,
-                    snapshot_state: SnapshotState::Imported {
-                        source: crate::provider_models::SourceStamp::Discovery,
+                .create(
+                    NewProviderModelRecord {
+                        provider_id: provider.into(),
+                        model_id: "model".into(),
+                        source_kind: ProviderModelSourceKind::Discovered,
+                        snapshot_state: SnapshotState::Imported {
+                            source: crate::provider_models::SourceStamp::Discovery,
+                        },
+                        metadata_source_provider_id: None,
+                        presence: ProviderModelPresence::Present,
+                        selection_policy: ProviderModelSelectionPolicy::Auto,
+                        metadata: ProviderModelMetadata {
+                            cost: Some(cost.clone()),
+                            ..Default::default()
+                        },
                     },
-                    metadata_source_provider_id: None,
-                    presence: ProviderModelPresence::Present,
-                    selection_policy: ProviderModelSelectionPolicy::Auto,
-                    metadata: ProviderModelMetadata {
-                        cost: Some(cost.clone()),
-                        ..Default::default()
-                    },
-                })
+                    None,
+                )
                 .await
                 .expect("provider model created");
             assert!(matches!(applied, ProviderModelMutation::Applied(_)));
@@ -1556,7 +1606,7 @@ mod tests {
         let costs = snapshot_costs(&fixture, &route).await;
         assert_eq!(costs, vec![("p:model".to_string(), None, None)]);
         let applied = models
-            .create(priced_model("p", 1, 2))
+            .create(priced_model("p", 1, 2), None)
             .await
             .expect("create");
         assert!(matches!(applied, ProviderModelMutation::Applied(_)));

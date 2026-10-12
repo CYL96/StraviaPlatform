@@ -247,9 +247,7 @@ impl ProviderModelMetadata {
             .limit
             .as_ref()
             .is_some_and(|limit| limit.context.is_some());
-        let declared_modalities = self.modalities.as_ref().is_some_and(|modalities| {
-            !modalities.input.is_empty() || !modalities.output.is_empty()
-        });
+        let declared_modalities = self.modalities.is_some();
         declared_limit
             || declared_modalities
             || self.open_weights.is_some()
@@ -564,14 +562,197 @@ pub struct ProviderModelPresenceUpdate {
 pub struct ProviderModelReconciliation {
     pub inserts: Vec<NewProviderModelRecord>,
     pub updates: Vec<ProviderModelPresenceUpdate>,
+    pub sync_summary: Option<ProviderModelSyncSummary>,
+    pub change_record: Option<ModelChangeRecord>,
+    pub expected_provider: Option<crate::db::models::Provider>,
+    pub expected_revisions: Vec<(String, i64)>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProviderModelSyncSummary {
     pub added: usize,
     pub missing: usize,
     pub restored: usize,
     pub deprecated: usize,
+    pub checked_at: String,
+    pub source: ModelChangeSource,
+    pub record_id: Option<String>,
+    pub deprecation_cleared: usize,
+    pub specification_updated: usize,
+    pub outcome: ModelChangeOutcome,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelChangeSource {
+    AutomaticSync,
+    ManualSync,
+    ManualChange,
+}
+
+impl ModelChangeSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AutomaticSync => "automatic_sync",
+            Self::ManualSync => "manual_sync",
+            Self::ManualChange => "manual_change",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelChangeType {
+    Added,
+    Missing,
+    Restored,
+    Deprecated,
+    DeprecationCleared,
+    SpecificationUpdated,
+    ManualAdded,
+    SelectionPolicyChanged,
+    SyncFailed,
+}
+
+impl ModelChangeType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Added => "added",
+            Self::Missing => "missing",
+            Self::Restored => "restored",
+            Self::Deprecated => "deprecated",
+            Self::DeprecationCleared => "deprecation_cleared",
+            Self::SpecificationUpdated => "specification_updated",
+            Self::ManualAdded => "manual_added",
+            Self::SelectionPolicyChanged => "selection_policy_changed",
+            Self::SyncFailed => "sync_failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelChangeOutcome {
+    Success,
+    PartialSuccess,
+    Failure,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModelSpecificationDiff {
+    pub field: String,
+    pub before: Value,
+    pub after: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModelChangeItem {
+    pub model_id: String,
+    pub name: String,
+    pub types: Vec<ModelChangeType>,
+    pub specification: Vec<ModelSpecificationDiff>,
+    pub before_presence: Option<ProviderModelPresence>,
+    pub after_presence: Option<ProviderModelPresence>,
+    pub before_deprecated: Option<bool>,
+    pub after_deprecated: Option<bool>,
+    pub before_policy: Option<ProviderModelSelectionPolicy>,
+    pub after_policy: Option<ProviderModelSelectionPolicy>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModelChangeRecord {
+    pub id: String,
+    pub provider_id: String,
+    pub provider_name: String,
+    pub provider_deleted: bool,
+    pub source: ModelChangeSource,
+    pub checked_at: String,
+    pub outcome: ModelChangeOutcome,
+    pub initial_sync: bool,
+    pub changes: Vec<ModelChangeItem>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ModelChangeQuery {
+    pub provider_id: Option<String>,
+    #[serde(rename = "type")]
+    pub change_type: Option<ModelChangeType>,
+    pub source: Option<ModelChangeSource>,
+    pub q: Option<String>,
+    pub cursor: Option<String>,
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelChangePage {
+    pub records: Vec<ModelChangeRecord>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderModelSyncState {
+    pub automatic_sync: bool,
+    pub in_progress: bool,
+    pub pause_reason: Option<String>,
+    pub last_check: Option<ProviderModelSyncSummary>,
+    pub has_successful_sync: bool,
+}
+
+impl Default for ProviderModelSyncState {
+    fn default() -> Self {
+        Self {
+            automatic_sync: true,
+            in_progress: false,
+            pause_reason: None,
+            last_check: None,
+            has_successful_sync: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateProviderModelSyncState {
+    pub automatic_sync: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProviderModelSyncFailure {
+    pub summary: ProviderModelSyncSummary,
+}
+
+impl std::fmt::Display for ProviderModelSyncFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            self.summary
+                .error
+                .as_deref()
+                .unwrap_or("Model synchronization failed"),
+        )
+    }
+}
+impl std::error::Error for ProviderModelSyncFailure {}
+
+pub(crate) fn same_discovery_provider(
+    left: &crate::db::models::Provider,
+    right: &crate::db::models::Provider,
+) -> bool {
+    left.id == right.id
+        && left.vendor == right.vendor
+        && left.protocol == right.protocol
+        && left.base_url == right.base_url
+        && left.preset_key == right.preset_key
+        && left.channel == right.channel
+        && left.models_source == right.models_source
+        && left.static_models == right.static_models
+        && left.api_key == right.api_key
+        && left.adapter_credentials == right.adapter_credentials
+        && left.vendor_options == right.vendor_options
+        && left.auth_mode == right.auth_mode
+        && left.use_proxy == right.use_proxy
+        && left.is_enabled == right.is_enabled
+        && left.updated_at == right.updated_at
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

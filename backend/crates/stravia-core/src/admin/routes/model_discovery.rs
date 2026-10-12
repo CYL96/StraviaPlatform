@@ -63,7 +63,7 @@ pub(super) async fn discover_provider_models(
     gw: &Gateway,
     provider_id: &str,
 ) -> Result<DiscoveredModels, RouteModelDiscoveryError> {
-    let cancellation = stravia_runtime_contract::CancellationToken::new();
+    let cancellation = gw.lifecycle.cancellation.clone();
     let deadline = stravia_runtime_contract::Deadline::fixed(Instant::now() + DISCOVERY_TIMEOUT);
     let prepared = gw
         .prepare_vendor_execution(

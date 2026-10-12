@@ -196,7 +196,9 @@ async fn run_server(
         Ok::<(), anyhow::Error>(())
     }
     .await;
-    // 包括准备或令牌输出失败：先停止接收并排空请求，再关闭 Gateway。
+    // 后台同步可能被 HTTP 请求等待；先取消后台，再排空请求和清理 Gateway。
+    server.handle().shutdown();
+    startup.request_shutdown().await;
     let stopped = if result.is_err() {
         server.shutdown_with_timeout(Duration::ZERO).await
     } else {

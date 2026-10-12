@@ -16,6 +16,8 @@ import { connectServerStartup, initialServerStartupState } from '$lib/server-sta
 import type { ServerStartupState } from '$lib/server-startup'
 import DesktopStartupNotices from '$lib/components/desktop-startup-notices.svelte'
 import ProductUpdateOverlay from '$lib/components/product-update-overlay.svelte'
+import ModelChangesSheet from '$lib/components/model-changes-sheet.svelte'
+import { setModelChanges, type ModelChanges } from '$lib/model-changes'
 import { Button } from '$lib/components/ui/button'
 import { Toaster } from '$lib/components/ui/sonner'
 import * as Tooltip from '$lib/components/ui/tooltip'
@@ -40,6 +42,11 @@ const connectSetup = $state<ConnectSetup>({ draft: undefined, createKey: false }
 setConnectSetup(connectSetup)
 const chat = createConsoleChat()
 setConsoleChat(chat)
+let modelChanges = $state<ModelChanges>()
+setModelChanges({
+  show: (providerId) => modelChanges?.show(providerId),
+  reveal: (recordId) => modelChanges?.reveal(recordId),
+})
 const isSetupResource = $derived(/^\/(providers|models|api-keys)(\/|$)/.test(page.url.pathname))
 afterNavigate(({ from }) => {
   if (!isSetupResource && page.url.pathname !== resolve('/connect')) {
@@ -235,8 +242,13 @@ onMount(() => {
 {:else}
   <QueryClientProvider client={queryClient}>
     <Tooltip.Provider>
-      <Toaster toastOptions={{ class: 'pointer-events-none' }} />
+      <Toaster
+        toastOptions={{
+          class: 'pointer-events-none',
+          classes: { actionButton: 'pointer-events-auto', cancelButton: 'pointer-events-auto' },
+        }} />
       {#if authReady}
+        <ModelChangesSheet bind:this={modelChanges} />
         <ProductUpdateOverlay />
         <AppShell>
           {#if isTauri}

@@ -462,6 +462,12 @@ impl SendEligibility {
                     error.to_string(),
                 ))
             })?;
+        if model
+            .as_ref()
+            .is_some_and(|model| !model.effective_available())
+        {
+            return Err(rejected());
+        }
         crate::model_turn::validate_target_capability(
             channel,
             self.target.model().as_str(),

@@ -275,7 +275,7 @@ impl<'a> RouteModule<'a> {
             },
         };
 
-        match store.create(input).await? {
+        match store.create(input, None).await? {
             ProviderModelMutation::Applied(_) | ProviderModelMutation::Conflict => Ok(()),
             ProviderModelMutation::NotFound => {
                 anyhow::bail!("copied Provider Model unexpectedly disappeared")

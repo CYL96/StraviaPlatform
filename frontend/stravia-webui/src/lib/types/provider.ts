@@ -160,10 +160,81 @@ export interface PreparedProviderModel {
 }
 
 export interface ProviderModelSyncSummary {
+  checked_at: string
+  source: ModelChangeSource
+  record_id: string | null
   added: number
   missing: number
   restored: number
   deprecated: number
+  deprecation_cleared: number
+  specification_updated: number
+  outcome: ModelChangeOutcome
+  error: string | null
+}
+
+export type ModelChangeSource = 'automatic_sync' | 'manual_sync' | 'manual_change'
+export type ModelChangeOutcome = 'success' | 'partial_success' | 'failure'
+export type ModelChangeType =
+  | 'added'
+  | 'missing'
+  | 'restored'
+  | 'deprecated'
+  | 'deprecation_cleared'
+  | 'specification_updated'
+  | 'manual_added'
+  | 'selection_policy_changed'
+  | 'sync_failed'
+export interface ModelSpecificationDiff {
+  field: string
+  before: unknown
+  after: unknown
+}
+export interface ModelChangeItem {
+  model_id: string
+  name: string
+  types: ModelChangeType[]
+  specification: ModelSpecificationDiff[]
+  before_presence: 'present' | 'missing' | null
+  after_presence: 'present' | 'missing' | null
+  before_deprecated: boolean | null
+  after_deprecated: boolean | null
+  before_policy: ProviderModelSelectionPolicy | null
+  after_policy: ProviderModelSelectionPolicy | null
+}
+export interface ModelChangeRecord {
+  id: string
+  provider_id: string
+  provider_name: string
+  provider_deleted: boolean
+  source: ModelChangeSource
+  checked_at: string
+  outcome: ModelChangeOutcome
+  initial_sync: boolean
+  changes: ModelChangeItem[]
+  error: string | null
+}
+export interface ModelChangeQuery {
+  provider_id?: string
+  type?: ModelChangeType
+  source?: ModelChangeSource
+  q?: string
+  cursor?: string
+  limit?: number
+}
+export interface ModelChangePage {
+  records: ModelChangeRecord[]
+  next_cursor: string | null
+}
+export interface ProviderModelSyncState {
+  automatic_sync: boolean
+  in_progress: boolean
+  pause_reason: string | null
+  last_check: ProviderModelSyncSummary | null
+  has_successful_sync: boolean
+}
+export interface UpdateProviderModelSyncState {
+  automatic_sync: boolean
 }
 
 export interface CreateProvider {

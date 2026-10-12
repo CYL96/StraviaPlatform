@@ -1106,6 +1106,31 @@ CREATE TABLE public.model_backends (
 
 
 --
+-- Name: model_change_items; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.model_change_items (
+    record_id text NOT NULL,
+    name_key text NOT NULL,
+    model_id_key text NOT NULL,
+    change_type text NOT NULL
+);
+
+
+--
+-- Name: model_changes; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.model_changes (
+    id text NOT NULL,
+    provider_id text NOT NULL,
+    checked_at text NOT NULL,
+    source text NOT NULL,
+    record_json text NOT NULL
+);
+
+
+--
 -- Name: model_turn_observations; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -1309,6 +1334,18 @@ CREATE TABLE public.provider_model_cost_rules (
     CONSTRAINT provider_model_cost_rules_rule_index_check CHECK ((rule_index >= 0)),
     CONSTRAINT provider_model_cost_rules_rule_kind_check CHECK ((rule_kind = ANY (ARRAY['context_over_200k'::text, 'tier'::text]))),
     CONSTRAINT provider_model_cost_rules_threshold_tokens_check CHECK ((threshold_tokens >= 0))
+);
+
+
+--
+-- Name: provider_model_sync_state; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.provider_model_sync_state (
+    provider_id text NOT NULL,
+    automatic_sync boolean DEFAULT true NOT NULL,
+    has_successful_sync boolean DEFAULT false NOT NULL,
+    last_check text
 );
 
 
@@ -2471,6 +2508,14 @@ ALTER TABLE ONLY public.model_backends
 
 
 --
+-- Name: model_changes model_changes_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.model_changes
+    ADD CONSTRAINT model_changes_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: model_turn_observations model_turn_observations_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -2564,6 +2609,14 @@ ALTER TABLE ONLY public.provider_allowance_suspensions
 
 ALTER TABLE ONLY public.provider_model_cost_rules
     ADD CONSTRAINT provider_model_cost_rules_pkey PRIMARY KEY (provider_id, model_id, rule_index);
+
+
+--
+-- Name: provider_model_sync_state provider_model_sync_state_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.provider_model_sync_state
+    ADD CONSTRAINT provider_model_sync_state_pkey PRIMARY KEY (provider_id);
 
 
 --
@@ -3035,6 +3088,27 @@ CREATE INDEX interaction_observations_window_idx ON public.interaction_observati
 
 
 --
+-- Name: model_change_items_record; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX model_change_items_record ON public.model_change_items USING btree (record_id, change_type);
+
+
+--
+-- Name: model_changes_order; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX model_changes_order ON public.model_changes USING btree (checked_at DESC, id DESC);
+
+
+--
+-- Name: model_changes_provider_order; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX model_changes_provider_order ON public.model_changes USING btree (provider_id, checked_at DESC, id DESC);
+
+
+--
 -- Name: model_turns_analytics_idx; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -3315,6 +3389,14 @@ ALTER TABLE ONLY public.model_backends
 
 
 --
+-- Name: model_change_items model_change_items_record_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.model_change_items
+    ADD CONSTRAINT model_change_items_record_id_fkey FOREIGN KEY (record_id) REFERENCES public.model_changes(id) ON DELETE CASCADE;
+
+
+--
 -- Name: model_turn_observations model_turn_observations_interaction_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -3448,6 +3530,14 @@ ALTER TABLE ONLY public.provider_allowance_suspensions
 
 ALTER TABLE ONLY public.provider_model_cost_rules
     ADD CONSTRAINT provider_model_cost_rules_provider_id_model_id_fkey FOREIGN KEY (provider_id, model_id) REFERENCES public.provider_models(provider_id, model_id) ON DELETE CASCADE;
+
+
+--
+-- Name: provider_model_sync_state provider_model_sync_state_provider_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.provider_model_sync_state
+    ADD CONSTRAINT provider_model_sync_state_provider_id_fkey FOREIGN KEY (provider_id) REFERENCES public.providers(id) ON DELETE CASCADE;
 
 
 --
