@@ -41,6 +41,8 @@
 
 ### Fixed
 
+- Automatic and manual model discovery now share a bounded 120-second budget instead of the short 30-second limit, allowing slow account catalogs such as Devin's to finish. Manual checks still join an active background discovery without a duplicate upstream request; shutdown cancellation and inventory publication checks remain unchanged.
+- Allowance-pause details no longer expand model-service table rows or allowance-matrix rows. The list, service header and matrix now use a compact status trigger with hover, keyboard and touch-accessible details; the routing-recovery explanation has been removed.
 - A confirmed account inventory is no longer rejected because optional Provider Catalog enrichment fails. The catalog failure remains explicit; existing catalog specifications and reimport sources remain valid, and missing lifecycle metadata cannot clear deprecation. Canonical or unregistered metadata never adds inventory members.
 - Desktop and Server now cancel background discovery before draining HTTP on full exit, so an active manual model check cannot hold shutdown open while waiting for its own cancellation. Final task, observation and cache cleanup keeps its existing order.
 - Manual model-check detail actions remain usable after switching tabs or pages, including keyboard activation and focus recovery at 320px. Completing a check no longer navigates users back to a page they left, and late automatic-sync preference responses cannot overwrite another service's state.

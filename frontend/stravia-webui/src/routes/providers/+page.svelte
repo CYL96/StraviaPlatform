@@ -21,7 +21,7 @@ import ProviderEditor from '$lib/components/provider-editor.svelte'
 import ProviderOAuthAuthorization from '$lib/components/provider-oauth-authorization.svelte'
 import ProviderMark from '$lib/components/provider-mark.svelte'
 import StatusIndicator from '$lib/components/status-indicator.svelte'
-import AllowanceSuspensionBanner from '$lib/components/allowance-suspension.svelte'
+import AllowanceSuspension from '$lib/components/allowance-suspension.svelte'
 import TechnicalValue from '$lib/components/technical-value.svelte'
 import * as AlertDialog from '$lib/components/ui/alert-dialog'
 import { Badge } from '$lib/components/ui/badge'
@@ -394,23 +394,19 @@ async function copyProvider(): Promise<void> {
 {#snippet providerStatusCell(context: DataTableCellContext<Provider>)}
   {@const provider = context.row.original}
   {@const credentialInvalid = provider.credential_status === 'invalid'}
-  <StatusIndicator
-    compact
-    label={credentialInvalid && provider.is_enabled
-      ? m.providers_credential_invalid()
-      : provider.allowance_suspension && provider.is_enabled
-        ? m.allowances_suspended()
-        : provider.is_enabled
-          ? m.common_enabled_status()
-          : m.common_disabled_status()}
-    tone={credentialInvalid && provider.is_enabled
-      ? 'error'
-      : provider.allowance_suspension && provider.is_enabled
-        ? 'warning'
-        : provider.is_enabled
-          ? 'healthy'
-          : 'neutral'} />
-  {#if provider.allowance_suspension}<AllowanceSuspensionBanner suspension={provider.allowance_suspension} />{/if}
+  <div class="flex flex-wrap items-center gap-x-2 gap-y-1">
+    {#if credentialInvalid || !provider.is_enabled || !provider.allowance_suspension}
+      <StatusIndicator
+        compact
+        label={credentialInvalid && provider.is_enabled
+          ? m.providers_credential_invalid()
+          : provider.is_enabled
+            ? m.common_enabled_status()
+            : m.common_disabled_status()}
+        tone={credentialInvalid && provider.is_enabled ? 'error' : provider.is_enabled ? 'healthy' : 'neutral'} />
+    {/if}
+    {#if provider.allowance_suspension}<AllowanceSuspension suspension={provider.allowance_suspension} />{/if}
+  </div>
   {#if credentialInvalid && !provider.is_enabled}
     <p class="mt-1 text-xs text-destructive">{m.providers_credential_invalid()}</p>
   {/if}
@@ -514,28 +510,27 @@ async function copyProvider(): Promise<void> {
                 </div>
               </div>
               <TechnicalValue class="mt-2 max-w-full text-muted-foreground" value={provider.base_url} />
-              <StatusIndicator
-                class="mt-1"
-                compact
-                label={credentialInvalid && provider.is_enabled
-                  ? m.providers_credential_invalid()
-                  : provider.allowance_suspension && provider.is_enabled
-                    ? m.allowances_suspended()
-                    : provider.is_enabled
-                      ? m.common_enabled_status()
-                      : m.common_disabled_status()}
-                tone={credentialInvalid && provider.is_enabled
-                  ? 'error'
-                  : provider.allowance_suspension && provider.is_enabled
-                    ? 'warning'
-                    : provider.is_enabled
-                      ? 'healthy'
-                      : 'neutral'} />
+              <div class="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1">
+                {#if credentialInvalid || !provider.is_enabled || !provider.allowance_suspension}
+                  <StatusIndicator
+                    compact
+                    label={credentialInvalid && provider.is_enabled
+                      ? m.providers_credential_invalid()
+                      : provider.is_enabled
+                        ? m.common_enabled_status()
+                        : m.common_disabled_status()}
+                    tone={credentialInvalid && provider.is_enabled
+                      ? 'error'
+                      : provider.is_enabled
+                        ? 'healthy'
+                        : 'neutral'} />
+                {/if}
+                {#if provider.allowance_suspension}<AllowanceSuspension
+                    suspension={provider.allowance_suspension} />{/if}
+              </div>
               {#if credentialInvalid && !provider.is_enabled}
                 <p class="mt-1 text-xs text-destructive">{m.providers_credential_invalid()}</p>
               {/if}
-              {#if provider.allowance_suspension}<AllowanceSuspensionBanner
-                  suspension={provider.allowance_suspension} />{/if}
               {#if drifts.length > 0}
                 <Badge
                   class="mt-2"

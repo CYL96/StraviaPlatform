@@ -33,6 +33,7 @@ const DEVIN_BASE_URL: &str = "https://server.codeium.com";
 const DEVIN_TOKEN_PATH: &str =
     "/exa.seat_management_pb.SeatManagementService/ExchangeDevinCLIPKCECode";
 const DEVIN_ALLOWANCE_PATH: &str = "/exa.seat_management_pb.SeatManagementService/GetUserStatus";
+const DEVIN_MODELS_PATH: &str = "/exa.api_server_pb.ApiServerService/GetCliModelConfigs";
 
 #[derive(Clone, Debug)]
 struct ObservedRequest {
@@ -226,7 +227,6 @@ async fn gateway_for(
     }
     let root = reqwest::tls::Certificate::from_der(&server.certificate_der)?;
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
         .redirect(reqwest::redirect::Policy::none())
         .no_proxy()
         .https_only(true)
@@ -438,6 +438,104 @@ async fn deepseek_allowance_uses_real_tls_get_and_preserves_multi_currency_unkno
         Some("Bearer deepseek-contract-secret")
     );
     assert!(request.body.is_empty());
+    server.task.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn devin_slow_model_discovery_publishes_the_confirmed_inventory() -> anyhow::Result<()> {
+    let release = Arc::new(Notify::new());
+    let server_release = Arc::clone(&release);
+    let mut config = proto_string(1, "Delayed catalog model");
+    config.extend(proto_string(22, "contract-delayed-model"));
+    config.extend(proto_len(23, &proto_string(23, "contract-delayed-model")));
+    let body = proto_len(1, &config);
+    let mut server = local_tls_server(1, move |_| {
+        let mut response = LocalResponse::protobuf(body.clone());
+        response.release = Some(Arc::clone(&server_release));
+        response
+    })
+    .await?;
+    let (_directory, gateway) = gateway_for(&server, &["devin"]).await?;
+    let authorization = gateway
+        .admin()
+        .init_oauth_session(
+            AuthSessionCandidate {
+                vendor_id: "devin".into(),
+                channel: "devin".into(),
+                provider_id: None,
+                base_url: DEVIN_BASE_URL.into(),
+                protocol: Some("devin-connect".into()),
+                options: Default::default(),
+                credentials: Default::default(),
+                use_proxy: false,
+            },
+            OAuthSessionStartOptions {
+                callback_mode: OAuthCallbackMode::Manual,
+                redirect_uri: "chisel-show-auth-token".into(),
+                listener_port: None,
+                fallback_reason: None,
+            },
+        )
+        .await?;
+    gateway
+        .admin()
+        .complete_oauth_session(
+            &authorization.session_id,
+            AuthCompletionInput {
+                input: AuthCompletionValue::Manual {
+                    value: "session_token=devin-contract-token".into(),
+                },
+            },
+        )
+        .await?;
+    let provider = gateway
+        .admin()
+        .create_provider_with_oauth_session(
+            &authorization.session_id,
+            devin_oauth_provider("Devin slow discovery"),
+        )
+        .await?;
+    gateway.start_provider_model_sync().await?;
+    let request = tokio::time::timeout(Duration::from_secs(10), server.requests.recv())
+        .await?
+        .expect("Devin discovery request");
+    assert_eq!(request.method, "POST");
+    assert_eq!(request.path, DEVIN_MODELS_PATH);
+    let sync_gateway = gateway.clone();
+    let provider_id = provider.id.clone();
+    let sync = tokio::spawn(async move {
+        sync_gateway
+            .admin()
+            .sync_provider_models(&provider_id)
+            .await
+    });
+    // 真实上游延迟跨过旧的 30 秒发现上限；不缩短产品 deadline 来模拟。
+    tokio::time::sleep(Duration::from_secs(31)).await;
+    release.notify_one();
+    let summary = tokio::time::timeout(Duration::from_secs(10), sync).await???;
+    assert_eq!(
+        summary.outcome,
+        crate::provider_models::ModelChangeOutcome::Success
+    );
+    assert_eq!(
+        summary.source,
+        crate::provider_models::ModelChangeSource::AutomaticSync,
+        "manual checks must join the scheduled discovery instead of issuing another request"
+    );
+    let state = gateway
+        .admin()
+        .provider_model_sync_state(&provider.id)
+        .await?;
+    assert_eq!(state.last_check.as_ref(), Some(&summary));
+    let inventory = gateway.admin().list_provider_models(&provider.id).await?;
+    assert!(
+        inventory
+            .models
+            .iter()
+            .any(|model| model.id == "contract-delayed-model"),
+        "the delayed upstream model must be saved, not replaced by static fallback"
+    );
     server.task.await??;
     Ok(())
 }

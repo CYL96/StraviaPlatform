@@ -143,7 +143,6 @@
   "allowances_suspension_trigger": "暂停触发条目",
   "allowances_suspended_since": "暂停开始于 {time}",
   "allowances_suspension_triggers": "触发条目：{keys}",
-  "allowances_suspension_recovery": "只有成功读取额度并确认恢复后才会恢复路由；到达重置时间不会直接恢复。",
   "allowances_guard_item": "{item}耗尽时暂停此服务",
   "allowances_guard_column": "耗尽时暂停",
   "allowances_guard_help_label": "关于耗尽时暂停",

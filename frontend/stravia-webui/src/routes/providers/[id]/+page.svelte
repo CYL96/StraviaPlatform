@@ -19,7 +19,7 @@ import ProviderConnectionView from '$lib/components/provider-connection-view.sve
 import ProviderMark from '$lib/components/provider-mark.svelte'
 import ProviderModelCatalog from '$lib/components/provider-model-catalog.svelte'
 import StatusIndicator from '$lib/components/status-indicator.svelte'
-import AllowanceSuspensionBanner from '$lib/components/allowance-suspension.svelte'
+import AllowanceSuspension from '$lib/components/allowance-suspension.svelte'
 import TechnicalValue from '$lib/components/technical-value.svelte'
 import { Badge } from '$lib/components/ui/badge'
 import { Button } from '$lib/components/ui/button'
@@ -148,22 +148,17 @@ async function syncModels(id = providerId): Promise<ProviderModelSyncSummary | u
             icon={descriptor?.catalog_id ?? provider.preset_key ?? provider.vendor ?? 'custom'}
             name={provider.name}
             logo={provider.id} />
-          <StatusIndicator
-            compact
-            label={credentialInvalid && provider.is_enabled
-              ? m.providers_credential_invalid()
-              : provider.allowance_suspension && provider.is_enabled
-                ? m.allowances_suspended()
+          {#if credentialInvalid || !provider.is_enabled || !provider.allowance_suspension}
+            <StatusIndicator
+              compact
+              label={credentialInvalid && provider.is_enabled
+                ? m.providers_credential_invalid()
                 : provider.is_enabled
                   ? m.common_enabled_status()
                   : m.common_inactive_status()}
-            tone={credentialInvalid && provider.is_enabled
-              ? 'error'
-              : provider.allowance_suspension && provider.is_enabled
-                ? 'warning'
-                : provider.is_enabled
-                  ? 'healthy'
-                  : 'neutral'} />
+              tone={credentialInvalid && provider.is_enabled ? 'error' : provider.is_enabled ? 'healthy' : 'neutral'} />
+          {/if}
+          {#if provider.allowance_suspension}<AllowanceSuspension suspension={provider.allowance_suspension} />{/if}
           {#if credentialInvalid && !provider.is_enabled}
             <Badge variant="destructive">{m.providers_credential_invalid()}</Badge>
           {/if}
@@ -176,8 +171,6 @@ async function syncModels(id = providerId): Promise<ProviderModelSyncSummary | u
         {/if}
       {/snippet}
     </PageHeader>
-    {#if provider.allowance_suspension}<AllowanceSuspensionBanner suspension={provider.allowance_suspension} />{/if}
-
     <nav class={tabsListVariants()} data-variant="default" aria-label={m.common_model_service_details()}>
       {#each detailTabs as item (item.id)}
         <a
