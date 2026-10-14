@@ -59,6 +59,7 @@ struct PooledWebSocket {
     actual_protocols: Vec<String>,
     socket: WebSocket,
     connected_at: tokio::time::Instant,
+    reuse_expires_at: tokio::time::Instant,
     parked_at: tokio::time::Instant,
 }
 
@@ -73,20 +74,33 @@ struct WebSocketPoolIdentity {
     actual_protocols: Vec<String>,
 }
 
+/// Reuse lookup key; the pool matches every field exactly.
+struct WebSocketPoolRequest<'a> {
+    scope_key: &'a str,
+    affinity: &'a str,
+    requested_url: &'a str,
+    requested_headers: &'a [u8; 32],
+    requested_protocols: &'a [String],
+    continuation_id: Option<&'a str>,
+}
+
 impl VendorWebSocketPool {
     fn take(
         &self,
-        scope_key: &str,
-        affinity: &str,
-        requested_url: &str,
-        requested_headers: &[u8; 32],
-        requested_protocols: &[String],
-        continuation_id: Option<&str>,
+        request: &WebSocketPoolRequest<'_>,
+        reuse_age: Duration,
     ) -> Option<PooledWebSocket> {
-        let now = tokio::time::Instant::now();
+        let WebSocketPoolRequest {
+            scope_key,
+            affinity,
+            requested_url,
+            requested_headers,
+            requested_protocols,
+            continuation_id,
+        } = *request;
         let mut idle = self.idle.lock();
-        idle.retain(|entry| entry.connected_at + MAX_WEBSOCKET_AGE > now);
-        let index = idle.iter().position(|entry| {
+        let now = tokio::time::Instant::now();
+        let matches = |entry: &PooledWebSocket| {
             entry.scope_key == scope_key
                 && entry.affinity == affinity
                 && continuation_id.is_none_or(|id| entry.continuation_id.as_deref() == Some(id))
@@ -96,7 +110,20 @@ impl VendorWebSocketPool {
                 && entry.actual_headers == *requested_headers
                 && entry.requested_protocols == requested_protocols
                 && entry.actual_protocols == requested_protocols
-        })?;
+        };
+        let mut expiration_changed = false;
+        idle.retain_mut(|entry| {
+            if matches(entry) {
+                let expires_at = entry.reuse_expires_at.min(entry.connected_at + reuse_age);
+                expiration_changed |= expires_at != entry.reuse_expires_at;
+                entry.reuse_expires_at = expires_at;
+            }
+            entry.reuse_expires_at > now
+        });
+        if expiration_changed {
+            self.expiration_changed.notify_one();
+        }
+        let index = idle.iter().position(matches)?;
         Some(idle.swap_remove(index))
     }
 
@@ -105,15 +132,16 @@ impl VendorWebSocketPool {
         identity: WebSocketPoolIdentity,
         socket: WebSocket,
         connected_at: tokio::time::Instant,
+        reuse_expires_at: tokio::time::Instant,
         continuation_id: Option<String>,
     ) -> bool {
-        let now = tokio::time::Instant::now();
-        if connected_at + MAX_WEBSOCKET_AGE <= now {
-            return false;
-        }
         {
             let mut idle = self.idle.lock();
-            idle.retain(|entry| entry.connected_at + MAX_WEBSOCKET_AGE > now);
+            let now = tokio::time::Instant::now();
+            if reuse_expires_at <= now {
+                return false;
+            }
+            idle.retain(|entry| entry.reuse_expires_at > now);
             if idle.len() >= MAX_IDLE_WEBSOCKETS {
                 let oldest = idle
                     .iter()
@@ -135,6 +163,7 @@ impl VendorWebSocketPool {
                 actual_protocols: identity.actual_protocols,
                 socket,
                 connected_at,
+                reuse_expires_at,
                 parked_at: now,
             });
         }
@@ -160,7 +189,7 @@ impl VendorWebSocketPool {
                         .idle
                         .lock()
                         .iter()
-                        .map(|entry| entry.connected_at + MAX_WEBSOCKET_AGE)
+                        .map(|entry| entry.reuse_expires_at)
                         .min();
                     drop(pool);
                     let Some(expires_at) = expires_at else {
@@ -175,7 +204,7 @@ impl VendorWebSocketPool {
                             let now = tokio::time::Instant::now();
                             pool.idle
                                 .lock()
-                                .retain(|entry| entry.connected_at + MAX_WEBSOCKET_AGE > now);
+                                .retain(|entry| entry.reuse_expires_at > now);
                         }
                         _ = expiration_changed.notified() => {}
                     }
@@ -502,7 +531,12 @@ impl VendorNetwork {
         headers: Vec<(String, String)>,
         protocols: Vec<String>,
         continuation_id: Option<String>,
+        reuse_max_age_millis: Option<u64>,
     ) -> Result<Arc<dyn HostWebSocket>, HostFailure> {
+        let reuse_age = reuse_max_age_millis
+            .map(Duration::from_millis)
+            .unwrap_or(MAX_WEBSOCKET_AGE)
+            .min(MAX_WEBSOCKET_AGE);
         let mut url = self.url(&url, true)?;
         let requested_url = url.as_str().to_owned();
         let mut headers = request_headers(headers, &url)?;
@@ -515,14 +549,15 @@ impl VendorNetwork {
             self.websocket_scope_key.as_deref(),
             self.websocket_affinity.as_deref(),
         ) {
-            while let Some(mut entry) = pool.take(
+            let lookup = WebSocketPoolRequest {
                 scope_key,
                 affinity,
-                &requested_url,
-                &requested_headers,
-                &requested_protocols,
-                continuation_id.as_deref(),
-            ) {
+                requested_url: &requested_url,
+                requested_headers: &requested_headers,
+                requested_protocols: &requested_protocols,
+                continuation_id: continuation_id.as_deref(),
+            };
+            while let Some(mut entry) = pool.take(&lookup, reuse_age) {
                 if self.url(&entry.actual_url, true).is_err()
                     || !drain_idle_frames(&mut entry.socket)
                 {
@@ -544,6 +579,7 @@ impl VendorNetwork {
                         actual_protocols: entry.actual_protocols,
                     }),
                     connected_at: entry.connected_at,
+                    reuse_expires_at: entry.reuse_expires_at,
                     reused: true,
                     first_send_admitted: AtomicBool::new(false),
                     application_message_seen: AtomicBool::new(false),
@@ -711,6 +747,7 @@ impl VendorNetwork {
                 wire_url: url.as_str().to_owned(),
                 pool_identity,
                 connected_at,
+                reuse_expires_at: connected_at + reuse_age,
                 reused: false,
                 first_send_admitted: AtomicBool::new(true),
                 application_message_seen: AtomicBool::new(false),
@@ -964,6 +1001,9 @@ struct ScopedWebSocket {
     wire_url: String,
     pool_identity: Option<WebSocketPoolIdentity>,
     connected_at: tokio::time::Instant,
+    // Retirement only controls checkout/check-in; in-flight I/O keeps the
+    // existing 60-minute hard limit measured from the same connection start.
+    reuse_expires_at: tokio::time::Instant,
     reused: bool,
     first_send_admitted: AtomicBool,
     application_message_seen: AtomicBool,
@@ -1195,6 +1235,7 @@ impl HostWebSocket for ScopedWebSocket {
                 },
                 socket,
                 self.connected_at,
+                self.reuse_expires_at,
                 continuation_id,
             ) {
                 self.explicitly_released.store(true, Ordering::Release);

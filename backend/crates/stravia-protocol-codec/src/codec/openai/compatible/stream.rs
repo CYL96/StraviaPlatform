@@ -151,6 +151,30 @@ impl OpenAIResponseParser {
         }
         ai_resp.stop_reason = stop_reason;
         ai_resp.usage = usage;
+        if let Some(index) = choice
+            .and_then(|choice| choice.get("index"))
+            .and_then(Value::as_u64)
+            .filter(|index| *index != 0)
+        {
+            ai_resp
+                .vendor
+                .egress
+                .insert("__openai_native_choice_index".into(), Value::from(index));
+        }
+        if let Some(choices) = resp.get("choices").and_then(Value::as_array)
+            && choices.len() > 1
+        {
+            for choice in &choices[1..] {
+                self.parse_response_with_reasoning_field(
+                    serde_json::json!({"choices": [choice]}),
+                    reasoning_source,
+                )?;
+            }
+            ai_resp.vendor.egress.insert(
+                "__openai_native_choices".into(),
+                Value::Array(choices[1..].to_vec()),
+            );
+        }
         Ok(ai_resp)
     }
 }
@@ -202,17 +226,55 @@ impl OpenAIResponseFormatter {
                 .insert("tool_calls".into(), Value::Array(tool_calls));
         }
 
-        serde_json::json!({
+        let mut out = serde_json::json!({
             "id": resp.id,
             "object": "chat.completion",
             "model": resp.model,
             "choices": [{
-                "index": 0,
+                "index": resp.vendor.egress
+                    .get("__openai_native_choice_index")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
                 "message": message,
                 "finish_reason": finish_reason,
             }],
             "usage": openai_usage_json(&resp.usage)
-        })
+        });
+        let mut source_text = String::new();
+        let mut logprobs = Vec::new();
+        for item in &resp.items {
+            if let Some(parts) = item
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.get("__open_responses_content"))
+                .and_then(Value::as_array)
+            {
+                for part in parts {
+                    if part.get("type").and_then(Value::as_str) == Some("output_text") {
+                        source_text
+                            .push_str(part.get("text").and_then(Value::as_str).unwrap_or(""));
+                        if let Some(values) = part.get("logprobs").and_then(Value::as_array) {
+                            logprobs.extend(values.iter().cloned());
+                        }
+                    }
+                }
+            }
+        }
+        if !logprobs.is_empty() && source_text == resp.output_text() {
+            out["choices"][0]["logprobs"] = serde_json::json!({"content": logprobs});
+        }
+        if let Some(extra) = resp
+            .vendor
+            .egress
+            .get("__openai_native_choices")
+            .and_then(Value::as_array)
+        {
+            out["choices"]
+                .as_array_mut()
+                .expect("choices array")
+                .extend(extra.iter().cloned());
+        }
+        out
     }
 }
 
@@ -319,6 +381,9 @@ pub struct OpenAIStreamParser {
     reasoning_source: Option<Arc<str>>,
     saw_tool_call: bool,
     pending_tool_terminal_error: bool,
+    pending_stop_reason: Option<String>,
+    canonical_choice: Option<u64>,
+    native_choices: std::collections::HashMap<u64, bool>,
     usage_input: Option<u64>,
     usage_output: Option<u64>,
     usage_cache_read: Option<u32>,
@@ -344,6 +409,9 @@ impl OpenAIStreamParser {
             reasoning_source: None,
             saw_tool_call: false,
             pending_tool_terminal_error: false,
+            pending_stop_reason: None,
+            canonical_choice: None,
+            native_choices: std::collections::HashMap::new(),
             usage_input: None,
             usage_output: None,
             usage_cache_read: None,
@@ -377,9 +445,13 @@ impl OpenAIStreamParser {
                             deltas.extend(self.flush_pending_text());
                             self.emit_pending_terminal_error(&mut deltas);
                         } else if !self.done {
+                            deltas.extend(self.flush_pending_text());
                             self.done = true;
                             deltas.push(AiStreamDelta::Done {
-                                stop_reason: "stop".to_string(),
+                                stop_reason: self
+                                    .pending_stop_reason
+                                    .take()
+                                    .unwrap_or_else(|| "stop".to_string()),
                             });
                         }
                         continue;
@@ -411,6 +483,7 @@ impl OpenAIStreamParser {
             return;
         }
         self.pending_tool_terminal_error = false;
+        self.done = true;
         deltas.push(AiStreamDelta::StreamError {
             error: stravia_runtime_contract::protocol::ir::AiError::new(
                 stravia_runtime_contract::protocol::ir::AiErrorKind::StreamMidError,
@@ -468,6 +541,25 @@ impl OpenAIStreamParser {
             });
             return Ok(());
         }
+        let choices = chunk.get("choices").and_then(Value::as_array);
+        let canonical_index = self.canonical_choice.unwrap_or_else(|| {
+            choices
+                .and_then(|choices| choices.first())
+                .and_then(|choice| choice.get("index"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+        });
+        if self.canonical_choice.is_none() && choices.is_some_and(|choices| !choices.is_empty()) {
+            self.canonical_choice = Some(canonical_index);
+            if canonical_index != 0 {
+                // Private native identity precedes all public canonical deltas,
+                // including the role frame; cross-protocol projection drops it.
+                deltas.push(AiStreamDelta::Unknown {
+                    raw: serde_json::json!({"__openai_native_choice_index": canonical_index})
+                        .to_string(),
+                });
+            }
+        }
         if !self.started
             && let (Some(id), Some(model)) = (
                 chunk.get("id").and_then(|v| v.as_str()),
@@ -480,12 +572,54 @@ impl OpenAIStreamParser {
                 model: model.to_string(),
             });
         }
-
-        let Some(choice) = chunk
-            .get("choices")
-            .and_then(|v| v.as_array())
-            .and_then(|a| a.first())
-        else {
+        let mut extra = Vec::new();
+        let mut canonical = None;
+        if let Some(choices) = choices {
+            for (position, choice) in choices.iter().enumerate() {
+                let index = choice
+                    .get("index")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(position as u64);
+                if index == canonical_index {
+                    canonical = Some(choice);
+                    continue;
+                }
+                let saw_tool = self.native_choices.entry(index).or_default();
+                if let Some(delta) = choice.get("delta") {
+                    extract_selected_reasoning(delta, self.reasoning_source.as_deref())?;
+                    if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
+                        *saw_tool |= calls.iter().any(|call| {
+                            call.get("function").is_some_and(|function| {
+                                [
+                                    call.get("id"),
+                                    function.get("name"),
+                                    function.get("arguments"),
+                                ]
+                                .into_iter()
+                                .flatten()
+                                .any(|value| value.as_str().is_some_and(|text| !text.is_empty()))
+                            })
+                        });
+                    }
+                }
+                if choice.get("finish_reason").and_then(Value::as_str) == Some("tool_calls")
+                    && !*saw_tool
+                {
+                    anyhow::bail!(
+                        "upstream tool_calls terminal contains no representable tool call"
+                    );
+                }
+                let mut native_choice = choice.clone();
+                native_choice["index"] = index.into();
+                extra.push(native_choice);
+            }
+        }
+        if !extra.is_empty() {
+            deltas.push(AiStreamDelta::Unknown {
+                raw: serde_json::json!({"__openai_native_choices": extra}).to_string(),
+            });
+        }
+        let Some(choice) = canonical else {
             self.emit_usage(chunk, deltas);
             return Ok(());
         };
@@ -541,22 +675,23 @@ impl OpenAIStreamParser {
             }
         }
 
+        self.emit_usage(chunk, deltas);
         if !self.done
+            && self.pending_stop_reason.is_none()
+            && !self.pending_tool_terminal_error
             && let Some(reason) = choice.get("finish_reason").and_then(|v| v.as_str())
             && !reason.is_empty()
         {
-            self.done = true;
             if reason == "tool_calls" && !self.saw_tool_call {
                 // 独立 usage 尾帧仍需消费；语义错误在流结束后交付，避免丢掉同批增量。
                 self.pending_tool_terminal_error = true;
             } else {
-                deltas.push(AiStreamDelta::Done {
-                    stop_reason: reason.to_string(),
-                });
+                // A choice terminal is not the global stream terminal: other
+                // native choices and the observed usage tail can still follow.
+                self.pending_stop_reason = Some(reason.to_string());
             }
         }
 
-        self.emit_usage(chunk, deltas);
         Ok(())
     }
 
@@ -637,6 +772,9 @@ pub struct OpenAIStreamFormatter {
     model: String,
     saw_tool_call: bool,
     saw_reasoning: bool,
+    native_choices_seen: bool,
+    native_choice_index: u64,
+    pending_done: bool,
 }
 
 impl Default for OpenAIStreamFormatter {
@@ -653,6 +791,9 @@ impl OpenAIStreamFormatter {
             model: String::new(),
             saw_tool_call: false,
             saw_reasoning: false,
+            native_choices_seen: false,
+            native_choice_index: 0,
+            pending_done: false,
         }
     }
 }
@@ -671,9 +812,29 @@ impl OpenAIStreamFormatter {
                         "id": self.id,
                         "object": "chat.completion.chunk",
                         "model": self.model,
-                        "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": null}]
+                        "choices": [{"index": self.native_choice_index, "delta": {"role": "assistant"}, "finish_reason": null}]
                     });
                     events.push(SseEvent::new(None, chunk.to_string()));
+                }
+                AiStreamDelta::Unknown { raw } => {
+                    if let Ok(value) = serde_json::from_str::<Value>(raw) {
+                        if let Some(index) = value
+                            .get("__openai_native_choice_index")
+                            .and_then(Value::as_u64)
+                        {
+                            self.native_choice_index = index;
+                        }
+                        if let Some(choices) = value
+                            .get("__openai_native_choices")
+                            .and_then(Value::as_array)
+                        {
+                            self.native_choices_seen = true;
+                            events.push(SseEvent::new(None, serde_json::json!({
+                                "id": self.id, "object": "chat.completion.chunk", "model": self.model,
+                                "choices": choices,
+                            }).to_string()));
+                        }
+                    }
                 }
                 AiStreamDelta::ResponseMetadata { metadata } => {
                     // 已公开的真实推理不能被后续 empty/null 字段覆盖。
@@ -686,7 +847,7 @@ impl OpenAIStreamFormatter {
                             "id": self.id,
                             "object": "chat.completion.chunk",
                             "model": self.model,
-                            "choices": [{"index": 0, "delta": {"reasoning_content": value}, "finish_reason": null}]
+                            "choices": [{"index": self.native_choice_index, "delta": {"reasoning_content": value}, "finish_reason": null}]
                         });
                         events.push(SseEvent::new(None, chunk.to_string()));
                     }
@@ -699,20 +860,29 @@ impl OpenAIStreamFormatter {
                         "id": self.id,
                         "object": "chat.completion.chunk",
                         "model": self.model,
-                        "choices": [{"index": 0, "delta": {"reasoning_content": text}, "finish_reason": null}]
+                        "choices": [{"index": self.native_choice_index, "delta": {"reasoning_content": text}, "finish_reason": null}]
                     });
                     events.push(SseEvent::new(None, chunk.to_string()));
                 }
                 AiStreamDelta::ThinkingSignature(_) => {}
+                AiStreamDelta::TextDeltaWithMetadata { text, logprobs, .. } => {
+                    let mut chunk = serde_json::json!({
+                        "id": self.id, "object": "chat.completion.chunk", "model": self.model,
+                        "choices": [{"index": self.native_choice_index, "delta": {"content": text}, "finish_reason": null}]
+                    });
+                    if !logprobs.is_empty() {
+                        chunk["choices"][0]["logprobs"] = serde_json::json!({"content": logprobs});
+                    }
+                    events.push(SseEvent::new(None, chunk.to_string()));
+                }
                 AiStreamDelta::TextDelta(text)
-                | AiStreamDelta::TextDeltaWithMetadata { text, .. }
                 | AiStreamDelta::RefusalDelta(text)
                 | AiStreamDelta::RefusalDeltaWithIndex { text, .. } => {
                     let chunk = serde_json::json!({
                         "id": self.id,
                         "object": "chat.completion.chunk",
                         "model": self.model,
-                        "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": null}]
+                        "choices": [{"index": self.native_choice_index, "delta": {"content": text}, "finish_reason": null}]
                     });
                     events.push(SseEvent::new(None, chunk.to_string()));
                 }
@@ -722,7 +892,7 @@ impl OpenAIStreamFormatter {
                         "id": self.id,
                         "object": "chat.completion.chunk",
                         "model": self.model,
-                        "choices": [{"index": 0, "delta": {
+                        "choices": [{"index": self.native_choice_index, "delta": {
                             "tool_calls": [{"index": index, "id": id, "type": "function", "function": {"name": name, "arguments": ""}}]
                         }, "finish_reason": null}]
                     });
@@ -734,7 +904,7 @@ impl OpenAIStreamFormatter {
                         "id": self.id,
                         "object": "chat.completion.chunk",
                         "model": self.model,
-                        "choices": [{"index": 0, "delta": {
+                        "choices": [{"index": self.native_choice_index, "delta": {
                             "tool_calls": [{"index": index, "function": {"arguments": arguments}}]
                         }, "finish_reason": null}]
                     });
@@ -763,11 +933,15 @@ impl OpenAIStreamFormatter {
                         "id": self.id,
                         "object": "chat.completion.chunk",
                         "model": self.model,
-                        "choices": [{"index": 0, "delta": {}, "finish_reason": final_reason}],
+                        "choices": [{"index": self.native_choice_index, "delta": {}, "finish_reason": final_reason}],
                         "usage": openai_usage_json(&self.usage)
                     });
                     events.push(SseEvent::new(None, chunk.to_string()));
-                    events.push(SseEvent::new(None, "[DONE]"));
+                    if self.native_choices_seen {
+                        self.pending_done = true;
+                    } else {
+                        events.push(SseEvent::new(None, "[DONE]"));
+                    }
                 }
                 _ => {}
             }
@@ -776,7 +950,11 @@ impl OpenAIStreamFormatter {
     }
 
     pub(crate) fn format_done(&mut self) -> Vec<SseEvent> {
-        vec![]
+        if std::mem::take(&mut self.pending_done) {
+            vec![SseEvent::new(None, "[DONE]")]
+        } else {
+            vec![]
+        }
     }
 }
 

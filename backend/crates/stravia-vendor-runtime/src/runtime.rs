@@ -459,7 +459,7 @@ impl VendorRuntime {
         for (name, _) in component.component_type().imports(&self.engine) {
             let allowed = matches!(
                 name,
-                "stravia:vendor/host@0.4.0" | "stravia:vendor/types@0.4.0"
+                "stravia:vendor/host@0.5.0" | "stravia:vendor/types@0.5.0"
             ) || name.rsplit_once('@').is_some_and(|(interface, version)| {
                 // Component compilation already validates SemVer. Ignore build
                 // metadata and admit only stable 0.2.x; the linker still checks
@@ -680,6 +680,7 @@ impl wit_host::Host for StoreState {
                 request.headers,
                 request.protocols,
                 request.continuation_id,
+                request.reuse_max_age_millis,
             )
             .await
         {
@@ -1187,6 +1188,7 @@ impl HostServices for DenyServices {
         _headers: Vec<(String, String)>,
         _protocols: Vec<String>,
         _continuation_id: Option<String>,
+        _reuse_max_age_millis: Option<u64>,
     ) -> Result<Arc<dyn crate::host::HostWebSocket>, HostFailure> {
         Err(HostFailure::new(
             ErrorKind::Trapped,
@@ -1219,6 +1221,115 @@ impl HostServices for DenyServices {
 
     fn generation_is_current(&self, _generation: u64) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod websocket_contract_tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct RecordingServices {
+        requests: Mutex<Vec<wit_types::WsRequest>>,
+    }
+
+    #[async_trait]
+    impl HostServices for RecordingServices {
+        fn http_start(
+            &self,
+            request: HttpRequest,
+        ) -> Result<Arc<dyn crate::host::HostHttpResponse>, HostFailure> {
+            DenyServices.http_start(request)
+        }
+
+        async fn ws_connect(
+            &self,
+            url: String,
+            headers: Vec<(String, String)>,
+            protocols: Vec<String>,
+            continuation_id: Option<String>,
+            reuse_max_age_millis: Option<u64>,
+        ) -> Result<Arc<dyn crate::host::HostWebSocket>, HostFailure> {
+            self.requests
+                .lock()
+                .expect("record requests")
+                .push(wit_types::WsRequest {
+                    url,
+                    headers,
+                    protocols,
+                    continuation_id,
+                    reuse_max_age_millis,
+                });
+            Err(HostFailure::new(ErrorKind::Trapped, "recorded connection"))
+        }
+
+        async fn read_private_state(&self) -> Result<Option<Vec<u8>>, HostFailure> {
+            DenyServices.read_private_state().await
+        }
+
+        async fn write_private_state(&self, bytes: Vec<u8>) -> Result<(), HostFailure> {
+            DenyServices.write_private_state(bytes).await
+        }
+
+        async fn emit_event(&self, event: RuntimeEvent) -> Result<(), HostFailure> {
+            DenyServices.emit_event(event).await
+        }
+
+        fn log(&self, level: LogLevel, message: &str) {
+            DenyServices.log(level, message);
+        }
+
+        fn generation_is_current(&self, generation: u64) -> bool {
+            DenyServices.generation_is_current(generation)
+        }
+    }
+
+    #[tokio::test]
+    async fn forwards_guest_reuse_policy_without_interpretation() {
+        let services = Arc::new(RecordingServices::default());
+        let mut state = StoreState {
+            wasi: WasiCtx::builder().build(),
+            table: ResourceTable::new(),
+            services: services.clone(),
+            cancellation: CancellationToken::new(),
+            deadline: Deadline::from_now(Duration::from_secs(60)),
+            generation: 0,
+            operation: Some(Operation::Infer),
+            upstream_starts: 0,
+            catalog_sync: false,
+        };
+        for policy in [None, Some(0), Some(3_300_000), Some(u64::MAX)] {
+            let result = wit_host::Host::ws_connect(
+                &mut state,
+                wit_types::WsRequest {
+                    url: "wss://example.invalid/socket".into(),
+                    headers: vec![("x-test".into(), "value".into())],
+                    protocols: vec!["test".into()],
+                    continuation_id: Some("response-1".into()),
+                    reuse_max_age_millis: policy,
+                },
+            )
+            .await
+            .expect("host boundary must not trap");
+            assert!(
+                result.is_err(),
+                "recording service returns its declared error"
+            );
+            let requests = services.requests.lock().expect("recorded requests");
+            let request = requests.last().expect("host received request");
+            assert_eq!(request.url, "wss://example.invalid/socket");
+            assert_eq!(
+                request.headers,
+                vec![("x-test".to_owned(), "value".to_owned())]
+            );
+            assert_eq!(request.protocols, vec!["test".to_owned()]);
+            assert_eq!(request.continuation_id.as_deref(), Some("response-1"));
+            assert_eq!(request.reuse_max_age_millis, policy);
+        }
+        assert_eq!(
+            services.requests.lock().expect("recorded requests").len(),
+            4
+        );
     }
 }
 
@@ -1308,6 +1419,7 @@ mod profile_admission_tests {
                 default_models_source: None,
                 consumes_catalog_models: false,
                 capabilities: capabilities.clone(),
+                client_header_names: BTreeSet::new(),
                 model_capabilities: BTreeSet::new(),
             }],
             capabilities,

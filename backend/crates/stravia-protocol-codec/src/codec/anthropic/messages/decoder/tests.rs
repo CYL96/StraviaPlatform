@@ -14,6 +14,26 @@ fn request_with(extra: Value) -> Value {
 }
 
 #[test]
+fn malformed_structured_output_and_controls_remain_decode_errors() {
+    for extra in [
+        serde_json::json!({"output_config": {"format": {"type": "json_schema", "schema": null}}}),
+        serde_json::json!({"output_config": {"format": {"type": "json_schema", "schema": []}}}),
+        serde_json::json!({"output_config": {"format": {"type": "json_schema"}}}),
+        serde_json::json!({"output_config": {"format": {"type": "unknown", "schema": {}}}}),
+        serde_json::json!({"tool_choice": {"type": "auto", "disable_parallel_tool_use": "false"}}),
+        serde_json::json!({"stop_sequences": [1]}),
+        serde_json::json!({"tools": [{"name": "read", "input_schema": {}, "strict": "true"}]}),
+    ] {
+        assert!(
+            AnthropicDecoder
+                .decode_request(request_with(extra.clone()))
+                .is_err(),
+            "malformed source controls must fail: {extra}"
+        );
+    }
+}
+
+#[test]
 fn adaptive_thinking_uses_output_effort() {
     let request = AnthropicDecoder
         .decode_request(request_with(serde_json::json!({
@@ -87,7 +107,8 @@ fn same_protocol_round_trip_keeps_tool_strict_and_tool_result_is_error() {
         "max_tokens": 1024,
         "tools": [
             {"name": "read", "description": "Read", "input_schema": {"type": "object"}, "strict": true},
-            {"name": "grep", "description": "Grep", "input_schema": {"type": "object"}}
+            {"name": "grep", "description": "Grep", "input_schema": {"type": "object"}, "strict": false},
+            {"name": "list", "input_schema": {"type": "object"}}
         ],
         "messages": [
             {"role": "user", "content": "hello"},
@@ -99,20 +120,16 @@ fn same_protocol_round_trip_keeps_tool_strict_and_tool_result_is_error() {
     });
 
     let request = AnthropicDecoder.decode_request(body).expect("decode");
-    // 两个字段只随原样快照到达同协议上游；IR 不带它们，跨协议路由不变。
-    assert!(
-        request
-            .tools
-            .as_ref()
-            .expect("tools")
-            .iter()
-            .all(|tool| tool.strict.is_none())
-    );
+    let tools = request.tools.as_ref().expect("tools");
+    assert_eq!(tools[0].strict, Some(true));
+    assert_eq!(tools[1].strict, Some(false));
+    assert_eq!(tools[2].strict, None);
     let (encoded, _) = crate::codec::anthropic::messages::encoder::AnthropicEncoder
         .encode_request(request)
         .expect("encode");
 
     assert_eq!(encoded["tools"][0]["strict"], true);
-    assert!(encoded["tools"][1].get("strict").is_none());
+    assert_eq!(encoded["tools"][1]["strict"], false);
+    assert!(encoded["tools"][2].get("strict").is_none());
     assert_eq!(encoded["messages"][2]["content"][0]["is_error"], false);
 }

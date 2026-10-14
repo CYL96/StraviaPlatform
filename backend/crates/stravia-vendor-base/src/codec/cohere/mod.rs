@@ -128,17 +128,18 @@ impl ProtocolAdapter for CohereChatV2 {
                     body.insert("tool_choice".into(), Value::String("REQUIRED".into()));
                 }
                 ToolChoice::Named { name } => {
-                    tools.retain(|tool| {
-                        tool.pointer("/function/name")
-                            .and_then(Value::as_str)
-                            .is_some_and(|candidate| candidate == name)
-                    });
-                    if tools.is_empty() {
-                        bail!("Cohere tool_choice names undeclared tool `{name}`");
+                    if tools.iter().any(|tool| {
+                        tool.pointer("/function/name").and_then(Value::as_str)
+                            == Some(name.as_str())
+                    }) {
+                        tools.retain(|tool| {
+                            tool.pointer("/function/name").and_then(Value::as_str)
+                                == Some(name.as_str())
+                        });
+                        body.insert("tool_choice".into(), Value::String("REQUIRED".into()));
                     }
-                    body.insert("tool_choice".into(), Value::String("REQUIRED".into()));
                 }
-                ToolChoice::Raw(_) => bail!("Cohere Chat cannot represent raw tool_choice"),
+                ToolChoice::Raw(_) => {}
             }
         }
         if !tools.is_empty() {
@@ -482,24 +483,31 @@ fn encode_message(item: &AiItem) -> anyhow::Result<Option<Value>> {
             }
         }
         Role::Tool => {
-            message.insert(
-                "content".into(),
-                Value::String(encode_tool_result_content(&item.content)?),
-            );
-            let id = item
-                .tool_call_id
-                .as_deref()
-                .context("Cohere tool message is missing tool_call_id")?;
+            let content = encode_tool_result_content(&item.content)?;
+            if content.is_empty() {
+                return Ok(None);
+            }
+            message.insert("content".into(), Value::String(content));
+            let Some(id) = item.tool_call_id.as_deref() else {
+                return Ok(None);
+            };
             message.insert("tool_call_id".into(), Value::String(id.into()));
         }
         Role::User => {
-            message.insert("content".into(), encode_user_content(&item.content)?);
+            let content = encode_user_content(&item.content)?;
+            if content.as_str().is_some_and(str::is_empty)
+                || content.as_array().is_some_and(Vec::is_empty)
+            {
+                return Ok(None);
+            }
+            message.insert("content".into(), content);
         }
         Role::System | Role::Developer => {
-            message.insert(
-                "content".into(),
-                Value::String(encode_text_content(&item.content)?),
-            );
+            let content = encode_text_content(&item.content)?;
+            if content.is_empty() {
+                return Ok(None);
+            }
+            message.insert("content".into(), Value::String(content));
         }
     };
     Ok(Some(Value::Object(message)))
@@ -550,10 +558,7 @@ fn encode_assistant_content(content: &MessageContent) -> anyhow::Result<Option<V
                     // redacted_thinking 是纯密文载荷，Cohere 没有对应载体。
                     ContentBlock::RedactedThinking { .. } => {}
                     ContentBlock::ToolUse { .. } | ContentBlock::ToolResult { .. } => {}
-                    other => bail!(
-                        "Cohere cannot represent assistant content block `{}`",
-                        content_block_name(other)
-                    ),
+                    _ => {}
                 }
             }
             Ok((!parts.is_empty()).then_some(Value::Array(parts)))
@@ -585,16 +590,11 @@ fn encode_user_content(content: &MessageContent) -> anyhow::Result<Value> {
                             MediaSource::Base64 { media_type, data } => {
                                 format!("data:{media_type};base64,{data}")
                             }
-                            MediaSource::FileId { .. } => {
-                                bail!("Cohere cannot represent file-id images")
-                            }
+                            MediaSource::FileId { .. } => continue,
                         };
                         parts.push(json!({"type": "image_url", "image_url": {"url": url}}));
                     }
-                    other => bail!(
-                        "Cohere cannot represent user content block `{}`",
-                        content_block_name(other)
-                    ),
+                    _ => {}
                 }
             }
             Ok(Value::Array(parts))
@@ -611,10 +611,7 @@ fn encode_text_content(content: &MessageContent) -> anyhow::Result<String> {
                 match block {
                     ContentBlock::Text { text, .. } => out.push_str(text),
                     ContentBlock::ToolUse { .. } | ContentBlock::ToolResult { .. } => {}
-                    other => bail!(
-                        "Cohere cannot represent content block `{}`",
-                        content_block_name(other)
-                    ),
+                    _ => {}
                 }
             }
             Ok(out)
@@ -630,14 +627,14 @@ fn encode_tool_result_content(content: &MessageContent) -> anyhow::Result<String
             for block in blocks {
                 match block {
                     ContentBlock::Text { text, .. } => values.push(text.as_ref().clone()),
-                    ContentBlock::ToolResult { content, .. } => values.push(match content {
-                        Value::String(text) => text.clone(),
-                        other => serde_json::to_string(other)?,
-                    }),
-                    other => bail!(
-                        "Cohere cannot represent tool content block `{}`",
-                        content_block_name(other)
-                    ),
+                    ContentBlock::ToolResult {
+                        content,
+                        content_kind,
+                        ..
+                    } => {
+                        values.push(super::tool_result_text_value(content, *content_kind)?);
+                    }
+                    _ => {}
                 }
             }
             Ok(values.join(""))
@@ -875,33 +872,6 @@ fn insert_number(object: &mut Map<String, Value>, key: &str, value: Option<f64>)
 fn insert_u32(object: &mut Map<String, Value>, key: &str, value: Option<u32>) {
     if let Some(value) = value {
         object.insert(key.into(), Value::from(value));
-    }
-}
-
-fn content_block_name(block: &ContentBlock) -> &'static str {
-    match block {
-        ContentBlock::Text { .. } => "text",
-        ContentBlock::Image { .. } => "image",
-        ContentBlock::Audio { .. } => "audio",
-        ContentBlock::File { .. } => "file",
-        ContentBlock::Video { .. } => "video",
-        ContentBlock::Thinking { .. } => "thinking",
-        ContentBlock::Reasoning { .. } => "reasoning",
-        ContentBlock::Compaction { .. } => "compaction",
-        ContentBlock::CompactionTrigger {} => "compaction_trigger",
-        ContentBlock::RedactedThinking { .. } => "redacted_thinking",
-        ContentBlock::ToolUse { .. } => "tool_use",
-        ContentBlock::ToolResult { .. } => "tool_result",
-        ContentBlock::ServerToolUse { .. } => "server_tool_use",
-        ContentBlock::ServerToolResult { .. } => "server_tool_result",
-        ContentBlock::Document { .. } => "document",
-        ContentBlock::SearchResult { .. } => "search_result",
-        ContentBlock::Citation { .. } => "citation",
-        ContentBlock::ExecutableCode { .. } => "executable_code",
-        ContentBlock::CodeExecutionResult { .. } => "code_execution_result",
-        ContentBlock::ContainerUpload { .. } => "container_upload",
-        ContentBlock::Refusal { .. } => "refusal",
-        ContentBlock::Unknown { .. } => "unknown",
     }
 }
 

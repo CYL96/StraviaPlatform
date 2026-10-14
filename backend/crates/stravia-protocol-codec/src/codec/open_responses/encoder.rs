@@ -26,11 +26,6 @@ impl ResponsesEncoder {
             }
             _ => None,
         };
-        if matches!(req.response_format, Some(ResponseFormat::JsonObject)) {
-            anyhow::bail!(
-                "Open Responses 2026-04-24 cannot represent canonical json_object response format"
-            );
-        }
         let mut input: Vec<Value> = Vec::new();
 
         for mut item in std::mem::take(&mut req.items) {
@@ -88,7 +83,7 @@ impl ResponsesEncoder {
             if let Some(raw) = item.unknown_ref() {
                 let item_type = raw.get("type").and_then(Value::as_str).unwrap_or_default();
                 if !super::is_registered_extension_item(item_type) {
-                    anyhow::bail!("unregistered Open Responses input extension: {item_type}");
+                    continue;
                 }
                 let MessageContent::Blocks(mut blocks) = item.content else {
                     unreachable!("unknown item has block content");
@@ -105,10 +100,13 @@ impl ResponsesEncoder {
                     "call_id": item.tool_call_id.clone().unwrap_or_default(),
                 });
                 insert_owned_item_metadata(&mut output, &mut item, true);
-                output["output"] = encode_tool_output(std::mem::replace(
+                let Some(content) = encode_tool_output(std::mem::replace(
                     &mut item.content,
                     MessageContent::Blocks(Vec::new()),
-                ))?;
+                )) else {
+                    continue;
+                };
+                output["output"] = content;
                 input.push(output);
                 continue;
             }
@@ -702,7 +700,9 @@ fn encode_mixed_assistant_items(
         match block {
             ContentBlock::Text { text, .. } if text.is_empty() => {}
             ContentBlock::Text { .. } | ContentBlock::Refusal { .. } => {
-                message_content.push(encode_responses_content_block(block, "output_text")?);
+                if let Some(encoded) = encode_responses_content_block(block, "output_text") {
+                    message_content.push(encoded);
+                }
             }
             ContentBlock::Thinking { thinking, .. } => {
                 message_content
@@ -744,12 +744,7 @@ fn encode_mixed_assistant_items(
                     "arguments": input.to_string(),
                 }));
             }
-            other => {
-                anyhow::bail!(
-                    "responses request cannot encode {} content block in assistant message",
-                    content_block_kind(&other)
-                );
-            }
+            _ => {}
         }
     }
     push_derived_assistant_message(&mut items, &mut message_content);
@@ -816,13 +811,12 @@ fn encode_message_content(content: MessageContent, role: Role) -> Result<Option<
                         block,
                         ContentBlock::Text { .. } | ContentBlock::Refusal { .. }
                     ) {
-                        anyhow::bail!(
-                            "responses request cannot encode {} content block in assistant message",
-                            content_block_kind(&block)
-                        );
+                        continue;
                     }
                 }
-                encoded.push(encode_responses_content_block(block, text_type)?);
+                if let Some(part) = encode_responses_content_block(block, text_type) {
+                    encoded.push(part);
+                }
             }
             if encoded.is_empty() {
                 Ok(None)
@@ -837,92 +831,167 @@ fn request_tool_output_part(value: &Value) -> bool {
     let Some(object) = value.as_object() else {
         return false;
     };
-    let allowed = |fields: &[&str]| object.keys().all(|key| fields.contains(&key.as_str()));
     match object.get("type").and_then(Value::as_str) {
-        Some("input_text") => {
-            allowed(&["type", "text"]) && object.get("text").is_some_and(Value::is_string)
-        }
-        Some("input_image") => {
-            allowed(&["type", "image_url", "detail"])
-                && object.get("image_url").is_some_and(Value::is_string)
-                && object.get("detail").is_none_or(|detail| {
-                    detail.is_null()
-                        || detail
-                            .as_str()
-                            .is_some_and(|detail| matches!(detail, "low" | "high" | "auto"))
-                })
-        }
-        Some("input_file") => {
-            allowed(&["type", "file_data", "file_url", "filename"])
-                && ["file_data", "file_url"]
-                    .iter()
-                    .any(|field| object.get(*field).is_some_and(Value::is_string))
-                && object
-                    .get("filename")
-                    .is_none_or(|filename| filename.is_null() || filename.is_string())
-        }
+        Some("text" | "input_text") => object.get("text").is_some_and(Value::is_string),
+        Some("input_image") => object.get("image_url").is_some_and(Value::is_string),
+        Some("input_file") => ["file_data", "file_url"]
+            .iter()
+            .any(|field| object.get(*field).is_some_and(Value::is_string)),
+        Some("image" | "file") => object.get("source").is_some_and(|source| {
+            match source.get("type").and_then(Value::as_str) {
+                Some("base64") => {
+                    source.get("data").is_some_and(Value::is_string)
+                        && source.get("media_type").is_some_and(Value::is_string)
+                }
+                Some("url") => source.get("url").is_some_and(Value::is_string),
+                _ => false,
+            }
+        }),
         _ => false,
     }
 }
 
-fn normalize_tool_result_content(content: Value) -> Result<Value> {
-    match &content {
-        Value::String(_) => Ok(content),
-        Value::Array(items) if items.iter().all(request_tool_output_part) => Ok(content),
-        other => Ok(Value::String(serde_json::to_string(other)?)),
+fn normalize_tool_output_part(mut part: Value, response: bool) -> Option<Value> {
+    let kind = part.get("type").and_then(Value::as_str)?;
+    if matches!(kind, "text" | "image" | "file") {
+        let block: ContentBlock = serde_json::from_value(part).ok()?;
+        part = encode_responses_content_block(block, "input_text")?;
+    }
+    let object = part.as_object_mut()?;
+    let fields: &[&str] = match object.get("type").and_then(Value::as_str)? {
+        "input_text" => &["type", "text"],
+        "input_image" => &["type", "image_url", "detail"],
+        "input_file" if response => &["type", "filename", "file_url"],
+        "input_file" => &["type", "filename", "file_data", "file_url"],
+        _ => return None,
+    };
+    object.retain(|key, _| fields.contains(&key.as_str()));
+    if object.get("detail").is_some_and(|detail| {
+        !detail
+            .as_str()
+            .is_some_and(|value| matches!(value, "low" | "high" | "auto"))
+    }) {
+        object.remove("detail");
+    }
+    if object
+        .get("filename")
+        .is_some_and(|filename| !filename.is_string())
+    {
+        object.remove("filename");
+    }
+    if response && object.get("type").and_then(Value::as_str) == Some("input_image") {
+        object
+            .entry("detail")
+            .or_insert_with(|| Value::String("auto".into()));
+    }
+    let representable = if response {
+        response_tool_output_part
+    } else {
+        request_tool_output_part
+    };
+    representable(&part).then_some(part)
+}
+
+fn normalize_tool_result_content(
+    content: Value,
+    kind: Option<stravia_runtime_contract::protocol::ir::ToolResultContentKind>,
+) -> Option<Value> {
+    if kind != Some(stravia_runtime_contract::protocol::ir::ToolResultContentKind::ContentBlocks)
+        && !content.is_string()
+    {
+        return Some(Value::String(content.to_string()));
+    }
+    match content {
+        Value::String(_) => Some(content),
+        Value::Array(items) => {
+            let parts: Vec<_> = items
+                .into_iter()
+                .filter_map(|part| normalize_tool_output_part(part, false))
+                .collect();
+            (!parts.is_empty()).then_some(Value::Array(parts))
+        }
+        _ => None,
     }
 }
 
 pub(crate) fn tool_output_representable(content: &MessageContent) -> bool {
     match content {
         MessageContent::Text(_) => true,
-        MessageContent::Blocks(blocks) => blocks.iter().all(|block| match block {
-            ContentBlock::Text { .. }
-            | ContentBlock::ToolResult { .. }
-            | ContentBlock::ServerToolResult { .. } => true,
+        MessageContent::Blocks(blocks) => blocks.iter().any(|block| match block {
+            ContentBlock::Text { .. } => true,
+            ContentBlock::ToolResult { content, content_kind, .. }
+            | ContentBlock::ServerToolResult { content, content_kind, .. } => match content {
+                _ if *content_kind != Some(stravia_runtime_contract::protocol::ir::ToolResultContentKind::ContentBlocks) => true,
+                Value::String(_) => true,
+                Value::Array(items) => items.iter().any(request_tool_output_part),
+                _ => false,
+            },
             ContentBlock::Image { source, detail, .. } => {
                 matches!(source, MediaSource::Base64 { .. } | MediaSource::Url(_))
                     && detail
                         .as_deref()
                         .is_none_or(|detail| matches!(detail, "low" | "high" | "auto"))
             }
-            ContentBlock::File { source, .. } => matches!(source, MediaSource::Url(_)),
+            ContentBlock::File { source, .. } => {
+                matches!(source, MediaSource::Base64 { .. } | MediaSource::Url(_))
+            }
             _ => false,
         }),
     }
 }
 
-pub(crate) fn encode_tool_output(content: MessageContent) -> Result<Value> {
+pub(crate) fn encode_tool_output(content: MessageContent) -> Option<Value> {
     match content {
-        MessageContent::Text(text) => Ok(Value::String(Arc::unwrap_or_clone(text))),
+        MessageContent::Text(text) => Some(Value::String(Arc::unwrap_or_clone(text))),
         MessageContent::Blocks(mut blocks) => {
             if let [ContentBlock::ToolResult { .. } | ContentBlock::ServerToolResult { .. }] =
                 blocks.as_slice()
             {
-                let (ContentBlock::ToolResult { content, .. }
-                | ContentBlock::ServerToolResult { content, .. }) = blocks.remove(0)
+                let (ContentBlock::ToolResult {
+                    content,
+                    content_kind,
+                    ..
+                }
+                | ContentBlock::ServerToolResult {
+                    content,
+                    content_kind,
+                    ..
+                }) = blocks.remove(0)
                 else {
                     unreachable!("single tool result checked above");
                 };
-                return normalize_tool_result_content(content);
+                return normalize_tool_result_content(content, content_kind);
             }
             let mut output = Vec::with_capacity(blocks.len());
             for block in blocks {
                 match block {
-                    ContentBlock::ToolResult { content, .. }
-                    | ContentBlock::ServerToolResult { content, .. } => {
-                        match normalize_tool_result_content(content)? {
-                            Value::Array(items) => output.extend(items),
-                            Value::String(text) => {
-                                output.push(text_part("input_text", text));
-                            }
-                            _ => unreachable!("normalized tool output is string or array"),
+                    ContentBlock::ToolResult {
+                        content,
+                        content_kind,
+                        ..
+                    }
+                    | ContentBlock::ServerToolResult {
+                        content,
+                        content_kind,
+                        ..
+                    } => match normalize_tool_result_content(content, content_kind) {
+                        Some(Value::Array(items)) => output.extend(items),
+                        Some(Value::String(text)) => {
+                            output.push(text_part("input_text", text));
+                        }
+                        None => {}
+                        _ => unreachable!("normalized tool output is string or array"),
+                    },
+                    _ => {
+                        if let Some(part) = encode_responses_content_block(block, "input_text")
+                            && request_tool_output_part(&part)
+                        {
+                            output.push(part);
                         }
                     }
-                    _ => output.push(encode_responses_content_block(block, "input_text")?),
                 }
             }
-            Ok(Value::Array(output))
+            (!output.is_empty()).then_some(Value::Array(output))
         }
     }
 }
@@ -956,60 +1025,126 @@ fn response_tool_output_part(value: &Value) -> bool {
     }
 }
 
-pub(crate) fn encode_response_tool_output(content: &MessageContent) -> Result<Value> {
+pub(crate) fn encode_response_tool_output(content: &MessageContent) -> Option<Value> {
     match content {
-        MessageContent::Text(text) => Ok(Value::String(text.as_ref().clone())),
+        MessageContent::Text(text) => Some(Value::String(text.as_ref().clone())),
         MessageContent::Blocks(blocks) => {
             if let [
-                ContentBlock::ToolResult { content, .. }
-                | ContentBlock::ServerToolResult { content, .. },
+                ContentBlock::ToolResult {
+                    content,
+                    content_kind,
+                    ..
+                }
+                | ContentBlock::ServerToolResult {
+                    content,
+                    content_kind,
+                    ..
+                },
             ] = blocks.as_slice()
             {
                 return match content {
-                    Value::String(_) => Ok(content.clone()),
-                    Value::Array(items) if items.iter().all(response_tool_output_part) => {
-                        Ok(content.clone())
+                    _ if *content_kind != Some(stravia_runtime_contract::protocol::ir::ToolResultContentKind::ContentBlocks)
+                        && !content.is_string() => Some(Value::String(content.to_string())),
+                    Value::String(_) => Some(content.clone()),
+                    Value::Array(items) => {
+                        let parts: Vec<_> = items
+                            .iter()
+                            .filter_map(normalize_response_tool_output_part)
+                            .collect();
+                        (!parts.is_empty()).then_some(Value::Array(parts))
                     }
-                    other => Ok(Value::String(serde_json::to_string(other)?)),
+                    _ => None,
                 };
             }
             let mut output = Vec::with_capacity(blocks.len());
             for block in blocks {
                 match block {
-                    ContentBlock::ToolResult { content, .. }
-                    | ContentBlock::ServerToolResult { content, .. } => match content {
-                        Value::Array(items) if items.iter().all(response_tool_output_part) => {
-                            output.extend(items.iter().cloned());
+                    ContentBlock::ToolResult { content, content_kind, .. }
+                    | ContentBlock::ServerToolResult { content, content_kind, .. } => match content {
+                        _ if *content_kind != Some(stravia_runtime_contract::protocol::ir::ToolResultContentKind::ContentBlocks)
+                            && !content.is_string() => output.push(text_part("input_text", content.to_string())),
+                        Value::Array(items) => {
+                            output.extend(
+                                items
+                                    .iter()
+                                    .filter_map(normalize_response_tool_output_part),
+                            );
                         }
-                        other => output.push(serde_json::json!({
-                            "type": "input_text",
-                            "text": match other {
-                                Value::String(text) => text.clone(),
-                                value => serde_json::to_string(value)?,
-                            }
-                        })),
+                        Value::String(text) => output.push(text_part("input_text", text.clone())),
+                        _ => {}
                     },
-                    _ => {
-                        let mut encoded =
-                            encode_responses_content_block(block.clone(), "input_text")?;
+                    ContentBlock::Text { .. }
+                    | ContentBlock::Image { .. }
+                    | ContentBlock::File { .. } => {
+                        let Some(mut encoded) =
+                            encode_responses_content_block(block.clone(), "input_text")
+                        else {
+                            continue;
+                        };
                         if encoded.get("type").and_then(Value::as_str) == Some("input_image")
                             && encoded.get("detail").is_none()
                         {
                             encoded["detail"] = Value::String("auto".into());
                         }
-                        if !response_tool_output_part(&encoded) {
-                            anyhow::bail!(
-                                "responses output cannot encode {} tool-result content block",
-                                content_block_kind(block)
-                            );
+                        if response_tool_output_part(&encoded) {
+                            output.push(encoded);
                         }
-                        output.push(encoded);
                     }
+                    _ => {}
                 }
             }
-            Ok(Value::Array(output))
+            (!output.is_empty()).then_some(Value::Array(output))
         }
     }
+}
+
+fn normalize_response_tool_output_part(part: &Value) -> Option<Value> {
+    let object = part.as_object()?;
+    let kind = object.get("type").and_then(Value::as_str)?;
+    let fields: &[&str] = match kind {
+        "text" | "input_text" => &["type", "text"],
+        "input_image" => &["type", "image_url", "detail"],
+        "input_file" => &["type", "filename", "file_url"],
+        "image" | "file" => {
+            let source = object.get("source")?;
+            let (field, value) = match source.get("type").and_then(Value::as_str)? {
+                "url" => (
+                    if kind == "image" {
+                        "image_url"
+                    } else {
+                        "file_url"
+                    },
+                    Value::String(source.get("url")?.as_str()?.to_owned()),
+                ),
+                "base64" if kind == "image" => (
+                    "image_url",
+                    Value::String(format!(
+                        "data:{};base64,{}",
+                        source.get("media_type")?.as_str()?,
+                        source.get("data")?.as_str()?
+                    )),
+                ),
+                _ => return None,
+            };
+            let mut normalized = serde_json::json!({"type": if kind == "image" { "input_image" } else { "input_file" }});
+            normalized[field] = value;
+            for key in ["detail", "filename"] {
+                if let Some(value) = object.get(key) {
+                    normalized[key] = value.clone();
+                }
+            }
+            return normalize_tool_output_part(normalized, true);
+        }
+        _ => return None,
+    };
+    let normalized = Value::Object(
+        object
+            .iter()
+            .filter(|(key, _)| fields.contains(&key.as_str()))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+    );
+    normalize_tool_output_part(normalized, true)
 }
 
 fn text_part(text_type: &str, text: String) -> Value {
@@ -1019,9 +1154,23 @@ fn text_part(text_type: &str, text: String) -> Value {
     Value::Object(part)
 }
 
-fn encode_responses_content_block(block: ContentBlock, text_type: &str) -> Result<Value> {
+fn encode_responses_content_block(block: ContentBlock, text_type: &str) -> Option<Value> {
     match block {
-        ContentBlock::Text { text, .. } => Ok(text_part(text_type, Arc::unwrap_or_clone(text))),
+        ContentBlock::Document { source, title, .. } => {
+            let source = crate::codec::document_media_source(source)?;
+            let mut encoded = encode_responses_content_block(
+                ContentBlock::File {
+                    source,
+                    media_type: None,
+                },
+                text_type,
+            )?;
+            if let Some(title) = title {
+                encoded["filename"] = Value::String(title);
+            }
+            Some(encoded)
+        }
+        ContentBlock::Text { text, .. } => Some(text_part(text_type, Arc::unwrap_or_clone(text))),
         ContentBlock::Image { source, detail, .. } => {
             let mut encoded = serde_json::json!({"type": "input_image"});
             match source {
@@ -1042,12 +1191,12 @@ fn encode_responses_content_block(block: ContentBlock, text_type: &str) -> Resul
             if let Some(detail) = detail {
                 encoded["detail"] = Value::String(detail);
             }
-            Ok(encoded)
+            Some(encoded)
         }
-        ContentBlock::Refusal { refusal } => {
+        ContentBlock::Refusal { refusal } if text_type == "output_text" => {
             let mut encoded = serde_json::json!({"type": "refusal"});
             encoded["refusal"] = Value::String(refusal);
-            Ok(encoded)
+            Some(encoded)
         }
         ContentBlock::File { source, media_type } => {
             let mut encoded = serde_json::json!({"type": "input_file"});
@@ -1070,7 +1219,7 @@ fn encode_responses_content_block(block: ContentBlock, text_type: &str) -> Resul
                     encoded["file_id"] = Value::String(file_id);
                 }
             }
-            Ok(encoded)
+            Some(encoded)
         }
         ContentBlock::Video { source, media_type } => {
             let video_url = match source {
@@ -1085,51 +1234,13 @@ fn encode_responses_content_block(block: ContentBlock, text_type: &str) -> Resul
                     format!("data:{media_type};base64,{data}")
                 }
                 MediaSource::Url(url) => url,
-                MediaSource::FileId { .. } => {
-                    anyhow::bail!(
-                        "responses request cannot encode a file-id video: dated input_video requires video_url"
-                    )
-                }
+                MediaSource::FileId { .. } => return None,
             };
             let mut encoded = serde_json::json!({"type": "input_video"});
             encoded["video_url"] = Value::String(video_url);
-            Ok(encoded)
+            Some(encoded)
         }
-        block @ ContentBlock::Audio { .. } => anyhow::bail!(
-            "responses request cannot encode {} content block: Responses API has no supported wire mapping",
-            content_block_kind(&block)
-        ),
-        block => anyhow::bail!(
-            "responses request cannot encode {} content block",
-            content_block_kind(&block)
-        ),
-    }
-}
-
-fn content_block_kind(block: &ContentBlock) -> &'static str {
-    match block {
-        ContentBlock::Text { .. } => "text",
-        ContentBlock::Image { .. } => "image",
-        ContentBlock::Audio { .. } => "audio",
-        ContentBlock::File { .. } => "file",
-        ContentBlock::Video { .. } => "video",
-        ContentBlock::Thinking { .. } => "thinking",
-        ContentBlock::Reasoning { .. } => "reasoning",
-        ContentBlock::Compaction { .. } => "compaction",
-        ContentBlock::CompactionTrigger {} => "compaction_trigger",
-        ContentBlock::RedactedThinking { .. } => "redacted_thinking",
-        ContentBlock::ToolUse { .. } => "tool_use",
-        ContentBlock::ToolResult { .. } => "tool_result",
-        ContentBlock::ServerToolUse { .. } => "server_tool_use",
-        ContentBlock::ServerToolResult { .. } => "server_tool_result",
-        ContentBlock::Document { .. } => "document",
-        ContentBlock::SearchResult { .. } => "search_result",
-        ContentBlock::Citation { .. } => "citation",
-        ContentBlock::ExecutableCode { .. } => "executable_code",
-        ContentBlock::CodeExecutionResult { .. } => "code_execution_result",
-        ContentBlock::ContainerUpload { .. } => "container_upload",
-        ContentBlock::Refusal { .. } => "refusal",
-        ContentBlock::Unknown { .. } => "unknown",
+        _ => None,
     }
 }
 

@@ -683,8 +683,7 @@ impl ClientProjectionSession {
             || source
                 .as_ref()
                 .and_then(|source| source.protocol.as_ref())
-                .and_then(|protocol| protocol.protocol())
-                .is_some_and(|protocol| protocol != self.state.ingress.protocol);
+                .is_some_and(|protocol| !protocol.matches_endpoint(self.state.ingress));
         self.model_leg_ordinal += 1;
         self.thinking_source = source;
         self.state.begin_model_leg();
@@ -2435,16 +2434,20 @@ mod tests {
     use crate::history_marker::{ReasoningRejections, ThinkingProvenance, ThinkingSource};
     use stravia_runtime_contract::protocol::ids::{
         ANTHROPIC_MESSAGES_2023_06_01, GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA,
-        OPEN_RESPONSES_2026_04_24, ProtocolId,
+        OPEN_RESPONSES_2026_04_24,
     };
 
-    fn replay_source(protocol: ProtocolId, model: &str) -> ThinkingSource {
+    fn replay_source(
+        protocol: impl Into<stravia_runtime_contract::protocol::ids::ProtocolIdentity>,
+        model: &str,
+    ) -> ThinkingSource {
+        let protocol = protocol.into();
         ThinkingSource {
             namespace: format!("issuer-{protocol}-{model}"),
-            protocol: Some(protocol.into()),
             actual_model: model.into(),
             target_id: "actual-provider".into(),
             authority: Some(format!("authority-{protocol}-{model}")),
+            protocol: Some(protocol),
         }
     }
 
@@ -3000,10 +3003,7 @@ mod tests {
                 projection_session_fixture("interleaved-thinking-owner").await;
             let mut session =
                 ClientProjectionSession::new(Arc::clone(&store), principal.clone(), ingress);
-            let source = replay_source(
-                stravia_runtime_contract::protocol::ids::DEVIN_CONNECT_GET_CHAT_MESSAGE_V1,
-                "deepseek-model",
-            );
+            let source = replay_source("acme/private-inference-v7", "deepseek-model");
             session.begin_model_leg(
                 ThinkingCarrierFacts {
                     indexed: true,

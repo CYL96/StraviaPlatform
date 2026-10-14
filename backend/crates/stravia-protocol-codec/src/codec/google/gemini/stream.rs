@@ -116,6 +116,41 @@ impl GoogleResponseParser {
         ai_resp.stop_reason = stop_reason;
         ai_resp.usage = usage;
         preserve_google_response_metadata(&mut ai_resp, &resp);
+        if let Some(candidate) = candidate {
+            ai_resp.vendor.egress.insert(
+                "__google_native_candidate_index".into(),
+                candidate
+                    .get("index")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0)
+                    .into(),
+            );
+        }
+        if let Some(candidates) = resp.get("candidates").and_then(Value::as_array)
+            && candidates.len() > 1
+        {
+            for candidate in &candidates[1..] {
+                self.parse_response(serde_json::json!({"candidates": [candidate]}))?;
+            }
+            ai_resp.vendor.egress.insert(
+                "__google_native_candidates".into(),
+                Value::Array(
+                    candidates[1..]
+                        .iter()
+                        .enumerate()
+                        .map(|(position, candidate)| {
+                            let mut native_candidate = candidate.clone();
+                            native_candidate["index"] = candidate
+                                .get("index")
+                                .and_then(Value::as_u64)
+                                .unwrap_or((position + 1) as u64)
+                                .into();
+                            native_candidate
+                        })
+                        .collect(),
+                ),
+            );
+        }
         Ok(ai_resp)
     }
 }
@@ -137,12 +172,31 @@ impl GoogleResponseFormatter {
 
         let mut out = serde_json::json!({
             "candidates": [{
+                "index": 0,
                 "content": {"role": "model", "parts": parts},
                 "finishReason": finish_reason,
             }],
             "usageMetadata": google_usage_metadata(resp)
         });
         add_preserved_google_response_metadata(&mut out, resp);
+        out["candidates"][0]["index"] = resp
+            .vendor
+            .egress
+            .get("__google_native_candidate_index")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            .into();
+        if let Some(extra) = resp
+            .vendor
+            .egress
+            .get("__google_native_candidates")
+            .and_then(Value::as_array)
+        {
+            out["candidates"]
+                .as_array_mut()
+                .expect("candidates array")
+                .extend(extra.iter().cloned());
+        }
         out
     }
 }
@@ -203,6 +257,7 @@ enum NativeStreamKind {
 
 #[derive(Default)]
 struct NativeStreamCursor {
+    candidate_index: Option<u64>,
     kind: Option<NativeStreamKind>,
     index: usize,
     next_index: usize,
@@ -302,6 +357,19 @@ fn parse_gemini_chunk(
     first: &mut bool,
     cursor: &mut NativeStreamCursor,
 ) -> Result<()> {
+    if let Some(error) = raw_chunk.get("error").filter(|error| !error.is_null()) {
+        deltas.push(AiStreamDelta::StreamError {
+            error: stravia_runtime_contract::protocol::ir::AiError::new(
+                stravia_runtime_contract::protocol::ir::AiErrorKind::StreamMidError,
+                error
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("upstream stream error"),
+            )
+            .with_raw(raw_chunk.clone()),
+        });
+        return Ok(());
+    }
     let chunk: GeminiStreamChunk = serde_json::from_value(raw_chunk.clone())?;
     if *first {
         *first = false;
@@ -311,7 +379,57 @@ fn parse_gemini_chunk(
         });
     }
 
-    let candidate = chunk.candidates.first();
+    let raw_candidates = raw_chunk.get("candidates").and_then(Value::as_array);
+    let canonical_index = cursor.candidate_index.unwrap_or_else(|| {
+        raw_candidates
+            .and_then(|candidates| candidates.first())
+            .and_then(|candidate| candidate.get("index"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+    });
+    if !chunk.candidates.is_empty() && cursor.candidate_index.is_none() {
+        cursor.candidate_index = Some(canonical_index);
+        // Index zero is the native default and needs no private frame.
+        if canonical_index != 0 {
+            deltas.push(AiStreamDelta::Unknown {
+                raw: serde_json::json!({"__google_native_candidate_index": canonical_index})
+                    .to_string(),
+            });
+        }
+    }
+    let mut candidate = None;
+    let mut extra = Vec::new();
+    for (position, parsed) in chunk.candidates.iter().enumerate() {
+        let raw = &raw_candidates.expect("typed candidates came from array")[position];
+        let index = raw
+            .get("index")
+            .and_then(Value::as_u64)
+            .unwrap_or(position as u64);
+        if index == canonical_index {
+            candidate = Some(parsed);
+        } else {
+            if let Some(content) = &parsed.content {
+                for part in &content.parts {
+                    if let GeminiStreamPart::Other(raw) = part {
+                        google_media_item(raw)?;
+                        if raw.as_object().is_some_and(|fields| {
+                            fields.contains_key("text") || fields.contains_key("functionCall")
+                        }) {
+                            anyhow::bail!("invalid typed Gemini stream part: {raw}");
+                        }
+                    }
+                }
+            }
+            let mut native_candidate = raw.clone();
+            native_candidate["index"] = index.into();
+            extra.push(native_candidate);
+        }
+    }
+    if !extra.is_empty() {
+        deltas.push(AiStreamDelta::Unknown {
+            raw: serde_json::json!({"__google_native_candidates": extra}).to_string(),
+        });
+    }
     if let Some(parts) = candidate
         .and_then(|candidate| candidate.content.as_ref())
         .map(|content| content.parts.as_slice())
@@ -498,7 +616,9 @@ struct StreamToolCall {
 }
 
 pub struct GoogleStreamFormatter {
+    candidate_index: u64,
     usage: Usage,
+    usage_observed: bool,
     model: String,
     tools: HashMap<usize, StreamToolCall>,
     response_metadata: serde_json::Map<String, Value>,
@@ -516,7 +636,9 @@ impl Default for GoogleStreamFormatter {
 impl GoogleStreamFormatter {
     pub fn new() -> Self {
         Self {
+            candidate_index: 0,
             usage: Usage::default(),
+            usage_observed: false,
             model: String::new(),
             tools: HashMap::new(),
             response_metadata: serde_json::Map::new(),
@@ -531,6 +653,7 @@ impl GoogleStreamFormatter {
     fn emit_thinking_signature(&self, events: &mut Vec<SseEvent>, signature: &str) {
         let chunk = serde_json::json!({
             "candidates": [{
+                "index": self.candidate_index,
                 "content": {
                     "role": "model",
                     "parts": [{
@@ -580,6 +703,7 @@ impl GoogleStreamFormatter {
                     self.reasoning_has_text = true;
                     let chunk = serde_json::json!({
                         "candidates": [{
+                            "index": self.candidate_index,
                             "content": {
                                 "role": "model",
                                 "parts": [{"text": text, "thought": true}]
@@ -593,7 +717,16 @@ impl GoogleStreamFormatter {
                     self.emit_thinking_signature(&mut events, signature);
                     self.thinking_signature_emitted = true;
                 }
-                AiStreamDelta::ItemDone { item, .. } => {
+                AiStreamDelta::ItemDone { index, item } => {
+                    if let Some(call) = item.function_call_ref() {
+                        let tool = self.tools.remove(index).unwrap_or_else(|| StreamToolCall {
+                            name: call.name.clone(),
+                            id: call.id.as_str().to_owned(),
+                            arguments: String::new(),
+                            signature: None,
+                        });
+                        self.emit_tool_call(tool, &call.arguments, &mut events);
+                    }
                     if let Some((text, signature)) = item.thinking_ref() {
                         if let Some(pending) = self.pending_signature.take() {
                             self.emit_thinking_signature(&mut events, &pending);
@@ -617,14 +750,14 @@ impl GoogleStreamFormatter {
                             .filter(|text| !text.is_empty())
                         {
                             events.push(SseEvent::new(None, serde_json::json!({
-                                "candidates": [{"content": {"role": "model", "parts": [{"text": text, "thought": true}]}}],
+                                "candidates": [{"index": self.candidate_index, "content": {"role": "model", "parts": [{"text": text, "thought": true}]}}],
                                 "modelVersion": self.model,
                             }).to_string()));
                         }
                     }
                     self.reasoning_has_text = false;
                     if let Some(part) = google_media_part(item) {
-                        events.push(SseEvent::new(None, serde_json::json!({"candidates":[{"content":{"role":"model","parts":[part]}}],"modelVersion":self.model}).to_string()));
+                        events.push(SseEvent::new(None, serde_json::json!({"candidates":[{"index":self.candidate_index,"content":{"role":"model","parts":[part]}}],"modelVersion":self.model}).to_string()));
                     }
                 }
                 AiStreamDelta::TextDelta(text)
@@ -633,6 +766,7 @@ impl GoogleStreamFormatter {
                 | AiStreamDelta::RefusalDeltaWithIndex { text, .. } => {
                     let chunk = serde_json::json!({
                         "candidates": [{
+                            "index": self.candidate_index,
                             "content": {"role": "model", "parts": [{"text": text}]},
                         }],
                         "modelVersion": self.model,
@@ -655,26 +789,9 @@ impl GoogleStreamFormatter {
                         continue;
                     };
                     tool.arguments.push_str(arguments);
-                    let Ok(args @ Value::Object(_)) =
-                        serde_json::from_str::<Value>(&tool.arguments)
-                    else {
-                        continue;
-                    };
-                    let normalized_args = normalize_tool_args(&tool.name, args);
-                    let mut part = serde_json::json!({"functionCall": {
-                        "id": tool.id, "name": tool.name, "args": normalized_args
-                    }});
-                    if let Some(signature) = tool.signature.take() {
-                        part["thoughtSignature"] = Value::String(signature);
-                    }
-                    let chunk = serde_json::json!({
-                        "candidates": [{
-                            "content": {"role": "model", "parts": [part]},
-                        }],
-                    });
-                    events.push(SseEvent::new(None, chunk.to_string()));
                 }
                 AiStreamDelta::Usage(u) => {
+                    self.usage_observed = true;
                     if u.prompt_tokens > 0 {
                         self.usage.prompt_tokens = u.prompt_tokens;
                     }
@@ -702,6 +819,22 @@ impl GoogleStreamFormatter {
                     let Ok(value) = serde_json::from_str::<Value>(raw) else {
                         continue;
                     };
+                    if let Some(index) = value
+                        .get("__google_native_candidate_index")
+                        .and_then(Value::as_u64)
+                    {
+                        self.candidate_index = index;
+                        continue;
+                    }
+                    if let Some(candidates) = value
+                        .get("__google_native_candidates")
+                        .and_then(Value::as_array)
+                    {
+                        let mut chunk = serde_json::json!({"candidates": candidates, "modelVersion": self.model});
+                        add_stream_response_metadata(&mut chunk, &self.response_metadata);
+                        events.push(SseEvent::new(None, chunk.to_string()));
+                        continue;
+                    }
                     if let Some(metadata) = value
                         .get("__google_response_metadata")
                         .and_then(Value::as_object)
@@ -711,6 +844,7 @@ impl GoogleStreamFormatter {
                     }
                     let chunk = serde_json::json!({
                         "candidates": [{
+                            "index": self.candidate_index,
                             "content": {"role": "model", "parts": [value]},
                         }],
                         "modelVersion": self.model,
@@ -728,6 +862,7 @@ impl GoogleStreamFormatter {
                     events.push(SseEvent::new(None, error.to_string()));
                 }
                 AiStreamDelta::Done { stop_reason } => {
+                    self.flush_tool_calls(&mut events);
                     let gemini_reason = match stop_reason.as_str() {
                         "stop" | "tool_calls" => "STOP",
                         "length" => "MAX_TOKENS",
@@ -735,10 +870,13 @@ impl GoogleStreamFormatter {
                     };
                     let mut chunk = serde_json::json!({
                         "candidates": [{
+                            "index": self.candidate_index,
                             "content": {"role": "model", "parts": []},
                             "finishReason": gemini_reason,
                         }],
-                        "usageMetadata": merge_usage_counts(
+                    });
+                    if self.usage_observed {
+                        chunk["usageMetadata"] = merge_usage_counts(
                             self.response_metadata
                                 .get("usageMetadata")
                                 .cloned()
@@ -747,8 +885,10 @@ impl GoogleStreamFormatter {
                                 usage: self.usage.clone(),
                                 ..AiResponse::new("", self.model.clone())
                             },
-                        )
-                    });
+                        );
+                    } else if let Some(usage) = self.response_metadata.get("usageMetadata") {
+                        chunk["usageMetadata"] = usage.clone();
+                    }
                     add_stream_response_metadata(&mut chunk, &self.response_metadata);
                     events.push(SseEvent::new(None, chunk.to_string()));
                 }
@@ -761,25 +901,40 @@ impl GoogleStreamFormatter {
 
     pub(crate) fn format_done(&mut self) -> Vec<SseEvent> {
         let mut events = Vec::new();
+        self.flush_tool_calls(&mut events);
         if let Some(signature) = self.pending_signature.take() {
             self.emit_thinking_signature(&mut events, &signature);
         }
         events
     }
 
-    // functionCall 的 args 契约是 JSON 对象：标量、数组、null 与非 JSON 字节
-    // 同样不可表达；合法 JSON 不足以满足对象契约。
-    pub(crate) fn unrepresentable_tool_arguments(&self) -> Vec<String> {
-        self.tools
-            .iter()
-            .filter(|(_, tool)| {
-                !matches!(
-                    serde_json::from_str::<Value>(&tool.arguments),
-                    Ok(Value::Object(_))
-                )
+    fn emit_tool_call(&self, tool: StreamToolCall, arguments: &str, events: &mut Vec<SseEvent>) {
+        let Ok(args @ Value::Object(_)) = serde_json::from_str::<Value>(arguments) else {
+            return;
+        };
+        let args = normalize_tool_args(&tool.name, args);
+        let mut part = serde_json::json!({"functionCall": {
+            "id": tool.id, "name": tool.name, "args": args
+        }});
+        if let Some(signature) = tool.signature {
+            part["thoughtSignature"] = Value::String(signature);
+        }
+        events.push(SseEvent::new(
+            None,
+            serde_json::json!({
+                "candidates": [{"index": self.candidate_index, "content": {"role": "model", "parts": [part]}}]
             })
-            .map(|(index, _)| format!("tool_calls[{index}].arguments"))
-            .collect()
+            .to_string(),
+        ));
+    }
+
+    fn flush_tool_calls(&mut self, events: &mut Vec<SseEvent>) {
+        let mut tools: Vec<_> = self.tools.drain().collect();
+        tools.sort_unstable_by_key(|(index, _)| *index);
+        for (_, mut tool) in tools {
+            let arguments = std::mem::take(&mut tool.arguments);
+            self.emit_tool_call(tool, &arguments, events);
+        }
     }
 }
 
@@ -805,10 +960,9 @@ fn google_parts_from_response(resp: &AiResponse) -> Vec<Value> {
         {
             parts.push(serde_json::json!({"text": text}));
         } else if let Some(call) = item.function_call_ref() {
-            // response_loss_paths 已在可失败边界拦截不可表达的入参；这里只
-            // 兜底保留原始字节，绝不凭空生成空对象。
-            let args: Value = serde_json::from_str(&call.arguments)
-                .unwrap_or_else(|_| Value::String(call.arguments.clone()));
+            let Ok(args @ Value::Object(_)) = serde_json::from_str(&call.arguments) else {
+                continue;
+            };
             parts.push(serde_json::json!({
                 "functionCall": {"id": call.id, "name": call.name, "args": args}
             }));

@@ -109,6 +109,120 @@ fn stream_formatter_encodes_canonical_stream_error() {
     assert_eq!(body["error"]["message"], "stream aborted");
 }
 
+#[test]
+fn stream_formatter_preserves_raw_tool_arguments_and_same_batch_completion() {
+    // Unlike unary tool_use.input, streaming partial_json is a string carrier:
+    // even malformed or nonobject argument bytes remain representable verbatim.
+    for fragments in [
+        vec![r#"{"key":"value"}"#, " trailing invalid bytes"],
+        vec!["not JSON"],
+        vec!["[]"],
+        vec!["null"],
+        vec!["42"],
+        vec![r#""scalar""#],
+        vec![""],
+        vec![r#"{"city":"#, r#""Paris"}"#],
+    ] {
+        let mut formatter = AnthropicStreamFormatter::new();
+        let mut deltas = vec![
+            AiStreamDelta::ThinkingDelta("signed thought".into()),
+            AiStreamDelta::ThinkingSignature("source-signature".into()),
+            AiStreamDelta::ToolCallStart {
+                index: 0,
+                id: "toolu_raw".into(),
+                name: "raw_probe".into(),
+            },
+        ];
+        deltas.extend(
+            fragments
+                .iter()
+                .map(|arguments| AiStreamDelta::ToolCallDelta {
+                    index: 0,
+                    arguments: (*arguments).into(),
+                }),
+        );
+        deltas.extend([
+            AiStreamDelta::TextDelta("continued text".into()),
+            AiStreamDelta::Usage(Usage {
+                prompt_tokens: 17,
+                completion_tokens: 9,
+                ..Usage::default()
+            }),
+            AiStreamDelta::Done {
+                stop_reason: "stop".into(),
+            },
+        ]);
+
+        let events = formatter.format_deltas(&deltas);
+        let payloads: Vec<Value> = events
+            .iter()
+            .map(|event| serde_json::from_str(&event.data).expect("valid native event JSON"))
+            .collect();
+        let raw_fragments: Vec<&str> = payloads
+            .iter()
+            .filter(|body| body["delta"]["type"] == "input_json_delta")
+            .map(|body| {
+                body["delta"]["partial_json"]
+                    .as_str()
+                    .expect("string carrier")
+            })
+            .collect();
+        assert_eq!(
+            raw_fragments, fragments,
+            "raw argument bytes must not be projected"
+        );
+        let tool_start = payloads
+            .iter()
+            .find(|body| body["content_block"]["type"] == "tool_use")
+            .expect("native tool block start");
+        assert_eq!(tool_start["content_block"]["id"], "toolu_raw");
+        assert_eq!(tool_start["content_block"]["name"], "raw_probe");
+        assert_eq!(tool_start["content_block"]["input"], serde_json::json!({}));
+        assert!(
+            payloads
+                .iter()
+                .any(|body| body["delta"]["signature"] == "source-signature")
+        );
+        assert!(
+            payloads
+                .iter()
+                .any(|body| body["delta"]["text"] == "continued text")
+        );
+        let completion = payloads
+            .iter()
+            .find(|body| body["type"] == "message_delta")
+            .expect("successful completion after raw arguments");
+        assert_eq!(completion["delta"]["stop_reason"], "end_turn");
+        assert_eq!(completion["usage"]["input_tokens"], 17);
+        assert_eq!(completion["usage"]["output_tokens"], 9);
+        assert_eq!(
+            events.last().unwrap().event.as_deref(),
+            Some("message_stop")
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| event.event.as_deref() != Some("error"))
+        );
+
+        let wire: String = events
+            .iter()
+            .map(|event| make_sse_block(event.event.as_deref().unwrap(), &event.data))
+            .collect();
+        let decoded = AnthropicStreamParser::new()
+            .parse_chunk(&wire)
+            .expect("raw argument strings do not invalidate source-wire JSON");
+        let decoded_fragments: Vec<&str> = decoded
+            .iter()
+            .filter_map(|delta| match delta {
+                AiStreamDelta::ToolCallDelta { arguments, .. } => Some(arguments.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(decoded_fragments, fragments);
+    }
+}
+
 // ── AnthropicResponseParser ──
 
 #[test]

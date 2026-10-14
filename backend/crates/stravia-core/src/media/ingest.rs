@@ -699,7 +699,8 @@ async fn materialize_source(
     }
     let id = ArtifactId::from_reference(reference)?;
     let (url, inline) = match protocol.map(|protocol| protocol.protocol) {
-        None => (true, true),
+        // 无共享标准 endpoint 时，向 guest 提供 canonical bytes；不能假定其支持 URL。
+        None => (false, true),
         Some(Protocol::BedrockConverse) => (false, kind == "image"),
         Some(Protocol::AnthropicMessages) => (
             matches!(kind, "image" | "document"),
@@ -716,9 +717,6 @@ async fn materialize_source(
             (kind != "document", kind != "document")
         }
         Some(Protocol::CohereChat) => (kind == "image", kind == "image"),
-        Some(Protocol::CommandCode) => (false, kind == "image"),
-        // Inline base64 only — the wire ImageData field carries bytes, no URL.
-        Some(Protocol::DevinConnect) => (false, kind == "image"),
     };
     if access.settings.external_signed_downloads && url {
         let download = access

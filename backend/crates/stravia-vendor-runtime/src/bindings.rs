@@ -7,7 +7,7 @@ wasmtime::component::bindgen!({
         "stravia:vendor/host.ws-connection": crate::host::WebSocketResource,
     },
     imports: {
-        "stravia:vendor/host@0.4.0": async | trappable,
+        "stravia:vendor/host@0.5.0": async | trappable,
     },
     exports: {
         "execute": async | store,

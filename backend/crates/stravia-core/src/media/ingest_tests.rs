@@ -9,6 +9,174 @@ use base64::Engine;
 use tower::ServiceExt;
 
 #[tokio::test]
+async fn opaque_media_uses_inline_bytes_and_standard_media_keeps_signed_downloads() {
+    use stravia_runtime_contract::protocol::ids::ProtocolIdentity;
+    use stravia_runtime_contract::protocol::ir::{
+        AiItem, AiRequest, ContentBlock, DocumentSource, MediaSource, MessageContent,
+        ToolResultContentKind,
+    };
+
+    let directory = tempfile::tempdir().unwrap();
+    let gateway = crate::Gateway::new(crate::config::GatewayConfig {
+        data_dir: directory.path().to_owned(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    gateway
+        .storage
+        .settings()
+        .set(
+            "artifact_settings",
+            r#"{"external_signed_downloads":true,"client_base_url":"https://downloads.example","file_public_base_url":"https://downloads.example"}"#,
+        )
+        .await
+        .unwrap();
+    let owner = Principal::new("opaque-media-owner");
+    let bytes = include_bytes!("../../tests/fixtures/media/transparent.png");
+    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+    let image = ContentBlock::Image {
+        source: MediaSource::Base64 {
+            media_type: "image/png".into(),
+            data: encoded.clone(),
+        },
+        detail: None,
+        cache_control: None,
+    };
+    let pdf = base64::engine::general_purpose::STANDARD.encode(b"%PDF-1.7\nopaque document\n");
+    let mut item = AiItem::output_text("");
+    item.role = stravia_runtime_contract::protocol::ir::Role::User;
+    item.content = MessageContent::Blocks(vec![
+        image.clone(),
+        ContentBlock::Document {
+            source: DocumentSource::Blocks {
+                content: vec![image.clone()],
+            },
+            title: None,
+            context: None,
+            cache_control: None,
+        },
+        ContentBlock::ToolResult {
+            tool_use_id: "nested-media".into(),
+            content: serde_json::to_value(vec![image.clone()]).unwrap(),
+            content_kind: Some(ToolResultContentKind::ContentBlocks),
+            is_error: None,
+            cache_control: None,
+        },
+        ContentBlock::Document {
+            source: DocumentSource::Base64Pdf { data: pdf },
+            title: None,
+            context: None,
+            cache_control: None,
+        },
+    ]);
+    let original = Arc::new(AiRequest::new("model", vec![item]));
+    let mut normalized = original.clone();
+    ingest::normalize_shared_request(
+        &gateway,
+        &owner,
+        &mut normalized,
+        &stravia_runtime_contract::CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    // 与 Target preparation 一样从 guest identity 查找共享 codec；空 hint 也没有 endpoint。
+    let identity = ProtocolIdentity::new("opaque-test-plugin/private-api/v7");
+    assert!(identity.protocol().is_none());
+    for hint in [identity.as_str(), ""] {
+        let protocol =
+            stravia_protocol_codec::registry::ProtocolRegistry::global().resolve_alias(hint);
+        assert!(protocol.is_none());
+        let mut request = normalized.clone();
+        let transfers = ingest::materialize_request(&gateway, &owner, &mut request, protocol)
+            .await
+            .unwrap();
+        assert!(
+            transfers.is_empty(),
+            "opaque delivery must not issue URL grants"
+        );
+        assert_eq!(
+            serde_json::to_value(&request.items).unwrap(),
+            serde_json::to_value(&original.items).unwrap(),
+            "nested images and PDF must retain their bytes"
+        );
+        let MessageContent::Blocks(blocks) = &request.items[0].content else {
+            panic!("expected media blocks");
+        };
+        let ContentBlock::Image {
+            source: MediaSource::Base64 { media_type, data },
+            ..
+        } = &blocks[0]
+        else {
+            panic!("opaque guest must receive canonical inline image bytes");
+        };
+        assert_eq!(media_type, "image/png");
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(data)
+                .unwrap(),
+            bytes
+        );
+    }
+    let mut unauthorized = normalized.clone();
+    assert!(
+        ingest::materialize_request(
+            &gateway,
+            &Principal::new("other-owner"),
+            &mut unauthorized,
+            None,
+        )
+        .await
+        .is_err(),
+        "inline delivery must retain Artifact ownership enforcement"
+    );
+
+    let MessageContent::Blocks(blocks) = &normalized.items[0].content else {
+        panic!("expected normalized media blocks");
+    };
+    let mut standard_item = AiItem::output_text("");
+    standard_item.role = stravia_runtime_contract::protocol::ir::Role::User;
+    standard_item.content = MessageContent::Blocks(vec![blocks[0].clone()]);
+    let mut standard = Arc::new(AiRequest::new("model", vec![standard_item]));
+    let protocol = stravia_protocol_codec::registry::ProtocolRegistry::global()
+        .resolve_alias("openai-compatible/chat-completions/v1")
+        .expect("standard shared endpoint");
+    let transfers = ingest::materialize_request(&gateway, &owner, &mut standard, Some(protocol))
+        .await
+        .unwrap();
+    let MessageContent::Blocks(blocks) = &standard.items[0].content else {
+        panic!("expected standard media blocks");
+    };
+    let ContentBlock::Image {
+        source: MediaSource::Url(url),
+        ..
+    } = &blocks[0]
+    else {
+        panic!("standard image target must still receive a signed URL");
+    };
+    assert!(url.starts_with("https://downloads.example/v1/artifacts/downloads/"));
+    assert_eq!(transfers.len(), 1);
+    assert_eq!(transfers[0].0, *url);
+    let download = crate::proxy::server::create_router(gateway.clone())
+        .oneshot(
+            Request::get(url.strip_prefix("https://downloads.example").unwrap())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(download.status(), StatusCode::OK);
+    assert_eq!(
+        to_bytes(download.into_body(), 1024 * 1024)
+            .await
+            .unwrap()
+            .as_ref(),
+        bytes
+    );
+    gateway.shutdown().await;
+}
+
+#[tokio::test]
 async fn shared_text_normalization_scrubs_extension_keys_and_keeps_sql_errors() {
     use stravia_runtime_contract::protocol::ir::{AiItem, AiRequest};
     let directory = tempfile::tempdir().unwrap();

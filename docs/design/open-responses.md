@@ -13,7 +13,7 @@
 
 Stravia 将以 **Open Responses Protocol** 作为唯一 Responses-shaped canonical baseline，并固定到官方 `2026-04-24` dated release。它是独立于 OpenAI rolling Responses API 的协议身份，不是现有 `OpenAIResponsesV1` 的别名。Ingress 兼容 rolling 客户端的 additive fields 与 hosted tools，但这些扩展不会隐式成为 canonical semantics。
 
-协议转换继续服从 ADR-0006 的 pair-bound seam，但 canonical model 收敛为有序、双向的 `AiItem` Graph。所有 request、response、stream、continuation 与跨协议转换先恢复 canonical 语义，再由目标协议编码。能等价表达的语义必须转换；不能表达的内容、身份、引用、结构和硬约束必须在 provider call 前拒绝；additive metadata、响应装饰以及没有被 required/named 选择的 hosted tools 可以为兼容性静默省略。
+协议转换继续服从 ADR-0006 的 pair-bound seam，但 canonical model 收敛为有序、双向的 `AiItem` Graph。所有 request、response、stream、continuation 与跨协议转换先恢复 canonical 语义，再由目标协议编码。能等价表达的语义必须转换；目标不能表达的内容、身份、引用、结构、控制、扩展和硬约束默认省略，覆盖 request、response、stream delta 与 continuation 历史，不因语义损失整体拒绝，也不提供严格模式开关。该规则可能损失图片、工具、硬约束、多候选及历史，不宣称无损；非法源输入、解析错误、安全/凭据校验与网络失败仍是真实错误。
 
 对外能力声明固定为：
 
@@ -161,13 +161,13 @@ Core typed bodies 覆盖：
 - item reference；
 - extension wrapper。
 
-`function_call_output.output` 保留官方允许的字符串或 content-array 语义，不再对 array 做 JSON stringify。
+`function_call_output.output` 保留官方允许的字符串或 content-array 语义，不把 content-block 数组 JSON stringify。显式标为业务 JSON 的结果使用目标原生 JSON 或 JSON-text 载体，业务数组不因形似媒体块而被重新解释。
 
 ### 5.4 Instructions 与 Developer role
 
 顶层 `instructions` 是独立 request field，不转换为 System/Developer message。Continuation 可按第 8 节继承它。
 
-Open Responses `developer` message 在目标协议有等价角色时原样映射。目标协议无 Developer role 时，按已接受的兼容例外静默降级为 System。这是 representability fail-closed 原则的唯一初始 role 例外，必须在 ADR 和 contract tests 中固定。
+Open Responses `developer` message 在目标协议有等价角色时原样映射。目标协议无 Developer role 时，按已接受的兼容例外静默降级为 System。这是已接受的 role 映射，须在 ADR 和 contract tests 中固定；其它目标无法表达的语义遵循默认省略政策。
 
 ### 5.5 Stream model
 
@@ -369,7 +369,7 @@ Ingress 接受 `{ "id": "..." }`；若显式提供 `type`，必须等于 `item_r
 
 客户端拥有的 function call，其 `arguments` 是不透明字符串：空串、非法 JSON、缺失闭合符号与原始空白均原样保留，不由响应 Hook 校验、补全或替换。此规则覆盖流式 delta/done、完整响应、Generation Chain 及客户端下一轮回显；工具参数解析错误由客户端处理，不单独升级为平台响应失败。Platform Tool 在实际执行前解析参数，解析失败作为 `is_error` 工具结果交回模型，不调用工具执行器。Hook 主动修改参数仍遵循既有 patch 契约。
 
-透传不绕过凭据保护：结构不完整但字符串转义可解释的参数继续检测与还原；检测、替换或还原无法安全解释转义时仍失败关闭。跨协议目标若只能承载结构化工具参数，无法表示的原始字符串明确返回转换错误，不伪造 `{}`；Anthropic 流式 `input_json_delta` 可保留原始参数分片。
+透传不绕过凭据保护：结构不完整但字符串转义可解释的参数继续检测与还原；检测、替换或还原无法安全解释转义时仍失败关闭。跨协议目标若只能承载对象工具参数，无法表示的调用及其关联结果省略，不伪造 `{}`。跨协议 Anthropic 流即使使用字符串 `partial_json` 载体，最终 `tool_use.input` 仍须为对象，因此按调用累积完整参数后校验；合法对象的原始参数字节保持不变。
 
 纯客户端 function call 终结当前 response；客户端下一次请求创建新的 Inference Run。只有同轮同时出现 Platform Tool 和客户端 function call 时，才保留现有 mixed-only、process-local `ToolContinuation`：隐藏 Platform Tool 继续执行，客户端 call 等待 output 后恢复同一个 run。
 
@@ -407,45 +407,42 @@ Extension final item 仍使用标准 `response.output_item.added` / `response.ou
 | function output | `function_call_output` | `tool_result` | `functionResponse` |
 | previous response | native ID 或 canonical expansion | canonical history → messages | canonical history → contents |
 | item reference | resolve item | resolve 后编码 block | resolve 后编码 part |
-| JSON Schema output | `text.format` | 仅在等价 contract 可证明时 | `responseSchema` |
+| JSON Schema output | `text.format` | `output_config.format` | `responseJsonSchema` |
 
-### 10.2 必须拒绝
+### 10.2 默认省略不可表达语义
 
-以下语义在目标 Target 不可表达时，必须在 provider call 前拒绝：
+目标 Target 无法表达的内容、控制、扩展与硬约束默认省略，不因语义损失拒绝整体转换，也不维护 strict toggle 或仅可选字段的 allowlist。该规则同时覆盖请求、完整响应、stream delta 和 continuation 历史，例如：
 
-- text/image/file/media content；
-- function output 和 call correlation；
-- response/item identity 与 reference；
-- required output format；
-- `tool_choice=required/none`、allowed tools；
-- output/tool call limits；
-- truncation 和其它安全、成本、上下文完整性硬约束。
+- text/image/file/media content、reasoning signature 与原生状态；
+- function call/output、call correlation、response/item identity 与 reference；
+- required output format、`tool_choice=required/none`、named/allowed tools、output/tool call limits；
+- `truncation`、采样、工具 `strict`、JSON Schema 约束、成本和上下文完整性硬约束；
+- additive metadata、响应装饰、未知提供方扩展与目标不能执行的 hosted tools；
+- 多候选响应中单候选目标不能承载的其它候选。
 
-拒绝必须指出具体 parameter/item 和目标 capability 缺口，不能把内容塞进 prompt 假装等价。
+目标支持 `truncation` 时保留 `auto`/`disabled` 原值，不支持时两者都省略，由目标原生上下文处理决定结果；不擅自裁剪历史，也不保证自动截断意图仍获执行。入站合法值校验不变。
 
-### 10.3 Compatibility omission
+### 10.3 保留内容与真实错误边界
 
-跨协议转换允许静默省略不改变任务事实、工具硬要求、输出硬结构、成本上限或身份关联的 advisory surface：
+可以表达的语义必须保留，同协议可承载字段不能因跨协议省略规则而删除。省略只作用于此次编码，不损坏共享 canonical 请求或原始历史；continuation 展开后的历史同样可能因目标能力而损失内容，不保证无损。
 
-- `temperature`
-- `top_p`
-- `presence_penalty`
-- `frequency_penalty`
-- `reasoning.effort`
-- `service_tier`
-- function tool 的 `strict` 与目标无法表达的参数 schema 约束（如 Gemini 的 `additionalProperties`、`$ref`）：目标协议没有等价控制时降级，工具名与参数 schema 主体照常保留
-- `prompt_cache_key`
-- 图片 `detail` 提示（如 `auto`、`low`、`high`）：目标协议没有等价控制时允许省略，图片本体与工具结果关联仍必须保留；目标协议支持时继续传递该提示。省略仅发生在目标 wire 编码，不改写 canonical 历史，也不放宽入站字段值校验。
-- `client_metadata` 与其它 additive metadata
-- 普通 item 的附加字段（包括未知提供方字段）：canonical 与同协议输出保留，跨协议请求回放、完整响应及流式交付允许省略，不维护字段白名单。附加字段不等同于未知 item/content 类型或原生压缩状态，后者继续按其实际语义检查。
-- `include`、`stream_options.include_obfuscation`、`top_logprobs`、`text.verbosity`
-- `tool_choice=auto/none` 下目标协议不能执行的 hosted tools
+目标只接受对象工具参数时，不可表达的整个工具调用及其关联结果省略，不能制造 `{}` 或把不可表达内容 stringify 冒充支持；工具结果的合法原生字符串、对象包装等映射仍保留。Gemini 与跨协议 Anthropic 流按工具调用等待完整对象参数，不缓冲整条流；正文、思考与 usage 继续交付，EOF 或真实错误不合成成功终态。
 
-兼容性判断按语义类别而不是 dated field allowlist。`required`/named/allowed tools、`max_tool_calls`、required output format、truncation 等硬约束仍适用 10.2。
+混合内容逐项转换：可表达的文本、媒体、业务 JSON、工具身份及状态必须保留，只有无法承载的子项或属性才省略，不能因为一项不支持删除整个消息或结果。同协议多候选保留各自真实索引；单候选目标只省略额外候选，不能把它们合并到主候选。
+
+Gemini 输出格式使用[官方 `responseJsonSchema` 载体及支持子集](https://ai.google.dev/api/generate-content#GenerationConfig)，工具参数使用[`parametersJsonSchema`](https://ai.google.dev/api/caching#FunctionDeclaration)，保留可表达的 `additionalProperties`、本地 `$defs` 与 `$ref`；旧 `responseSchema`/`parameters` 的 uppercase type、`nullable` 和定义引用先归一化。不内联递归引用、不访问外部 schema URI；原生模型的复杂度、循环引用及支持范围限制仍由上游裁决。[工具选择模式](https://ai.google.dev/api/caching#FunctionCallingConfig)按语义转换为 `AUTO`、`NONE` 或 `ANY`，指定工具保留 `allowedFunctionNames`。可表达的 stop、seed、frequency/presence penalty 同样编码，显式 canonical 修改优先于保留的原生配置。
+
+Anthropic 将支持的 JSON Schema 输出约束转换为 [`output_config.format`](https://platform.claude.com/docs/en/api/messages/create)，工具 strict、禁止并行调用、stop 与 `tool_choice: none` 按真实原生字段转换。不能表达的 schema 约束逐项省略；不擅自把开放对象改成 `additionalProperties: false`，不能满足原生 structured-output 格式的 schema 不伪装成有效格式。原生扩展已有对应字段时保持原生优先级。
+
+媒体按真实载体转换，而不是把不支持的内容 stringify：PDF 与纯文本文档可以转换为 Responses/Chat 文件及 Gemini file/inline data；文档中的文本和图片逐项映射。Anthropic 使用[原生 image/document sources](https://platform.claude.com/docs/en/api/messages/create)，支持已确认的 URL、base64 与 file ID；标准 Messages 不发送不存在的音频 block。Bedrock 使用[原生 DocumentBlock](https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_DocumentBlock.html)承载用户消息中的 PDF、纯文本及已支持文件格式，不主动下载 URL。媒体大小、模型能力与上游请求限制仍由既有校验和实际 Provider 响应决定。
+
+实际观测 usage 保持真实，即使内容或候选省略也不合成零值。图片、工具、硬约束、多候选和 continuation 历史均可能损失，调用方不能依赖被省略约束仍被执行，也不能把内容塞进 prompt 假装等价。
+
+非法源 wire、JSON/schema/semantic 解析错误、安全与凭据校验、真实 Provider 协议违例及网络/上游错误仍沿原有错误路径返回；目标表达能力不足不是这些错误，也不授权吞掉这些错误。
 
 ### 10.4 Conformance boundary
 
-Open Responses `2026-04-24` 定义 canonical baseline；Ingress 可以接受其 additive superset。Open Responses Target 原样接收 compatibility envelope，跨协议 Target 只承诺 canonical semantics 与硬约束，不宣称完整 rolling Responses conformance。
+Open Responses `2026-04-24` 定义 canonical baseline；Ingress 可以接受其 additive superset。Open Responses Target 原样接收 compatibility envelope，跨协议 Target 只保留其可表达的 canonical semantics，不能保证所有内容或硬约束仍获执行，不宣称无损或完整 rolling Responses conformance。
 
 ---
 
@@ -516,7 +513,7 @@ Codex 官方客户端已[移除旧 `/responses/compact` 实现](https://github.c
 | JSON/schema/semantic invalid | 400 `invalid_request` |
 | previous response 不可见/过期 | 400 `previous_response_not_found` |
 | item reference 不可见/过期 | 400 `item_reference_not_found` |
-| representability failure | 400 `unsupported_feature` 或具体 invalid parameter code |
+| 目标无法表达的语义 | 默认省略不可表达部分，保留可表达内容；不产生转换失败 |
 | WS 已有 in-flight response | WS error 409 `response_in_progress`，连接保持 |
 | pre-commit Provider failure | normalized HTTP error |
 | post-commit stream failure | `response.failed`（部分输出、已报告 usage、嵌套 error）→ `[DONE]` |
@@ -554,7 +551,7 @@ Production 不加载或解释该 artifact；production wire types 为手写 owne
 - WebSocket sequential turns、busy、reauthorization、disconnect；
 - `store=true/false`、branch、TTL、Principal isolation；
 - item reference resolution；
-- representability reject 与 silent-drop allowlist；
+- request/response/stream 默认省略、可表达字段保留与真实错误边界；
 - extension registry 与 final-only output；
 - Provider protocol violation fail-closed；
 - compact/background unsupported contracts。
@@ -606,9 +603,9 @@ Vendored OpenAPI、hash、Rust schema tests、behavior tests 和 contract matrix
 4. **Store false**：HTTP response 完成但不进入 durable chain；后续 HTTP continuation统一 not found；同 socket 可继续，断线后不可继续。
 5. **Durable branch**：两个请求从同一 stored parent 分支，互不共享 Inference Run mutable state。
 6. **Reference isolation**：本 Principal item 可解析；其它 Principal、过期和未知 item 返回相同错误。
-7. **Cross-protocol tool result**：function output 等价映射到 Anthropic/Google；目标不支持时 provider call 前拒绝。
-8. **Hard constraint**：目标无法表达 required tool choice 或 required output format 时拒绝；function tool `strict` 与 schema 约束按 10.3 兼容降级。
-9. **Advisory hint**：跨协议仅允许第 10.3 节列出的字段静默省略。
+7. **Cross-protocol tool result**：function output 映射到 Anthropic/Google 可承载的形态；目标无法承载的调用及关联结果省略，不伪造空对象或中断其它可表达内容。
+8. **Hard constraint**：目标无法表达 required tool choice、required output format、function tool `strict` 或 schema 约束时省略该约束，不保证原约束仍被执行。
+9. **Destination support**：请求、响应、stream 和 continuation 转换统一省略目标无法承载的内容、控制与扩展；目标可承载的部分保持，源 wire/解析/安全错误仍明确失败。
 10. **Extension final-only**：Web Search 返回标准 assistant message；Image/Agent/Media 只返回 registered final item，无私有 progress event。
 11. **Protocol violation**：same-protocol upstream 返回未注册 event，Stravia fail closed；已 commit stream 发标准失败序列。
 12. **Unsupported surface**：background 与 compact 返回明确 400 contract，无假实现、无 404。

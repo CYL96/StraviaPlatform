@@ -13,6 +13,24 @@ use stravia_runtime_contract::protocol::ir::ContentBlock;
 use stravia_runtime_contract::protocol::ir::DocumentSource;
 use stravia_runtime_contract::protocol::ir::MediaSource;
 
+pub(crate) fn document_media_source(source: DocumentSource) -> Option<MediaSource> {
+    match source {
+        DocumentSource::Base64Pdf { data } => Some(MediaSource::Base64 {
+            media_type: "application/pdf".into(),
+            data,
+        }),
+        DocumentSource::PlainText { data } => {
+            use base64::Engine as _;
+            Some(MediaSource::Base64 {
+                media_type: "text/plain".into(),
+                data: base64::engine::general_purpose::STANDARD.encode(data.as_bytes()),
+            })
+        }
+        DocumentSource::Url(url) => Some(MediaSource::Url(url)),
+        DocumentSource::Blocks { .. } => None,
+    }
+}
+
 /// Preserve legacy fallback wire shapes without exposing persisted IR metadata.
 pub(crate) fn content_block_wire_value(block: &ContentBlock) -> serde_json::Value {
     fn strip_internal_fields(block: &ContentBlock, value: &mut serde_json::Value) {

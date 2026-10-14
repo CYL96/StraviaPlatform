@@ -19,13 +19,6 @@ pub struct GoogleEncoder;
 impl GoogleEncoder {
     pub(crate) fn encode_request(&self, mut req: AiRequest) -> Result<(Value, HeaderMap)> {
         let ingress = &mut req.meta.vendor.ingress;
-        if req
-            .tool_choice
-            .as_ref()
-            .is_some_and(|choice| !matches!(choice, ToolChoice::Auto))
-        {
-            anyhow::bail!("unsupported tool_choice for Google Gemini");
-        }
 
         // ── System instruction ────────────────────────────────────────────────
         let raw_system = ingress.remove("__google_raw_system_instruction");
@@ -129,6 +122,21 @@ impl GoogleEncoder {
         if let Some(p) = req.generation.top_p {
             gen_config.insert("topP".into(), p.into());
         }
+        if let Some(stop) = req.generation.stop {
+            gen_config.insert(
+                "stopSequences".into(),
+                Value::Array(stop.into_iter().map(Value::String).collect()),
+            );
+        }
+        if let Some(seed) = req.generation.seed {
+            gen_config.insert("seed".into(), seed.into());
+        }
+        if let Some(penalty) = req.generation.frequency_penalty {
+            gen_config.insert("frequencyPenalty".into(), penalty.into());
+        }
+        if let Some(penalty) = req.generation.presence_penalty {
+            gen_config.insert("presencePenalty".into(), penalty.into());
+        }
         match req.response_format {
             Some(ResponseFormat::JsonObject) => {
                 gen_config.insert(
@@ -141,9 +149,10 @@ impl GoogleEncoder {
                     "responseMimeType".into(),
                     Value::String("application/json".into()),
                 );
+                gen_config.remove("responseSchema");
                 gen_config.insert(
-                    "responseSchema".into(),
-                    sanitize_owned_gemini_schema(schema),
+                    "responseJsonSchema".into(),
+                    sanitize_response_json_schema(super::types::normalize_json_schema(schema)),
                 );
             }
             Some(ResponseFormat::Text) | None => {}
@@ -209,8 +218,8 @@ impl GoogleEncoder {
                             d.insert("description".into(), Value::String(desc));
                         }
                         d.insert(
-                            "parameters".into(),
-                            sanitize_owned_gemini_schema(t.parameters),
+                            "parametersJsonSchema".into(),
+                            super::types::normalize_json_schema(t.parameters),
                         );
                         fn_decls.push(decl);
                     }
@@ -229,8 +238,43 @@ impl GoogleEncoder {
         }
 
         // ── Extra passthrough fields ───────────────────────────────────────────
-        if let Some(v) = ingress.remove("__google_tool_config") {
-            obj.insert("toolConfig".into(), v);
+        let mut tool_config = ingress.remove("__google_tool_config");
+        let native_choice_matches = tool_config
+            .as_ref()
+            .and_then(super::decoder::decode_tool_choice)
+            .zip(req.tool_choice.as_ref())
+            .is_some_and(|(native, canonical)| match (&native, canonical) {
+                (ToolChoice::Auto, ToolChoice::Auto)
+                | (ToolChoice::None, ToolChoice::None)
+                | (ToolChoice::Required, ToolChoice::Required) => true,
+                (ToolChoice::Named { name: a }, ToolChoice::Named { name: b }) => a == b,
+                _ => false,
+            });
+        let calling_config = if native_choice_matches {
+            None
+        } else {
+            match req.tool_choice {
+                Some(ToolChoice::Auto) => Some(serde_json::json!({"mode": "AUTO"})),
+                Some(ToolChoice::None) => Some(serde_json::json!({"mode": "NONE"})),
+                Some(ToolChoice::Required) => Some(serde_json::json!({"mode": "ANY"})),
+                Some(ToolChoice::Named { name }) => {
+                    Some(serde_json::json!({"mode": "ANY", "allowedFunctionNames": [name]}))
+                }
+                _ => None,
+            }
+        };
+        if let Some(calling_config) = calling_config {
+            let config = tool_config.get_or_insert_with(|| serde_json::json!({}));
+            if !config.is_object() {
+                *config = serde_json::json!({});
+            }
+            config
+                .as_object_mut()
+                .unwrap()
+                .insert("functionCallingConfig".into(), calling_config);
+        }
+        if let Some(config) = tool_config {
+            obj.insert("toolConfig".into(), config);
         }
         if let Some(v) = ingress.remove("__google_safety_settings") {
             obj.insert("safetySettings".into(), v);
@@ -253,56 +297,76 @@ impl GoogleEncoder {
 
 // ── Schema sanitisation ───────────────────────────────────────────────────────
 
-fn sanitize_gemini_schema(value: &Value) -> Value {
-    match value {
-        Value::Object(map) => {
-            let mut out = serde_json::Map::new();
-            for (k, v) in map {
-                if matches!(
-                    k.as_str(),
-                    "$schema" | "additionalProperties" | "$ref" | "ref" | "definitions" | "$defs"
-                ) {
-                    continue;
+fn sanitize_response_json_schema(value: Value) -> Value {
+    let Value::Object(map) = value else {
+        return value;
+    };
+    let has_ref = map.contains_key("$ref");
+    Value::Object(
+        map.into_iter()
+            .filter_map(|(key, value)| {
+                if !matches!(
+                    key.as_str(),
+                    "$id"
+                        | "$defs"
+                        | "$ref"
+                        | "$anchor"
+                        | "type"
+                        | "format"
+                        | "title"
+                        | "description"
+                        | "enum"
+                        | "items"
+                        | "prefixItems"
+                        | "minItems"
+                        | "maxItems"
+                        | "minimum"
+                        | "maximum"
+                        | "anyOf"
+                        | "oneOf"
+                        | "properties"
+                        | "additionalProperties"
+                        | "required"
+                        | "propertyOrdering"
+                ) || (has_ref && !key.starts_with('$'))
+                {
+                    return None;
                 }
-                out.insert(k.clone(), sanitize_gemini_schema(v));
-            }
-            Value::Object(out)
-        }
-        Value::Array(arr) => Value::Array(arr.iter().map(sanitize_gemini_schema).collect()),
-        _ => value.clone(),
-    }
-}
-
-pub(crate) fn schema_is_losslessly_representable(schema: &Value) -> bool {
-    sanitize_gemini_schema(schema) == *schema
-}
-
-fn sanitize_owned_gemini_schema(value: Value) -> Value {
-    match value {
-        Value::Object(map) => Value::Object(
-            map.into_iter()
-                .filter(|(key, _)| {
-                    !matches!(
-                        key.as_str(),
-                        "$schema"
-                            | "additionalProperties"
-                            | "$ref"
-                            | "ref"
-                            | "definitions"
-                            | "$defs"
-                    )
-                })
-                .map(|(key, value)| (key, sanitize_owned_gemini_schema(value)))
-                .collect(),
-        ),
-        Value::Array(values) => Value::Array(
-            values
-                .into_iter()
-                .map(sanitize_owned_gemini_schema)
-                .collect(),
-        ),
-        other => other,
-    }
+                if key == "enum"
+                    && !value.as_array().is_some_and(|values| {
+                        values
+                            .iter()
+                            .all(|value| value.is_string() || value.is_number())
+                    })
+                {
+                    return None;
+                }
+                let value = match key.as_str() {
+                    "properties" | "$defs" => match value {
+                        Value::Object(children) => Value::Object(
+                            children
+                                .into_iter()
+                                .map(|(name, schema)| (name, sanitize_response_json_schema(schema)))
+                                .collect(),
+                        ),
+                        other => other,
+                    },
+                    "items" | "additionalProperties" => sanitize_response_json_schema(value),
+                    "prefixItems" | "anyOf" | "oneOf" => match value {
+                        Value::Array(children) => Value::Array(
+                            children
+                                .into_iter()
+                                .map(sanitize_response_json_schema)
+                                .collect(),
+                        ),
+                        other => other,
+                    },
+                    _ => value,
+                };
+                Some((key, value))
+            })
+            .collect(),
+    )
 }
 
 // ── Content encoding ──────────────────────────────────────────────────────────
@@ -391,12 +455,9 @@ fn encode_content(msg: AiItem, call_names: &HashMap<String, String>) -> Result<V
                     parts.push(object([("text", Value::String(Arc::unwrap_or_clone(t)))]));
                 }
                 for tc in tcs {
-                    let args: Value = serde_json::from_str(&tc.arguments).map_err(|error| {
-                        anyhow::anyhow!(
-                            "gemini functionCall args cannot represent arguments for tool call {}: {error}",
-                            tc.id
-                        )
-                    })?;
+                    let Ok(args @ Value::Object(_)) = serde_json::from_str(&tc.arguments) else {
+                        continue;
+                    };
                     parts.push(function_call(tc.id.into_string(), tc.name, args));
                 }
                 parts
@@ -416,33 +477,44 @@ fn encode_content(msg: AiItem, call_names: &HashMap<String, String>) -> Result<V
                 // 原生工具结果已携带 JSON 响应，不能再作为媒体嵌套进空文本响应。
                 let mut parts = Vec::new();
                 for block in blocks {
-                    append_content_parts_for_gemini(&mut parts, block, call_names);
+                    if matches!(block, ContentBlock::ToolResult { .. })
+                        || tool_result_block_is_supported(&block)
+                    {
+                        append_content_parts_for_gemini(&mut parts, block, call_names);
+                    }
                 }
                 parts
             } else {
-                let mut text = String::new();
+                let mut text: Option<String> = None;
                 let mut parts = Vec::new();
                 for block in blocks {
                     if let ContentBlock::Text { text: next, .. } = block {
                         let next = Arc::unwrap_or_clone(next);
-                        if text.is_empty() {
-                            text = next;
-                        } else {
+                        if let Some(text) = &mut text {
                             text.push_str(&next);
+                        } else {
+                            text = Some(next);
                         }
-                    } else {
+                    } else if tool_result_block_is_supported(&block) {
                         append_content_parts_for_gemini(&mut parts, block, call_names);
                     }
                 }
-                let mut function_response = object([
-                    ("id", Value::String(call_id.to_owned())),
-                    ("name", Value::String(name.clone())),
-                    ("response", object([("result", Value::String(text))])),
-                ]);
-                if !parts.is_empty() {
-                    function_response["parts"] = Value::Array(parts);
+                if text.is_none() && parts.is_empty() {
+                    Vec::new()
+                } else {
+                    let mut function_response = object([
+                        ("id", Value::String(call_id.to_owned())),
+                        ("name", Value::String(name.clone())),
+                        (
+                            "response",
+                            object([("result", Value::String(text.unwrap_or_default()))]),
+                        ),
+                    ]);
+                    if !parts.is_empty() {
+                        function_response["parts"] = Value::Array(parts);
+                    }
+                    vec![object([("functionResponse", function_response)])]
                 }
-                vec![object([("functionResponse", function_response)])]
             }
         }
         MessageContent::Blocks(blocks) => {
@@ -462,12 +534,9 @@ fn encode_content(msg: AiItem, call_names: &HashMap<String, String>) -> Result<V
             if block_call_ids.contains(call.id.as_str()) {
                 continue;
             }
-            let args: Value = serde_json::from_str(&call.arguments).map_err(|error| {
-                anyhow::anyhow!(
-                    "gemini functionCall args cannot represent arguments for tool call {}: {error}",
-                    call.id
-                )
-            })?;
+            let Ok(args @ Value::Object(_)) = serde_json::from_str(&call.arguments) else {
+                continue;
+            };
             parts.push(function_call(call.id.into_string(), call.name, args));
         }
     }
@@ -540,6 +609,19 @@ pub(super) fn encode_content_block_for_gemini(
     call_names: &HashMap<String, String>,
 ) -> Option<Value> {
     Some(match b {
+        ContentBlock::Document { source, title, .. } => {
+            let source = crate::codec::document_media_source(source)?;
+            let mut part = encode_media_source(source, None);
+            if let Some(title) = title {
+                let field = if part.get("inlineData").is_some() {
+                    "inlineData"
+                } else {
+                    "fileData"
+                };
+                part[field]["displayName"] = Value::String(title);
+            }
+            part
+        }
         ContentBlock::Text { text, .. } => {
             object([("text", Value::String(Arc::unwrap_or_clone(text)))])
         }
@@ -550,31 +632,80 @@ pub(super) fn encode_content_block_for_gemini(
         }
         ContentBlock::ToolUse {
             id, name, input, ..
-        } => function_call(id.into_string(), name, input),
+        } => {
+            if !input.is_object() {
+                return None;
+            }
+            function_call(id.into_string(), name, input)
+        }
         ContentBlock::ToolResult {
             tool_use_id,
             content,
+            content_kind,
             ..
         } => {
             let name = call_names
                 .get(tool_use_id.as_str())
                 .cloned()
                 .unwrap_or_else(|| tool_use_id.as_str().to_owned());
-            object([(
-                "functionResponse",
-                object([
-                    ("id", Value::String(tool_use_id.into_string())),
-                    ("name", Value::String(name)),
-                    (
-                        "response",
-                        if content.is_object() {
-                            content
-                        } else {
-                            object([("result", content)])
-                        },
-                    ),
-                ]),
-            )])
+            let (response, media_parts) = match content {
+                Value::String(text) => (object([("result", Value::String(text))]), Vec::new()),
+                Value::Array(blocks)
+                    if content_kind
+                        == Some(stravia_runtime_contract::protocol::ir::ToolResultContentKind::ContentBlocks) =>
+                {
+                    let mut text: Option<String> = None;
+                    let mut media_parts = Vec::new();
+                    for block in blocks {
+                        let Ok(block) = serde_json::from_value::<ContentBlock>(block) else {
+                            continue;
+                        };
+                        match block {
+                            ContentBlock::Text { text: next, .. } => {
+                                let next = Arc::unwrap_or_clone(next);
+                                if let Some(text) = &mut text {
+                                    text.push_str(&next);
+                                } else {
+                                    text = Some(next);
+                                }
+                            }
+                            block if tool_result_block_is_supported(&block) => {
+                                if let Some(part) = encode_content_block_for_gemini(block, call_names) {
+                                    media_parts.push(part);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    if text.is_none() && media_parts.is_empty() {
+                        return None;
+                    }
+                    let response = text.map_or_else(
+                        || object([] as [(&str, Value); 0]),
+                        |text| object([("result", Value::String(text))]),
+                    );
+                    (response, media_parts)
+                }
+                _ if content_kind
+                    == Some(stravia_runtime_contract::protocol::ir::ToolResultContentKind::ContentBlocks) => return None,
+                content => (
+                    if content.is_object() {
+                        content
+                    } else {
+                        object([("result", content)])
+                    },
+                    Vec::new(),
+                ),
+            };
+            let mut response = object([
+                ("id", Value::String(tool_use_id.into_string())),
+                ("name", Value::String(name)),
+                ("response", response),
+            ]);
+            if !media_parts.is_empty() {
+                response["parts"] = Value::Array(media_parts);
+            }
+            object([("functionResponse", response)])
         }
         // Gemini 接受无 thoughtSignature 的 thought part（可能只是忽略它），所以
         // 无签名明文保持原生 thought part，不降级为正文：降级会让模型把自己的
@@ -598,6 +729,60 @@ pub(super) fn encode_content_block_for_gemini(
         ContentBlock::RedactedThinking { .. } => return None,
         ContentBlock::Unknown { raw } => raw,
         other => crate::codec::content_block_wire_value(&other),
+    })
+}
+
+pub(crate) fn tool_result_block_is_supported(block: &ContentBlock) -> bool {
+    matches!(
+        block,
+        ContentBlock::Text { .. }
+            | ContentBlock::Image { .. }
+            | ContentBlock::Audio { .. }
+            | ContentBlock::File { .. }
+            | ContentBlock::Video { .. }
+            | ContentBlock::Document {
+                source: stravia_runtime_contract::protocol::ir::DocumentSource::Base64Pdf { .. }
+                    | stravia_runtime_contract::protocol::ir::DocumentSource::PlainText { .. }
+                    | stravia_runtime_contract::protocol::ir::DocumentSource::Url(_),
+                ..
+            }
+    )
+}
+
+pub(crate) fn tool_result_content_is_supported(
+    content: &Value,
+    kind: Option<stravia_runtime_contract::protocol::ir::ToolResultContentKind>,
+) -> bool {
+    if content.is_string()
+        || kind
+            != Some(stravia_runtime_contract::protocol::ir::ToolResultContentKind::ContentBlocks)
+    {
+        return true;
+    }
+    content.as_array().is_some_and(|blocks| {
+        blocks.iter().any(|block| match block["type"].as_str() {
+            Some("text") => block["text"].is_string(),
+            Some("image" | "audio" | "file" | "video") => {
+                let source = &block["source"];
+                match source["type"].as_str() {
+                    Some("base64") => {
+                        source["media_type"].is_string() && source["data"].is_string()
+                    }
+                    Some("url") => source["url"].is_string(),
+                    Some("file_id") => source["file_id"].is_string(),
+                    _ => false,
+                }
+            }
+            Some("document") => {
+                let source = &block["source"];
+                match source["type"].as_str() {
+                    Some("base64_pdf" | "plain_text") => source["data"].is_string(),
+                    Some("url") => source["url"].is_string(),
+                    _ => false,
+                }
+            }
+            _ => false,
+        })
     })
 }
 

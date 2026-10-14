@@ -1,5 +1,572 @@
 use super::*;
 
+// Read public wire fields independently of the codec's one-candidate IR.
+#[derive(Default, Debug, PartialEq)]
+struct CandidateWireState {
+    text: String,
+    calls: Vec<Value>,
+    finish: Option<String>,
+}
+
+fn consume_candidate_wire(body: &Value, states: &mut HashMap<u64, CandidateWireState>) {
+    assert!(!body.to_string().contains("__google_native_candidate"));
+    for candidate in body["candidates"].as_array().into_iter().flatten() {
+        let index = candidate.get("index").and_then(Value::as_u64).unwrap_or(0);
+        let state = states.entry(index).or_default();
+        for part in candidate["content"]["parts"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            if let Some(text) = part["text"].as_str() {
+                state.text.push_str(text);
+            }
+            if let Some(call) = part.get("functionCall") {
+                state.calls.push(call.clone());
+            }
+        }
+        if let Some(reason) = candidate["finishReason"].as_str() {
+            state.finish = Some(reason.to_owned());
+        }
+    }
+}
+
+fn reversed_candidates() -> Value {
+    serde_json::json!({"candidates": [
+        {"index": 1, "content": {"role": "model", "parts": [
+            {"text": "primary"},
+            {"functionCall": {"id": "call_one", "name": "lookup", "args": {"key": "one"}}}
+        ]}, "finishReason": "STOP"},
+        {"index": 0, "content": {"role": "model", "parts": [
+            {"text": "alternate"},
+            {"functionCall": {"id": "call_zero", "name": "lookup", "args": {"key": "zero"}}}
+        ]}, "finishReason": "MAX_TOKENS"}
+    ]})
+}
+
+#[test]
+fn bound_native_unary_keeps_reversed_candidate_identity() {
+    let endpoint = stravia_runtime_contract::protocol::ids::GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA;
+    let pair = crate::transform::ProtocolTransform::global()
+        .bind(endpoint, endpoint)
+        .unwrap();
+    let upstream = reversed_candidates();
+    let response = pair.decode_response(upstream.clone()).unwrap();
+    let output = pair.encode_response(&response).unwrap();
+    assert_eq!(output["candidates"][0]["index"], 1);
+    assert_eq!(output["candidates"][1]["index"], 0);
+    let mut expected = HashMap::new();
+    consume_candidate_wire(&upstream, &mut expected);
+    let mut actual = HashMap::new();
+    consume_candidate_wire(&output, &mut actual);
+    assert_eq!(actual, expected);
+    assert_eq!(actual.len(), 2);
+}
+
+#[test]
+fn bound_native_stream_keeps_reversed_and_late_candidates_separate() {
+    let endpoint = stravia_runtime_contract::protocol::ids::GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA;
+    let pair = crate::transform::ProtocolTransform::global()
+        .bind(endpoint, endpoint)
+        .unwrap();
+    for late_alternate in [false, true] {
+        let upstream = reversed_candidates();
+        let primary = &upstream["candidates"][0];
+        let alternate = &upstream["candidates"][1];
+        let primary_head = serde_json::json!({"index": 1, "content": {"role": "model", "parts": [{"text": "pri"}]}});
+        let primary_tail = serde_json::json!({"index": 1, "content": {"role": "model", "parts": [
+            {"text": "mary"}, primary["content"]["parts"][1].clone()
+        ]}});
+        let alternate_head = serde_json::json!({"index": 0, "content": {"role": "model", "parts": [{"text": "alter"}]}});
+        let alternate_tail = serde_json::json!({"index": 0, "content": {"role": "model", "parts": [
+            {"text": "nate"}, alternate["content"]["parts"][1].clone()
+        ]}});
+        let mut chunks = if late_alternate {
+            vec![
+                serde_json::json!({"candidates": [primary_head]}),
+                serde_json::json!({"candidates": [alternate_head]}),
+            ]
+        } else {
+            vec![serde_json::json!({"candidates": [primary_head, alternate_head]})]
+        };
+        chunks.extend([
+            serde_json::json!({"candidates": [alternate_tail, primary_tail]}),
+            serde_json::json!({"candidates": [{"index": 0, "finishReason": "MAX_TOKENS"}]}),
+            serde_json::json!({"candidates": [{"index": 1, "finishReason": "STOP"}], "usageMetadata": {"promptTokenCount": 2, "candidatesTokenCount": 3}}),
+        ]);
+        let (mut decoder, mut encoder) = pair.stream().unwrap().into_parts();
+        let mut actual = HashMap::new();
+        let mut usage_seen = false;
+        for (position, chunk) in chunks.iter().enumerate() {
+            // Leave the final frame unterminated so decoder.finish also participates.
+            let wire = if position + 1 == chunks.len() {
+                format!("data: {chunk}")
+            } else {
+                format!("data: {chunk}\n\n")
+            };
+            for fragment in wire.as_bytes().chunks(7) {
+                let deltas = decoder.decode_chunk(fragment).unwrap();
+                for event in encoder.encode_deltas(&deltas).unwrap() {
+                    let body: Value = serde_json::from_str(&event.data).unwrap();
+                    usage_seen |= body.get("usageMetadata").is_some();
+                    consume_candidate_wire(&body, &mut actual);
+                }
+            }
+        }
+        let deltas = decoder.finish().unwrap();
+        let mut events = encoder.encode_deltas(&deltas).unwrap();
+        events.extend(encoder.finish().unwrap());
+        for event in events {
+            let body: Value = serde_json::from_str(&event.data).unwrap();
+            usage_seen |= body.get("usageMetadata").is_some();
+            consume_candidate_wire(&body, &mut actual);
+        }
+        let mut expected = HashMap::new();
+        consume_candidate_wire(&upstream, &mut expected);
+        assert_eq!(actual, expected);
+        assert_eq!(actual.len(), 2);
+        assert!(usage_seen);
+    }
+}
+
+#[test]
+fn native_stream_aggregation_keeps_reversed_and_late_candidate_identity() {
+    for late_alternate in [false, true] {
+        let upstream = reversed_candidates();
+        let primary = &upstream["candidates"][0];
+        let alternate = &upstream["candidates"][1];
+        let primary_head = serde_json::json!({"index": 1, "content": {"role": "model", "parts": [{"text": "pri"}]}});
+        let alternate_head = serde_json::json!({"index": 0, "content": {"role": "model", "parts": [{"text": "alter"}]}});
+        let mut chunks = if late_alternate {
+            vec![
+                serde_json::json!({"candidates": [primary_head]}),
+                serde_json::json!({"candidates": [alternate_head]}),
+            ]
+        } else {
+            vec![serde_json::json!({"candidates": [primary_head, alternate_head]})]
+        };
+        chunks.extend([
+            serde_json::json!({"candidates": [
+                {"index": 0, "content": {"parts": [{"text": "nate"}, alternate["content"]["parts"][1].clone()]}},
+                {"index": 1, "content": {"parts": [{"text": "mary"}, primary["content"]["parts"][1].clone()]}}
+            ]}),
+            serde_json::json!({"candidates": [{"index": 0, "finishReason": "MAX_TOKENS"}]}),
+            serde_json::json!({"candidates": [{"index": 1, "finishReason": "STOP"}], "usageMetadata": {"promptTokenCount": 2, "candidatesTokenCount": 3}}),
+        ]);
+        let mut parser = GoogleStreamParser::new();
+        let mut accumulator = crate::accumulator::StreamResponseAccumulator::default();
+        for chunk in chunks {
+            for delta in parser.parse_chunk(&format!("data: {chunk}\n\n")).unwrap() {
+                accumulator.apply_with_identity(&delta);
+            }
+        }
+        for delta in parser.finish().unwrap() {
+            accumulator.apply_with_identity(&delta);
+        }
+        let (response, ordinals) = accumulator.into_ai_response_with_ordinals();
+        assert_eq!(response.items.len(), 2);
+        assert_eq!(ordinals, [0, 1]);
+        assert_eq!(
+            response.items[1].function_call_ref().unwrap().id,
+            "call_one"
+        );
+        let output = GoogleResponseFormatter.format_response(&response);
+        assert_eq!(output["candidates"][0]["index"], 1);
+        assert_eq!(output["candidates"][1]["index"], 0);
+        assert_eq!(output["candidates"].as_array().unwrap().len(), 2);
+        let mut expected = HashMap::new();
+        consume_candidate_wire(&upstream, &mut expected);
+        let mut actual = HashMap::new();
+        consume_candidate_wire(&output, &mut actual);
+        assert_eq!(actual, expected);
+        assert_eq!(output["usageMetadata"]["promptTokenCount"], 2);
+        assert_eq!(output["usageMetadata"]["candidatesTokenCount"], 3);
+        assert_eq!(output["usageMetadata"]["totalTokenCount"], 5);
+    }
+}
+
+#[test]
+fn native_stream_aggregation_preserves_alternate_text_media_text_parts() {
+    let image = serde_json::json!({"inlineData": {"mimeType": "image/png", "data": "iVBORw0KGgoAAAANSUhEUgA"}});
+    let parts = [
+        serde_json::json!({"text": "before"}),
+        image,
+        serde_json::json!({"text": "after"}),
+    ];
+    let mut parser = GoogleStreamParser::new();
+    let mut accumulator = crate::accumulator::StreamResponseAccumulator::default();
+    accumulator.apply_all(&parser.parse_chunk("data: {\"candidates\":[{\"index\":1,\"content\":{\"parts\":[{\"text\":\"primary\"}]}}]}\n\n").unwrap());
+    for part in &parts {
+        let chunk = serde_json::json!({"candidates": [{"index": 0, "content": {"role": "model", "parts": [part]}}]});
+        accumulator.apply_all(&parser.parse_chunk(&format!("data: {chunk}\n\n")).unwrap());
+    }
+    let chunk = serde_json::json!({"candidates": [{"index": 0, "finishReason": "STOP"}, {"index": 1, "finishReason": "STOP"}]});
+    accumulator.apply_all(&parser.parse_chunk(&format!("data: {chunk}\n\n")).unwrap());
+    let response = accumulator.into_ai_response();
+    assert_eq!(response.items.len(), 1);
+    assert_eq!(response.output_text(), "primary");
+    let output = GoogleResponseFormatter.format_response(&response);
+    assert_eq!(output["candidates"].as_array().unwrap().len(), 2);
+    assert_eq!(output["candidates"][1]["index"], 0);
+    assert_eq!(
+        output["candidates"][1]["content"]["parts"],
+        serde_json::json!(parts)
+    );
+    assert_eq!(output["candidates"][1]["finishReason"], "STOP");
+}
+
+#[test]
+fn default_candidate_identity_does_not_emit_a_private_frame() {
+    let mut parser = GoogleStreamParser::new();
+    let deltas = parser.parse_chunk("data: {\"candidates\":[{\"index\":0,\"content\":{\"parts\":[{\"text\":\"first\"},{\"text\":\"\",\"thought\":true}]}}]}\n\n").unwrap();
+    assert!(!deltas.iter().any(|delta| matches!(delta, AiStreamDelta::Unknown { raw } if raw.contains("__google_native_candidate_index"))));
+    let mut accumulator = crate::accumulator::StreamResponseAccumulator::default();
+    accumulator.apply_all(&deltas);
+    let response = accumulator.into_ai_response();
+    assert_eq!(
+        GoogleResponseFormatter.format_response(&response)["candidates"][0]["index"],
+        0
+    );
+}
+
+#[test]
+fn bound_cross_protocol_candidates_keep_only_primary_without_private_identity() {
+    let pair = crate::transform::ProtocolTransform::global()
+        .bind(
+            stravia_runtime_contract::protocol::ids::OPEN_RESPONSES_2026_04_24,
+            stravia_runtime_contract::protocol::ids::GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA,
+        )
+        .unwrap();
+    let upstream = reversed_candidates();
+    let response = pair.decode_response(upstream.clone()).unwrap();
+    let output = pair.encode_response(&response).unwrap();
+    let wire = output.to_string();
+    assert!(wire.contains("primary"));
+    assert!(wire.contains("call_one"));
+    assert!(!wire.contains("alternate"));
+    assert!(!wire.contains("call_zero"));
+    assert!(!wire.contains("__google_native_candidate"));
+
+    let (mut decoder, mut encoder) = pair.stream().unwrap().into_parts();
+    let deltas = decoder
+        .decode_chunk(format!("data: {upstream}\n\n").as_bytes())
+        .unwrap();
+    let mut events = encoder.encode_deltas(&deltas).unwrap();
+    let deltas = decoder.finish().unwrap();
+    events.extend(encoder.encode_deltas(&deltas).unwrap());
+    events.extend(encoder.finish().unwrap());
+    let wire: String = events.iter().map(|event| event.data.as_str()).collect();
+    assert!(wire.contains("primary"));
+    assert!(wire.contains("call_one"));
+    assert!(!wire.contains("alternate"));
+    assert!(!wire.contains("call_zero"));
+    assert!(!wire.contains("__google_native_candidate"));
+}
+
+#[test]
+fn native_candidates_keep_current_first_projection_and_private_alternates() {
+    let extra = serde_json::json!({"index": 1, "content": {"role": "model", "parts": [{"text": "alternate"}]}, "finishReason": "STOP", "safetyRatings": []});
+    let mut response = GoogleResponseParser
+        .parse_response(serde_json::json!({
+            "candidates": [{"content": {"parts": [{"text": "first"}]}}, extra.clone()]
+        }))
+        .unwrap();
+    response.items = vec![AiItem::output_text("edited")];
+    let native = GoogleResponseFormatter.format_response(&response);
+    assert_eq!(
+        native["candidates"][0]["content"]["parts"][0]["text"],
+        "edited"
+    );
+    assert_eq!(native["candidates"][1], extra);
+    assert!(native.get("__google_native_candidates").is_none());
+    response.vendor.egress.remove("__google_native_candidates");
+    assert_eq!(
+        GoogleResponseFormatter.format_response(&response)["candidates"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn native_stream_candidates_emit_immediately_and_keep_usage_and_first_text() {
+    let mut parser = GoogleStreamParser::new();
+    let mut formatter = GoogleStreamFormatter::new();
+    let deltas = parser.parse_chunk("data: {\"modelVersion\":\"m\",\"candidates\":[{\"index\":0,\"content\":{\"parts\":[{\"text\":\"first\"}]}},{\"index\":1,\"content\":{\"parts\":[{\"text\":\"other\"}]}}],\"usageMetadata\":{\"promptTokenCount\":2,\"candidatesTokenCount\":3}}\n\n").unwrap();
+    assert!(
+        deltas
+            .iter()
+            .any(|delta| matches!(delta, AiStreamDelta::TextDelta(text) if text == "first"))
+    );
+    assert!(
+        !deltas
+            .iter()
+            .any(|delta| matches!(delta, AiStreamDelta::TextDelta(text) if text == "other"))
+    );
+    assert!(
+        deltas.iter().any(
+            |delta| matches!(delta, AiStreamDelta::Usage(usage) if usage.completion_tokens == 3)
+        )
+    );
+    let events = formatter.format_deltas(&deltas);
+    assert!(
+        events.iter().any(
+            |event| serde_json::from_str::<Value>(&event.data).unwrap()["candidates"][0]["content"]
+                ["parts"][0]["text"]
+                == "other"
+        )
+    );
+    let deltas = parser.parse_chunk("data: {\"candidates\":[{\"index\":1,\"content\":{\"parts\":[{\"text\":\" next\"}]},\"finishReason\":\"STOP\"}]}\n\n").unwrap();
+    assert!(
+        deltas
+            .iter()
+            .all(|delta| matches!(delta, AiStreamDelta::Unknown { .. }))
+    );
+    let events = formatter.format_deltas(&deltas);
+    assert_eq!(
+        serde_json::from_str::<Value>(&events[0].data).unwrap()["candidates"][0]["index"],
+        1
+    );
+}
+
+#[test]
+fn native_alternate_candidates_retain_invalidwire_and_upstream_errors() {
+    assert!(GoogleStreamParser::new().parse_chunk("data: {\"candidates\":[{\"index\":0},{\"index\":1,\"content\":{\"parts\":[{\"text\":42}]}}]}\n\n").is_err());
+    let deltas = GoogleStreamParser::new()
+        .parse_chunk("data: {\"error\":{\"message\":\"real upstream failure\"}}\n\n")
+        .unwrap();
+    assert!(
+        matches!(&deltas[0], AiStreamDelta::StreamError { error } if error.message == "real upstream failure")
+    );
+}
+
+#[test]
+fn stream_formatter_distinguishes_absent_usage_from_reported_zero() {
+    for usage in [
+        None,
+        Some(Usage::default()),
+        Some(Usage {
+            prompt_tokens: 10,
+            completion_tokens: 7,
+            total_tokens: 17,
+            required_components_known: true,
+            ..Usage::default()
+        }),
+    ] {
+        let mut formatter = GoogleStreamFormatter::new();
+        if let Some(usage) = &usage {
+            assert!(
+                formatter
+                    .format_deltas(&[AiStreamDelta::Usage(usage.clone())])
+                    .is_empty()
+            );
+        }
+        let events = formatter.format_deltas(&[AiStreamDelta::Done {
+            stop_reason: "stop".into(),
+        }]);
+        assert_eq!(events.len(), 1);
+        let body: Value = serde_json::from_str(&events[0].data).unwrap();
+        assert_eq!(body["candidates"][0]["finishReason"], "STOP");
+        if let Some(usage) = usage {
+            assert_eq!(
+                body["usageMetadata"]["promptTokenCount"],
+                usage.prompt_tokens
+            );
+            assert_eq!(
+                body["usageMetadata"]["candidatesTokenCount"],
+                usage.completion_tokens
+            );
+            assert_eq!(body["usageMetadata"]["totalTokenCount"], usage.total_tokens);
+        } else {
+            assert!(body.get("usageMetadata").is_none());
+        }
+    }
+}
+
+#[test]
+fn stream_formatter_preserves_metadata_usage_without_usage_delta() {
+    let mut formatter = GoogleStreamFormatter::new();
+    let metadata = serde_json::json!({"__google_response_metadata": {"usageMetadata": {
+        "totalTokenCount": 19, "trafficType": "ON_DEMAND"
+    }}});
+    assert!(
+        formatter
+            .format_deltas(&[AiStreamDelta::Unknown {
+                raw: metadata.to_string()
+            }])
+            .is_empty()
+    );
+    let events = formatter.format_deltas(&[AiStreamDelta::Done {
+        stop_reason: "stop".into(),
+    }]);
+    let body: Value = serde_json::from_str(&events[0].data).unwrap();
+    assert_eq!(
+        body["usageMetadata"],
+        metadata["__google_response_metadata"]["usageMetadata"]
+    );
+}
+
+#[test]
+fn stream_formatter_drops_invalid_complete_calls_and_preserves_output() {
+    for arguments in [
+        "[]",
+        "null",
+        "42",
+        "\"scalar\"",
+        "not JSON",
+        "{} trailing",
+        "",
+    ] {
+        let mut formatter = GoogleStreamFormatter::new();
+        let initial = formatter.format_deltas(&[
+            AiStreamDelta::ToolCallStart {
+                index: 0,
+                id: "bad".into(),
+                name: "lookup".into(),
+            },
+            AiStreamDelta::ToolCallDelta {
+                index: 0,
+                arguments: arguments.into(),
+            },
+        ]);
+        assert!(initial.is_empty(), "calls must wait for completion");
+        let events = formatter.format_deltas(&[
+            AiStreamDelta::TextDelta("kept".into()),
+            AiStreamDelta::ToolCallStart {
+                index: 1,
+                id: "good".into(),
+                name: "lookup".into(),
+            },
+            AiStreamDelta::ToolCallDelta {
+                index: 1,
+                arguments: r#"{"key":1}"#.into(),
+            },
+            AiStreamDelta::Usage(Usage {
+                prompt_tokens: 3,
+                completion_tokens: 2,
+                total_tokens: 5,
+                ..Usage::default()
+            }),
+            AiStreamDelta::Done {
+                stop_reason: "tool_calls".into(),
+            },
+        ]);
+        let bodies: Vec<Value> = events
+            .iter()
+            .map(|event| serde_json::from_str(&event.data).unwrap())
+            .collect();
+        assert_eq!(bodies.len(), 3);
+        assert_eq!(
+            bodies[0]["candidates"][0]["content"]["parts"][0]["text"],
+            "kept"
+        );
+        assert_eq!(
+            bodies[1]["candidates"][0]["content"]["parts"][0]["functionCall"]["id"],
+            "good"
+        );
+        assert_eq!(bodies[2]["candidates"][0]["finishReason"], "STOP");
+        assert_eq!(bodies[2]["usageMetadata"]["totalTokenCount"], 5);
+        assert!(formatter.format_done().is_empty());
+    }
+}
+
+#[test]
+fn stream_formatter_does_not_emit_valid_prefix_of_invalid_completed_call() {
+    let mut formatter = GoogleStreamFormatter::new();
+    assert!(
+        formatter
+            .format_deltas(&[
+                AiStreamDelta::ToolCallStart {
+                    index: 0,
+                    id: "bad".into(),
+                    name: "lookup".into()
+                },
+                AiStreamDelta::ToolCallDelta {
+                    index: 0,
+                    arguments: "{}".into()
+                },
+            ])
+            .is_empty()
+    );
+    assert!(
+        formatter
+            .format_deltas(&[AiStreamDelta::ToolCallDelta {
+                index: 0,
+                arguments: " trailing".into()
+            },])
+            .is_empty()
+    );
+    assert!(formatter.format_done().is_empty());
+}
+
+#[test]
+fn stream_formatter_uses_completed_arguments_and_emits_once() {
+    for arguments in ["[]", "not JSON", r#"{"final":true}"#] {
+        let mut formatter = GoogleStreamFormatter::new();
+        assert!(
+            formatter
+                .format_deltas(&[
+                    AiStreamDelta::ToolCallStart {
+                        index: 0,
+                        id: "call".into(),
+                        name: "lookup".into()
+                    },
+                    AiStreamDelta::ToolCallDelta {
+                        index: 0,
+                        arguments: "{}".into()
+                    },
+                ])
+                .is_empty()
+        );
+        let events = formatter.format_deltas(&[AiStreamDelta::ItemDone {
+            index: 0,
+            item: AiItem::function_call(ToolCall {
+                id: "call".into(),
+                name: "lookup".into(),
+                arguments: arguments.into(),
+            }),
+        }]);
+        if arguments.starts_with('{') {
+            assert_eq!(events.len(), 1);
+            let body: Value = serde_json::from_str(&events[0].data).unwrap();
+            assert_eq!(
+                body["candidates"][0]["content"]["parts"][0]["functionCall"]["args"],
+                serde_json::json!({"final": true})
+            );
+        } else {
+            assert!(events.is_empty());
+        }
+        assert!(formatter.format_done().is_empty());
+    }
+}
+
+#[test]
+fn response_formatter_drops_nonobject_and_invalid_tool_arguments() {
+    for arguments in ["[]", "null", "42", "\"scalar\"", "not JSON", ""] {
+        let mut response = AiResponse::new("response", "model");
+        response.items = vec![
+            AiItem::function_call(ToolCall {
+                id: "bad".into(),
+                name: "lookup".into(),
+                arguments: arguments.into(),
+            }),
+            AiItem::function_call(ToolCall {
+                id: "good".into(),
+                name: "lookup".into(),
+                arguments: "{}".into(),
+            }),
+        ];
+        let body = GoogleResponseFormatter.format_response(&response);
+        assert_eq!(
+            body["candidates"][0]["content"]["parts"],
+            serde_json::json!([
+                {"functionCall": {"id": "good", "name": "lookup", "args": {}}}
+            ])
+        );
+    }
+}
+
 #[test]
 fn gemini_stream_usage_preserves_reasoning_and_final_cumulative_revision() {
     let mut reasoning_total = 0;
@@ -502,6 +1069,9 @@ fn stream_formatter_does_not_bind_signature_across_text_boundary() {
         AiStreamDelta::ToolCallDelta {
             index: 0,
             arguments: r#"{"path":"Cargo.toml"}"#.into(),
+        },
+        AiStreamDelta::Done {
+            stop_reason: "tool_calls".into(),
         },
     ]));
     let parts = events
@@ -1010,7 +1580,7 @@ fn responses_terminal_output_preserves_text_call_text_order() {
 }
 
 #[test]
-fn responses_stream_encode_rejects_unrepresentable_media_item() {
+fn responses_stream_encode_drops_unrepresentable_media_item() {
     let chunk = serde_json::json!({
         "candidates": [{
             "content": {"role": "model", "parts": [
@@ -1032,11 +1602,21 @@ fn responses_stream_encode_rejects_unrepresentable_media_item() {
         )
         .expect("Gemini to Responses protocol pair");
     let (_, mut encoder) = pair.stream().expect("stream session").into_parts();
-    let error = encoder
+    let events = encoder
         .encode_deltas(&deltas)
-        .expect_err("Gemini inlineData has no Responses output carrier");
-    assert!(matches!(
-        error,
-        crate::transform::TransformError::Unrepresentable { .. }
-    ));
+        .expect("Gemini inlineData is omitted from Responses output");
+    let completed = events
+        .iter()
+        .find(|event| event.event.as_deref() == Some("response.completed"))
+        .expect("completion preserved");
+    let body: Value = serde_json::from_str(&completed.data).expect("completed JSON");
+    let text: String = body["response"]["output"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|item| item["content"].as_array().into_iter().flatten())
+        .filter_map(|part| part["text"].as_str())
+        .collect();
+    assert_eq!(text, "alpha textomega text");
+    assert!(!completed.data.contains("iVBORw0KGgoAAAANSUhEUgA"));
 }

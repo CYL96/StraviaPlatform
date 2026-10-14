@@ -3,25 +3,19 @@
 //! The CLI wire is not OpenAI Chat Completions. Request bodies wrap model
 //! params in a CLI envelope; the upstream always streams NDJSON events named
 //! like AI SDK (`text-delta`, `reasoning-delta`, `tool-call`, `finish`).
+//! Request projection is private to this codec: readable document children and
+//! JSON tool results use existing text carriers; unrepresentable blocks and
+//! file-id images are omitted without dropping their representable siblings.
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::{Context, bail};
-use http::header::HeaderMap;
 use serde_json::{Map, Value, json};
 
-use stravia_protocol_codec::transform::{
-    ProtocolAdapter, TextWireStreamParser, TransformError, WireStreamDecoder, WireStreamEncoder,
-};
-use stravia_runtime_contract::protocol::ids::COMMAND_CODE_GENERATE_V1;
-use stravia_runtime_contract::protocol::ids::EndpointCapabilities;
-use stravia_runtime_contract::protocol::ids::ProtocolEndpoint;
-use stravia_runtime_contract::protocol::ids::StreamCaps;
-use stravia_runtime_contract::protocol::ids::VendorFieldPolicy;
+use stravia_protocol_codec::transform::TextWireStreamParser;
 use stravia_runtime_contract::protocol::ir::AiItem;
 use stravia_runtime_contract::protocol::ir::AiRequest;
-use stravia_runtime_contract::protocol::ir::AiResponse;
 use stravia_runtime_contract::protocol::ir::AiStreamDelta;
 use stravia_runtime_contract::protocol::ir::ContentBlock;
 use stravia_runtime_contract::protocol::ir::MediaSource;
@@ -49,83 +43,8 @@ const TOOL_NAME_ALIASES: &[(&str, &str)] = &[
     ("read_multiple_files", "read_file"),
 ];
 
-const CAPS: EndpointCapabilities = EndpointCapabilities {
-    streaming: true,
-    tools: true,
-    reasoning: true,
-    embeddings: false,
-    override_model_in_body: false,
-    ingress_routes: &[],
-    multimodal: true,
-    structured_output: false,
-    function_calling: true,
-    parallel_tool_calls: true,
-    extended_reasoning: true,
-    deterministic_seed: false,
-    stream: StreamCaps {
-        server_sent_events: false,
-        usage_in_stream: true,
-        requires_stream_flag: false,
-    },
-    unknown_field_policy: VendorFieldPolicy::Drop,
-};
-
-impl ProtocolAdapter for CommandCodeGenerateV1 {
-    fn id(&self) -> ProtocolEndpoint {
-        COMMAND_CODE_GENERATE_V1
-    }
-
-    fn capabilities(&self) -> &'static EndpointCapabilities {
-        &CAPS
-    }
-
-    fn decode_request(&self, body: Value) -> anyhow::Result<AiRequest> {
-        let params = body.get("params").unwrap_or(&body);
-        let model = params
-            .get("model")
-            .or_else(|| body.get("model"))
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        let mut items = Vec::new();
-        if let Some(system) = params.get("system").or_else(|| body.get("system")) {
-            items.extend(decode_system(system)?);
-        }
-        let messages = params
-            .get("messages")
-            .or_else(|| body.get("messages"))
-            .and_then(Value::as_array)
-            .context("Command Code request is missing messages")?;
-        for message in messages {
-            items.push(decode_message(message)?);
-        }
-        let mut request = AiRequest::new(model, items);
-        request.generation.max_tokens = params
-            .get("max_tokens")
-            .and_then(Value::as_u64)
-            .and_then(|value| u32::try_from(value).ok());
-        request.generation.temperature = params.get("temperature").and_then(Value::as_f64);
-        request.tools = params.get("tools").map(decode_tools).transpose()?;
-        request.tool_choice = params
-            .get("tool_choice")
-            .map(decode_tool_choice)
-            .transpose()?;
-        if let Some(effort) = params.get("reasoning_effort").and_then(Value::as_str) {
-            request.reasoning.enabled = true;
-            request.reasoning.effort = ReasoningEffort::from_openai_str(effort).ok();
-        }
-        if let Some(parallel) = params.get("parallel_tool_calls").and_then(Value::as_bool) {
-            request.parallel_tool_calls = Some(parallel);
-        }
-        request.stream.enabled = params
-            .get("stream")
-            .and_then(Value::as_bool)
-            .unwrap_or(true);
-        request.meta.source_protocol = Some(COMMAND_CODE_GENERATE_V1);
-        Ok(request)
-    }
-
-    fn encode_request(&self, request: AiRequest) -> anyhow::Result<(Value, HeaderMap)> {
+impl CommandCodeGenerateV1 {
+    pub(crate) fn encode_request(&self, request: AiRequest) -> anyhow::Result<Value> {
         let tool_names = tool_names(&request);
         let mut system = Vec::new();
         if let Some(instructions) = request.instructions
@@ -181,13 +100,21 @@ impl ProtocolAdapter for CommandCodeGenerateV1 {
             ),
         ]);
         insert_optional(&mut params, "temperature", request.generation.temperature);
-        if let Some(effort) = request
-            .reasoning
-            .effort
-            .as_ref()
-            .and_then(ReasoningEffort::as_openai_str)
-        {
-            params.insert("reasoning_effort".into(), Value::String(effort.into()));
+        match request.reasoning.target_control {
+            Some(stravia_runtime_contract::thinking::TargetThinkingControl::Effort { value }) => {
+                params.insert("reasoning_effort".into(), Value::String(value));
+            }
+            None => {
+                if let Some(effort) = request
+                    .reasoning
+                    .effort
+                    .as_ref()
+                    .and_then(ReasoningEffort::as_openai_str)
+                {
+                    params.insert("reasoning_effort".into(), Value::String(effort.into()));
+                }
+            }
+            _ => {}
         }
         if let Some(choice) = request.tool_choice {
             params.insert("tool_choice".into(), encode_tool_choice(choice));
@@ -217,268 +144,7 @@ impl ProtocolAdapter for CommandCodeGenerateV1 {
         body.as_object_mut()
             .expect("envelope is an object")
             .insert("params".into(), Value::Object(params));
-        Ok((body, HeaderMap::new()))
-    }
-
-    fn request_path(&self, _model: &str, _stream: bool) -> String {
-        "/alpha/generate".into()
-    }
-
-    fn decode_response(&self, body: Value) -> anyhow::Result<AiResponse> {
-        let mut response = AiResponse::new(
-            body.get("id").and_then(Value::as_str).unwrap_or_default(),
-            body.get("model")
-                .and_then(Value::as_str)
-                .unwrap_or_default(),
-        );
-        for content in body
-            .get("content")
-            .and_then(Value::as_array)
-            .context("Command Code response is missing content")?
-        {
-            match content.get("type").and_then(Value::as_str) {
-                Some("text") => response.push_output_text(required_string(content, "text")?),
-                Some("reasoning") => {
-                    response.push_reasoning(required_string(content, "text")?, None)
-                }
-                Some("tool-call") => response.push_tool_call(decode_tool_call(content)?),
-                Some(other) => bail!("unsupported Command Code response content type `{other}`"),
-                None => bail!("Command Code response content is missing type"),
-            }
-        }
-        response.stop_reason = body
-            .get("finishReason")
-            .and_then(Value::as_str)
-            .map(map_finish_reason)
-            .map(str::to_string);
-        response.usage = command_code_usage(body.get("usage").or_else(|| body.get("totalUsage")));
-        Ok(response)
-    }
-
-    fn encode_response(&self, response: &AiResponse) -> Value {
-        let mut content = Vec::new();
-        for item in &response.items {
-            match &item.content {
-                MessageContent::Text(text) if item.role == Role::Assistant && !text.is_empty() => {
-                    content.push(json!({"type": "text", "text": text}));
-                }
-                MessageContent::Blocks(blocks) if item.role == Role::Assistant => {
-                    for block in blocks {
-                        match block {
-                            ContentBlock::Text { text, .. } if !text.is_empty() => {
-                                content.push(json!({"type": "text", "text": text}));
-                            }
-                            ContentBlock::Thinking { thinking, .. } if !thinking.is_empty() => {
-                                content.push(json!({"type": "reasoning", "text": thinking}));
-                            }
-                            ContentBlock::Reasoning {
-                                summary,
-                                content: reasoning,
-                                ..
-                            } => {
-                                for text in summary.iter().chain(reasoning) {
-                                    if !text.is_empty() {
-                                        content.push(json!({"type": "reasoning", "text": text}));
-                                    }
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                _ => {}
-            }
-            for call in item.tool_calls.as_deref().unwrap_or_default() {
-                content.push(encode_tool_call_value(call));
-            }
-        }
-        json!({
-            "id": response.id,
-            "model": response.model,
-            "content": content,
-            "finishReason": response.stop_reason.as_deref().unwrap_or("stop"),
-            "usage": usage_value(&response.usage),
-        })
-    }
-
-    fn stream_decoder(&self) -> Result<WireStreamDecoder, TransformError> {
-        Ok(WireStreamDecoder::custom_text(
-            CommandCodeStreamParser::new(),
-        ))
-    }
-
-    fn stream_encoder(&self) -> Result<WireStreamEncoder, TransformError> {
-        Err(TransformError::UnsupportedOperation {
-            endpoint: COMMAND_CODE_GENERATE_V1,
-            operation: "ingress stream encoding",
-        })
-    }
-}
-
-fn decode_system(value: &Value) -> anyhow::Result<Vec<AiItem>> {
-    if let Some(text) = value.as_str() {
-        if text.trim().is_empty() {
-            return Ok(Vec::new());
-        }
-        return Ok(vec![AiItem {
-            role: Role::System,
-            content: MessageContent::Text(text.to_string().into()),
-            tool_calls: None,
-            tool_call_id: None,
-            meta: None,
-        }]);
-    }
-    let blocks = value
-        .as_array()
-        .context("Command Code system must be a string or block array")?
-        .iter()
-        .map(|block| {
-            Ok(ContentBlock::Text {
-                text: required_string(block, "text")?.into(),
-                cache_control: None,
-            })
-        })
-        .collect::<anyhow::Result<Vec<_>>>()?;
-    if blocks.is_empty()
-        || blocks.iter().all(|block| match block {
-            ContentBlock::Text { text, .. } => text.trim().is_empty(),
-            _ => false,
-        })
-    {
-        return Ok(Vec::new());
-    }
-    Ok(vec![AiItem {
-        role: Role::System,
-        content: MessageContent::Blocks(blocks),
-        tool_calls: None,
-        tool_call_id: None,
-        meta: None,
-    }])
-}
-
-fn decode_message(message: &Value) -> anyhow::Result<AiItem> {
-    let role = match required_string(message, "role")?.as_str() {
-        "system" | "developer" => Role::System,
-        "user" => Role::User,
-        "assistant" => Role::Assistant,
-        "tool" => Role::Tool,
-        other => bail!("unsupported Command Code message role `{other}`"),
-    };
-    if matches!(role, Role::System) {
-        // Content may be a plain string or the same block array shape the
-        // top-level `system` field accepts.
-        let text = match message.get("content") {
-            Some(Value::String(text)) => text.clone(),
-            Some(Value::Array(blocks)) => blocks
-                .iter()
-                .filter_map(|block| block.get("text").and_then(Value::as_str))
-                .collect::<Vec<_>>()
-                .join("\n"),
-            _ => String::new(),
-        };
-        return Ok(AiItem {
-            role,
-            content: MessageContent::Text(text.into()),
-            tool_calls: None,
-            tool_call_id: None,
-            meta: None,
-        });
-    }
-    let parts = message
-        .get("content")
-        .and_then(Value::as_array)
-        .context("Command Code message content must be an array")?;
-    let mut blocks = Vec::new();
-    let mut tool_calls = Vec::new();
-    let mut tool_call_id = None;
-    for part in parts {
-        match part.get("type").and_then(Value::as_str) {
-            Some("text") => blocks.push(ContentBlock::Text {
-                text: required_string(part, "text")?.into(),
-                cache_control: None,
-            }),
-            Some("reasoning") if role == Role::Assistant => {
-                blocks.push(ContentBlock::Thinking {
-                    thinking: required_string(part, "text")?,
-                    signature: None,
-                });
-            }
-            Some("tool-call") if role == Role::Assistant => {
-                tool_calls.push(decode_tool_call(part)?);
-            }
-            Some("tool-result") if role == Role::Tool => {
-                let id = required_string(part, "toolCallId")?;
-                if tool_call_id.replace(id.clone()).is_some() {
-                    bail!("Command Code tool message must contain exactly one tool result");
-                }
-                blocks.push(ContentBlock::ToolResult {
-                    tool_use_id: (id).into(),
-                    content: tool_result_content(part)?,
-                    content_kind: Some(
-                        stravia_runtime_contract::protocol::ir::ToolResultContentKind::Json,
-                    ),
-                    is_error: None,
-                    cache_control: None,
-                });
-            }
-            Some("image") if role == Role::User => {
-                let image = required_string(part, "image")?;
-                blocks.push(ContentBlock::Image {
-                    source: image_source(&image),
-                    detail: None,
-                    cache_control: None,
-                });
-            }
-            Some(other) => {
-                bail!("unsupported Command Code content type `{other}` for role `{role:?}`")
-            }
-            None => bail!("Command Code message content is missing type"),
-        }
-    }
-    Ok(AiItem {
-        role,
-        content: MessageContent::Blocks(blocks),
-        tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
-        tool_call_id: tool_call_id.map(Into::into),
-        meta: None,
-    })
-}
-
-fn decode_tools(value: &Value) -> anyhow::Result<Vec<ToolSpec>> {
-    value
-        .as_array()
-        .context("Command Code tools must be an array")?
-        .iter()
-        .map(|tool| {
-            Ok(ToolSpec {
-                name: required_string(tool, "name")?,
-                description: tool
-                    .get("description")
-                    .and_then(Value::as_str)
-                    .map(str::to_string),
-                parameters: tool
-                    .get("input_schema")
-                    .or_else(|| tool.get("inputSchema"))
-                    .cloned()
-                    .unwrap_or_else(|| json!({"type": "object", "properties": {}})),
-                strict: None,
-                cache_control: None,
-                meta: None,
-            })
-        })
-        .collect()
-}
-
-fn decode_tool_choice(value: &Value) -> anyhow::Result<ToolChoice> {
-    match value.get("type").and_then(Value::as_str) {
-        Some("auto") => Ok(ToolChoice::Auto),
-        Some("none") => Ok(ToolChoice::None),
-        Some("any") | Some("required") => Ok(ToolChoice::Required),
-        Some("tool") => Ok(ToolChoice::Named {
-            name: required_string(value, "name")?,
-        }),
-        Some(other) => bail!("unsupported Command Code tool choice `{other}`"),
-        None => bail!("Command Code tool choice is missing type"),
+        Ok(body)
     }
 }
 
@@ -522,18 +188,13 @@ fn encode_system_blocks(item: AiItem) -> anyhow::Result<Vec<Value>> {
         MessageContent::Text(text) if !text.is_empty() => {
             Ok(vec![text_part("text", Arc::unwrap_or_clone(text))])
         }
-        MessageContent::Blocks(blocks) => blocks
-            .into_iter()
-            .map(|block| match block {
-                ContentBlock::Text { text, .. } => {
-                    Ok(text_part("text", Arc::unwrap_or_clone(text)))
-                }
-                other => bail!(
-                    "Command Code system cannot represent `{}`",
-                    content_block_name(&other)
-                ),
-            })
-            .collect(),
+        MessageContent::Blocks(blocks) => {
+            let mut parts = Vec::new();
+            for block in blocks {
+                encode_readable_block(block, false, &mut parts)?;
+            }
+            Ok(parts)
+        }
         MessageContent::Text(_) => Ok(Vec::new()),
     }
 }
@@ -546,7 +207,10 @@ fn encode_message(
 ) -> anyhow::Result<Option<Value>> {
     match item.role {
         Role::System | Role::Developer => unreachable!("system messages are encoded separately"),
-        Role::User => Ok(Some(message("user", encode_user_parts(item.content)?))),
+        Role::User => {
+            let content = encode_user_parts(item.content)?;
+            Ok((!content.is_empty()).then(|| message("user", content)))
+        }
         Role::Assistant => {
             let mut content = encode_assistant_parts(item.content)?;
             for call in item.tool_calls.unwrap_or_default() {
@@ -565,6 +229,10 @@ fn encode_message(
                 .get(tool_call_id.as_str())
                 .map(String::as_str)
                 .unwrap_or("");
+            let is_error = matches!(&item.content, MessageContent::Blocks(blocks) if blocks.iter().any(|block| matches!(block, ContentBlock::ToolResult { is_error: Some(true), .. })));
+            let Some(text) = tool_result_text(item.content)? else {
+                return Ok(None);
+            };
             Ok(Some(message(
                 "tool",
                 vec![object([
@@ -574,8 +242,11 @@ fn encode_message(
                     (
                         "output",
                         object([
-                            ("type", Value::String("text".into())),
-                            ("value", Value::String(tool_result_text(item.content)?)),
+                            (
+                                "type",
+                                Value::String(if is_error { "error-text" } else { "text" }.into()),
+                            ),
+                            ("value", Value::String(text)),
                         ]),
                     ),
                 ])],
@@ -587,19 +258,13 @@ fn encode_message(
 fn encode_user_parts(content: MessageContent) -> anyhow::Result<Vec<Value>> {
     match content {
         MessageContent::Text(text) => Ok(vec![text_part("text", Arc::unwrap_or_clone(text))]),
-        MessageContent::Blocks(blocks) => blocks
-            .into_iter()
-            .map(|block| match block {
-                ContentBlock::Text { text, .. } => {
-                    Ok(text_part("text", Arc::unwrap_or_clone(text)))
-                }
-                ContentBlock::Image { source, .. } => encode_image(source),
-                other => bail!(
-                    "Command Code user message cannot represent `{}`",
-                    content_block_name(&other)
-                ),
-            })
-            .collect(),
+        MessageContent::Blocks(blocks) => {
+            let mut parts = Vec::new();
+            for block in blocks {
+                encode_readable_block(block, true, &mut parts)?;
+            }
+            Ok(parts)
+        }
     }
 }
 
@@ -644,10 +309,7 @@ fn encode_assistant_parts(content: MessageContent) -> anyhow::Result<Vec<Value>>
                         ]));
                     }
                     ContentBlock::Text { .. } => {}
-                    other => bail!(
-                        "Command Code assistant message cannot represent `{}`",
-                        content_block_name(&other)
-                    ),
+                    other => encode_readable_block(other, false, &mut rest)?,
                 }
             }
             parts.extend(reasoning);
@@ -657,7 +319,7 @@ fn encode_assistant_parts(content: MessageContent) -> anyhow::Result<Vec<Value>>
     }
 }
 
-fn encode_image(source: MediaSource) -> anyhow::Result<Value> {
+fn encode_image(source: MediaSource) -> anyhow::Result<Option<Value>> {
     match source {
         MediaSource::Url(url) => {
             let media_type = data_url_media_type(&url).map(str::to_owned);
@@ -671,19 +333,17 @@ fn encode_image(source: MediaSource) -> anyhow::Result<Value> {
                     .expect("image part is an object")
                     .insert("mimeType".into(), Value::String(media_type));
             }
-            Ok(image)
+            Ok(Some(image))
         }
         MediaSource::Base64 { media_type, data } => {
             let image = format!("data:{media_type};base64,{data}");
-            Ok(object([
+            Ok(Some(object([
                 ("type", Value::String("image".into())),
                 ("image", Value::String(image)),
                 ("mimeType", Value::String(media_type)),
-            ]))
+            ])))
         }
-        MediaSource::FileId { .. } => {
-            bail!("Command Code cannot represent file-id image sources")
-        }
+        MediaSource::FileId { .. } => Ok(None),
     }
 }
 
@@ -722,16 +382,6 @@ fn encode_tool_choice(choice: ToolChoice) -> Value {
     }
 }
 
-fn encode_tool_call_value(call: &ToolCall) -> Value {
-    json!({
-        "type": "tool-call",
-        "toolCallId": call.id,
-        "toolName": call.name,
-        "input": serde_json::from_str::<Value>(&call.arguments)
-            .unwrap_or_else(|_| Value::String(call.arguments.clone())),
-    })
-}
-
 fn owned_tool_call_value(call: ToolCall) -> Value {
     let input =
         serde_json::from_str::<Value>(&call.arguments).unwrap_or(Value::String(call.arguments));
@@ -749,53 +399,97 @@ fn tool_names(request: &AiRequest) -> BTreeMap<String, String> {
         .iter()
         .flat_map(|item| item.tool_calls.as_deref().unwrap_or_default())
         .map(|call| (call.id.to_string(), call.name.clone()))
+        .chain(
+            request
+                .items
+                .iter()
+                .flat_map(|item| match &item.content {
+                    MessageContent::Blocks(blocks) => blocks.as_slice(),
+                    MessageContent::Text(_) => &[],
+                })
+                .filter_map(|block| match block {
+                    ContentBlock::ToolUse { id, name, .. } => Some((id.to_string(), name.clone())),
+                    _ => None,
+                }),
+        )
         .collect()
 }
 
-fn tool_result_text(content: MessageContent) -> anyhow::Result<String> {
+// Private wire projection: documents expose their readable children, while
+// unsupported media and protected payloads never become invented text.
+fn encode_readable_block(
+    block: ContentBlock,
+    images: bool,
+    parts: &mut Vec<Value>,
+) -> anyhow::Result<()> {
+    use stravia_runtime_contract::protocol::ir::{DocumentSource, ToolResultContentKind};
+    match block {
+        ContentBlock::Text { text, .. } => {
+            parts.push(text_part("text", Arc::unwrap_or_clone(text)));
+        }
+        ContentBlock::Image { source, .. } if images => {
+            parts.extend(encode_image(source)?);
+        }
+        ContentBlock::Document { source, .. } => match source {
+            DocumentSource::PlainText { data } => parts.push(text_part("text", data)),
+            DocumentSource::Blocks { content } => {
+                for block in content {
+                    encode_readable_block(block, images, parts)?;
+                }
+            }
+            _ => {}
+        },
+        ContentBlock::ToolResult {
+            content,
+            content_kind,
+            ..
+        }
+        | ContentBlock::ServerToolResult {
+            content,
+            content_kind,
+            ..
+        } => {
+            if content_kind == Some(ToolResultContentKind::ContentBlocks) {
+                let blocks: Vec<ContentBlock> = serde_json::from_value(content)
+                    .context("invalid Command Code tool result content blocks")?;
+                for block in blocks {
+                    encode_readable_block(block, images, parts)?;
+                }
+            } else {
+                let text = match content {
+                    Value::String(text) => text,
+                    other => serde_json::to_string(&other)?,
+                };
+                parts.push(text_part("text", text));
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn tool_result_text(content: MessageContent) -> anyhow::Result<Option<String>> {
     match content {
-        MessageContent::Text(text) => Ok(Arc::unwrap_or_clone(text)),
-        MessageContent::Blocks(blocks) => Ok(blocks
-            .into_iter()
-            .filter_map(|block| match block {
-                ContentBlock::Text { text, .. } => Some(Arc::unwrap_or_clone(text)),
-                ContentBlock::ToolResult { content, .. } => content
-                    .as_str()
-                    .map(str::to_string)
-                    .or_else(|| serde_json::to_string(&content).ok()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n")),
-    }
-}
-
-fn tool_result_content(part: &Value) -> anyhow::Result<Value> {
-    let output = part
-        .get("output")
-        .context("Command Code tool result is missing output")?;
-    if let Some(text) = output.get("value").and_then(Value::as_str) {
-        return Ok(Value::String(text.to_string()));
-    }
-    if let Some(text) = output.as_str() {
-        return Ok(Value::String(text.to_string()));
-    }
-    Ok(output.clone())
-}
-
-fn image_source(image: &str) -> MediaSource {
-    if let Some(rest) = image.strip_prefix("data:")
-        && let Some(semi) = rest.find(';')
-    {
-        let media_type = rest[..semi].to_string();
-        if let Some(data) = rest[semi + 1..].strip_prefix("base64,") {
-            return MediaSource::Base64 {
-                media_type,
-                data: data.to_string(),
-            };
+        MessageContent::Text(text) => Ok(Some(Arc::unwrap_or_clone(text))),
+        MessageContent::Blocks(blocks) => {
+            let mut parts = Vec::new();
+            for block in blocks {
+                encode_readable_block(block, false, &mut parts)?;
+            }
+            if parts.is_empty() {
+                return Ok(None);
+            }
+            let text = parts
+                .into_iter()
+                .filter_map(|mut part| match part.get_mut("text").map(Value::take) {
+                    Some(Value::String(text)) => Some(text),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            Ok(Some(text))
         }
     }
-    MediaSource::Url(image.to_string())
 }
 
 fn data_url_media_type(url: &str) -> Option<&str> {
@@ -839,18 +533,6 @@ fn command_code_usage(value: Option<&Value>) -> Usage {
     }
 }
 
-fn usage_value(usage: &Usage) -> Value {
-    json!({
-        "inputTokens": usage.prompt_tokens,
-        "outputTokens": usage.completion_tokens,
-        "cachedInputTokens": usage.cache_read_tokens.unwrap_or(0),
-        "inputTokenDetails": {
-            "cacheReadTokens": usage.cache_read_tokens.unwrap_or(0),
-            "cacheWriteTokens": usage.cache_creation_tokens.unwrap_or(0),
-        },
-    })
-}
-
 fn map_finish_reason(reason: &str) -> &str {
     let reason = reason.trim();
     match reason.to_ascii_lowercase().as_str() {
@@ -879,33 +561,6 @@ fn as_u32(value: Option<&Value>) -> Option<u32> {
     value
         .and_then(Value::as_u64)
         .and_then(|n| u32::try_from(n).ok())
-}
-
-fn content_block_name(block: &ContentBlock) -> &'static str {
-    match block {
-        ContentBlock::Text { .. } => "text",
-        ContentBlock::Image { .. } => "image",
-        ContentBlock::Audio { .. } => "audio",
-        ContentBlock::File { .. } => "file",
-        ContentBlock::Video { .. } => "video",
-        ContentBlock::Thinking { .. } => "thinking",
-        ContentBlock::Reasoning { .. } => "reasoning",
-        ContentBlock::Compaction { .. } => "compaction",
-        ContentBlock::CompactionTrigger {} => "compaction_trigger",
-        ContentBlock::RedactedThinking { .. } => "redacted_thinking",
-        ContentBlock::ToolUse { .. } => "tool_use",
-        ContentBlock::ToolResult { .. } => "tool_result",
-        ContentBlock::ServerToolUse { .. } => "server_tool_use",
-        ContentBlock::ServerToolResult { .. } => "server_tool_result",
-        ContentBlock::Document { .. } => "document",
-        ContentBlock::SearchResult { .. } => "search_result",
-        ContentBlock::Citation { .. } => "citation",
-        ContentBlock::ExecutableCode { .. } => "executable_code",
-        ContentBlock::CodeExecutionResult { .. } => "code_execution_result",
-        ContentBlock::ContainerUpload { .. } => "container_upload",
-        ContentBlock::Refusal { .. } => "refusal",
-        ContentBlock::Unknown { .. } => "unknown",
-    }
 }
 
 pub struct CommandCodeStreamParser {

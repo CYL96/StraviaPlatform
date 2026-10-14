@@ -1828,6 +1828,49 @@ impl ResponsesStreamFormatter {
                     }
                 }
                 AiStreamDelta::ItemDone { index, item } => {
+                    if let Some(parts) = super::formatter::split_assistant_output(item) {
+                        self.finish_unindexed_message(&mut events);
+                        self.ensure_started(&mut events);
+                        self.seal_reasoning_item(&mut events);
+                        self.next_output_index = self.next_output_index.max(*index);
+                        let outputs = super::formatter::ResponsesResponseFormatter
+                            .format_output_items(&parts, &self.resp_id);
+                        for mut output in outputs {
+                            let output_index = self.next_output_index;
+                            self.next_output_index += 1;
+                            let prefix =
+                                match output.get("type").and_then(serde_json::Value::as_str) {
+                                    Some("message") => "msg",
+                                    Some("reasoning") => "rs",
+                                    Some("function_call") => "fc",
+                                    _ => unreachable!(
+                                        "assistant projection has native output carriers"
+                                    ),
+                                };
+                            output["id"] =
+                                gateway_item_id(prefix, &self.resp_id, output_index).into();
+                            let mut added = output.clone();
+                            added["status"] = "in_progress".into();
+                            events.push(SseEvent::new(
+                                Some("response.output_item.added"),
+                                serde_json::json!({"type": "response.output_item.added",
+                                    "output_index": output_index, "item": added})
+                                .to_string(),
+                            ));
+                            events.push(SseEvent::new(
+                                Some("response.output_item.done"),
+                                serde_json::json!({"type": "response.output_item.done",
+                                    "output_index": output_index, "item": output})
+                                .to_string(),
+                            ));
+                            self.standalone_items.push(PendingOutputItem {
+                                output_index,
+                                item: output,
+                                done: true,
+                            });
+                        }
+                        continue;
+                    }
                     // An unindexed native Thinking block has finished. Its public
                     // preview and marker share the current reasoning carrier, but
                     // the next independent block must open a new item.
@@ -1884,12 +1927,14 @@ impl ResponsesStreamFormatter {
                         );
                     }
                     if let Some((call_id, content)) = item.function_call_output_ref() {
+                        let Some(output) = super::formatter::function_output_value(content) else {
+                            continue;
+                        };
                         self.finish_unindexed_message(&mut events);
                         self.ensure_started(&mut events);
                         self.seal_reasoning_item(&mut events);
                         self.next_output_index = self.next_output_index.max(*index + 1);
                         let item_id = gateway_item_id("fco", &self.resp_id, *index);
-                        let output = super::formatter::function_output_value(content);
                         events.push(SseEvent::new(
                             Some("response.output_item.added"),
                             serde_json::json!({

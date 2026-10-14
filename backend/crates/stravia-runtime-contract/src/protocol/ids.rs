@@ -38,10 +38,6 @@ pub enum Protocol {
     WatsonxTextChat,
     /// Vercel AI Gateway AI SDK v4 language-model wire.
     GatewayLanguageModel,
-    /// Command Code `/alpha/generate` envelope and NDJSON stream.
-    CommandCode,
-    /// Devin Connect-RPC `ApiServerService` protobuf wire.
-    DevinConnect,
 }
 
 impl Protocol {
@@ -55,8 +51,6 @@ impl Protocol {
             Self::CohereChat => "cohere-chat",
             Self::WatsonxTextChat => "watsonx-text-chat",
             Self::GatewayLanguageModel => "gateway-language-model",
-            Self::CommandCode => "command-code",
-            Self::DevinConnect => "devin-connect",
         }
     }
 
@@ -70,8 +64,6 @@ impl Protocol {
             Self::CohereChat => "Cohere Chat",
             Self::WatsonxTextChat => "watsonx.ai Text Chat",
             Self::GatewayLanguageModel => "Vercel AI Gateway Language Model",
-            Self::CommandCode => "Command Code Generate",
-            Self::DevinConnect => "Devin Connect ApiServer",
         }
     }
 }
@@ -113,17 +105,10 @@ impl Protocol {
             Self::OpenAICompatible => {
                 matches!(control, TargetThinkingControl::Effort { .. })
             }
-            Self::DevinConnect => matches!(
-                control,
-                TargetThinkingControl::Effort { .. }
-                    | TargetThinkingControl::Enabled
-                    | TargetThinkingControl::Disabled
-            ),
             Self::BedrockConverse
             | Self::CohereChat
             | Self::WatsonxTextChat
-            | Self::GatewayLanguageModel
-            | Self::CommandCode => false,
+            | Self::GatewayLanguageModel => false,
         }
     }
 }
@@ -145,8 +130,6 @@ impl FromStr for Protocol {
             "cohere-chat" | "cohere" => Ok(Self::CohereChat),
             "watsonx-text-chat" | "watsonx" => Ok(Self::WatsonxTextChat),
             "gateway-language-model" | "gateway" => Ok(Self::GatewayLanguageModel),
-            "command-code" | "commandcode" | "command-code-generate" => Ok(Self::CommandCode),
-            "devin-connect" | "devin" | "windsurf-connect" => Ok(Self::DevinConnect),
             other => anyhow::bail!("unknown protocol: {other}"),
         }
     }
@@ -263,12 +246,6 @@ pub const WATSONX_TEXT_CHAT_V1: ProtocolEndpoint =
 pub const GATEWAY_LANGUAGE_MODEL_V4: ProtocolEndpoint =
     ProtocolEndpoint::new(Protocol::GatewayLanguageModel, "language-model", "v4");
 
-pub const COMMAND_CODE_GENERATE_V1: ProtocolEndpoint =
-    ProtocolEndpoint::new(Protocol::CommandCode, "generate", "v1");
-
-pub const DEVIN_CONNECT_GET_CHAT_MESSAGE_V1: ProtocolEndpoint =
-    ProtocolEndpoint::new(Protocol::DevinConnect, "get-chat-message", "v1");
-
 impl ProtocolEndpoint {
     /// Resolve endpoint identities that are part of the shared runtime contract.
     /// This is identity parsing only; owning guest codecs remain responsible for
@@ -294,8 +271,6 @@ impl ProtocolEndpoint {
             "cohere-chat/chat/v2" => COHERE_CHAT_V2,
             "watsonx-text-chat/chat/v1" => WATSONX_TEXT_CHAT_V1,
             "gateway-language-model/language-model/v4" => GATEWAY_LANGUAGE_MODEL_V4,
-            "command-code/generate/v1" => COMMAND_CODE_GENERATE_V1,
-            "devin-connect/get-chat-message/v1" => DEVIN_CONNECT_GET_CHAT_MESSAGE_V1,
             _ => return None,
         })
     }
@@ -317,8 +292,6 @@ impl<'de> Deserialize<'de> for ProtocolEndpoint {
             "cohere-chat/chat/v2" => Ok(COHERE_CHAT_V2),
             "watsonx-text-chat/chat/v1" => Ok(WATSONX_TEXT_CHAT_V1),
             "gateway-language-model/language-model/v4" => Ok(GATEWAY_LANGUAGE_MODEL_V4),
-            "command-code/generate/v1" => Ok(COMMAND_CODE_GENERATE_V1),
-            "devin-connect/get-chat-message/v1" => Ok(DEVIN_CONNECT_GET_CHAT_MESSAGE_V1),
             _ => Err(serde::de::Error::custom(format_args!(
                 "unknown canonical protocol endpoint `{value}`"
             ))),
@@ -487,8 +460,6 @@ mod tests {
             Protocol::CohereChat,
             Protocol::WatsonxTextChat,
             Protocol::GatewayLanguageModel,
-            Protocol::CommandCode,
-            Protocol::DevinConnect,
         ] {
             assert_eq!(p.as_str().parse::<Protocol>().unwrap(), p);
         }
@@ -507,25 +478,30 @@ mod tests {
 
     #[test]
     fn selected_protocol_identity_preserves_unknown_plugins() {
-        let identity = ProtocolIdentity::new("acme/private-inference-v7");
-        assert_eq!(identity.as_str(), "acme/private-inference-v7");
-        assert_eq!(identity.protocol(), None);
-        assert!(!identity.matches_endpoint(OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1));
-        assert_eq!(
-            serde_json::to_string(&identity).unwrap(),
-            r#""acme/private-inference-v7""#
-        );
+        for name in [
+            "acme/private-inference-v7",
+            "devin-connect",
+            "devin-connect/get-chat-message/v1",
+            "command-code",
+            "command-code/generate/v1",
+        ] {
+            let identity = ProtocolIdentity::new(name);
+            assert_eq!(identity.as_str(), name);
+            assert_eq!(identity.protocol(), None);
+            assert!(!identity.matches_endpoint(OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1));
+            assert_eq!(
+                serde_json::to_value(&identity).unwrap(),
+                serde_json::json!(name)
+            );
+            assert_eq!(
+                serde_json::from_value::<ProtocolIdentity>(serde_json::json!(name)).unwrap(),
+                identity
+            );
+        }
     }
 
     #[test]
     fn selected_protocol_identity_exposes_known_semantics_without_a_codec() {
-        let private = ProtocolIdentity::new("devin-connect");
-        assert_eq!(private.protocol(), Some(Protocol::DevinConnect));
-        assert!(Protocol::DevinConnect.represents_target_thinking_control(
-            &crate::thinking::TargetThinkingControl::Effort {
-                value: "high".into()
-            }
-        ));
         let standard = ProtocolIdentity::new("openai/chat/v1");
         assert!(standard.matches_endpoint(OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1));
         assert!(standard.matches_endpoint(OPENAI_COMPATIBLE_EMBEDDINGS_V1));

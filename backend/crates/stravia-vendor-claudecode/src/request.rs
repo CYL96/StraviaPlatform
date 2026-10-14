@@ -158,6 +158,7 @@ pub(crate) fn shape(
     thinking::normalize(object, caps);
     capabilities::constrain(object, caps);
     drop_disallowed_sampling(object, caps);
+    drop_unsupported_prefill(object, caps);
     prefix_tool_names(object);
     default_tool_result_errors(object);
     let session_id = client_session_id(object.get("metadata")).unwrap_or_else(fallback_session_id);
@@ -225,6 +226,31 @@ pub(crate) fn decode_tool_name(name: &str) -> Option<String> {
 /// 丢弃真实 Claude Code 不会发送的顶层字段。
 fn restrict_to_claude_code_fields(object: &mut Map<String, Value>) {
     object.retain(|key, _| CLAUDE_CODE_FIELDS.contains(&key.as_str()));
+}
+
+/// 不支持 prefill 时省略末尾 assistant，不把助手内容冒充用户，也不插入合成提示。
+/// 前面的 assistant 历史及已完成的工具调用/结果保持原样。
+fn drop_unsupported_prefill(object: &mut Map<String, Value>, caps: &ModelCapabilities) {
+    let thinking_enabled = object
+        .get("thinking")
+        .and_then(|thinking| thinking.get("type"))
+        .and_then(Value::as_str)
+        .is_some_and(|kind| matches!(kind, "enabled" | "adaptive" | "between_tools"));
+    let model_rejects = ModelProfile::of_request(object, caps)
+        .is_some_and(|model| !model.accepts_prefill())
+        || object.get("model").and_then(Value::as_str) == Some("claude-mythos-preview");
+    if !thinking_enabled && !model_rejects {
+        return;
+    }
+    let Some(messages) = object.get_mut("messages").and_then(Value::as_array_mut) else {
+        return;
+    };
+    while messages
+        .last()
+        .is_some_and(|message| message.get("role").and_then(Value::as_str) == Some("assistant"))
+    {
+        messages.pop();
+    }
 }
 
 /// 复刻 oh-my-pi `buildParams`：仅在模型支持自定义采样且思考未开启时才保留
@@ -552,6 +578,66 @@ mod tests {
             serde_json::from_slice(&shaped.body).expect("shaped body is JSON"),
             shaped,
         )
+    }
+
+    #[test]
+    fn unsupported_prefill_is_dropped_only_at_the_tail() {
+        for model in [
+            "claude-sonnet-4-6",
+            "claude-sonnet-5-5",
+            "claude-opus-4-6",
+            "claude-opus-5-5",
+            "claude-mythos-preview",
+        ] {
+            let (body, _) = shaped(json!({
+                "model": model,
+                "max_tokens": 4096,
+                "messages": [
+                    {"role": "user", "content": "first turn"},
+                    {"role": "assistant", "content": "completed earlier answer"},
+                    {"role": "user", "content": "next turn"},
+                    {"role": "assistant", "content": "prefix"},
+                    {"role": "assistant", "content": "more prefix"}
+                ]
+            }));
+            let messages = body["messages"].as_array().unwrap();
+            assert_eq!(messages.len(), 3, "{model}");
+            assert_eq!(messages[1]["role"], "assistant");
+            assert_eq!(
+                messages[1]["content"][0]["text"],
+                "completed earlier answer"
+            );
+            assert_eq!(messages[2]["role"], "user");
+            assert_eq!(messages[2]["content"][0]["text"], "next turn");
+        }
+    }
+
+    #[test]
+    fn legacy_and_unknown_models_keep_native_prefill_unless_thinking_is_enabled() {
+        for model in ["claude-sonnet-4-5", "claude-opus-4-5", "custom-model"] {
+            let (body, _) = shaped(json!({
+                "model": model,
+                "max_tokens": 4096,
+                "messages": [
+                    {"role": "user", "content": "first turn"},
+                    {"role": "assistant", "content": "supported prefix"}
+                ]
+            }));
+            let messages = body["messages"].as_array().unwrap();
+            assert_eq!(messages.len(), 2, "{model}");
+            assert_eq!(messages[1]["content"][0]["text"], "supported prefix");
+        }
+        let (body, _) = shaped(json!({
+            "model": "claude-sonnet-4-5",
+            "max_tokens": 8192,
+            "thinking": {"type": "enabled", "budget_tokens": 1024},
+            "messages": [
+                {"role": "user", "content": "first turn"},
+                {"role": "assistant", "content": "unsupported prefix"}
+            ]
+        }));
+        assert_eq!(body["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(body["messages"][0]["content"][0]["text"], "first turn");
     }
 
     #[test]

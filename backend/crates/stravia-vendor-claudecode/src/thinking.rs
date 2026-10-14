@@ -61,6 +61,16 @@ impl<'a> ModelProfile<'a> {
         Self::new(object.get("model").and_then(Value::as_str)?, caps)
     }
 
+    /// Anthropic 从 Claude 4.6 起不再接受末尾 assistant 作为响应前缀。
+    /// 未识别型号沿用原生行为，不从思考能力推断 prefill 支持。
+    pub(crate) fn accepts_prefill(&self) -> bool {
+        match self.known {
+            Some((Family::Opus | Family::Sonnet | Family::Haiku, revision)) => revision < [4, 6, 0],
+            Some((Family::Fable | Family::Mythos, _)) => false,
+            None => true,
+        }
+    }
+
     /// 只接受 `adaptive`，拒绝 `enabled` 与非默认采样参数的型号：Opus ≥ 4.7、
     /// Sonnet ≥ 5、Fable/Mythos。对应 oh-my-pi `anthropicAdaptiveGenAtLeast("4.7")`。
     pub(crate) fn adaptive_only(&self) -> bool {

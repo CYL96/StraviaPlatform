@@ -4,18 +4,17 @@ mod selector;
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::codec::devin_connect::request::SessionShape;
+use crate::codec::devin_connect::request::{SessionShape, encode_prepared_request};
 use crate::codec::devin_connect::{
     ASSIGN_MODEL_PATH, DevinClientPlatform, GET_CHAT_MESSAGE_PATH, ModelAssignment,
     decode_assign_model_response, decode_cli_model_configs,
     encode_assign_model_request_with_platform, encode_client_metadata_request_with_platform,
-    encode_get_chat_message_request_with_platform, session_shape, wrap_request,
+    session_shape, wrap_request,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use stravia_protocol_codec::accumulator::StreamResponseAccumulator;
-use stravia_runtime_contract::protocol::ir::{AiErrorKind, AiRequest, AiStreamDelta, ProtocolExt};
-use stravia_runtime_contract::thinking::TargetThinkingControl;
+use stravia_runtime_contract::protocol::ir::{AiErrorKind, AiStreamDelta};
 use stravia_vendor_common::common;
 use stravia_vendor_sdk::{
     AuthCallback, AuthCallbackPort, AuthDescriptor, AuthFlow, AuthManualInput, AuthManualInputType,
@@ -111,6 +110,7 @@ pub(crate) fn descriptor() -> VendorDescriptor {
                 default_models_source: None,
                 consumes_catalog_models: false,
                 capabilities: capabilities.clone(),
+                client_header_names: BTreeSet::new(),
                 model_capabilities: BTreeSet::new(),
             }],
             capabilities,
@@ -207,7 +207,7 @@ fn infer(
 ) -> Result<OperationOutput, PluginError> {
     let token = session_token(&provider)?;
     let platform = client_platform(&provider)?;
-    normalize_optional_controls(&mut request);
+    crate::codec::devin_connect::prepare_request(&mut request);
     let configured_model = provider
         .model
         .as_deref()
@@ -244,13 +244,6 @@ fn infer(
     stravia_protocol_codec::codec::tool_correlation::normalize_request_tool_results(&mut request);
     request.stream.enabled = true;
 
-    common::ensure_no_native_compaction(&request)?;
-    crate::codec::devin_connect::validate_request(&request).map_err(|err| {
-        error(
-            ErrorKind::Invalid,
-            format!("Devin request is not representable: {err}"),
-        )
-    })?;
     let mut state = read_state(host)?;
     let base_shape = session_shape(&request, token);
     let step_index = match state.next_steps.get_mut(&base_shape.trajectory_id) {
@@ -296,7 +289,7 @@ fn infer(
     }
     write_state(host, &state)?;
 
-    let proto = encode_get_chat_message_request_with_platform(
+    let proto = encode_prepared_request(
         &request,
         token,
         &shape,
@@ -487,62 +480,6 @@ fn discover(
         models,
         next_cursor: None,
     })
-}
-
-fn normalize_optional_controls(request: &mut AiRequest) {
-    // 兼容优先仅作用于可选控制；保留输入、工具和安全/数据位置约束，让校验器拒绝无法表示的内容。
-    request.tool_choice = None;
-    request.parallel_tool_calls = None;
-    request.disable_parallel_tool_calls = None;
-    request.generation.seed = None;
-    request.generation.stop = None;
-    request.generation.presence_penalty = None;
-    request.generation.frequency_penalty = None;
-    request.response_format = None;
-    if request
-        .reasoning
-        .target_control
-        .as_ref()
-        .is_some_and(|control| !matches!(control, TargetThinkingControl::Effort { .. }))
-    {
-        request.reasoning.target_control = None;
-    }
-    match request.ext.as_mut() {
-        Some(ProtocolExt::OpenAiChat(extension)) => {
-            extension.n = None;
-            extension.logit_bias = None;
-            extension.logprobs = None;
-            extension.top_logprobs = None;
-            extension.prediction = None;
-            extension.prompt_cache_retention = None;
-            extension.verbosity = None;
-        }
-        Some(ProtocolExt::OpenResponses(extension)) => {
-            extension.background = None;
-            extension.max_tool_calls = None;
-            extension.top_logprobs = None;
-            extension.truncation = None;
-            extension.text = None;
-            extension.tool_choice_ext = None;
-            extension.passthrough_body.remove("context_management");
-        }
-        Some(ProtocolExt::Anthropic(extension)) => {
-            extension.top_k = None;
-            extension.output_config = None;
-            extension.service_tier = None;
-        }
-        Some(ProtocolExt::Google(extension)) => {
-            extension.top_k = None;
-            extension.candidate_count = None;
-            extension.response_logprobs = None;
-            extension.logprobs = None;
-            extension.response_mime_type = None;
-            extension.response_json_schema = None;
-            extension.tool_config = None;
-            extension.thinking_config = None;
-        }
-        None => {}
-    }
 }
 
 fn client_platform(provider: &ProviderSnapshot) -> Result<DevinClientPlatform, PluginError> {

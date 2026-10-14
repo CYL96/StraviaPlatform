@@ -395,7 +395,7 @@ _避免使用_：最长链、文本前缀、Session 命中
 
 ## Open Responses Protocol
 
-Open Responses Protocol 是 Stravia 以官方日期版本为 canonical baseline 的多供应商 Responses wire contract。Ingress 兼容 rolling Responses 的 additive 字段和 hosted tool 声明：同协议 Target 原样保留，跨协议 Target 在不改变任务内容、工具硬要求或成本上限时可以省略。它不等同于任何单一供应商的滚动产品协议。
+Open Responses Protocol 是 Stravia 以官方日期版本为 canonical baseline 的多供应商 Responses wire contract。Ingress 兼容 rolling Responses 的 additive 字段和 hosted tool 声明：目标协议可以表达的保留，无法表达的默认省略，包括内容、工具硬要求或成本上限；这不保证跨协议无损，也不放宽非法源输入或安全校验。它不等同于任何单一供应商的滚动产品协议。
 
 ## Namespaced Extension
 
@@ -403,7 +403,7 @@ Namespaced Extension 是 Open Responses Protocol 核心契约之外、由一个�
 
 ## Representability
 
-Representability 是一段 canonical 语义能否在目标协议中等价表达的性质。它区分等价转换与会改变任务内容、身份、结构或硬约束的 lossy conversion。
+Representability 是一段 canonical 语义能否在目标协议中等价表达的性质。它区分等价转换与会改变任务内容、身份、结构或硬约束的 lossy conversion；当前 Protocol Conversion 对目标无法表达的部分默认省略、保留可表达部分，而不是以此拒绝合法源输入。它不豁免源协议有效性、解析或安全校验。
 
 ## Context Rewrite
 
@@ -599,8 +599,8 @@ _避免使用_：Output Started、Response Committed、Delivery Commit
 
 ## Protocol Conversion
 
-Protocol Conversion 是在改变客户端与上游 wire protocol 时保留一次推理的 canonical semantics。目标协议无法表示任务内容、实际使用的工具、身份、结构或硬约束时必须拒绝；additive metadata、响应装饰和未被强制选择的 hosted tool 可以兼容性省略。它不把响应投影成客户端历史。它向 Client Projection 提供 Thinking 载体形状（是否 indexed、是否可能 protected、未保护 summary 能否直播），不执行投影。
-_避免使用_：把硬约束丢失称为兼容、把客户端可见投影当作 Protocol Conversion 的阶段
+Protocol Conversion 是在客户端与上游 wire protocol 之间转换一次推理的 canonical semantics。请求、响应、stream delta 和 continuation 历史均按目标协议的表达能力处理：可表达的内容、控制与扩展保留，无法表达的默认省略，不因语义损失拒绝整个转换，也不提供严格模式开关。省略可能损失图片、工具调用及关联结果、硬约束、多候选或历史，不能宣称无损；省略只作用于此次编码，不改写原始 canonical 历史。非法源 wire、解析错误、安全与凭据校验及网络失败仍是真实错误；不得伪造工具参数 `{}`、把不可表达内容 stringify 冒充支持或合成零 usage。它不把响应投影成客户端历史。它向 Client Projection 提供 Thinking 载体形状（是否 indexed、是否可能 protected、未保护 summary 能否直播），不执行投影。
+_避免使用_：无损跨协议转换、把客户端可见投影当作 Protocol Conversion 的阶段
 
 ## Thinking Summary
 
@@ -712,6 +712,7 @@ _避免使用_：SDK、npm package、Provider（当指接入定义）、把基�
 ## Vendor Plugin
 
 Vendor Plugin 是实现一个 Vendor 的可安装、版本化软件包，可包含多个 channel，并提供模型推理、完整联网搜索、媒体生成中的一种或多种能力，不以模型推理为必备能力。一个基础插件实现一个覆盖多个供应商 Profile 的回退 Vendor，而不是导出多个 Vendor 身份；专属插件完整接管匹配的供应商 Profile。它不是已保存的 Provider 连接，也不是供多个插件复用的 Protocol Codec。
+私有上游协议的身份由插件声明并作为不透明字符串保留，不进入宿主共享协议枚举；私有 wire 与表达能力判断归所属插件。channel 可以精确声明需读取的额外非凭据客户端头，宿主按当前目标及通用安全规则提供上下文，不按供应商名字补齐权限。
 _避免使用_：Provider 连接、Protocol Codec
 
 ## Vendor Credential Authorization

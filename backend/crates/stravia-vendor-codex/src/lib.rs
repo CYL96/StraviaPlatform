@@ -26,6 +26,14 @@ use stravia_vendor_sdk::{
 const VENDOR_ID: &str = "openai-codex";
 const CATALOG_ID: &str = "openai";
 const CHANNEL: &str = "codex";
+/// Non-credential client metadata requested by this channel and forwarded upstream.
+const CODEX_CLIENT_HEADER_NAMES: [&str; 5] = [
+    "x-codex-beta-features",
+    "x-codex-installation-id",
+    "x-codex-turn-metadata",
+    "x-codex-turn-state",
+    "x-codex-window-id",
+];
 /// Spoofed Codex CLI version sent on every request. The backend version-gates
 /// model availability for `/models` and `/responses` by exact client version
 /// rather than the catalog's `minimal_client_version`; an older pin silently
@@ -100,6 +108,10 @@ pub fn descriptor() -> VendorDescriptor {
                 default_models_source: None,
                 consumes_catalog_models: false,
                 capabilities: capabilities.clone(),
+                client_header_names: CODEX_CLIENT_HEADER_NAMES
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
                 model_capabilities: BTreeSet::new(),
             }],
             capabilities,

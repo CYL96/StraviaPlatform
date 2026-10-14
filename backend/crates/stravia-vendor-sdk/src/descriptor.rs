@@ -260,10 +260,73 @@ pub struct ChannelDescriptor {
     pub consumes_catalog_models: bool,
     /// Capabilities actually usable through this channel. Non-empty.
     pub capabilities: BTreeSet<Capability>,
+    /// Extra client request headers this channel may read, matched exactly.
+    /// Names must be lowercase HTTP tokens; credentials and hop-by-hop headers
+    /// remain forbidden even when declared. An omitted set grants no access.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub client_header_names: BTreeSet<String>,
     /// Positive model capability defaults, supplemented by discovered model
     /// metadata. Explicit negative canonical model facts still take precedence.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub model_capabilities: BTreeSet<String>,
+}
+
+impl ChannelDescriptor {
+    /// Whether this channel may read an additional client header. Rechecks the
+    /// safety policy so unvalidated descriptors cannot grant unsafe access.
+    pub fn allows_client_header(&self, lowercase_name: &str) -> bool {
+        self.client_header_names.contains(lowercase_name)
+            && valid_client_header_name(lowercase_name)
+    }
+}
+
+fn valid_client_header_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.bytes().all(|byte| {
+            byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || matches!(
+                    byte,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
+        && !matches!(
+            name,
+            "authorization"
+                | "proxy-authorization"
+                | "www-authenticate"
+                | "proxy-authenticate"
+                | "authentication-info"
+                | "proxy-authentication-info"
+                | "cookie"
+                | "cookie2"
+                | "set-cookie"
+                | "set-cookie2"
+                | "x-api-key"
+                | "api-key"
+                | "x-goog-api-key"
+                | "connection"
+                | "proxy-connection"
+                | "keep-alive"
+                | "transfer-encoding"
+                | "upgrade"
+                | "host"
+                | "content-length"
+                | "te"
+                | "trailer"
+        )
 }
 
 /// Simple conditional display for a config field. No expressions or scripts.
@@ -624,6 +687,14 @@ impl ProviderDescriptor {
             if ch.capabilities.is_empty() {
                 return Err(DescriptorError::ChannelWithoutCapabilities(ch.id.clone()));
             }
+            for name in &ch.client_header_names {
+                if !valid_client_header_name(name) {
+                    return Err(DescriptorError::InvalidClientHeaderName {
+                        channel: ch.id.clone(),
+                        name: name.clone(),
+                    });
+                }
+            }
             if ch.default_models_source == Some(DefaultModelsSource::Catalog)
                 && !ch.consumes_catalog_models
             {
@@ -875,6 +946,8 @@ pub enum DescriptorError {
     DuplicateChannel(String),
     #[error("channel `{0}` declares no capabilities")]
     ChannelWithoutCapabilities(String),
+    #[error("channel `{channel}` declares forbidden or invalid client header `{name}`")]
+    InvalidClientHeaderName { channel: String, name: String },
     #[error("channel `{0}` declares an invalid authentication callback policy")]
     InvalidAuthPolicy(String),
     #[error(
@@ -975,6 +1048,7 @@ mod tests {
                 default_models_source: None,
                 consumes_catalog_models: false,
                 capabilities: capabilities.clone(),
+                client_header_names: BTreeSet::new(),
                 model_capabilities: BTreeSet::new(),
             }],
             capabilities,
@@ -984,6 +1058,94 @@ mod tests {
             config_fields: Vec::new(),
             network: NetworkDeclaration::default(),
             data_compat: DataCompatibility::default(),
+        }
+    }
+
+    #[test]
+    fn client_header_declarations_are_exact_and_optional() {
+        let mut profile = provider("alpha");
+        assert!(!profile.channels[0].allows_client_header("x-client-metadata"));
+        profile.channels[0].client_header_names =
+            BTreeSet::from(["x-client-metadata".into(), "x-client-trace".into()]);
+        assert!(
+            manifest("alpha", VendorKind::Dedicated, vec![profile.clone()])
+                .validate()
+                .is_ok()
+        );
+        let channel = &profile.channels[0];
+        assert!(channel.allows_client_header("x-client-metadata"));
+        assert!(channel.allows_client_header("x-client-trace"));
+        assert!(!channel.allows_client_header("x-client-metadata-extra"));
+        assert!(!channel.allows_client_header("X-Client-Metadata"));
+        assert!(!channel.allows_client_header("x-client-*"));
+        let encoded = serde_json::to_value(channel).unwrap();
+        assert_eq!(
+            encoded["client_header_names"],
+            serde_json::json!(["x-client-metadata", "x-client-trace"])
+        );
+        let decoded: ChannelDescriptor = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded, *channel);
+
+        let mut legacy = serde_json::to_value(&provider("alpha").channels[0]).unwrap();
+        assert!(legacy.get("client_header_names").is_none());
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("client_header_names");
+        let decoded: ChannelDescriptor = serde_json::from_value(legacy).unwrap();
+        assert!(decoded.client_header_names.is_empty());
+        assert!(!decoded.allows_client_header("x-client-metadata"));
+    }
+
+    #[test]
+    fn unsafe_client_header_declarations_are_rejected_without_runtime_grants() {
+        for name in [
+            "",
+            "X-Client-Metadata",
+            "x-client-*",
+            "*",
+            "x client",
+            "x:client",
+            "x/client",
+            "x\r\nclient",
+            "x\tclient",
+            "x-client-\u{7f}",
+            "x-cliënt",
+            "authorization",
+            "proxy-authorization",
+            "www-authenticate",
+            "proxy-authenticate",
+            "authentication-info",
+            "proxy-authentication-info",
+            "cookie",
+            "cookie2",
+            "set-cookie",
+            "set-cookie2",
+            "x-api-key",
+            "api-key",
+            "x-goog-api-key",
+            "connection",
+            "proxy-connection",
+            "keep-alive",
+            "transfer-encoding",
+            "upgrade",
+            "host",
+            "content-length",
+            "te",
+            "trailer",
+        ] {
+            let mut profile = provider("alpha");
+            profile.channels[0].client_header_names.insert(name.into());
+            // Runtime authorization must also reject descriptors not yet validated.
+            assert!(!profile.channels[0].allows_client_header(name), "{name:?}");
+            assert_eq!(
+                manifest("alpha", VendorKind::Dedicated, vec![profile]).validate(),
+                Err(DescriptorError::InvalidClientHeaderName {
+                    channel: "default".into(),
+                    name: name.into(),
+                }),
+                "{name:?}",
+            );
         }
     }
 

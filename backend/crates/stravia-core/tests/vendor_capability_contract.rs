@@ -171,6 +171,7 @@ impl Drop for LocalUpstream {
 struct CapturedRequest {
     path: String,
     body: Value,
+    headers: HeaderMap,
     state_before: Option<String>,
 }
 
@@ -314,6 +315,7 @@ async fn upstream_handler(
     state.requests.lock().await.push(CapturedRequest {
         path: path.clone(),
         body,
+        headers,
         state_before,
     });
     let reply = state
@@ -2933,9 +2935,23 @@ async fn manually_installed_codex_component_reuses_one_connection_for_search_and
             ),
         )
         .await;
-    let inferred = reqwest::Client::new()
+    assert_eq!(codex.client_header_names.len(), 5);
+    let declared_headers: Vec<_> = codex
+        .client_header_names
+        .iter()
+        .enumerate()
+        .map(|(index, name)| (name.to_ascii_uppercase(), format!("client-context-{index}")))
+        .collect();
+    let mut infer_request = reqwest::Client::new()
         .post(harness.endpoint.trim_end_matches("/mcp").to_owned() + "/v1/responses")
         .bearer_auth(&harness.token)
+        .header("cookie", "client-session=never-upstream")
+        .header("idempotency-key", "public-client-request")
+        .header("x-undeclared-plugin-context", "never-upstream");
+    for (name, value) in &declared_headers {
+        infer_request = infer_request.header(name.as_str(), value.as_str());
+    }
+    let inferred = infer_request
         .json(&json!({"model":route.model_id,"input":"Codex inference through Wasm"}))
         .send()
         .await?;
@@ -3061,6 +3077,36 @@ async fn manually_installed_codex_component_reuses_one_connection_for_search_and
     let requests = upstream.requests().await;
     assert_eq!(requests.len(), 4);
     assert!(requests.iter().all(|request| request.path == "/responses"));
+    for (name, value) in &declared_headers {
+        assert_eq!(
+            requests[0]
+                .headers
+                .get(name.to_ascii_lowercase().as_str())
+                .and_then(|value| value.to_str().ok()),
+            Some(value.as_str()),
+            "declared client header {name}",
+        );
+    }
+    assert_eq!(
+        requests[0]
+            .headers
+            .get("idempotency-key")
+            .and_then(|value| value.to_str().ok()),
+        Some("public-client-request"),
+    );
+    assert_eq!(
+        requests[0]
+            .headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok()),
+        Some("Bearer controlled-codex-token-not-production"),
+    );
+    assert!(!requests[0].headers.contains_key("cookie"));
+    assert!(
+        !requests[0]
+            .headers
+            .contains_key("x-undeclared-plugin-context")
+    );
     assert_eq!(requests[0].body["model"], "gpt-5.4");
     assert_eq!(requests[1].body["model"], "gpt-5.4");
     assert!(

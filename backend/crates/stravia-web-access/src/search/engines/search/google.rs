@@ -85,7 +85,7 @@ fn search_url(search: &SearchQuery) -> Url {
     let query = search.query_with_allowed_domains();
     Url::parse_with_params(
         "https://www.google.com/search",
-        &[
+        [
             ("q", query.as_ref()),
             // nfpr makes it not try to autocorrect
             ("nfpr", "1"),
@@ -296,7 +296,7 @@ fn recursive_iter_featured_snippet_children(description: &mut String, el: &Eleme
 pub fn request_autocomplete(query: &str, _client: &HttpClient) -> anyhow::Result<Request> {
     let url = Url::parse_with_params(
         "https://suggestqueries.google.com/complete/search",
-        &[
+        [
             ("output", "firefox"),
             ("client", "firefox"),
             ("hl", "US-en"),

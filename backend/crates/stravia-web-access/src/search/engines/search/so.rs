@@ -73,8 +73,7 @@ pub(crate) async fn render_response(search: &SearchQuery) -> anyhow::Result<Engi
 
 fn search_url(search: &SearchQuery) -> Url {
     let query = search.query_with_allowed_domains();
-    Url::parse_with_params(SO_SEARCH_URL, &[("q", query.as_ref())])
-        .expect("360 search URL is valid")
+    Url::parse_with_params(SO_SEARCH_URL, [("q", query.as_ref())]).expect("360 search URL is valid")
 }
 
 pub fn parse_response(body: &str) -> anyhow::Result<EngineResponse> {

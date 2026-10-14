@@ -1682,6 +1682,7 @@ fn channel(
         default_models_source,
         consumes_catalog_models: false,
         capabilities: capabilities.iter().copied().collect::<BTreeSet<_>>(),
+        client_header_names: BTreeSet::new(),
         model_capabilities: BTreeSet::new(),
     }
 }

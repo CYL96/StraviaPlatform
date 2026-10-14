@@ -93,6 +93,7 @@ impl HostServices for MockServices {
         _headers: Vec<(String, String)>,
         _protocols: Vec<String>,
         _continuation_id: Option<String>,
+        _reuse_max_age_millis: Option<u64>,
     ) -> Result<Arc<dyn HostWebSocket>, HostFailure> {
         Err(HostFailure::new(
             ErrorKind::Trapped,
@@ -470,6 +471,7 @@ impl HostServices for RealServices {
         _headers: Vec<(String, String)>,
         _protocols: Vec<String>,
         _continuation_id: Option<String>,
+        _reuse_max_age_millis: Option<u64>,
     ) -> Result<Arc<dyn HostWebSocket>, HostFailure> {
         Err(HostFailure::new(
             ErrorKind::Trapped,

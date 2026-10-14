@@ -218,7 +218,8 @@ pub struct ProviderSnapshot {
     pub provider_id: String,
     pub channel: String,
     pub base_url: String,
-    /// Canonical selected egress protocol endpoint or host-defined alias.
+    /// Configured egress hint or guest-selected identity. Private identities
+    /// remain opaque and need not resolve to a host codec.
     pub protocol: String,
     #[serde(default)]
     pub options: BTreeMap<String, Value>,
@@ -226,7 +227,8 @@ pub struct ProviderSnapshot {
     pub credentials: BTreeMap<String, Value>,
     pub model: Option<String>,
     pub model_metadata: Option<ModelMetadata>,
-    /// Host-filtered inbound headers for this operation only.
+    /// Host-filtered inbound headers for this operation only: standard public
+    /// headers plus safe names explicitly requested by the selected channel.
     #[serde(default)]
     pub client_headers: Vec<(String, String)>,
     /// Host-owned non-secret request/session metadata.
@@ -1147,6 +1149,7 @@ mod profile_admission_tests {
                 default_models_source: None,
                 consumes_catalog_models: false,
                 capabilities: capabilities.clone(),
+                client_header_names: BTreeSet::new(),
                 model_capabilities: BTreeSet::new(),
             }],
             capabilities,

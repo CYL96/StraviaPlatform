@@ -132,43 +132,6 @@ impl Config {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{Config, PartialConfig};
-    use crate::search::engines::Engine;
-
-    #[test]
-    fn rejects_removed_image_search_configuration() {
-        assert!(toml::from_str::<PartialConfig>("[image_search]\nenabled = false\n").is_err());
-    }
-
-    #[test]
-    fn rejects_removed_search_engines() {
-        for engine in ["rightdao", "stract", "yep"] {
-            let config = format!("[engines]\n{engine} = false\n");
-            assert!(toml::from_str::<PartialConfig>(&config).is_err());
-        }
-    }
-
-    #[test]
-    fn enables_360_and_sogou_weixin_search() {
-        let partial = toml::from_str(
-            r#"
-                [engines]
-                "360" = true
-                sogou_weixin = true
-            "#,
-        )
-        .unwrap();
-        let mut config = Config::default();
-
-        config.overlay(partial);
-
-        assert!(config.engines.get(Engine::So360).enabled);
-        assert!(config.engines.get(Engine::SogouWeixin).enabled);
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct EnginesConfig {
     pub map: HashMap<Engine, EngineConfig>,
@@ -309,5 +272,42 @@ impl UrlsConfig {
             let b_len = b.path.len() + b.host.len();
             b_len.cmp(&a_len)
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Config, PartialConfig};
+    use crate::search::engines::Engine;
+
+    #[test]
+    fn rejects_removed_image_search_configuration() {
+        assert!(toml::from_str::<PartialConfig>("[image_search]\nenabled = false\n").is_err());
+    }
+
+    #[test]
+    fn rejects_removed_search_engines() {
+        for engine in ["rightdao", "stract", "yep"] {
+            let config = format!("[engines]\n{engine} = false\n");
+            assert!(toml::from_str::<PartialConfig>(&config).is_err());
+        }
+    }
+
+    #[test]
+    fn enables_360_and_sogou_weixin_search() {
+        let partial = toml::from_str(
+            r#"
+                [engines]
+                "360" = true
+                sogou_weixin = true
+            "#,
+        )
+        .unwrap();
+        let mut config = Config::default();
+
+        config.overlay(partial);
+
+        assert!(config.engines.get(Engine::So360).enabled);
+        assert!(config.engines.get(Engine::SogouWeixin).enabled);
     }
 }

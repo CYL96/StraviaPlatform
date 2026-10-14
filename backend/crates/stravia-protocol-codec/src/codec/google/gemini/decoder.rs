@@ -46,6 +46,21 @@ fn is_plain_auto_tool_config(value: &Value) -> bool {
         && function_calling.get("mode").and_then(Value::as_str) == Some("AUTO")
 }
 
+pub(super) fn decode_tool_choice(value: &Value) -> Option<ToolChoice> {
+    let config = value.get("functionCallingConfig")?;
+    match config.get("mode")?.as_str()? {
+        "AUTO" => Some(ToolChoice::Auto),
+        "NONE" => Some(ToolChoice::None),
+        "ANY" => match config.get("allowedFunctionNames").and_then(Value::as_array) {
+            Some(names) if names.len() == 1 => names[0]
+                .as_str()
+                .map(|name| ToolChoice::Named { name: name.into() }),
+            _ => Some(ToolChoice::Required),
+        },
+        _ => None,
+    }
+}
+
 impl GoogleDecoder {
     pub fn decode_with_model(&self, body: Value, model: &str, stream: bool) -> Result<AiRequest> {
         let req: GoogleRequest = serde_json::from_value(body)?;
@@ -135,10 +150,13 @@ impl GoogleDecoder {
                         defs.push(ToolSpec {
                             name: fd.name.clone(),
                             description: fd.description.clone(),
-                            parameters: fd
-                                .parameters
-                                .clone()
-                                .unwrap_or(Value::Object(Default::default())),
+                            parameters: super::types::normalize_json_schema(
+                                fd.parameters_json_schema
+                                    .as_ref()
+                                    .or(fd.parameters.as_ref())
+                                    .cloned()
+                                    .unwrap_or(Value::Object(Default::default())),
+                            ),
                             strict: None,
                             cache_control: None,
                             meta: None,
@@ -185,7 +203,7 @@ impl GoogleDecoder {
         let temperature = gc.and_then(|c| c.temperature);
         let top_p = gc.and_then(|c| c.top_p);
         let stop = gc.and_then(|c| c.stop_sequences.clone());
-        let seed = gc.and_then(|c| c.seed.map(|s| s as i64));
+        let seed = gc.and_then(|c| c.seed);
         let frequency_penalty = gc.and_then(|c| c.frequency_penalty);
         let presence_penalty = gc.and_then(|c| c.presence_penalty);
 
@@ -244,7 +262,13 @@ impl GoogleDecoder {
             response_logprobs: gc.and_then(|c| c.response_logprobs),
             logprobs: gc.and_then(|c| c.logprobs.map(|v| v as u32)),
             response_mime_type: gc.and_then(|c| c.response_mime_type.clone()),
-            response_json_schema: gc.and_then(|c| c.response_schema.clone()),
+            response_json_schema: gc.and_then(|c| {
+                c.response_json_schema
+                    .as_ref()
+                    .or(c.response_schema.as_ref())
+                    .cloned()
+                    .map(super::types::normalize_json_schema)
+            }),
             tool_config: if plain_auto_tool_config {
                 None
             } else {
@@ -300,7 +324,7 @@ impl GoogleDecoder {
             include_usage: false,
         };
         ai_req.tools = tools_opt;
-        ai_req.tool_choice = plain_auto_tool_config.then_some(ToolChoice::Auto);
+        ai_req.tool_choice = req.tool_config.as_ref().and_then(decode_tool_choice);
         ai_req.reasoning = reasoning;
         ai_req.safety_settings = safety_settings;
         ai_req.ext = Some(ProtocolExt::Google(google_ext));

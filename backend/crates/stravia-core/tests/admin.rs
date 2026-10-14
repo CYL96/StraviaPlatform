@@ -1857,10 +1857,10 @@ async fn confirmed_inventory_check(
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     while std::time::Instant::now() < deadline {
         let state = gw.admin().provider_model_sync_state(id).await?;
-        if !state.in_progress {
-            if let Some(summary) = state.last_check {
-                return Ok(summary);
-            }
+        if !state.in_progress
+            && let Some(summary) = state.last_check
+        {
+            return Ok(summary);
         }
         tokio::task::yield_now().await;
     }

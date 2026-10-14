@@ -80,11 +80,37 @@ struct MockServices {
     requests: Mutex<Vec<HttpRequest>>,
     private_state: Mutex<Option<Vec<u8>>>,
     deltas: Mutex<Vec<AiStreamDelta>>,
+    reject_assistant_prefill: bool,
 }
 
 #[async_trait]
 impl HostServices for MockServices {
     fn http_start(&self, request: HttpRequest) -> Result<Arc<dyn HostHttpResponse>, HostFailure> {
+        if self.reject_assistant_prefill {
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            if body["messages"]
+                .as_array()
+                .and_then(|messages| messages.last())
+                .is_some_and(|message| message["role"] == "assistant")
+            {
+                self.requests.lock().push(request);
+                return Ok(Arc::new(MockResponse {
+                    status: 400,
+                    content_type: "application/json",
+                    body: Mutex::new(Some(
+                        json!({
+                            "type": "error",
+                            "error": {
+                                "type": "invalid_request_error",
+                                "message": "This model does not support assistant message prefill. The conversation must end with a user message."
+                            }
+                        })
+                        .to_string()
+                        .into_bytes(),
+                    )),
+                }));
+            }
+        }
         let route = self
             .routes
             .iter()
@@ -106,6 +132,7 @@ impl HostServices for MockServices {
         _headers: Vec<(String, String)>,
         _protocols: Vec<String>,
         _continuation_id: Option<String>,
+        _reuse_max_age_millis: Option<u64>,
     ) -> Result<Arc<dyn HostWebSocket>, HostFailure> {
         Err(HostFailure::new(
             ErrorKind::Trapped,
@@ -212,6 +239,141 @@ fn sent_cch(body: &[u8]) -> &str {
     let text = std::str::from_utf8(body).unwrap();
     let start = text.find("cch=").unwrap() + 4;
     &text[start..start + 5]
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires task build:vendors:all"]
+async fn responses_tail_prefill_is_dropped_without_losing_completed_tool_history() {
+    let (runtime, plugin) = load_plugin().await;
+    let services = Arc::new(MockServices {
+        routes: vec![(UPSTREAM, 200, "text/event-stream", SSE_TOOL_USE.into())],
+        reject_assistant_prefill: true,
+        ..MockServices::default()
+    });
+    let endpoint = stravia_vendor_common::common::endpoint("open-responses/responses/2026-04-24")
+        .expect("Responses endpoint is registered");
+    let request = ProtocolTransform::global()
+        .bind(endpoint, endpoint)
+        .unwrap()
+        .decode_request(json!({
+            "model": "claude-sonnet-5-5",
+            "input": [
+                {"role": "user", "content": "read the file"},
+                {"type": "function_call", "call_id": "call_read", "name": "read", "arguments": "{\"path\":\"a\"}"},
+                {"type": "function_call_output", "call_id": "call_read", "output": "retained tool result"},
+                {"role": "assistant", "content": "unsupported response prefix"}
+            ]
+        }))
+        .unwrap();
+    let mut provider = signed_in();
+    provider.model = Some("claude-sonnet-5-5".into());
+    let output = run(
+        &runtime,
+        &plugin,
+        &services,
+        OperationInput::Infer { provider, request },
+    )
+    .await
+    .expect("a model without prefill accepts the converted tool continuation");
+    let requests = services.requests.lock();
+    let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    let messages = body["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 3);
+    assert_eq!(messages[0]["content"][0]["text"], "read the file");
+    assert_eq!(messages[1]["content"][0]["id"], "call_read");
+    assert_eq!(messages[1]["content"][0]["name"], "_read");
+    assert_eq!(messages[1]["content"][0]["input"], json!({"path": "a"}));
+    assert_eq!(messages[2]["role"], "user");
+    assert_eq!(messages[2]["content"][0]["tool_use_id"], "call_read");
+    assert_eq!(messages[2]["content"][0]["content"], "retained tool result");
+    let OperationOutput::Infer(response) = output else {
+        panic!("expected parsed Infer output");
+    };
+    assert_eq!(response.id, "msg_1");
+    assert_eq!(response.tool_calls().next().unwrap().name, "read");
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires task build:vendors:all"]
+async fn responses_auto_truncation_sends_complete_tool_continuation_history() {
+    let (runtime, plugin) = load_plugin().await;
+    let services = Arc::new(MockServices {
+        routes: vec![(UPSTREAM, 200, "text/event-stream", SSE_TOOL_USE.into())],
+        ..MockServices::default()
+    });
+    let endpoint = stravia_vendor_common::common::endpoint("open-responses/responses/2026-04-24")
+        .expect("Responses endpoint is registered");
+    let request = ProtocolTransform::global()
+        .bind(endpoint, endpoint)
+        .expect("Responses transform binds")
+        .decode_request(json!({
+            "model": "claude-sonnet-4-5",
+            "truncation": "auto",
+            "max_output_tokens": 128,
+            "tools": [{"type": "function", "name": "read", "description": "Read a file", "parameters": {"type": "object"}}],
+            "input": [
+                {"role": "user", "content": "retain the first turn"},
+                {"type": "function_call", "call_id": "call_read", "name": "read", "arguments": "{\"path\":\"a\"}"},
+                {"type": "function_call_output", "call_id": "call_read", "output": "retained tool result"},
+                {"role": "user", "content": "continue with all history"}
+            ]
+        }))
+        .expect("Responses client request decodes");
+    let output = run(
+        &runtime,
+        &plugin,
+        &services,
+        OperationInput::Infer {
+            provider: signed_in(),
+            request,
+        },
+    )
+    .await
+    .expect("unsupported truncation is omitted and complete tool history reaches Anthropic");
+
+    let requests = services.requests.lock();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].url,
+        "https://api.anthropic.com/v1/messages?beta=true"
+    );
+    let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    let messages = body["messages"]
+        .as_array()
+        .expect("complete Anthropic history");
+    assert_eq!(messages.len(), 3);
+    assert_eq!(messages[0]["role"], "user");
+    assert_eq!(messages[0]["content"].as_array().unwrap().len(), 1);
+    assert_eq!(messages[0]["content"][0]["type"], "text");
+    assert_eq!(messages[0]["content"][0]["text"], "retain the first turn");
+    assert_eq!(messages[1]["role"], "assistant");
+    assert_eq!(messages[1]["content"].as_array().unwrap().len(), 1);
+    let call = &messages[1]["content"][0];
+    assert_eq!(call["type"], "tool_use");
+    assert_eq!(call["id"], "call_read");
+    assert_eq!(call["name"], "_read");
+    assert_eq!(call["input"], json!({"path": "a"}));
+    assert_eq!(messages[2]["role"], "user");
+    assert_eq!(messages[2]["content"].as_array().unwrap().len(), 2);
+    let result = &messages[2]["content"][0];
+    assert_eq!(result["type"], "tool_result");
+    assert_eq!(result["tool_use_id"], "call_read");
+    assert_eq!(result["content"], "retained tool result");
+    assert_eq!(messages[2]["content"][1]["type"], "text");
+    assert_eq!(
+        messages[2]["content"][1]["text"],
+        "continue with all history"
+    );
+
+    let OperationOutput::Infer(response) = output else {
+        panic!("expected parsed Infer output");
+    };
+    assert_eq!(response.id, "msg_1");
+    let calls = response.tool_calls().collect::<Vec<_>>();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].id, "toolu_1");
+    assert_eq!(calls[0].name, "read");
+    assert_eq!(calls[0].arguments, "{\"path\":\"a\"}");
 }
 
 #[tokio::test(flavor = "current_thread")]

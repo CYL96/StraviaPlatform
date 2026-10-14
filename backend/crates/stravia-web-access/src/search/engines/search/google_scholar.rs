@@ -50,7 +50,7 @@ pub(crate) async fn render_response(search: &SearchQuery) -> anyhow::Result<Engi
 fn search_url(search: &SearchQuery) -> Url {
     Url::parse_with_params(
         "https://scholar.google.com/scholar",
-        &[
+        [
             ("hl", "en"),
             ("as_sdt", "0,5"),
             ("q", search.query.as_str()),

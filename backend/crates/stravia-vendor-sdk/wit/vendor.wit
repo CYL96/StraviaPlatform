@@ -1,10 +1,10 @@
-// Stravia vendor plugin contract, version 0.4.
+// Stravia vendor plugin contract, version 0.5.
 //
 // One package = one vendor. The guest orchestrates vendor flows and drives
 // controlled HTTP / WebSocket through host imports; it never gets raw sockets,
 // filesystem, env, or background tasks. Host enforces origin allowlists,
 // backpressure, cancellation, and resource limits.
-package stravia:vendor@0.4.0;
+package stravia:vendor@0.5.0;
 
 /// Types shared between the world exports and the host-side interfaces.
 interface types {
@@ -167,6 +167,12 @@ interface types {
         protocols: list<string>,
         /// Present only for ephemeral continuation; requires the exact local socket tip.
         continuation-id: option<string>,
+        /// Maximum reuse age in milliseconds from the original handshake.
+        /// None keeps the host default; zero disables reuse. The host may cap
+        /// this at its own limit. This never shortens an in-flight response;
+        /// idle sockets expire and completed expired sockets cannot be parked.
+        /// A later checkout may shorten, but never extend, this connection's age.
+        reuse-max-age-millis: option<u64>,
     }
 
     /// WebSocket message kind for the controlled socket interface.

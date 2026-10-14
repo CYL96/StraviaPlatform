@@ -798,7 +798,7 @@ impl RouteModule<'_> {
 
         let latest_provider = self.get_provider(provider_id).await?;
         anyhow::ensure!(
-            same_discovery_provider(&provider, &latest_provider),
+            same_discovery_provider(provider, &latest_provider),
             "Provider changed while synchronizing discovered models"
         );
         let reconciled = !reconciliation.updates.is_empty() || !reconciliation.inserts.is_empty();

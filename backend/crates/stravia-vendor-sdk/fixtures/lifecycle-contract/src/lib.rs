@@ -63,6 +63,7 @@ impl VendorGuest for LifecycleContractVendor {
                     default_models_source: None,
                     consumes_catalog_models: false,
                     capabilities: capabilities.clone(),
+                    client_header_names: BTreeSet::new(),
                     model_capabilities: BTreeSet::new(),
                 }],
                 capabilities,
@@ -288,6 +289,7 @@ impl VendorGuest for LifecycleContractVendor {
                     headers: Vec::new(),
                     protocols: Vec::new(),
                     continuation_id: None,
+                    reuse_max_age_millis: None,
                 })?;
             }
             _ => {}

@@ -26,6 +26,11 @@ impl GuestHost {
         host::http_start(&request)
     }
 
+    /// Connect with the plugin's cross-request reuse policy. A missing
+    /// `reuse_max_age_millis` uses the host default; zero prevents cross-request
+    /// reuse. The host may cap the requested age, measured from the first
+    /// handshake, and later requests cannot extend it. In-flight I/O keeps its
+    /// independent host deadline.
     pub fn ws_connect(&self, request: types::WsRequest) -> Result<WsConnection, PluginError> {
         host::ws_connect(&request)
     }

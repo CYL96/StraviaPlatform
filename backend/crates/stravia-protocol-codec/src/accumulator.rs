@@ -1,5 +1,7 @@
 //! Stream response accumulator: buffers streaming deltas into a complete
 //! `AiResponse` for caching and formatted response aggregation.
+//! Native candidate/choice identities and alternate answers stay in egress
+//! metadata; they never reserve canonical content slots.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -41,6 +43,7 @@ pub struct StreamResponseAccumulator {
     response_metadata: Option<serde_json::Value>,
     chat_reasoning_field: Option<serde_json::Value>,
     google_response_metadata: Option<serde_json::Map<String, serde_json::Value>>,
+    native_metadata: serde_json::Map<String, serde_json::Value>,
     items: Vec<AccumulatedItem>,
     tool_calls: Vec<Option<ToolCall>>,
     completed_items: BTreeMap<usize, AiItem>,
@@ -414,6 +417,44 @@ impl StreamResponseAccumulator {
                         for (key, value) in std::mem::take(metadata) {
                             target.entry(key).or_insert(value);
                         }
+                    } else if let Some(index) = raw
+                        .get("__google_native_candidate_index")
+                        .and_then(serde_json::Value::as_u64)
+                    {
+                        self.native_metadata
+                            .insert("__google_native_candidate_index".into(), index.into());
+                    } else if let Some(index) = raw
+                        .get("__openai_native_choice_index")
+                        .and_then(serde_json::Value::as_u64)
+                    {
+                        self.native_metadata
+                            .insert("__openai_native_choice_index".into(), index.into());
+                    } else if let Some(candidates) = raw
+                        .get_mut("__google_native_candidates")
+                        .and_then(serde_json::Value::as_array_mut)
+                    {
+                        let target = self
+                            .native_metadata
+                            .entry("__google_native_candidates")
+                            .or_insert_with(|| serde_json::Value::Array(Vec::new()))
+                            .as_array_mut()
+                            .expect("native candidates array");
+                        for candidate in std::mem::take(candidates) {
+                            accumulate_native_candidate(target, candidate);
+                        }
+                    } else if let Some(choices) = raw
+                        .get_mut("__openai_native_choices")
+                        .and_then(serde_json::Value::as_array_mut)
+                    {
+                        let target = self
+                            .native_metadata
+                            .entry("__openai_native_choices")
+                            .or_insert_with(|| serde_json::Value::Array(Vec::new()))
+                            .as_array_mut()
+                            .expect("native choices array");
+                        for choice in std::mem::take(choices) {
+                            accumulate_native_choice(target, choice);
+                        }
                     } else if raw.get("__open_responses_event").is_none() {
                         self.items
                             .push(AccumulatedItem::Unknown(AiItem::unknown(raw)));
@@ -454,6 +495,7 @@ impl StreamResponseAccumulator {
             response_metadata,
             chat_reasoning_field,
             google_response_metadata,
+            mut native_metadata,
             items,
             tool_calls,
             completed_items,
@@ -555,6 +597,30 @@ impl StreamResponseAccumulator {
             }
         }
         resp.stop_reason = stop_reason;
+        if let Some(choices) = native_metadata
+            .get_mut("__openai_native_choices")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            for choice in choices {
+                if let Some(calls) = choice
+                    .get_mut("message")
+                    .and_then(|message| message.get_mut("tool_calls"))
+                    .and_then(serde_json::Value::as_array_mut)
+                {
+                    calls.sort_by_key(|call| {
+                        call.get("index")
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or(0)
+                    });
+                    for call in calls {
+                        if let Some(fields) = call.as_object_mut() {
+                            fields.remove("index");
+                        }
+                    }
+                }
+            }
+        }
+        resp.vendor.egress.extend(native_metadata);
         resp.usage = usage;
         if let Some(value) = chat_reasoning_field {
             resp.vendor
@@ -582,6 +648,142 @@ impl StreamResponseAccumulator {
             );
         }
         (resp, ordinals)
+    }
+}
+
+fn accumulate_native_candidate(
+    target: &mut Vec<serde_json::Value>,
+    mut candidate: serde_json::Value,
+) {
+    let index = candidate
+        .get("index")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let Some(current) = target
+        .iter_mut()
+        .find(|value| value.get("index").and_then(serde_json::Value::as_u64) == Some(index))
+    else {
+        target.push(candidate);
+        return;
+    };
+    let Some(fields) = candidate.as_object_mut() else {
+        return;
+    };
+    if let Some(mut content) = fields.remove("content") {
+        if let Some(existing) = current
+            .get_mut("content")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            if let Some(parts) = content
+                .get_mut("parts")
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                existing
+                    .entry("parts")
+                    .or_insert_with(|| serde_json::Value::Array(Vec::new()))
+                    .as_array_mut()
+                    .expect("native parts array")
+                    .append(parts);
+            }
+            if let Some(content_fields) = content.as_object_mut() {
+                content_fields.remove("parts");
+                existing.extend(std::mem::take(content_fields));
+            }
+        } else {
+            current["content"] = content;
+        }
+    }
+    // Candidate-level snapshots (finish reason, safety ratings, etc.) revise
+    // metadata, while streamed parts retain their original encounter order.
+    current
+        .as_object_mut()
+        .expect("native candidate object")
+        .extend(std::mem::take(fields));
+}
+
+fn accumulate_native_choice(target: &mut Vec<serde_json::Value>, mut choice: serde_json::Value) {
+    let index = choice
+        .get("index")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let position = target.iter().position(|value| value.get("index").and_then(serde_json::Value::as_u64) == Some(index))
+        .unwrap_or_else(|| {
+            target.push(serde_json::json!({"index": index, "message": {"role": "assistant"}, "finish_reason": null}));
+            target.len() - 1
+        });
+    let current = &mut target[position];
+    let Some(fields) = choice.as_object_mut() else {
+        return;
+    };
+    if let Some(delta) = fields.remove("delta") {
+        merge_native_chat_delta(&mut current["message"], delta);
+    }
+    if let Some(logprobs) = fields.remove("logprobs").filter(|value| !value.is_null()) {
+        merge_native_chat_delta(&mut current["logprobs"], logprobs);
+    }
+    for (key, value) in std::mem::take(fields) {
+        if !value.is_null() {
+            current[key] = value;
+        }
+    }
+}
+
+fn merge_native_chat_delta(target: &mut serde_json::Value, delta: serde_json::Value) {
+    use serde_json::Value;
+    match delta {
+        Value::Object(fields) => {
+            if !target.is_object() {
+                *target = serde_json::json!({});
+            }
+            for (key, value) in fields {
+                if key == "tool_calls" {
+                    let calls = target
+                        .as_object_mut()
+                        .expect("message object")
+                        .entry(key)
+                        .or_insert_with(|| Value::Array(Vec::new()))
+                        .as_array_mut()
+                        .expect("tool calls array");
+                    for (position, mut call) in
+                        value.as_array().into_iter().flatten().cloned().enumerate()
+                    {
+                        let index = call
+                            .get("index")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(position as u64);
+                        call["index"] = index.into();
+                        if let Some(current) = calls
+                            .iter_mut()
+                            .find(|call| call.get("index").and_then(Value::as_u64) == Some(index))
+                        {
+                            merge_native_chat_delta(current, call);
+                        } else {
+                            calls.push(call);
+                        }
+                    }
+                } else if matches!(key.as_str(), "role" | "type" | "index") {
+                    target[key] = value;
+                } else {
+                    merge_native_chat_delta(&mut target[key], value);
+                }
+            }
+        }
+        Value::String(fragment) => {
+            if let Value::String(text) = target {
+                text.push_str(&fragment);
+            } else {
+                *target = Value::String(fragment);
+            }
+        }
+        Value::Array(mut values) => {
+            if let Value::Array(existing) = target {
+                existing.append(&mut values);
+            } else {
+                *target = Value::Array(values);
+            }
+        }
+        Value::Null => {}
+        value => *target = value,
     }
 }
 
@@ -1427,6 +1629,56 @@ mod tests {
         let response = accumulator.into_ai_response();
 
         assert_eq!(response.items[0].output_text_ref(), Some(""));
+    }
+
+    #[test]
+    fn native_chat_choices_aggregate_without_shifting_canonical_items() {
+        use crate::codec::openai::compatible::stream::{
+            OpenAIResponseFormatter, OpenAIStreamParser,
+        };
+        let mut parser = OpenAIStreamParser::new();
+        let mut accumulator = StreamResponseAccumulator::default();
+        let chunks = [
+            serde_json::json!({"id": "response", "model": "m", "choices": [{"index": 1, "delta": {"role": "assistant", "content": "primary"}, "finish_reason": null}]}),
+            serde_json::json!({"id": "response", "model": "m", "choices": [{"index": 0, "delta": {"role": "assistant", "content": "alter", "tool_calls": [{"index": 0, "id": "call_zero", "type": "function", "function": {"name": "lookup", "arguments": "{\"key\":"}}]}, "finish_reason": null}]}),
+            serde_json::json!({"id": "response", "model": "m", "choices": [
+                {"index": 0, "delta": {"content": "nate", "tool_calls": [{"index": 0, "function": {"arguments": "\"zero\"}"}}]}, "finish_reason": null},
+                {"index": 1, "delta": {"tool_calls": [{"index": 0, "id": "call_one", "type": "function", "function": {"name": "lookup", "arguments": "{\"key\":\"one\"}"}}]}, "finish_reason": null}
+            ]}),
+            serde_json::json!({"id": "response", "model": "m", "choices": [
+                {"index": 0, "delta": {}, "finish_reason": "tool_calls"},
+                {"index": 1, "delta": {}, "finish_reason": "tool_calls"}
+            ], "usage": {"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5}}),
+        ];
+        for chunk in chunks {
+            for delta in parser.parse_chunk(&format!("data: {chunk}\n\n")).unwrap() {
+                accumulator.apply_with_identity(&delta);
+            }
+        }
+        for delta in parser.parse_chunk("data: [DONE]\n\n").unwrap() {
+            accumulator.apply_with_identity(&delta);
+        }
+        let (response, ordinals) = accumulator.into_ai_response_with_ordinals();
+        assert_eq!(response.items.len(), 2);
+        assert_eq!(ordinals, [0, 1]);
+        assert_eq!(
+            response.items[1].function_call_ref().unwrap().id,
+            "call_one"
+        );
+        let output = OpenAIResponseFormatter.format_response(&response);
+        assert_eq!(output["choices"].as_array().unwrap().len(), 2);
+        assert_eq!(output["choices"][0]["index"], 1);
+        assert_eq!(output["choices"][0]["message"]["content"], "primary");
+        assert_eq!(
+            output["choices"][1],
+            serde_json::json!({
+                "index": 0,
+                "message": {"role": "assistant", "content": "alternate", "tool_calls": [{"id": "call_zero", "type": "function", "function": {"name": "lookup", "arguments": "{\"key\":\"zero\"}"}}]},
+                "finish_reason": "tool_calls"
+            })
+        );
+        assert_eq!(output["usage"]["total_tokens"], 5);
+        assert!(!output.to_string().contains("__openai_native"));
     }
 
     #[test]

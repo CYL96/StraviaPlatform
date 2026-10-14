@@ -11,8 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use stravia_protocol_codec::accumulator::StreamResponseAccumulator;
-use stravia_protocol_codec::transform::{ProtocolTransform, TextWireStreamParser};
-use stravia_runtime_contract::protocol::ids::COMMAND_CODE_GENERATE_V1;
+use stravia_protocol_codec::transform::TextWireStreamParser;
 use stravia_runtime_contract::protocol::ir::{AiErrorKind, AiRequest, AiStreamDelta};
 use stravia_vendor_common::{common, thinking};
 #[cfg(target_arch = "wasm32")]
@@ -120,6 +119,7 @@ pub fn descriptor() -> VendorDescriptor {
                 default_models_source: None,
                 consumes_catalog_models: false,
                 capabilities: capabilities.clone(),
+                client_header_names: BTreeSet::new(),
                 model_capabilities: BTreeSet::new(),
             }],
             capabilities,
@@ -196,7 +196,7 @@ pub fn select_protocol(
     if operation != Operation::Infer {
         return Err(unsupported(operation));
     }
-    Ok(COMMAND_CODE_GENERATE_V1.to_string())
+    Ok("command-code/generate/v1".into())
 }
 
 pub fn execute(
@@ -303,11 +303,14 @@ fn infer(
     }
     request.stream.enabled = true;
 
-    common::ensure_no_native_compaction(&request)?;
-    let adapter = CommandCodeGenerateV1;
-    let encoded = ProtocolTransform::encode_request_with(&adapter, request)
-        .map_err(common::map_request_transform_error)?;
-    let mut body = encoded.body;
+    let mut body = CommandCodeGenerateV1
+        .encode_request(request)
+        .map_err(|err| {
+            error(
+                ErrorKind::Invalid,
+                format!("encode Command Code request: {err:#}"),
+            )
+        })?;
     let mut state = read_state(host)?;
     let now_ms = Utc::now().timestamp_millis();
     let session_id = ensure_session(api_key, now_ms, &mut state);
@@ -324,7 +327,7 @@ fn infer(
     host.emit_started()?;
     let response = host.http_start(stravia_vendor_sdk::wit::types::HttpRequest {
         method: "POST".into(),
-        url: format!("{}{}", base_url(&provider), encoded.path),
+        url: format!("{}/alpha/generate", base_url(&provider)),
         headers: inference_headers(api_key, zdr_enabled(&provider), &session_id),
         body,
     })?;

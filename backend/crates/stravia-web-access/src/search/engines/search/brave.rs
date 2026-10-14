@@ -12,7 +12,7 @@ pub async fn request(search: &SearchQuery) -> anyhow::Result<RequestResponse> {
 
 fn search_url(search: &SearchQuery) -> Url {
     let query = search.query_with_allowed_domains();
-    Url::parse_with_params("https://search.brave.com/search", &[("q", query.as_ref())])
+    Url::parse_with_params("https://search.brave.com/search", [("q", query.as_ref())])
         .expect("Brave search URL is valid")
 }
 

@@ -273,13 +273,23 @@ async fn provider_route_and_key(
 }
 
 async fn chat(gateway: Gateway, token: &str, body: Value) -> anyhow::Result<(StatusCode, Value)> {
+    chat_with_headers(gateway, token, body, &[]).await
+}
+
+async fn chat_with_headers(
+    gateway: Gateway,
+    token: &str,
+    body: Value,
+    headers: &[(String, String)],
+) -> anyhow::Result<(StatusCode, Value)> {
+    let mut request = Request::post("/v1/chat/completions")
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-type", "application/json");
+    for (name, value) in headers {
+        request = request.header(name.as_str(), value.as_str());
+    }
     let response = stravia_core::proxy::server::create_router(gateway)
-        .oneshot(
-            Request::post("/v1/chat/completions")
-                .header("authorization", format!("Bearer {token}"))
-                .header("content-type", "application/json")
-                .body(Body::from(serde_json::to_vec(&body)?))?,
-        )
+        .oneshot(request.body(Body::from(serde_json::to_vec(&body)?))?)
         .await?;
     let status = response.status();
     let body = to_bytes(response.into_body(), 16 * 1024 * 1024).await?;
@@ -419,16 +429,41 @@ async fn custom_compatible_connection_can_call_an_explicit_local_upstream_withou
         json!({"id":"local-model","name":"local-model"}),
     )
     .await?;
-    let (status, response) = chat(
+    install_distributed_vendor_plugin(&gateway, "openai-codex").await?;
+    let profiles = gateway.admin().list_vendor_metadata().await?;
+    let declared = &profiles
+        .iter()
+        .find(|profile| profile.provider_id == "openai-codex")
+        .expect("installed Codex profile")
+        .channels
+        .iter()
+        .find(|channel| channel.id == "codex")
+        .expect("Codex channel")
+        .client_header_names;
+    assert_eq!(declared.len(), 5);
+    let mut client_headers: Vec<_> = declared
+        .iter()
+        .map(|name| (name.to_ascii_uppercase(), "other-channel-context".into()))
+        .collect();
+    client_headers.push(("cookie".into(), "client-session=never-upstream".into()));
+    let (status, response) = chat_with_headers(
         gateway,
         &token,
         json!({"model":route,"messages":[{"role":"user","content":"hello"}]}),
+        &client_headers,
     )
     .await?;
     assert_eq!(status, StatusCode::OK, "{response}");
     assert_eq!(response["choices"][0]["message"]["content"], "local answer");
     let requests = server.await??;
     assert!(!requests[0].headers.contains_key("authorization"));
+    assert!(!requests[0].headers.contains_key("cookie"));
+    for name in declared {
+        assert!(
+            !requests[0].headers.contains_key(name),
+            "undeclared target read {name}"
+        );
+    }
     Ok(())
 }
 
@@ -1939,48 +1974,94 @@ async fn azure_builtin_embeddings_use_the_native_endpoint_and_codec_over_wasm() 
 }
 
 #[tokio::test]
-async fn standard_plugin_rejects_an_unrepresentable_hard_requirement_before_network()
+async fn standard_plugin_omits_malformed_tool_arguments_and_delivers_representable_history()
 -> anyhow::Result<()> {
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let base_url = format!("http://{}", listener.local_addr()?);
+    let (base_url, server) = local_upstream(1, |_| {
+        MockResponse::json(json!({
+            "responseId": "gemini-dropped-history",
+            "modelVersion": "upstream-model",
+            "candidates": [{
+                "content": {"role": "model", "parts": [{"text": "History received."}]},
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {"promptTokenCount": 3, "candidatesTokenCount": 2, "totalTokenCount": 5}
+        }))
+    })
+    .await?;
     let (_directory, gateway) = gateway().await?;
     let (route, token) = provider_route_and_key(&gateway, "gemini-lossy", ProviderSourceInput::Custom { vendor: "custom".to_string(), channel: "default".to_string(), protocol: Some("google-gemini".to_string()), base_url, models_source: None, static_models: None }, "upstream-model", ProviderCredentialInput::ApiKey { value: "test-key".into() }, Default::default(), json!({"id": "upstream-model", "name": "upstream-model", "reasoning_efforts": ["none", "low", "medium", "high", "xhigh", "max"]}))
     .await?;
     let mut request = standard_client_request(&route);
-    // Tool-call arguments are opaque client-owned bytes. Gemini requires JSON
-    // objects, so this history must be rejected rather than repaired into {}.
-    // Unlike tool strictness, preserving those bytes is not an advisory control.
+    // Gemini requires object arguments. The malformed call is omitted, not
+    // repaired into {}, while valid calls and ordinary history still travel.
     request["messages"] = json!([
         {"role": "user", "content": "Use the lookup tool."},
         {
             "role": "assistant",
             "content": null,
-            "tool_calls": [{
-                "id": "call-lookup",
-                "type": "function",
-                "function": {"name": "lookup", "arguments": "{\"key\":\"value\""}
-            }]
+            "tool_calls": [
+                {
+                    "id": "call-malformed",
+                    "type": "function",
+                    "function": {"name": "malformed_lookup", "arguments": "{\"key\":\"value\""}
+                },
+                {
+                    "id": "call-lookup",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": "{\"key\":\"answer\"}"}
+                }
+            ]
         },
         {"role": "tool", "tool_call_id": "call-lookup", "content": "lookup failed"},
         {"role": "user", "content": "Continue."}
     ]);
 
     let (status, body) = chat(gateway, &token, request).await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(
-        status,
-        StatusCode::BAD_REQUEST,
-        "unrepresentable tool-call arguments were not rejected: {body}"
+        body["choices"][0]["message"]["content"],
+        "History received."
     );
-    assert_eq!(body["error"]["code"], "vendor_request_invalid");
+    assert_eq!(body["choices"][0]["finish_reason"], "stop");
+    assert_eq!(body["usage"]["total_tokens"], 5);
+    assert!(body.get("error").is_none());
+
+    let requests = server.await??;
+    assert_eq!(requests.len(), 1);
+    let upstream: Value = serde_json::from_slice(&requests[0].body)?;
+    let parts = upstream["contents"]
+        .as_array()
+        .expect("Gemini contents")
+        .iter()
+        .flat_map(|content| content["parts"].as_array().expect("Gemini parts"))
+        .collect::<Vec<_>>();
+    assert!(
+        parts
+            .iter()
+            .any(|part| part["text"] == "Use the lookup tool.")
+    );
+    assert!(parts.iter().any(|part| part["text"] == "Continue."));
+    let calls = parts
+        .iter()
+        .filter_map(|part| part.get("functionCall"))
+        .collect::<Vec<_>>();
     assert_eq!(
-        listener.into_std()?.accept().unwrap_err().kind(),
-        std::io::ErrorKind::WouldBlock,
-        "rejected request reached the upstream"
+        calls.len(),
+        1,
+        "malformed calls must be omitted: {upstream}"
     );
+    assert_eq!(calls[0]["name"], "lookup");
+    assert_eq!(calls[0]["args"], json!({"key": "answer"}));
+    assert!(
+        parts
+            .iter()
+            .any(|part| part["functionResponse"]["name"] == "lookup")
+    );
+    assert!(!std::str::from_utf8(&requests[0].body)?.contains("malformed_lookup"));
     Ok(())
 }
 
-async fn assert_native_compaction_rejected(
+async fn assert_native_compaction_omitted(
     gateway: &Gateway,
     token: &str,
     model: &str,
@@ -1992,6 +2073,7 @@ async fn assert_native_compaction_rejected(
         }),
         json!({"input": [
             {"role": "user", "content": "hello"},
+            {"type": "compaction", "encrypted_content": "opaque-compaction-state"},
             {"type": "compaction_trigger"}
         ]}),
     ] {
@@ -2009,9 +2091,10 @@ async fn assert_native_compaction_rejected(
         let status = response.status();
         let body = to_bytes(response.into_body(), 16 * 1024 * 1024).await?;
         let body: Value = serde_json::from_slice(&body)?;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{model}: {body}");
-        assert_eq!(
-            body["error"]["code"], "compaction_unsupported",
+        assert_eq!(status, StatusCode::OK, "{model}: {body}");
+        assert_eq!(body["status"], "completed", "{model}: {body}");
+        assert!(
+            body.get("error").is_none_or(Value::is_null),
             "{model}: {body}"
         );
     }
@@ -2019,25 +2102,71 @@ async fn assert_native_compaction_rejected(
 }
 
 #[tokio::test]
-async fn native_compaction_is_rejected_before_network_by_non_responses_plugins()
--> anyhow::Result<()> {
+async fn non_responses_plugins_omit_native_compaction_and_deliver_inference() -> anyhow::Result<()>
+{
     let (_directory, gateway) = gateway().await?;
     install_distributed_vendor_plugin(&gateway, "command-code").await?;
-    for (vendor, protocol) in [
-        ("custom", "openai-compatible"),
-        ("cohere", "cohere-chat"),
-        ("gateway", "gateway-language-model"),
-        ("command-code", "command-code"),
+    for (vendor, protocol, path, fixture) in [
+        (
+            "custom",
+            "openai-compatible",
+            "/v1/chat/completions",
+            json!({
+                "id": "compaction-drop-chat", "model": "upstream-model",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "done"}, "finish_reason": "stop"}]
+            }),
+        ),
+        (
+            "cohere",
+            "cohere-chat",
+            "/chat",
+            json!({
+                "id": "compaction-drop-cohere",
+                "message": {"role": "assistant", "content": [{"type": "text", "text": "done"}]},
+                "finish_reason": "COMPLETE"
+            }),
+        ),
+        (
+            "gateway",
+            "gateway-language-model",
+            "/language-model",
+            json!({
+                "content": [{"type": "text", "text": "done"}],
+                "finishReason": {"unified": "stop"},
+                "response": {"id": "compaction-drop-gateway", "modelId": "upstream-model"}
+            }),
+        ),
+        (
+            "command-code",
+            "command-code",
+            "/alpha/generate",
+            Value::Null,
+        ),
     ] {
-        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let request_count = if vendor == "command-code" { 4 } else { 2 };
+        let (base_url, server) = local_upstream(request_count, move |request| {
+            if vendor == "command-code" {
+                if request.path == "/alpha/generate" {
+                    MockResponse::bytes(
+                        "text/event-stream",
+                        b"{\"type\":\"text-delta\",\"text\":\"done\"}\n{\"type\":\"finish\",\"finishReason\":\"stop\"}\n".to_vec(),
+                    )
+                } else {
+                    MockResponse::json(json!({"ok": true}))
+                }
+            } else {
+                MockResponse::json(fixture.clone())
+            }
+        })
+        .await?;
         let (route, token) = provider_route_and_key(
             &gateway,
-            &format!("native-rejection-{vendor}"),
+            &format!("native-omission-{vendor}"),
             ProviderSourceInput::Custom {
                 vendor: vendor.into(),
                 channel: "default".into(),
                 protocol: Some(protocol.into()),
-                base_url: format!("http://{}", listener.local_addr()?),
+                base_url,
                 models_source: None,
                 static_models: None,
             },
@@ -2049,18 +2178,25 @@ async fn native_compaction_is_rejected_before_network_by_non_responses_plugins()
             json!({"id": "upstream-model", "name": "upstream-model"}),
         )
         .await?;
-        tokio::select! {
-            result = assert_native_compaction_rejected(&gateway, &token, &route) => result?,
-            request = listener.accept() => {
-                drop(request?);
-                anyhow::bail!("{vendor}: rejected request reached the upstream");
+        assert_native_compaction_omitted(&gateway, &token, &route).await?;
+        let requests = server.await??;
+        let inference_requests = requests
+            .iter()
+            .filter(|request| request.path == path)
+            .collect::<Vec<_>>();
+        assert_eq!(inference_requests.len(), 2, "{vendor}: {requests:?}");
+        for request in inference_requests {
+            let upstream: Value = serde_json::from_slice(&request.body)?;
+            let wire = serde_json::to_string(&upstream)?;
+            assert!(wire.contains("hello"), "{vendor}: {upstream}");
+            for omitted in [
+                "context_management",
+                "compaction",
+                "opaque-compaction-state",
+            ] {
+                assert!(!wire.contains(omitted), "{vendor}: {upstream}");
             }
         }
-        assert_eq!(
-            listener.into_std()?.accept().unwrap_err().kind(),
-            std::io::ErrorKind::WouldBlock,
-            "{vendor}: rejected request reached the upstream"
-        );
     }
     Ok(())
 }
@@ -2324,7 +2460,7 @@ async fn command_code_replays_unmatched_responses_reasoning_before_tool_continua
 #[tokio::test]
 async fn command_code_admin_option_reaches_initialization_and_inference_headers()
 -> anyhow::Result<()> {
-    let (base_url, server) = local_upstream(3, |request| {
+    let (base_url, server) = local_upstream(4, |request| {
         if request.path.contains("generate") {
             // The real upstream labels its NDJSON stream `text/event-stream`.
             MockResponse::bytes(
@@ -2370,8 +2506,26 @@ async fn command_code_admin_option_reaches_initialization_and_inference_headers(
             .is_some_and(|text| text.contains("because"))
     );
 
+    let (status, response) = chat(
+        gateway.clone(),
+        &token,
+        json!({"model": route, "messages": [{"role": "user", "content": "work"}],
+            "response_format": {"type":"json_object"}}),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response["choices"][0]["message"]["content"], "done");
+
     let requests = server.await??;
-    assert_eq!(requests.len(), 3);
+    assert_eq!(requests.len(), 4);
+    for request in requests
+        .iter()
+        .filter(|request| request.path.contains("generate"))
+    {
+        let body: Value = serde_json::from_slice(&request.body)?;
+        assert!(body["params"].get("response_format").is_none());
+        assert_eq!(body["params"]["messages"][0]["content"][0]["text"], "work");
+    }
     assert!(
         requests
             .iter()
@@ -2446,15 +2600,6 @@ async fn command_code_admin_option_reaches_initialization_and_inference_headers(
         let payload: Value = serde_json::from_slice(&response)?;
         assert_eq!(payload, json!({"ok": true}), "{path}");
     }
-    let (status, response) = chat(
-        gateway.clone(),
-        &token,
-        json!({"model": route, "messages": [{"role": "user", "content": "work"}],
-            "response_format": {"type":"json_object"}}),
-    )
-    .await?;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
-    assert_eq!(response["error"]["code"], "vendor_request_invalid");
     Ok(())
 }
 
@@ -2576,7 +2721,7 @@ fn devin_chat_fixture() -> Vec<u8> {
 #[tokio::test]
 async fn manually_installed_devin_discovers_families_assigns_a_router_and_streams_real_protobuf()
 -> anyhow::Result<()> {
-    let (base_url, server) = local_upstream(4, |request| {
+    let (base_url, server) = local_upstream(5, |request| {
         if request.path.ends_with("/GetCliModelConfigs") {
             MockResponse::bytes("application/proto", devin_catalog_fixture())
         } else if request.path.ends_with("/AssignModel") {
@@ -2750,8 +2895,8 @@ async fn manually_installed_devin_discovers_families_assigns_a_router_and_stream
     let status = response.status();
     let body: Value =
         serde_json::from_slice(&to_bytes(response.into_body(), 16 * 1024 * 1024).await?)?;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-    assert_eq!(body["error"]["code"], "compaction_unsupported");
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["output"][0]["content"][0]["text"], "devin answer");
     let (status, response) = chat(gateway.clone(), &key.token, request).await?;
     assert_eq!(status, StatusCode::OK, "{response}");
     assert_eq!(response["choices"][0]["message"]["content"], "devin answer");
@@ -2788,6 +2933,18 @@ async fn manually_installed_devin_discovers_families_assigns_a_router_and_stream
     assert_eq!(body["output"][0]["content"][0]["text"], "devin answer");
 
     let requests = server.await??;
+    for request in requests
+        .iter()
+        .filter(|request| request.path.ends_with("/GetChatMessage"))
+    {
+        assert!(
+            request
+                .body
+                .windows(b"hello".len())
+                .any(|window| window == b"hello"),
+            "omission must preserve the original user text"
+        );
+    }
     let catalog = requests
         .iter()
         .find(|request| request.path.ends_with("/GetCliModelConfigs"))

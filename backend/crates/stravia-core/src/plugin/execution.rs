@@ -232,7 +232,10 @@ impl Gateway {
             .descriptor()
             .provider(vendor_id)
             .ok_or_else(|| anyhow::anyhow!("loaded vendor plugin does not support the provider"))?;
-        provider.protocol = pinned_protocol(descriptor, &provider.channel, &provider.protocol)?;
+        provider.protocol = pinned_protocol(
+            selected_channel(descriptor, &provider.channel)?,
+            &provider.protocol,
+        );
         let origins = resolve_permissions(
             descriptor,
             Some(&provider.base_url),
@@ -628,8 +631,9 @@ impl Gateway {
         }
 
         let mut provider = session.provider.clone();
-        provider.protocol = pinned_protocol(descriptor, &provider.channel, &provider.protocol)?;
-        provider.client_headers = filtered_client_headers(&context.client_headers);
+        let channel = selected_channel(descriptor, &provider.channel)?;
+        provider.protocol = pinned_protocol(channel, &provider.protocol);
+        provider.client_headers = filtered_client_headers(&context.client_headers, channel);
         provider.operation_metadata.extend(context.metadata.clone());
         provider.operation_metadata.insert(
             "egress_protocol".into(),
@@ -887,7 +891,8 @@ fn provider_snapshot(
         .filter(|channel| !channel.is_empty())
         .ok_or_else(|| anyhow::anyhow!("provider channel is missing"))?
         .to_owned();
-    let protocol = pinned_protocol(descriptor, &channel, &connection.provider.protocol)?;
+    let selected_channel = selected_channel(descriptor, &channel)?;
+    let protocol = pinned_protocol(selected_channel, &connection.provider.protocol);
     let mut base_url = connection.provider.base_url.clone();
     if let Some(field) = descriptor.network.base_url_field.as_deref() {
         base_url = configured_string(field, &options, &saved_credentials)
@@ -966,7 +971,7 @@ fn provider_snapshot(
             credentials,
             model: model.map(str::to_owned),
             model_metadata: connection.model.as_ref().map(model_metadata).transpose()?,
-            client_headers: filtered_client_headers(&context.client_headers),
+            client_headers: filtered_client_headers(&context.client_headers, selected_channel),
             operation_metadata,
         },
         use_proxy,
@@ -974,23 +979,25 @@ fn provider_snapshot(
     ))
 }
 
-fn pinned_protocol(
-    descriptor: &stravia_vendor_sdk::ProviderDescriptor,
+fn selected_channel<'a>(
+    descriptor: &'a stravia_vendor_sdk::ProviderDescriptor,
     channel: &str,
-    saved_hint: &str,
-) -> anyhow::Result<String> {
-    let channel = descriptor
+) -> anyhow::Result<&'a stravia_vendor_sdk::ChannelDescriptor> {
+    descriptor
         .channels
         .iter()
         .find(|candidate| candidate.id == channel)
-        .ok_or_else(|| anyhow::anyhow!("vendor channel is not available in the acquired plugin"))?;
+        .ok_or_else(|| anyhow::anyhow!("vendor channel is not available in the acquired plugin"))
+}
+
+fn pinned_protocol(channel: &stravia_vendor_sdk::ChannelDescriptor, saved_hint: &str) -> String {
     // 管理员已选的 wire hint 是连接配置，不能被一次插件更新的默认值覆盖。
     // 缺省值取自本次实际组件；不解析或猜测第三方协议。
-    Ok(if saved_hint.trim().is_empty() {
+    if saved_hint.trim().is_empty() {
         channel.protocol.clone().unwrap_or_default()
     } else {
         saved_hint.to_owned()
-    })
+    }
 }
 
 fn connection_credentials(provider: &Provider) -> anyhow::Result<BTreeMap<String, Value>> {
@@ -1131,12 +1138,15 @@ fn websocket_scope_key(
     }
 }
 
-fn filtered_client_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
+fn filtered_client_headers(
+    headers: &[(String, String)],
+    channel: &stravia_vendor_sdk::ChannelDescriptor,
+) -> Vec<(String, String)> {
     headers
         .iter()
         .filter_map(|(name, value)| {
             let name = name.to_ascii_lowercase();
-            (matches!(
+            let allowed = matches!(
                 name.as_str(),
                 "accept"
                     | "accept-language"
@@ -1147,12 +1157,11 @@ fn filtered_client_headers(headers: &[(String, String)]) -> Vec<(String, String)
                     | "conversation_id"
                     | "thread-id"
                     | "x-client-request-id"
-                    | "x-codex-beta-features"
-                    | "x-codex-installation-id"
-                    | "x-codex-turn-metadata"
-                    | "x-codex-turn-state"
-                    | "x-codex-window-id"
-            ) && !value.contains(['\r', '\n']))
+            ) || channel.allows_client_header(&name);
+            (allowed
+                && !value
+                    .bytes()
+                    .any(|byte| byte.is_ascii_control() && byte != b'\t'))
             .then(|| (name, value.clone()))
         })
         .collect()
@@ -1306,10 +1315,17 @@ impl HostServices for ScopedHostServices {
         headers: Vec<(String, String)>,
         protocols: Vec<String>,
         continuation_id: Option<String>,
+        reuse_max_age_millis: Option<u64>,
     ) -> Result<Arc<dyn HostWebSocket>, HostFailure> {
         self.ensure_current()?;
         self.network
-            .ws_connect(url, headers, protocols, continuation_id)
+            .ws_connect(
+                url,
+                headers,
+                protocols,
+                continuation_id,
+                reuse_max_age_millis,
+            )
             .await
     }
 
@@ -1530,6 +1546,118 @@ fn plugin_storage_failure(error: PluginStorageError) -> HostFailure {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn header_channel(id: &str, names: &[&str]) -> stravia_vendor_sdk::ChannelDescriptor {
+        stravia_vendor_sdk::ChannelDescriptor {
+            id: id.into(),
+            name: stravia_vendor_sdk::LocalizedText::english(id),
+            description: None,
+            auth: None,
+            protocol: None,
+            protocols: Vec::new(),
+            default_base_url: None,
+            default_models_source: None,
+            consumes_catalog_models: false,
+            capabilities: BTreeSet::from([stravia_vendor_sdk::Capability::Infer]),
+            client_header_names: names.iter().map(|name| (*name).into()).collect(),
+            model_capabilities: BTreeSet::new(),
+        }
+    }
+
+    #[test]
+    fn client_header_consumer_uses_exact_channel_declarations_and_preserves_public_headers() {
+        let declared = header_channel("declared", &["x-plugin-context"]);
+        let undeclared = header_channel("undeclared", &[]);
+        let headers = vec![
+            ("X-Plugin-Context".into(), "declared-value".into()),
+            ("x-plugin-context-extra".into(), "not-declared".into()),
+            ("x-other-plugin-context".into(), "not-declared".into()),
+        ];
+        assert_eq!(
+            filtered_client_headers(&headers, &declared),
+            vec![("x-plugin-context".into(), "declared-value".into())],
+        );
+        assert!(filtered_client_headers(&headers, &undeclared).is_empty());
+
+        let public: Vec<_> = [
+            "accept",
+            "accept-language",
+            "idempotency-key",
+            "openai-beta",
+            "session-id",
+            "session_id",
+            "conversation_id",
+            "thread-id",
+            "x-client-request-id",
+        ]
+        .into_iter()
+        .map(|name| (name.into(), "public-value".into()))
+        .collect();
+        assert_eq!(filtered_client_headers(&public, &undeclared), public);
+    }
+
+    #[test]
+    fn client_header_consumer_defends_unvalidated_declarations_and_control_bytes() {
+        let denied = [
+            "authorization",
+            "proxy-authorization",
+            "cookie",
+            "set-cookie",
+            "x-api-key",
+            "api-key",
+            "x-goog-api-key",
+            "connection",
+            "proxy-connection",
+            "keep-alive",
+            "transfer-encoding",
+            "upgrade",
+            "host",
+            "content-length",
+            "te",
+            "trailer",
+            "x-plugin-*",
+            "X-Plugin-Mixed",
+            "invalid header",
+        ];
+        let mut channel = header_channel("unvalidated", &denied);
+        channel
+            .client_header_names
+            .insert("x-plugin-context".into());
+        let headers: Vec<_> = denied
+            .into_iter()
+            .map(|name| (name.into(), "secret".into()))
+            .chain([("x-plugin-unlisted".into(), "not-declared".into())])
+            .collect();
+        assert!(filtered_client_headers(&headers, &channel).is_empty());
+        for byte in (0_u8..=31).filter(|byte| *byte != b'\t').chain([127]) {
+            let value = format!("before{}after", char::from(byte));
+            let headers = vec![
+                ("x-plugin-context".into(), value.clone()),
+                ("accept".into(), value),
+            ];
+            assert!(
+                filtered_client_headers(&headers, &channel).is_empty(),
+                "byte {byte}"
+            );
+        }
+        assert_eq!(
+            filtered_client_headers(
+                &[("X-Plugin-Context".into(), "safe value".into())],
+                &channel
+            ),
+            vec![("x-plugin-context".into(), "safe value".into())],
+        );
+        let legal_values = vec![
+            ("x-plugin-context".into(), "before\tafter".into()),
+            ("accept".into(), "text/plain;\tq=0.8".into()),
+            ("accept-language".into(), "en,\tzh;q=0.8".into()),
+            ("x-plugin-context".into(), "opaque-é".into()),
+        ];
+        assert_eq!(
+            filtered_client_headers(&legal_values, &channel),
+            legal_values
+        );
+    }
 
     fn runtime(kind: ErrorKind, upstream_status: Option<u16>) -> anyhow::Error {
         RuntimeError::from_guest(kind, "diagnostic".to_string(), upstream_status).into()

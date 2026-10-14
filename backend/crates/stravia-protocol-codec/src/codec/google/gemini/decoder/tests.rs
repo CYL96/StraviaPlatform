@@ -1,6 +1,90 @@
 use super::*;
 
 #[test]
+fn decodes_both_official_schema_carriers_and_preserves_native_roundtrip() {
+    use crate::codec::google::gemini::encoder::GoogleEncoder;
+    for (carrier, schema) in [
+        (
+            "responseSchema",
+            serde_json::json!({
+                "type": "OBJECT", "properties": {"answer": {"type": "STRING", "nullable": true}, "items": {"type": "ARRAY", "minItems": "1", "items": {"type": "INTEGER"}}}
+            }),
+        ),
+        (
+            "responseJsonSchema",
+            serde_json::json!({
+                "type": "object", "additionalProperties": false,
+                "$defs": {"entry": {"type": "string"}},
+                "properties": {"answer": {"$ref": "#/$defs/entry"}}
+            }),
+        ),
+    ] {
+        let mut config = serde_json::json!({"responseMimeType": "application/json"});
+        config[carrier] = schema.clone();
+        let request = GoogleDecoder
+            .decode_request(serde_json::json!({"contents": [], "generationConfig": config}))
+            .expect("native schema");
+        let Some(ProtocolExt::Google(ext)) = &request.ext else {
+            panic!("Google extension")
+        };
+        let normalized = ext.response_json_schema.as_ref().expect("canonical schema");
+        if carrier == "responseSchema" {
+            assert_eq!(normalized["type"], "object");
+            assert_eq!(
+                normalized["properties"]["answer"]["type"],
+                serde_json::json!(["string", "null"])
+            );
+            assert!(normalized["properties"]["answer"].get("nullable").is_none());
+            assert_eq!(normalized["properties"]["items"]["minItems"], 1);
+            assert_eq!(
+                normalized["properties"]["items"]["items"]["type"],
+                "integer"
+            );
+        } else {
+            assert_eq!(normalized, &schema);
+        }
+        let (body, _) = GoogleEncoder
+            .encode_request(request)
+            .expect("native roundtrip");
+        assert_eq!(body["generationConfig"][carrier], schema);
+    }
+}
+
+#[test]
+fn decodes_and_roundtrips_native_function_calling_modes() {
+    use crate::codec::google::gemini::encoder::GoogleEncoder;
+    for config in [
+        serde_json::json!({"mode": "AUTO"}),
+        serde_json::json!({"mode": "NONE"}),
+        serde_json::json!({"mode": "ANY"}),
+        serde_json::json!({"mode": "ANY", "allowedFunctionNames": ["lookup"]}),
+        serde_json::json!({"mode": "ANY", "allowedFunctionNames": ["lookup", "search"]}),
+    ] {
+        let request = GoogleDecoder.decode_request(serde_json::json!({"contents": [], "toolConfig": {"functionCallingConfig": config}})).expect("native tool choice");
+        match config["mode"].as_str().unwrap() {
+            "AUTO" => assert!(matches!(request.tool_choice, Some(ToolChoice::Auto))),
+            "NONE" => assert!(matches!(request.tool_choice, Some(ToolChoice::None))),
+            "ANY"
+                if config["allowedFunctionNames"]
+                    .as_array()
+                    .is_some_and(|names| names.len() == 1) =>
+            {
+                assert!(
+                    matches!(&request.tool_choice, Some(ToolChoice::Named { name }) if name == "lookup")
+                )
+            }
+            _ => assert!(matches!(request.tool_choice, Some(ToolChoice::Required))),
+        }
+        let (body, _) = GoogleEncoder
+            .encode_request(request)
+            .expect("native tool choice roundtrip");
+        assert_eq!(body["toolConfig"]["functionCallingConfig"], config);
+    }
+    let request = GoogleDecoder.decode_request(serde_json::json!({"contents": [], "toolConfig": {"functionCallingConfig": {"mode": "UNKNOWN"}}})).expect("unknown mode is not rejected");
+    assert!(request.tool_choice.is_none());
+}
+
+#[test]
 fn decodes_thought_signature_and_function_ids() {
     let request = GoogleDecoder
         .decode_request(serde_json::json!({

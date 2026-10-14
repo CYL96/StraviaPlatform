@@ -1,6 +1,65 @@
 use super::*;
 
 #[test]
+fn projects_nested_cohere_results_without_disguising_media() {
+    use stravia_runtime_contract::protocol::ir::ToolResultContentKind;
+    let mixed = json!([
+        {"type": "text", "text": "keep"},
+        {"type": "input_text", "text": " more"},
+        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "aW1n"}},
+        {"type": "unknown", "text": "drop"}
+    ]);
+    for (kind, content, expected) in [
+        (
+            ToolResultContentKind::ContentBlocks,
+            mixed.clone(),
+            Some("keep more".to_owned()),
+        ),
+        (
+            ToolResultContentKind::Json,
+            mixed.clone(),
+            Some(serde_json::to_string(&mixed).unwrap()),
+        ),
+        (
+            ToolResultContentKind::Json,
+            json!({"type": "image", "business": true}),
+            Some("{\"type\":\"image\",\"business\":true}".to_owned()),
+        ),
+        (
+            ToolResultContentKind::ContentBlocks,
+            json!([{"type": "image"}, {"type": "unknown", "text": "drop"}]),
+            None,
+        ),
+    ] {
+        let mut item = AiItem::function_call_output("call_1", json!("unused"));
+        item.content = MessageContent::Blocks(vec![ContentBlock::ToolResult {
+            tool_use_id: "call_1".into(),
+            content_kind: Some(kind),
+            content,
+            is_error: Some(true),
+            cache_control: None,
+        }]);
+        let (body, _) = CohereChatV2
+            .encode_request(AiRequest::new("command-a", vec![item]))
+            .unwrap();
+        if let Some(expected) = expected {
+            assert_eq!(body["messages"][0]["tool_call_id"], "call_1");
+            let actual = body["messages"][0]["content"].as_str().unwrap();
+            if kind == ToolResultContentKind::Json {
+                assert_eq!(
+                    serde_json::from_str::<Value>(actual).unwrap(),
+                    serde_json::from_str::<Value>(&expected).unwrap()
+                );
+            } else {
+                assert_eq!(actual, expected);
+            }
+        } else {
+            assert_eq!(body["messages"], json!([]));
+        }
+    }
+}
+
+#[test]
 fn encodes_cohere_tool_schema_without_openai_shape() {
     let mut request = AiRequest::new("command-a", vec![AiItem::output_text("hello")]);
     request.items[0].role = Role::User;
@@ -152,4 +211,71 @@ fn drops_protected_only_assistant_without_breaking_tool_pairing() {
     assert_eq!(messages[2]["tool_call_id"], "call_1");
     let body_text = serde_json::to_string(&body).unwrap();
     assert!(!body_text.contains("redacted"));
+}
+
+#[test]
+fn omits_raw_choice_and_file_id_images_preserving_text() {
+    let mut item = AiItem::output_text("keep");
+    item.role = Role::User;
+    item.content = MessageContent::Blocks(vec![
+        ContentBlock::Text {
+            text: "keep".to_owned().into(),
+            cache_control: None,
+        },
+        ContentBlock::Image {
+            source: MediaSource::FileId {
+                file_id: "file_1".into(),
+                detail: None,
+            },
+            detail: None,
+            cache_control: None,
+        },
+    ]);
+    let mut request = AiRequest::new("command-a", vec![item]);
+    request.tool_choice = Some(ToolChoice::Raw(json!({"unsupported": true})));
+    let (body, _) = CohereChatV2.encode_request(request).unwrap();
+    assert!(body.get("tool_choice").is_none());
+    assert_eq!(
+        body["messages"][0]["content"],
+        json!([{"type": "text", "text": "keep"}])
+    );
+}
+
+#[test]
+fn skips_role_specific_unsupported_blocks_preserving_text() {
+    for role in [
+        Role::System,
+        Role::Developer,
+        Role::User,
+        Role::Assistant,
+        Role::Tool,
+    ] {
+        let item = AiItem {
+            role,
+            content: MessageContent::Blocks(vec![
+                ContentBlock::Text {
+                    text: "keep".to_owned().into(),
+                    cache_control: None,
+                },
+                ContentBlock::Image {
+                    source: MediaSource::FileId {
+                        file_id: "file_1".into(),
+                        detail: None,
+                    },
+                    detail: None,
+                    cache_control: None,
+                },
+            ]),
+            tool_calls: None,
+            tool_call_id: Some("call_1".into()),
+            meta: None,
+        };
+        let message = encode_message(&item).unwrap().unwrap();
+        let expected = if role == Role::User {
+            json!([{"type": "text", "text": "keep"}])
+        } else {
+            json!("keep")
+        };
+        assert_eq!(message["content"], expected);
+    }
 }

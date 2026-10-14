@@ -66,6 +66,20 @@ async fn rejects_forbidden_wasi_interfaces_and_versions() {
 }
 
 #[tokio::test]
+async fn rejects_retired_vendor_abi_before_descriptor_admission() {
+    let runtime = VendorRuntime::new().expect("runtime");
+    for name in ["stravia:vendor/host@0.4.0", "stravia:vendor/types@0.4.0"] {
+        let bytes = wat::parse_str(format!("(component (import \"{name}\" (instance)))"))
+            .expect("valid retired-ABI component");
+        match runtime.load(&bytes).await {
+            Err(LoadError::ForbiddenImport(actual)) => assert_eq!(actual, name),
+            Err(other) => panic!("{name}: expected ForbiddenImport, got {other:?}"),
+            Ok(_) => panic!("{name}: retired vendor ABI was admitted"),
+        }
+    }
+}
+
+#[tokio::test]
 async fn rejects_malformed_interface_versions_before_admission() {
     let runtime = VendorRuntime::new().expect("runtime");
     for version in ["0.2.", "0.2.01", "0.2.18446744073709551616"] {

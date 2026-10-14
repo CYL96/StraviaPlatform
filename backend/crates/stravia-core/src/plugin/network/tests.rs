@@ -10,6 +10,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use stravia_runtime_contract::CancellationToken;
 use stravia_vendor_runtime::{HostWebSocket, WebSocketMessage};
+use stravia_vendor_sdk::AiErrorKind;
 use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
 
@@ -22,12 +23,16 @@ use crate::plugin::lifecycle::VendorOperationTracker;
 struct UpstreamState {
     connections: Arc<AtomicUsize>,
     closed: mpsc::UnboundedSender<()>,
+    response_waiting: Arc<tokio::sync::Notify>,
+    response_release: Arc<tokio::sync::Notify>,
 }
 
 struct TestServer {
     url: String,
     connections: Arc<AtomicUsize>,
     closed: mpsc::UnboundedReceiver<()>,
+    response_waiting: Arc<tokio::sync::Notify>,
+    response_release: Arc<tokio::sync::Notify>,
     task: AbortHandle,
 }
 
@@ -61,6 +66,10 @@ async fn websocket_handler(
                         .expect("send real upstream Close");
                     break;
                 }
+                if text == "delayed-response" {
+                    state.response_waiting.notify_one();
+                    state.response_release.notified().await;
+                }
                 if socket
                     .send(AxumMessage::Text(format!("ack:{text}").into()))
                     .await
@@ -88,9 +97,13 @@ async fn test_server() -> TestServer {
     let address = listener.local_addr().expect("local upstream address");
     let connections = Arc::new(AtomicUsize::new(0));
     let (closed_tx, closed) = mpsc::unbounded_channel();
+    let response_waiting = Arc::new(tokio::sync::Notify::new());
+    let response_release = Arc::new(tokio::sync::Notify::new());
     let state = UpstreamState {
         connections: Arc::clone(&connections),
         closed: closed_tx,
+        response_waiting: Arc::clone(&response_waiting),
+        response_release: Arc::clone(&response_release),
     };
     let app = Router::new()
         .route("/socket", get(websocket_handler))
@@ -104,6 +117,8 @@ async fn test_server() -> TestServer {
         url: format!("ws://{address}/socket"),
         connections,
         closed,
+        response_waiting,
+        response_release,
         task: task.abort_handle(),
     }
 }
@@ -127,20 +142,43 @@ fn network(url: &str, pool: Arc<VendorWebSocketPool>) -> VendorNetwork {
         BTreeSet::from([origin]),
         operation,
         CancellationToken::new(),
-        "test".into(),
+        "open-responses".into(),
     )
     .with_websocket_pool(pool, "test-scope".into(), Some("response-id".into()))
 }
 
 async fn checkout(network: &VendorNetwork, url: &str) -> Arc<dyn HostWebSocket> {
+    checkout_with_age(network, url, None).await
+}
+
+async fn checkout_with_age(
+    network: &VendorNetwork,
+    url: &str,
+    reuse_max_age_millis: Option<u64>,
+) -> Arc<dyn HostWebSocket> {
     network
-        .ws_connect(url.to_owned(), Vec::new(), Vec::new(), None)
+        .ws_connect(
+            url.to_owned(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            reuse_max_age_millis,
+        )
         .await
         .expect("connect local WebSocket upstream")
 }
 
 async fn round_trip_and_park(network: &VendorNetwork, url: &str, request: &str) {
-    let socket = checkout(network, url).await;
+    round_trip_and_park_with_age(network, url, request, None).await;
+}
+
+async fn round_trip_and_park_with_age(
+    network: &VendorNetwork,
+    url: &str,
+    request: &str,
+    reuse_max_age_millis: Option<u64>,
+) {
+    let socket = checkout_with_age(network, url, reuse_max_age_millis).await;
     complete_and_park(&socket, request, Some(request)).await;
 }
 
@@ -173,8 +211,24 @@ async fn require_tip(
     tip: &str,
     headers: Vec<(String, String)>,
 ) -> Result<Arc<dyn HostWebSocket>, stravia_vendor_runtime::HostFailure> {
+    require_tip_with_age(network, url, tip, headers, None).await
+}
+
+async fn require_tip_with_age(
+    network: &VendorNetwork,
+    url: &str,
+    tip: &str,
+    headers: Vec<(String, String)>,
+    reuse_max_age_millis: Option<u64>,
+) -> Result<Arc<dyn HostWebSocket>, stravia_vendor_runtime::HostFailure> {
     network
-        .ws_connect(url.to_owned(), headers, Vec::new(), Some(tip.to_owned()))
+        .ws_connect(
+            url.to_owned(),
+            headers,
+            Vec::new(),
+            Some(tip.to_owned()),
+            reuse_max_age_millis,
+        )
         .await
 }
 
@@ -610,7 +664,7 @@ async fn continuation_does_not_cross_scope_affinity_or_credentials() {
     let network = network(&server.url, Arc::clone(&pool));
     let headers = vec![("authorization".into(), "Bearer first".into())];
     let socket = network
-        .ws_connect(server.url.clone(), headers.clone(), Vec::new(), None)
+        .ws_connect(server.url.clone(), headers.clone(), Vec::new(), None, None)
         .await
         .expect("open credential-bound socket");
     complete_and_park(&socket, "response", Some("response")).await;
@@ -853,6 +907,308 @@ fn wire_payloads_preserve_text_media_and_non_utf8_websocket_messages() {
 }
 
 #[tokio::test]
+async fn requested_age_retires_original_connection_and_requires_full_request() {
+    let mut server = test_server().await;
+    let pool = Arc::new(VendorWebSocketPool::default());
+    let network = network(&server.url, pool);
+
+    round_trip_and_park_with_age(&network, &server.url, "first", Some(55 * 60 * 1000)).await;
+    for (elapsed, previous, next) in [
+        (20 * 60, "first", "second"),
+        (20 * 60, "second", "third"),
+        (14 * 60, "third", "latest"),
+    ] {
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(elapsed)).await;
+        tokio::time::resume();
+        let socket = require_tip_with_age(
+            &network,
+            &server.url,
+            previous,
+            Vec::new(),
+            Some(60 * 60 * 1000),
+        )
+        .await
+        .expect("continuation available before requested retirement");
+        complete_and_park(&socket, next, Some(next)).await;
+    }
+    assert_eq!(server.connections.load(Ordering::SeqCst), 1);
+    assert!(server.closed.try_recv().is_err());
+
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(60)).await;
+    tokio::task::yield_now().await;
+    tokio::time::resume();
+    tokio::time::timeout(Duration::from_secs(1), server.closed.recv())
+        .await
+        .expect("idle connection released at its original requested 55-minute deadline")
+        .expect("upstream observed retirement without a new request");
+    let error = require_tip(&network, &server.url, "latest", Vec::new())
+        .await
+        .err()
+        .expect("retired connection-local tip must be unavailable");
+    assert_local_miss(error);
+    assert_eq!(server.connections.load(Ordering::SeqCst), 1);
+
+    round_trip_and_park(&network, &server.url, "full-request").await;
+    assert_eq!(server.connections.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn requested_age_does_not_expire_default_upstream_connections() {
+    let server = test_server().await;
+    let pool = Arc::new(VendorWebSocketPool::default());
+    let generic = network(&server.url, Arc::clone(&pool));
+    let requested = generic.clone().with_websocket_pool(
+        pool,
+        "test-scope".into(),
+        Some("another-affinity".into()),
+    );
+    round_trip_and_park(&generic, &server.url, "generic-tip").await;
+    round_trip_and_park_with_age(
+        &requested,
+        &server.url,
+        "requested-tip",
+        Some(55 * 60 * 1000),
+    )
+    .await;
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(55 * 60)).await;
+    tokio::time::resume();
+
+    let socket = require_tip(&generic, &server.url, "generic-tip", Vec::new())
+        .await
+        .expect("generic upstream retains its 60-minute lifetime");
+    complete_and_park(&socket, "generic-still-live", Some("generic-still-live")).await;
+    let error = require_tip(&requested, &server.url, "requested-tip", Vec::new())
+        .await
+        .err()
+        .expect("requested-age tip retired independently in the shared pool");
+    assert_local_miss(error);
+    assert_eq!(server.connections.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn requested_age_inflight_response_completes_without_reparking_retired_tip() {
+    let mut server = test_server().await;
+    let pool = Arc::new(VendorWebSocketPool::default());
+    let network = network(&server.url, pool);
+    round_trip_and_park_with_age(&network, &server.url, "original-tip", Some(55 * 60 * 1000)).await;
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(54 * 60)).await;
+    tokio::time::resume();
+    let socket = require_tip(&network, &server.url, "original-tip", Vec::new())
+        .await
+        .expect("checkout before retirement");
+    socket
+        .send(WebSocketMessage::Text("delayed-response".into()))
+        .await
+        .expect("start response before retirement");
+    server.response_waiting.notified().await;
+
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(2 * 60)).await;
+    tokio::time::resume();
+    assert!(
+        server.closed.try_recv().is_err(),
+        "retirement must not close an in-flight response"
+    );
+    let error = require_tip(&network, &server.url, "original-tip", Vec::new())
+        .await
+        .err()
+        .expect("exclusive checkout leaves no available original tip");
+    assert_local_miss(error);
+    assert_eq!(server.connections.load(Ordering::SeqCst), 1);
+    round_trip_and_park(&network, &server.url, "new-tip").await;
+    assert_eq!(server.connections.load(Ordering::SeqCst), 2);
+
+    server.response_release.notify_one();
+    assert!(matches!(
+        socket.next().await.expect("finish response after 55 minutes"),
+        Some(WebSocketMessage::Text(text)) if text == "ack:delayed-response"
+    ));
+    let (released, resumed) = tokio::join!(
+        socket.close(Some("expired-tip".into())),
+        require_tip(&network, &server.url, "expired-tip", Vec::new()),
+    );
+    released.expect("release expired response");
+    assert!(
+        !network
+            .response_continuation_available
+            .load(Ordering::Acquire)
+    );
+    let error = resumed
+        .err()
+        .expect("expired park must not restore a continuation tip");
+    assert_local_miss(error);
+    let fresh = require_tip(&network, &server.url, "new-tip", Vec::new())
+        .await
+        .expect("concurrent fresh connection remains reusable");
+    complete_and_park(&fresh, "fresh-continuation", Some("fresh-continuation")).await;
+    assert_eq!(server.connections.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn requested_age_active_connection_keeps_sixty_minute_limit() {
+    let server = test_server().await;
+    let network = network(&server.url, Arc::new(VendorWebSocketPool::default()));
+    let socket = checkout_with_age(&network, &server.url, Some(55 * 60 * 1000)).await;
+    tokio::time::pause();
+    tokio::time::advance(MAX_WEBSOCKET_AGE).await;
+    let error = socket
+        .send(WebSocketMessage::Text("past-active-limit".into()))
+        .await
+        .expect_err("requested reuse age retains the 60-minute active hard limit");
+    tokio::time::resume();
+    assert_eq!(
+        error.kind.model_error_kind(),
+        Some(AiErrorKind::ServiceUnavailable)
+    );
+    assert_eq!(server.connections.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn requested_age_zero_disables_reuse_and_continuation() {
+    let mut server = test_server().await;
+    let network = network(&server.url, Arc::new(VendorWebSocketPool::default()));
+    round_trip_and_park(&network, &server.url, "existing-tip").await;
+
+    // A full request with zero age must not borrow even an otherwise reusable socket.
+    round_trip_and_park_with_age(&network, &server.url, "zero-tip", Some(0)).await;
+    assert_eq!(server.connections.load(Ordering::SeqCst), 2);
+    tokio::time::timeout(Duration::from_secs(1), server.closed.recv())
+        .await
+        .expect("zero-age socket released immediately")
+        .expect("upstream observed zero-age release");
+    assert_local_miss(
+        require_tip(&network, &server.url, "zero-tip", Vec::new())
+            .await
+            .err()
+            .expect("zero-age completed response cannot be reused"),
+    );
+    assert_local_miss(
+        require_tip_with_age(&network, &server.url, "existing-tip", Vec::new(), Some(0))
+            .await
+            .err()
+            .expect("zero-age continuation cannot borrow an existing socket"),
+    );
+    assert_eq!(server.connections.load(Ordering::SeqCst), 2);
+    round_trip_and_park(&network, &server.url, "full-request").await;
+    assert_eq!(server.connections.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn requested_age_above_sixty_minutes_is_capped() {
+    let mut server = test_server().await;
+    let network = network(&server.url, Arc::new(VendorWebSocketPool::default()));
+    round_trip_and_park_with_age(&network, &server.url, "first", Some(u64::MAX)).await;
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(59 * 60)).await;
+    tokio::time::resume();
+    let socket = require_tip_with_age(&network, &server.url, "first", Vec::new(), Some(u64::MAX))
+        .await
+        .expect("capped socket remains reusable before sixty minutes");
+    complete_and_park(&socket, "latest", Some("latest")).await;
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(60)).await;
+    tokio::time::resume();
+    tokio::time::timeout(Duration::from_secs(1), server.closed.recv())
+        .await
+        .expect("capped socket released at sixty minutes")
+        .expect("upstream observed capped release");
+    assert_local_miss(
+        require_tip(&network, &server.url, "latest", Vec::new())
+            .await
+            .err()
+            .expect("requested age cannot exceed the sixty-minute cap"),
+    );
+    assert_eq!(server.connections.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn requested_age_shorter_checkout_tightens_original_deadline() {
+    let mut server = test_server().await;
+    let network = network(&server.url, Arc::new(VendorWebSocketPool::default()));
+    round_trip_and_park(&network, &server.url, "first").await;
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(20 * 60)).await;
+    tokio::time::resume();
+    let socket = require_tip_with_age(
+        &network,
+        &server.url,
+        "first",
+        Vec::new(),
+        Some(55 * 60 * 1000),
+    )
+    .await
+    .expect("shorter checkout remains before original handshake deadline");
+    complete_and_park(&socket, "shortened", Some("shortened")).await;
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(34 * 60)).await;
+    tokio::time::resume();
+    let socket = require_tip(&network, &server.url, "shortened", Vec::new())
+        .await
+        .expect("default checkout cannot extend the shortened deadline");
+    complete_and_park(&socket, "latest", Some("latest")).await;
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(60)).await;
+    tokio::time::resume();
+    tokio::time::timeout(Duration::from_secs(1), server.closed.recv())
+        .await
+        .expect("shortened socket retires at handshake plus fifty-five minutes")
+        .expect("upstream observed shortened release");
+    assert_local_miss(
+        require_tip(&network, &server.url, "latest", Vec::new())
+            .await
+            .err()
+            .expect("shortened tip unavailable"),
+    );
+    assert_eq!(server.connections.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn requested_age_shorter_checkout_retires_only_matching_affinity() {
+    let mut server = test_server().await;
+    let pool = Arc::new(VendorWebSocketPool::default());
+    let matching = network(&server.url, Arc::clone(&pool));
+    let other = matching.clone().with_websocket_pool(
+        pool,
+        "test-scope".into(),
+        Some("another-affinity".into()),
+    );
+    // Identical tips ensure that affinity, not the response ID, isolates retirement.
+    round_trip_and_park(&matching, &server.url, "shared-tip").await;
+    round_trip_and_park(&other, &server.url, "shared-tip").await;
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(30 * 60)).await;
+    tokio::time::resume();
+    assert_local_miss(
+        require_tip_with_age(
+            &matching,
+            &server.url,
+            "shared-tip",
+            Vec::new(),
+            Some(20 * 60 * 1000),
+        )
+        .await
+        .err()
+        .expect("shorter requested age retires matching socket immediately"),
+    );
+    tokio::time::timeout(Duration::from_secs(1), server.closed.recv())
+        .await
+        .expect("matching socket released on shortened checkout")
+        .expect("upstream observed matching release");
+    assert_eq!(server.connections.load(Ordering::SeqCst), 2);
+    let socket = require_tip(&other, &server.url, "shared-tip", Vec::new())
+        .await
+        .expect("different affinity retains its original default lifetime");
+    complete_and_park(&socket, "other-latest", Some("other-latest")).await;
+    assert!(server.closed.try_recv().is_err());
+    round_trip_and_park(&matching, &server.url, "full-request").await;
+    assert_eq!(server.connections.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
 async fn repeated_reuse_does_not_extend_the_connection_lifetime() {
     let server = test_server().await;
     let pool = Arc::new(VendorWebSocketPool::default());
@@ -888,7 +1244,7 @@ async fn repeated_reuse_does_not_extend_the_connection_lifetime() {
 }
 
 #[tokio::test]
-async fn parked_socket_is_released_at_max_age_without_another_request() {
+async fn requested_age_none_releases_parked_socket_at_sixty_minutes() {
     let mut server = test_server().await;
     let pool = Arc::new(VendorWebSocketPool::default());
     let network = network(&server.url, pool);

@@ -26,6 +26,6 @@ Adding OpenAI Responses WebSocket creates a second real way to execute the same 
 - 只有 Client Output Commit 前、且请求是否被接受没有歧义的 transport failure 可以在同一 Target 回退 HTTP/SSE；其后仍服从既有 Inference Run lifecycle。
 - OpenAI direct、base URL override 与 Codex channel 通过 Vendor capability 选择 Responses WebSocket；其他 Vendor 不因 wire shape 相似而自动获得该能力。
 - WebSocket client 复用现有 reqwest proxy、CONNECT、TLS 与认证配置，避免形成绕过管理员网络策略的第二条连接路径。
-- Responses WebSocket 每连接只允许一个 in-flight response，并以 60 分钟 max-age 限制复用。当前不设置本地连接数上限，也不对有 affinity 的连接做 idle 回收；高并发 branch 的资源增长是已接受运维风险。
+- Responses WebSocket 每连接只允许一个 in-flight response，活动连接保留 60 分钟 max-age 边界。插件可通过 `ws-request.reuse-max-age-millis` 声明连接从首次握手成功起算的复用上限（宿主封顶 60 分钟，复用不重置寿命）；Codex 插件声明 55 分钟：闲置时主动释放，新请求不能再复用，已在途的响应不被截断，完成后销毁而不再归池。宿主不识别供应商。退休后沿用下一条规定，以完整 Effective Model Request 在新 socket 上继续。
 - `store=false` continuation 依赖同 socket tip。Affinity 丢失或 sibling 排队后 tip 已前移时，新连接发送完整 Effective Model Request，不把 connection-local upstream ID 带到新 socket。
 - Transport 日志只记录 Target namespace、response/connection ID、连接年龄、fallback/replay 和 close reason；不记录 prompt、content、tool arguments、媒体或 credential。

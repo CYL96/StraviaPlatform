@@ -1178,7 +1178,9 @@ mod tests {
         accumulator.apply_all(deltas);
         let response = accumulator.into_ai_response();
         let mut request = AiRequest::new("swe-2-high", response.items);
+        request.generation.stop = Some(vec!["unsupported stop".into()]);
         stravia_protocol_codec::transform::prepare_thinking_replay(&mut request, |_| true);
+        let snapshot = serde_json::to_value(&request).unwrap();
         let body = encode_get_chat_message_request_with_platform(
             &request,
             "test-token",
@@ -1187,6 +1189,7 @@ mod tests {
             DevinClientPlatform::Linux,
         )
         .unwrap();
+        assert_eq!(serde_json::to_value(&request).unwrap(), snapshot);
         parse_fields(&body)
             .unwrap()
             .iter()

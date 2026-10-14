@@ -132,6 +132,7 @@ impl HostServices for LoopbackServices {
         _: Vec<(String, String)>,
         _: Vec<String>,
         _: Option<String>,
+        _: Option<u64>,
     ) -> Result<Arc<dyn HostWebSocket>, HostFailure> {
         panic!("HTTP-only attempt opened WebSocket")
     }
@@ -448,6 +449,7 @@ struct Recording {
 struct ConnectionRecord {
     headers: BTreeMap<String, String>,
     continuation_id: Option<String>,
+    reuse_max_age_millis: Option<u64>,
 }
 
 struct MockServices {
@@ -494,10 +496,12 @@ impl HostServices for MockServices {
         headers: Vec<(String, String)>,
         _protocols: Vec<String>,
         continuation_id: Option<String>,
+        reuse_max_age_millis: Option<u64>,
     ) -> Result<Arc<dyn HostWebSocket>, HostFailure> {
         self.recorded.connections.lock().push(ConnectionRecord {
             headers: headers.into_iter().collect(),
             continuation_id,
+            reuse_max_age_millis,
         });
         Ok(Arc::new(MockSocket {
             frames: Mutex::new(
@@ -810,6 +814,7 @@ async fn affinity_and_account_headers_follow_actual_codex_frames() {
             panic!("Codex inference returned a different operation");
         };
         assert_eq!(response.id, response_id);
+        assert_eq!(response.output_text(), "你好，我是 ChatGPT。");
     }
 
     let connections = recorded.connections.lock();
@@ -820,6 +825,7 @@ async fn affinity_and_account_headers_follow_actual_codex_frames() {
     assert_eq!(closed.len(), cases.len());
     for (index, (_, previous_id, _, response_id)) in cases.iter().enumerate() {
         assert_eq!(connections[index].continuation_id.as_deref(), *previous_id);
+        assert_eq!(connections[index].reuse_max_age_millis, Some(3_300_000));
         assert_eq!(sent[index]["previous_response_id"].as_str(), *previous_id);
         assert_eq!(sent[index]["type"], "response.create");
         assert_eq!(closed[index].as_deref(), Some(*response_id));

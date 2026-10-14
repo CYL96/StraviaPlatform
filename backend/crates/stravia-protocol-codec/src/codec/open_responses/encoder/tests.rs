@@ -450,25 +450,36 @@ fn continuation_without_new_input_omits_input() {
 }
 
 #[test]
-fn rejects_responses_unsupported_media() {
+fn omits_responses_unsupported_media() {
     let request = AiRequest::new(
         "gpt",
         vec![AiItem {
             role: Role::User,
-            content: MessageContent::Blocks(vec![ContentBlock::Audio {
-                source: MediaSource::Base64 {
-                    media_type: "audio/wav".into(),
-                    data: "aGk=".into(),
+            content: MessageContent::Blocks(vec![
+                ContentBlock::Text {
+                    text: Arc::new("keep".into()),
+                    cache_control: None,
                 },
-            }]),
+                ContentBlock::Audio {
+                    source: MediaSource::Base64 {
+                        media_type: "audio/wav".into(),
+                        data: "aGk=".into(),
+                    },
+                },
+            ]),
             tool_calls: None,
             tool_call_id: None,
             meta: None,
         }],
     );
 
-    let error = ResponsesEncoder.encode_request(request).unwrap_err();
-    assert!(error.to_string().contains("audio"));
+    let (body, _) = ResponsesEncoder.encode_request(request).unwrap();
+    assert_eq!(
+        body["input"][0]["content"],
+        serde_json::json!([
+            {"type": "input_text", "text": "keep"}
+        ])
+    );
 }
 
 #[test]
@@ -500,20 +511,18 @@ fn encodes_canonical_json_schema_for_dated_targets() {
 }
 
 #[test]
-fn rejects_canonical_json_object_for_dated_targets() {
+fn omits_canonical_json_object_for_dated_targets() {
     let mut input = AiItem::output_text("return JSON");
     input.role = Role::User;
     let mut request = AiRequest::new("gpt", vec![input]);
     request.response_format = Some(ResponseFormat::JsonObject);
 
-    let error = ResponsesEncoder
-        .encode_request(request)
-        .expect_err("json_object has no dated representation");
-    assert!(error.to_string().contains("json_object"));
+    let (body, _) = ResponsesEncoder.encode_request(request).unwrap();
+    assert!(body.get("text").is_none());
 }
 
 #[test]
-fn encodes_non_media_tool_payload_as_json_text() {
+fn business_json_tool_payloads_are_preserved_as_json_text() {
     for payload in [
         serde_json::json!({"temperature": 21}),
         serde_json::json!([
@@ -522,30 +531,40 @@ fn encodes_non_media_tool_payload_as_json_text() {
     ] {
         let request = AiRequest::new(
             "gpt",
-            vec![AiItem {
-                role: Role::Tool,
-                content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
-                    tool_use_id: "call_1".into(),
-                    content: payload.clone(),
-                    content_kind: Some(
-                        stravia_runtime_contract::protocol::ir::ToolResultContentKind::Json,
-                    ),
-                    is_error: None,
-                    cache_control: None,
-                }]),
-                tool_calls: None,
-                tool_call_id: Some("call_1".into()),
-                meta: None,
-            }],
+            vec![
+                AiItem::output_text("keep"),
+                AiItem {
+                    role: Role::Tool,
+                    content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                        tool_use_id: "call_1".into(),
+                        content: payload.clone(),
+                        content_kind: Some(
+                            stravia_runtime_contract::protocol::ir::ToolResultContentKind::Json,
+                        ),
+                        is_error: None,
+                        cache_control: None,
+                    }]),
+                    tool_calls: None,
+                    tool_call_id: Some("call_1".into()),
+                    meta: None,
+                },
+            ],
         );
 
         let (body, _) = ResponsesEncoder
             .encode_request(request)
             .expect("encode structured tool result");
-        let output = body["input"][0]["output"]
-            .as_str()
-            .expect("non-media tool output must be JSON text, not a native content array");
-        assert_eq!(serde_json::from_str::<Value>(output).unwrap(), payload);
+        let output = body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["type"] == "function_call_output")
+            .unwrap();
+        assert_eq!(output["call_id"], "call_1");
+        assert_eq!(
+            serde_json::from_str::<Value>(output["output"].as_str().unwrap()).unwrap(),
+            payload
+        );
     }
 }
 
@@ -922,7 +941,7 @@ fn mixed_reasoning_tool_use_split_does_not_reuse_item_identity() {
         "gpt",
         vec![
             item,
-            AiItem::function_call_output("call_1", serde_json::json!({"rows": 2}))
+            AiItem::function_call_output("call_1", serde_json::json!("rows: 2"))
                 .with_graph_metadata(
                     Some("fco_gateway_1".into()),
                     Some(AiItemStatus::Completed),
@@ -987,10 +1006,144 @@ fn mixed_reasoning_tool_use_split_does_not_reuse_item_identity() {
     assert_eq!(input[2]["call_id"], "call_1");
     assert_eq!(input[2]["id"], "fco_gateway_1");
     assert_eq!(input[2]["status"], "completed");
+    assert_eq!(input[2]["output"], "rows: 2");
+}
+
+#[test]
+fn mixed_assistant_media_omission_preserves_text_and_calls() {
+    for with_thinking in [false, true] {
+        let mut blocks = vec![
+            ContentBlock::Text {
+                text: Arc::new("answer".into()),
+                cache_control: None,
+            },
+            ContentBlock::Image {
+                source: MediaSource::Url("https://example.test/image.png".into()),
+                detail: None,
+                cache_control: None,
+            },
+            ContentBlock::File {
+                source: MediaSource::Url("https://example.test/file.pdf".into()),
+                media_type: None,
+            },
+        ];
+        if with_thinking {
+            blocks.insert(
+                0,
+                ContentBlock::Thinking {
+                    thinking: "consider".into(),
+                    signature: None,
+                },
+            );
+        }
+        let mut item = AiItem::output_text("unused");
+        item.content = MessageContent::Blocks(blocks);
+        item.tool_calls = Some(vec![stravia_runtime_contract::protocol::ir::ToolCall {
+            id: "call_1".into(),
+            name: "lookup".into(),
+            arguments: "{}".into(),
+        }]);
+        let (body, _) = ResponsesEncoder
+            .encode_request(AiRequest::new("gpt", vec![item]))
+            .unwrap();
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input.len(), 2);
+        assert!(
+            input
+                .iter()
+                .any(|item| item["type"] == "function_call" && item["call_id"] == "call_1")
+        );
+        let message = input.iter().find(|item| item["type"] == "message").unwrap();
+        let parts = message["content"].as_array().unwrap();
+        assert_eq!(parts.len(), if with_thinking { 2 } else { 1 });
+        assert!(parts.iter().all(|part| part["type"] == "output_text"));
+        assert_eq!(parts.last().unwrap()["text"], "answer");
+    }
+}
+
+#[test]
+fn nested_tool_outputs_filter_mixed_parts_and_omit_unsupported_only_payloads() {
+    let supported = serde_json::json!([
+        {"type": "input_text", "text": "keep"},
+        {"type": "input_image", "image_url": "https://example.test/image.png", "detail": "auto"},
+        {"type": "input_file", "file_url": "https://example.test/file.pdf"}
+    ]);
+    let mut mixed = supported.as_array().unwrap().clone();
+    mixed.insert(
+        1,
+        serde_json::json!({"type": "input_audio", "data": "aGk="}),
+    );
+    mixed.push(serde_json::json!({"temperature": 21}));
+    let result = |payload| {
+        MessageContent::Blocks(vec![ContentBlock::ToolResult {
+            tool_use_id: "call_1".into(),
+            content: payload,
+            content_kind: Some(
+                stravia_runtime_contract::protocol::ir::ToolResultContentKind::ContentBlocks,
+            ),
+            is_error: None,
+            cache_control: None,
+        }])
+    };
+    let content = result(Value::Array(mixed));
+    assert!(tool_output_representable(&content));
+    assert_eq!(encode_tool_output(content.clone()), Some(supported.clone()));
+    assert_eq!(encode_response_tool_output(&content), Some(supported));
+    for payload in [
+        serde_json::json!({"temperature": 21}),
+        serde_json::json!([
+            {"type": "input_audio", "data": "aGk="}
+        ]),
+        serde_json::json!([]),
+        Value::Null,
+    ] {
+        let content = result(payload);
+        assert!(!tool_output_representable(&content));
+        assert_eq!(encode_tool_output(content.clone()), None);
+        assert_eq!(encode_response_tool_output(&content), None);
+    }
+    let mixed_blocks = MessageContent::Blocks(vec![
+        ContentBlock::Text {
+            text: Arc::new("first".into()),
+            cache_control: None,
+        },
+        ContentBlock::ToolResult {
+            tool_use_id: "call_1".into(),
+            content: serde_json::json!([{"type":"input_audio","data":"aGk="}]),
+            content_kind: Some(
+                stravia_runtime_contract::protocol::ir::ToolResultContentKind::ContentBlocks,
+            ),
+            is_error: None,
+            cache_control: None,
+        },
+        ContentBlock::Audio {
+            source: MediaSource::Url("https://example.test/audio.wav".into()),
+        },
+        ContentBlock::ServerToolResult {
+            tool_use_id: "call_1".into(),
+            content: Value::String("last".into()),
+            content_kind: None,
+            server_type: None,
+            cache_control: None,
+        },
+    ]);
+    let expected = serde_json::json!([
+        {"type": "input_text", "text": "first"},
+        {"type": "input_text", "text": "last"}
+    ]);
     assert_eq!(
-        serde_json::from_str::<Value>(input[2]["output"].as_str().expect("output string"))
-            .expect("tool output is JSON text"),
-        serde_json::json!({"rows": 2})
+        encode_tool_output(mixed_blocks.clone()),
+        Some(expected.clone())
+    );
+    assert_eq!(encode_response_tool_output(&mixed_blocks), Some(expected));
+    let content = result(Value::String("".into()));
+    assert_eq!(
+        encode_tool_output(content.clone()),
+        Some(Value::String("".into()))
+    );
+    assert_eq!(
+        encode_response_tool_output(&content),
+        Some(Value::String("".into()))
     );
 }
 

@@ -126,12 +126,18 @@ pub trait HostServices: Send + Sync {
     /// forwarded across origins unless explicitly authorized.
     fn http_start(&self, request: HttpRequest) -> Result<Arc<dyn HostHttpResponse>, HostFailure>;
 
+    /// Connect with a guest-declared maximum age for cross-request reuse.
+    /// `None` uses the host default; zero disables cross-request reuse. Hosts
+    /// may cap the requested age. Age starts at the first handshake, and later
+    /// checkouts may shorten but never extend the deadline. This policy does
+    /// not shorten the independent in-flight I/O deadline.
     async fn ws_connect(
         &self,
         url: String,
         headers: Vec<(String, String)>,
         protocols: Vec<String>,
         continuation_id: Option<String>,
+        reuse_max_age_millis: Option<u64>,
     ) -> Result<Arc<dyn HostWebSocket>, HostFailure>;
 
     async fn read_private_state(&self) -> Result<Option<Vec<u8>>, HostFailure>;

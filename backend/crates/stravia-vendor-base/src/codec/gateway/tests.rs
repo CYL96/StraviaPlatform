@@ -1,4 +1,63 @@
 use super::*;
+
+#[test]
+fn projects_nested_gateway_results_preserving_error_and_json_semantics() {
+    use stravia_runtime_contract::protocol::ir::ToolResultContentKind;
+    let mixed = json!([
+        {"type": "text", "text": "keep"},
+        {"type": "input_text", "text": " more"},
+        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "aW1n"}},
+        {"type": "unknown", "text": "drop"}
+    ]);
+    for (kind, content, expected) in [
+        (
+            ToolResultContentKind::ContentBlocks,
+            mixed.clone(),
+            Some(json!({"type": "error-text", "value": "keep more"})),
+        ),
+        (
+            ToolResultContentKind::Json,
+            mixed.clone(),
+            Some(json!({"type": "error-json", "value": mixed})),
+        ),
+        (
+            ToolResultContentKind::Json,
+            json!({"type": "image", "business": true}),
+            Some(json!({"type": "error-json", "value": {"type": "image", "business": true}})),
+        ),
+        (
+            ToolResultContentKind::ContentBlocks,
+            json!([{"type": "image"}, {"type": "unknown", "text": "drop"}]),
+            None,
+        ),
+    ] {
+        let mut call = AiItem::output_text("calling");
+        call.tool_calls = Some(vec![ToolCall {
+            id: "call_1".into(),
+            name: "weather".into(),
+            arguments: "{}".into(),
+        }]);
+        let mut result = AiItem::function_call_output("call_1", json!("unused"));
+        result.content = MessageContent::Blocks(vec![ContentBlock::ToolResult {
+            tool_use_id: "call_1".into(),
+            content_kind: Some(kind),
+            content,
+            is_error: Some(true),
+            cache_control: None,
+        }]);
+        let (body, _) = GatewayLanguageModelV4
+            .encode_request(AiRequest::new("model", vec![call, result]))
+            .unwrap();
+        if let Some(expected) = expected {
+            let output = &body["prompt"][1]["content"][0];
+            assert_eq!(output["toolCallId"], "call_1");
+            assert_eq!(output["toolName"], "weather");
+            assert_eq!(output["output"], expected);
+        } else {
+            assert_eq!(body["prompt"].as_array().unwrap().len(), 1);
+        }
+    }
+}
 use stravia_runtime_contract::protocol::ir::AiRequest;
 use stravia_runtime_contract::protocol::ir::MessageContent;
 
@@ -155,4 +214,150 @@ fn replays_reasoning_natively_and_drops_protected_only_assistant() {
     assert!(!body_text.contains("sig_protected"));
     assert!(!body_text.contains("enc_protected"));
     assert!(!body_text.contains("redacted"));
+}
+
+#[test]
+fn omits_role_specific_unsupported_blocks_without_stringifying_results() {
+    let names = BTreeMap::from([("call_1".into(), "weather".into())]);
+    for role in [
+        Role::System,
+        Role::Developer,
+        Role::User,
+        Role::Assistant,
+        Role::Tool,
+    ] {
+        let mut item = AiItem {
+            role,
+            content: MessageContent::Blocks(vec![
+                ContentBlock::Text {
+                    text: "keep".to_owned().into(),
+                    cache_control: None,
+                },
+                ContentBlock::Audio {
+                    source: MediaSource::Url("https://example.com/audio.wav".into()),
+                },
+            ]),
+            tool_calls: None,
+            tool_call_id: Some("call_1".into()),
+            meta: None,
+        };
+        let message = encode_message(&item, &names).unwrap().unwrap();
+        match role {
+            Role::System | Role::Developer => assert_eq!(message["content"], json!("keep")),
+            Role::User | Role::Assistant => assert_eq!(
+                message["content"],
+                json!([{"type": "text", "text": "keep"}])
+            ),
+            Role::Tool => assert_eq!(
+                message["content"][0]["output"],
+                json!({"type": "text", "value": "keep"})
+            ),
+        }
+        item.content = MessageContent::Blocks(vec![ContentBlock::Audio {
+            source: MediaSource::Url("https://example.com/audio.wav".into()),
+        }]);
+        assert!(encode_message(&item, &names).unwrap().is_none());
+    }
+    let output = MessageContent::Blocks(vec![
+        ContentBlock::Text {
+            text: "keep".to_owned().into(),
+            cache_control: None,
+        },
+        ContentBlock::ToolResult {
+            tool_use_id: "call_1".into(),
+            content: json!([{"type":"input_audio","data":"aGk="}]),
+            content_kind: Some(
+                stravia_runtime_contract::protocol::ir::ToolResultContentKind::ContentBlocks,
+            ),
+            is_error: None,
+            cache_control: None,
+        },
+    ]);
+    assert_eq!(tool_result_text(&output).unwrap(), "keep");
+    let output = MessageContent::Blocks(vec![ContentBlock::ToolResult {
+        tool_use_id: "call_1".into(),
+        content: json!("plain result"),
+        content_kind: None,
+        is_error: None,
+        cache_control: None,
+    }]);
+    assert_eq!(tool_result_text(&output).unwrap(), "plain result");
+    let image = MessageContent::Blocks(vec![ContentBlock::Image {
+        source: MediaSource::Url("https://example.com/image.png".into()),
+        detail: None,
+        cache_control: None,
+    }]);
+    assert!(encode_content_parts(&image, true).unwrap().is_empty());
+    assert_eq!(encode_content_parts(&image, false).unwrap().len(), 1);
+}
+
+#[test]
+fn preserves_json_tool_results_in_native_output_carrier() {
+    let names = BTreeMap::from([("call_1".into(), "weather".into())]);
+    let item = AiItem::function_call_output("call_1", json!({"temperature": 23}));
+    let message = encode_message(&item, &names).unwrap().unwrap();
+    assert_eq!(
+        message["content"][0]["output"],
+        json!({
+            "type": "json", "value": {"temperature": 23},
+        })
+    );
+}
+
+#[test]
+fn roundtrips_native_tool_output_values_and_errors_without_stringification() {
+    let names = BTreeMap::from([("call_1".into(), "weather".into())]);
+    for output in [
+        json!({"type": "text", "value": "plain"}),
+        json!({"type": "text", "value": ""}),
+        json!({"type": "error-text", "value": "failed"}),
+        json!({"type": "json", "value": "plain"}),
+        json!({"type": "json", "value": {"temperature": 23}}),
+        json!({"type": "error-json", "value": [1,2]}),
+    ] {
+        let item = decode_message(&json!({
+            "role": "tool", "content": [{
+                "type": "tool-result", "toolCallId": "call_1", "toolName": "weather", "output": output,
+            }],
+        })).unwrap();
+        assert_eq!(
+            encode_message(&item, &names).unwrap().unwrap()["content"][0]["output"],
+            output
+        );
+    }
+    for output in [
+        json!({"type": "text", "value": 1}),
+        json!({"type": "json"}),
+        json!({"value": "missing type"}),
+    ] {
+        assert!(decode_message(&json!({
+            "role": "tool", "content": [{"type": "tool-result", "toolCallId": "call_1", "output": output}],
+        })).is_err());
+    }
+}
+
+#[test]
+fn response_omits_malformed_calls_but_preserves_native_json_inputs() {
+    let mut response = AiResponse::new("response", "model");
+    let mut item = AiItem::output_text("keep");
+    item.tool_calls = Some(vec![
+        ToolCall {
+            id: "bad".into(),
+            name: "weather".into(),
+            arguments: "not-json".into(),
+        },
+        ToolCall {
+            id: "valid".into(),
+            name: "weather".into(),
+            arguments: "[1,2]".into(),
+        },
+    ]);
+    response.items.push(item);
+    assert_eq!(
+        GatewayLanguageModelV4.encode_response(&response)["content"],
+        json!([
+            {"type": "text", "text": "keep"},
+            {"type": "tool-call", "toolCallId": "valid", "toolName": "weather", "input": [1,2]},
+        ])
+    );
 }

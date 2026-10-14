@@ -29,27 +29,6 @@ pub struct WebSearchRunPolicy {
     pub allowed_domains: Vec<String>,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn historical_policy_payloads_ignore_the_removed_blocked_domains_field() {
-        let policy: WebSearchRunPolicy = serde_json::from_value(serde_json::json!({
-            "allowed_domains": ["example.com"],
-            "blocked_domains": ["legacy.example"]
-        }))
-        .expect("historical Search Turn payloads must keep deserializing");
-
-        assert_eq!(
-            policy,
-            WebSearchRunPolicy {
-                allowed_domains: vec!["example.com".to_owned()]
-            }
-        );
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SearchCompletion {
@@ -258,5 +237,26 @@ impl WebSearchEvent {
             self,
             Self::Completed(_) | Self::Partial(_) | Self::Failed(_)
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn historical_policy_payloads_ignore_the_removed_blocked_domains_field() {
+        let policy: WebSearchRunPolicy = serde_json::from_value(serde_json::json!({
+            "allowed_domains": ["example.com"],
+            "blocked_domains": ["legacy.example"]
+        }))
+        .expect("historical Search Turn payloads must keep deserializing");
+
+        assert_eq!(
+            policy,
+            WebSearchRunPolicy {
+                allowed_domains: vec!["example.com".to_owned()]
+            }
+        );
     }
 }

@@ -1,6 +1,211 @@
 use super::*;
 
 #[test]
+fn nested_tool_results_project_supported_parts_without_reinterpreting_business_json() {
+    use stravia_runtime_contract::protocol::ir::{ToolCall, ToolResultContentKind};
+
+    let business = serde_json::json!([
+        {"type": "text", "text": "business", "extra": [1, 2]},
+        {"type": "image", "source": {"type": "url", "url": "https://example.invalid/business"}},
+        {"type": "unknown", "raw": {"business": true}}
+    ]);
+    for (content, kind, expected) in [
+        (
+            serde_json::json!([
+                {"type": "text", "text": "first"},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "image-data"}},
+                {"type": "audio", "source": {"type": "base64", "media_type": "audio/wav", "data": "audio-data"}},
+                {"type": "file", "source": {"type": "file_id", "file_id": "file-123"}, "media_type": "application/pdf"},
+                {"type": "video", "source": {"type": "url", "url": "https://example.invalid/video"}, "media_type": "video/mp4"},
+                {"type": "unknown", "raw": {"private": "discard"}},
+                {"type": "unrecognized", "payload": "discard"},
+                {"type": "text", "text": "second"}
+            ]),
+            Some(ToolResultContentKind::ContentBlocks),
+            Some(serde_json::json!({
+                "id": "call_lookup", "name": "lookup", "response": {"result": "firstsecond"},
+                "parts": [
+                    {"inlineData": {"mimeType": "image/png", "data": "image-data"}},
+                    {"inlineData": {"mimeType": "audio/wav", "data": "audio-data"}},
+                    {"fileData": {"fileUri": "file-123", "mimeType": "application/pdf"}},
+                    {"fileData": {"fileUri": "https://example.invalid/video", "mimeType": "video/mp4"}}
+                ]
+            })),
+        ),
+        (
+            serde_json::json!([
+                {"type": "unknown", "raw": {"discard": true}},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "image-only"}}
+            ]),
+            Some(ToolResultContentKind::ContentBlocks),
+            Some(serde_json::json!({
+                "id": "call_lookup", "name": "lookup", "response": {},
+                "parts": [{"inlineData": {"mimeType": "image/png", "data": "image-only"}}]
+            })),
+        ),
+        (
+            business.clone(),
+            Some(ToolResultContentKind::Json),
+            Some(serde_json::json!({
+                "id": "call_lookup", "name": "lookup", "response": {"result": business}
+            })),
+        ),
+        (
+            serde_json::json!([
+                {"type": "unknown", "raw": {"private": "discard"}},
+                {"type": "thinking", "thinking": "discard"}
+            ]),
+            Some(ToolResultContentKind::ContentBlocks),
+            None,
+        ),
+        (
+            serde_json::json!([]),
+            Some(ToolResultContentKind::ContentBlocks),
+            None,
+        ),
+        (
+            serde_json::json!("literal"),
+            Some(ToolResultContentKind::ContentBlocks),
+            Some(serde_json::json!({
+                "id": "call_lookup", "name": "lookup", "response": {"result": "literal"}
+            })),
+        ),
+    ] {
+        let request = AiRequest::new(
+            "model",
+            vec![
+                AiItem {
+                    role: Role::Assistant,
+                    content: MessageContent::Text("".to_owned().into()),
+                    tool_calls: Some(vec![ToolCall {
+                        id: "call_lookup".into(),
+                        name: "lookup".into(),
+                        arguments: "{}".into(),
+                    }]),
+                    tool_call_id: None,
+                    meta: None,
+                },
+                AiItem {
+                    role: Role::Tool,
+                    content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                        tool_use_id: "call_lookup".into(),
+                        content,
+                        content_kind: kind,
+                        is_error: None,
+                        cache_control: None,
+                    }]),
+                    tool_calls: None,
+                    tool_call_id: Some("call_lookup".into()),
+                    meta: None,
+                },
+            ],
+        );
+        let (body, _) = GoogleEncoder
+            .encode_request(request)
+            .expect("encode tool result");
+        let results: Vec<_> = body["contents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|content| content["parts"].as_array().unwrap())
+            .filter_map(|part| part.get("functionResponse"))
+            .collect();
+        if let Some(expected) = expected {
+            assert_eq!(results, vec![&expected]);
+        } else {
+            assert!(
+                results.is_empty(),
+                "unsupported blocks must not become a JSON response"
+            );
+        }
+    }
+}
+
+#[test]
+fn native_function_response_keeps_block_shaped_business_array() {
+    let response = serde_json::json!({"result": [
+        {"type": "text", "text": "business", "extra": [1, 2]},
+        {"type": "image", "source": {"type": "url", "url": "https://example.invalid/business"}}
+    ]});
+    let request = crate::codec::google::gemini::decoder::GoogleDecoder
+        .decode_request(serde_json::json!({"model": "model", "contents": [
+            {"role": "model", "parts": [{"functionCall": {"id": "call_lookup", "name": "lookup", "args": {}}}]},
+            {"role": "user", "parts": [{"functionResponse": {"id": "call_lookup", "name": "lookup", "response": response.clone()}}]}
+        ]})).expect("decode native response");
+    let (body, _) = GoogleEncoder
+        .encode_request(request)
+        .expect("encode native response");
+    assert_eq!(
+        body["contents"][1]["parts"][0]["functionResponse"],
+        serde_json::json!({
+            "id": "call_lookup", "name": "lookup", "response": response
+        })
+    );
+}
+
+#[test]
+fn request_encoder_drops_invalid_tool_arguments_in_all_call_carriers() {
+    use stravia_runtime_contract::protocol::ir::request::ToolCall;
+    for arguments in ["[]", "null", "42", "\"scalar\"", "not JSON", ""] {
+        for as_blocks in [false, true] {
+            let text = ContentBlock::Text {
+                text: "kept".to_owned().into(),
+                cache_control: None,
+            };
+            let content = if as_blocks {
+                MessageContent::Blocks(vec![text])
+            } else {
+                MessageContent::Text("kept".to_owned().into())
+            };
+            let request = AiRequest::new(
+                "model",
+                vec![AiItem {
+                    role: Role::Assistant,
+                    content,
+                    tool_calls: Some(vec![
+                        ToolCall {
+                            id: "bad".into(),
+                            name: "lookup".into(),
+                            arguments: arguments.into(),
+                        },
+                        ToolCall {
+                            id: "good".into(),
+                            name: "lookup".into(),
+                            arguments: "{}".into(),
+                        },
+                    ]),
+                    tool_call_id: None,
+                    meta: None,
+                }],
+            );
+            let (body, _) = GoogleEncoder
+                .encode_request(request)
+                .expect("unsupported arguments are omitted");
+            assert_eq!(
+                body["contents"][0]["parts"],
+                serde_json::json!([
+                    {"text": "kept"}, {"functionCall": {"id": "good", "name": "lookup", "args": {}}}
+                ])
+            );
+        }
+    }
+    for input in [
+        Value::Null,
+        serde_json::json!([]),
+        serde_json::json!(42),
+        serde_json::json!("scalar"),
+    ] {
+        let block = ContentBlock::ToolUse {
+            id: "bad".into(),
+            name: "lookup".into(),
+            input,
+            cache_control: None,
+        };
+        assert!(encode_content_block_for_gemini(block, &HashMap::new()).is_none());
+    }
+}
+
+#[test]
 fn owned_large_text_preserves_wire_content_and_roles() {
     for role in [Role::User, Role::Assistant] {
         for as_block in [false, true] {
@@ -332,7 +537,7 @@ fn chat_history_and_responses_tool_result_keep_gemini_call_pairing() {
 }
 
 #[test]
-fn rejects_unrepresentable_named_tool_choice() {
+fn encodes_named_tool_choice() {
     let mut request = AiRequest::new(
         "model",
         vec![AiItem {
@@ -347,10 +552,14 @@ fn rejects_unrepresentable_named_tool_choice() {
         name: "lookup".into(),
     });
 
-    let error = GoogleEncoder
+    let (body, _) = GoogleEncoder
         .encode_request(request)
-        .expect_err("Gemini encoder cannot silently drop named tool choice");
-    assert!(error.to_string().contains("tool_choice"));
+        .expect("Gemini supports named tool choice");
+    assert_eq!(body["contents"][0]["parts"][0]["text"], "hello");
+    assert_eq!(
+        body["toolConfig"]["functionCallingConfig"],
+        serde_json::json!({"mode": "ANY", "allowedFunctionNames": ["lookup"]})
+    );
 }
 #[test]
 fn encodes_json_schema_response_format_in_generation_config() {
@@ -383,14 +592,90 @@ fn encodes_json_schema_response_format_in_generation_config() {
         "application/json"
     );
     assert_eq!(
-        body["generationConfig"]["responseSchema"]["properties"]["answer"]["type"],
+        body["generationConfig"]["responseJsonSchema"]["properties"]["answer"]["type"],
         "string"
     );
     assert!(
-        body["generationConfig"]["responseSchema"]
+        body["generationConfig"]["responseJsonSchema"]
             .get("$schema")
             .is_none()
     );
+}
+
+#[test]
+fn preserves_json_schema_constraints_and_local_definitions() {
+    let mut request = AiRequest::new("gemini-2.5-flash", vec![]);
+    request.response_format = Some(ResponseFormat::JsonSchema {
+        name: "answer".into(),
+        strict: Some(true),
+        schema: serde_json::json!({
+            "type": "object", "additionalProperties": false,
+            "definitions": {"entry": {"type": "string", "minLength": 3}},
+            "$defs": {"entry": {"type": "number"}},
+            "properties": {
+                "answer": {"$ref": "#/definitions/entry"},
+                "additionalProperties": {"type": "string", "pattern": "x"},
+                "numeric": {"$ref": "#/$defs/entry"}
+            },
+            "required": ["answer"], "unknownConstraint": true
+        }),
+    });
+    request.meta.vendor.ingress.insert(
+        "__google_generation_config".into(),
+        serde_json::json!({"responseSchema": {"type": "OBJECT"}}),
+    );
+    let (body, _) = GoogleEncoder
+        .encode_request(request)
+        .expect("structured schema");
+    let schema = &body["generationConfig"]["responseJsonSchema"];
+    assert!(body["generationConfig"].get("responseSchema").is_none());
+    assert_eq!(schema["additionalProperties"], false);
+    assert_eq!(schema["properties"]["answer"]["$ref"], "#/$defs/_entry");
+    assert_eq!(schema["$defs"]["_entry"]["type"], "string");
+    assert_eq!(schema["$defs"]["entry"]["type"], "number");
+    assert_eq!(
+        schema["properties"]["additionalProperties"]["type"],
+        "string"
+    );
+    assert!(
+        schema["properties"]["additionalProperties"]
+            .get("pattern")
+            .is_none()
+    );
+    assert!(schema["$defs"]["_entry"].get("minLength").is_none());
+    assert!(schema.get("unknownConstraint").is_none());
+}
+
+#[test]
+fn preserves_recursive_refs_without_inlining() {
+    let mut request = AiRequest::new("gemini-2.5-flash", vec![]);
+    let schema = serde_json::json!({
+        "type": "object", "properties": {"next": {"$ref": "#/$defs/node"}},
+        "$defs": {"node": {"type": "object", "properties": {"next": {"$ref": "#/$defs/node"}}}}
+    });
+    request.response_format = Some(ResponseFormat::JsonSchema {
+        name: "node".into(),
+        strict: None,
+        schema: schema.clone(),
+    });
+    let (body, _) = GoogleEncoder
+        .encode_request(request)
+        .expect("recursive schema");
+    assert_eq!(body["generationConfig"]["responseJsonSchema"], schema);
+}
+
+#[test]
+fn encodes_all_canonical_function_calling_modes() {
+    for (choice, config) in [
+        (ToolChoice::Auto, serde_json::json!({"mode": "AUTO"})),
+        (ToolChoice::None, serde_json::json!({"mode": "NONE"})),
+        (ToolChoice::Required, serde_json::json!({"mode": "ANY"})),
+    ] {
+        let mut request = AiRequest::new("gemini-2.5-flash", vec![]);
+        request.tool_choice = Some(choice);
+        let (body, _) = GoogleEncoder.encode_request(request).expect("tool choice");
+        assert_eq!(body["toolConfig"]["functionCallingConfig"], config);
+    }
 }
 
 #[test]

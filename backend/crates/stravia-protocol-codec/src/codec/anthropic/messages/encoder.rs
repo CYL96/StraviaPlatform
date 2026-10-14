@@ -53,7 +53,7 @@ impl AnthropicEncoder {
         // Prefer __anthropic_raw_messages (preserves cache_control / exotic
         // blocks) if present; otherwise reconstruct from Message.
         let messages_val: Value = if let Some(v) = ingress.remove("__anthropic_raw_messages") {
-            v
+            project_native_anthropic_media(v)
         } else {
             let mut generated_tool_id_seq = 0;
             let mut raw_messages = Vec::new();
@@ -112,14 +112,28 @@ impl AnthropicEncoder {
                         }
                         entry
                     } else {
-                        object([
+                        let mut parameters = t.parameters;
+                        let strict = t
+                            .strict
+                            .filter(|strict| !*strict || !schema_has_open_object(&parameters));
+                        if strict == Some(true) {
+                            omit_unsupported_schema_constraints(&mut parameters);
+                        }
+                        let mut entry = object([
                             ("name", Value::String(t.name)),
                             (
                                 "description",
                                 t.description.map(Value::String).unwrap_or(Value::Null),
                             ),
-                            ("input_schema", t.parameters),
-                        ])
+                            ("input_schema", parameters),
+                        ]);
+                        if let Some(strict) = strict {
+                            entry
+                                .as_object_mut()
+                                .unwrap()
+                                .insert("strict".into(), strict.into());
+                        }
+                        entry
                     }
                 })
                 .collect();
@@ -129,31 +143,83 @@ impl AnthropicEncoder {
         // ── Tool choice ───────────────────────────────────────────────────────
         if let Some(tc) = req.tool_choice {
             let raw = tool_choice_to_value_raw(tc);
-            let mapped = map_tool_choice_for_anthropic(&raw)
-                .ok_or_else(|| anyhow::anyhow!("unsupported tool_choice for Anthropic Messages"))?;
-            obj.insert("tool_choice".into(), mapped);
+            if let Some(mapped) = map_tool_choice_for_anthropic(&raw) {
+                obj.insert("tool_choice".into(), mapped);
+            }
+        }
+        if let Some(disabled) = req
+            .disable_parallel_tool_calls
+            .or_else(|| req.parallel_tool_calls.map(|parallel| !parallel))
+        {
+            let choice = obj
+                .entry("tool_choice")
+                .or_insert_with(|| serde_json::json!({"type": "auto"}));
+            if choice["type"] != "none" {
+                choice
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("disable_parallel_tool_use".into(), disabled.into());
+            }
+        }
+        if let Some(stop) = req.generation.stop {
+            obj.insert("stop_sequences".into(), serde_json::to_value(stop)?);
+        }
+
+        let mut output_config = serde_json::Map::new();
+        if let Some(stravia_runtime_contract::protocol::ir::ResponseFormat::JsonSchema {
+            mut schema,
+            ..
+        }) = req.response_format
+            && schema.is_object()
+            && !schema_has_open_object(&schema)
+        {
+            omit_unsupported_schema_constraints(&mut schema);
+            output_config.insert(
+                "format".into(),
+                serde_json::json!({"type": "json_schema", "schema": schema}),
+            );
+        }
+        // 原生扩展优先于通用 format；effort 只合并到对应键，不能覆盖 format。
+        let native_output_config = match req.ext {
+            Some(stravia_runtime_contract::protocol::ir::ProtocolExt::Anthropic(ext)) => {
+                ext.output_config
+            }
+            _ => None,
+        }
+        .or_else(|| ingress.remove("__anthropic_output_config"));
+        if let Some(native) = native_output_config {
+            let Value::Object(native) = native else {
+                anyhow::bail!("Anthropic output_config must be an object");
+            };
+            output_config.extend(native);
         }
 
         if let Some(control) = req.reasoning.target_control.as_ref() {
             let thinking = match control {
                 stravia_runtime_contract::thinking::TargetThinkingControl::Budget { value } => {
-                    serde_json::json!({"type": "enabled", "budget_tokens": value})
+                    Some(serde_json::json!({"type": "enabled", "budget_tokens": value}))
                 }
                 stravia_runtime_contract::thinking::TargetThinkingControl::Enabled => {
-                    serde_json::json!({"type": "enabled"})
+                    Some(serde_json::json!({"type": "enabled"}))
                 }
                 stravia_runtime_contract::thinking::TargetThinkingControl::Disabled => {
-                    serde_json::json!({"type": "disabled"})
+                    Some(serde_json::json!({"type": "disabled"}))
                 }
                 stravia_runtime_contract::thinking::TargetThinkingControl::Effort { value } => {
-                    obj.insert("output_config".into(), serde_json::json!({"effort": value}));
-                    serde_json::json!({"type": "adaptive"})
+                    output_config
+                        .entry("effort")
+                        .or_insert_with(|| Value::String(value.clone()));
+                    Some(serde_json::json!({"type": "adaptive"}))
                 }
-                stravia_runtime_contract::thinking::TargetThinkingControl::Hidden => anyhow::bail!(
-                    "Anthropic Messages cannot represent Target Thinking Control {control:?}"
-                ),
+                stravia_runtime_contract::thinking::TargetThinkingControl::Hidden => None,
             };
-            obj.insert("thinking".into(), thinking);
+            if let Some(thinking) = thinking {
+                obj.insert("thinking".into(), thinking);
+            }
+        }
+
+        if !output_config.is_empty() {
+            obj.insert("output_config".into(), Value::Object(output_config));
         }
 
         // ── Extra fields ──────────────────────────────────────────────────────
@@ -225,6 +291,239 @@ fn append_system_content(target: &mut String, content: MessageContent) {
     }
 }
 
+// 只删目标不能表达的约束，不收紧对象、不改写枚举值或 schema 的数据字段。
+fn omit_unsupported_schema_constraints(schema: &mut Value) {
+    let mut recursive_refs = HashSet::new();
+    collect_recursive_schema_refs(schema, schema, &mut recursive_refs);
+    omit_schema_constraints(schema, &recursive_refs);
+}
+
+fn schema_has_open_object(schema: &Value) -> bool {
+    let object_type = schema.get("type").is_some_and(|kind| {
+        kind == "object"
+            || kind
+                .as_array()
+                .is_some_and(|types| types.iter().any(|kind| kind == "object"))
+    });
+    if (object_type
+        || schema.get("properties").is_some()
+        || schema.get("additionalProperties").is_some())
+        && schema.get("additionalProperties") != Some(&Value::Bool(false))
+    {
+        return true;
+    }
+    let mut open = false;
+    schema_children(schema, |child| {
+        if !open {
+            open = schema_has_open_object(child);
+        }
+    });
+    open
+}
+
+fn schema_children<'a>(schema: &'a Value, mut visit: impl FnMut(&'a Value)) {
+    for key in ["properties", "$defs", "$def", "definitions"] {
+        if let Some(children) = schema.get(key).and_then(Value::as_object) {
+            for child in children.values() {
+                visit(child);
+            }
+        }
+    }
+    if let Some(items) = schema.get("items") {
+        visit(items);
+    }
+    for key in ["anyOf", "allOf", "oneOf", "prefixItems"] {
+        if let Some(children) = schema.get(key).and_then(Value::as_array) {
+            for child in children {
+                visit(child);
+            }
+        }
+    }
+}
+
+fn schema_has_reference_cycle<'a>(
+    root: &'a Value,
+    schema: &'a Value,
+    active: &mut HashSet<&'a str>,
+) -> bool {
+    if let Some(reference) = schema.get("$ref").and_then(Value::as_str)
+        && let Some(pointer) = reference.strip_prefix('#')
+        && let Some(target) = root.pointer(pointer)
+    {
+        if !active.insert(reference) {
+            return true;
+        }
+        let recursive = schema_has_reference_cycle(root, target, active);
+        active.remove(reference);
+        if recursive {
+            return true;
+        }
+    }
+    let mut recursive = false;
+    schema_children(schema, |child| {
+        if !recursive {
+            recursive = schema_has_reference_cycle(root, child, active);
+        }
+    });
+    recursive
+}
+
+fn collect_recursive_schema_refs(
+    root: &Value,
+    schema: &Value,
+    recursive_refs: &mut HashSet<String>,
+) {
+    if let Some(reference) = schema.get("$ref").and_then(Value::as_str)
+        && reference.starts_with('#')
+        && schema_has_reference_cycle(root, schema, &mut HashSet::new())
+    {
+        recursive_refs.insert(reference.to_owned());
+    }
+    schema_children(schema, |child| {
+        collect_recursive_schema_refs(root, child, recursive_refs)
+    });
+}
+
+fn pattern_has_unsupported_tokens(pattern: &str) -> bool {
+    let bytes = pattern.as_bytes();
+    let mut index = 0;
+    let mut in_class = false;
+    while index < bytes.len() {
+        if bytes[index] == b'\\' {
+            if let Some(next) = bytes.get(index + 1)
+                && !in_class
+                && (matches!(*next, b'b' | b'B' | b'1'..=b'9'))
+            {
+                return true;
+            }
+            index += 2;
+            continue;
+        }
+        if bytes[index] == b'[' {
+            in_class = true;
+        }
+        if bytes[index] == b']' {
+            in_class = false;
+        }
+        if !in_class && bytes[index] == b'(' {
+            let suffix = &bytes[index..];
+            if suffix.starts_with(b"(?=")
+                || suffix.starts_with(b"(?!")
+                || suffix.starts_with(b"(?<=")
+                || suffix.starts_with(b"(?<!")
+            {
+                return true;
+            }
+        }
+        index += 1;
+    }
+    false
+}
+
+fn omit_schema_constraints(schema: &mut Value, recursive_refs: &HashSet<String>) {
+    let Some(schema) = schema.as_object_mut() else {
+        return;
+    };
+    for key in [
+        "minimum",
+        "maximum",
+        "exclusiveMinimum",
+        "exclusiveMaximum",
+        "multipleOf",
+        "minLength",
+        "maxLength",
+        "maxItems",
+        "uniqueItems",
+        "contains",
+        "minContains",
+        "maxContains",
+    ] {
+        schema.remove(key);
+    }
+    if schema
+        .get("minItems")
+        .is_some_and(|value| !matches!(value.as_u64(), Some(0 | 1)))
+    {
+        schema.remove("minItems");
+    }
+    if schema
+        .get("additionalProperties")
+        .is_some_and(|value| value != &Value::Bool(false))
+    {
+        schema.remove("additionalProperties");
+    }
+    if schema
+        .get("$ref")
+        .and_then(Value::as_str)
+        .is_some_and(|reference| !reference.starts_with('#') || recursive_refs.contains(reference))
+    {
+        schema.remove("$ref");
+    }
+    if schema
+        .get("enum")
+        .and_then(Value::as_array)
+        .is_some_and(|values| {
+            values
+                .iter()
+                .any(|value| value.is_object() || value.is_array())
+        })
+    {
+        schema.remove("enum");
+    }
+    if schema
+        .get("format")
+        .and_then(Value::as_str)
+        .is_some_and(|format| {
+            !matches!(
+                format,
+                "date-time"
+                    | "time"
+                    | "date"
+                    | "duration"
+                    | "email"
+                    | "hostname"
+                    | "uri"
+                    | "ipv4"
+                    | "ipv6"
+                    | "uuid"
+            )
+        })
+    {
+        schema.remove("format");
+    }
+    if schema
+        .get("pattern")
+        .and_then(Value::as_str)
+        .is_some_and(pattern_has_unsupported_tokens)
+    {
+        schema.remove("pattern");
+    }
+    for key in ["properties", "$defs", "$def", "definitions"] {
+        if let Some(children) = schema.get_mut(key).and_then(Value::as_object_mut) {
+            for child in children.values_mut() {
+                omit_schema_constraints(child, recursive_refs);
+            }
+        }
+    }
+    if let Some(items) = schema.get_mut("items") {
+        omit_schema_constraints(items, recursive_refs);
+    }
+    for key in ["anyOf", "allOf", "oneOf", "prefixItems"] {
+        if let Some(children) = schema.get_mut(key).and_then(Value::as_array_mut) {
+            if key == "allOf" {
+                for child in children.iter_mut() {
+                    if let Some(child) = child.as_object_mut() {
+                        child.remove("$ref");
+                    }
+                }
+            }
+            for child in children {
+                omit_schema_constraints(child, recursive_refs);
+            }
+        }
+    }
+}
+
 fn tool_choice_to_value_raw(tc: ToolChoice) -> Value {
     match tc {
         ToolChoice::Auto => Value::String("auto".into()),
@@ -243,7 +542,7 @@ fn map_tool_choice_for_anthropic(raw: &Value) -> Option<Value> {
         return match s {
             "auto" => Some(serde_json::json!({ "type": "auto" })),
             "required" => Some(serde_json::json!({ "type": "any" })),
-            "none" => None,
+            "none" => Some(serde_json::json!({ "type": "none" })),
             _ => None,
         };
     }
@@ -258,7 +557,7 @@ fn map_tool_choice_for_anthropic(raw: &Value) -> Option<Value> {
     let mut result = match kind {
         "auto" => serde_json::json!({ "type": "auto" }),
         "required" | "any" => serde_json::json!({ "type": "any" }),
-        "none" => return None,
+        "none" => serde_json::json!({ "type": "none" }),
         "tool" => {
             let name = obj.get("name").and_then(|v| v.as_str()).unwrap_or("");
             if name.is_empty() {
@@ -284,7 +583,7 @@ fn map_tool_choice_for_anthropic(raw: &Value) -> Option<Value> {
         _ => return None,
     };
 
-    if disable_parallel {
+    if disable_parallel && kind != "none" {
         result
             .as_object_mut()
             .unwrap()
@@ -304,7 +603,13 @@ const ALLOWED_BLOCK_TYPES: &[&str] = &[
     "tool_use",
     "tool_result",
     "document",
-    "input_audio",
+    "server_tool_use",
+    "web_search_tool_result",
+    "web_fetch_tool_result",
+    "code_execution_tool_result",
+    "bash_code_execution_tool_result",
+    "text_editor_code_execution_tool_result",
+    "tool_search_tool_result",
 ];
 
 fn validate_anthropic_payload(body: &Value) -> Result<()> {
@@ -324,9 +629,6 @@ fn validate_anthropic_payload(body: &Value) -> Result<()> {
         .get("messages")
         .and_then(|v| v.as_array())
         .ok_or_else(|| anyhow::anyhow!("anthropic payload missing messages"))?;
-    if messages.is_empty() {
-        anyhow::bail!("anthropic payload has empty messages");
-    }
     for (idx, msg) in messages.iter().enumerate() {
         let role = msg
             .get("role")
@@ -393,7 +695,7 @@ fn validate_anthropic_payload(body: &Value) -> Result<()> {
             .as_object()
             .ok_or_else(|| anyhow::anyhow!("anthropic tool_choice must be object"))?;
         let t = tc.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        if t != "auto" && t != "any" && t != "tool" {
+        if t != "auto" && t != "any" && t != "tool" && t != "none" {
             anyhow::bail!("anthropic tool_choice invalid type: {t}");
         }
         if t == "tool"
@@ -417,6 +719,9 @@ fn encode_message(
     generated_tool_id_seq: &mut usize,
     supplied_tool_ids: &HashSet<String>,
 ) -> Result<Value> {
+    if let MessageContent::Blocks(blocks) = &mut msg.content {
+        prepare_anthropic_media(blocks)?;
+    }
     let role = match msg.role {
         Role::User | Role::Tool => "user",
         Role::Assistant => "assistant",
@@ -569,6 +874,122 @@ fn encode_message(
     ]))
 }
 
+fn project_native_anthropic_media(mut messages: Value) -> Value {
+    if let Some(messages) = messages.as_array_mut() {
+        messages.retain_mut(|message| {
+            let Some(blocks) = message.get_mut("content").and_then(Value::as_array_mut) else {
+                return true;
+            };
+            blocks.retain_mut(|block| {
+                match block.get("type").and_then(Value::as_str) {
+                    Some("input_audio") => return false,
+                    Some("tool_result") => {
+                        if let Some(content) =
+                            block.get_mut("content").and_then(Value::as_array_mut)
+                        {
+                            content.retain_mut(|nested| {
+                                if !matches!(
+                                    nested.get("type").and_then(Value::as_str),
+                                    Some(
+                                        "text"
+                                            | "image"
+                                            | "document"
+                                            | "search_result"
+                                            | "tool_reference"
+                                            | "browser_state"
+                                    )
+                                ) {
+                                    return false;
+                                }
+                                if nested.get("type").and_then(Value::as_str) == Some("document")
+                                    && nested.pointer("/source/type").and_then(Value::as_str)
+                                        == Some("content")
+                                    && let Some(parts) = nested
+                                        .pointer_mut("/source/content")
+                                        .and_then(Value::as_array_mut)
+                                {
+                                    parts.retain(|part| {
+                                        matches!(
+                                            part.get("type").and_then(Value::as_str),
+                                            Some("text" | "image")
+                                        )
+                                    });
+                                    return !parts.is_empty();
+                                }
+                                true
+                            });
+                        }
+                    }
+                    Some("document")
+                        if block.pointer("/source/type").and_then(Value::as_str)
+                            == Some("content") =>
+                    {
+                        if let Some(content) = block
+                            .pointer_mut("/source/content")
+                            .and_then(Value::as_array_mut)
+                        {
+                            content.retain(|nested| {
+                                matches!(
+                                    nested.get("type").and_then(Value::as_str),
+                                    Some("text" | "image")
+                                )
+                            });
+                            return !content.is_empty();
+                        }
+                    }
+                    _ => {}
+                }
+                true
+            });
+            !blocks.is_empty()
+        });
+    }
+    messages
+}
+
+fn prepare_anthropic_media(blocks: &mut [ContentBlock]) -> Result<()> {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use stravia_runtime_contract::protocol::ir::DocumentSource;
+
+    for block in blocks {
+        match block {
+            ContentBlock::File {
+                source:
+                    MediaSource::Base64 {
+                        media_type: source_type,
+                        data,
+                    },
+                media_type,
+            } if source_type.as_str() == "text/plain"
+                && media_type
+                    .as_deref()
+                    .is_none_or(|mime| mime == "text/plain") =>
+            {
+                let bytes = STANDARD.decode(data.as_bytes()).map_err(|error| {
+                    anyhow::anyhow!("Invalid Anthropic text file base64: {error}")
+                })?;
+                let text = String::from_utf8(bytes).map_err(|error| {
+                    anyhow::anyhow!("Anthropic text file must contain UTF-8: {error}")
+                })?;
+                *block = ContentBlock::Document {
+                    source: DocumentSource::PlainText { data: text },
+                    title: None,
+                    context: None,
+                    cache_control: None,
+                };
+            }
+            ContentBlock::Document {
+                source: DocumentSource::Blocks { content },
+                ..
+            } => {
+                prepare_anthropic_media(content)?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 fn encode_content_block_for_anthropic(b: ContentBlock) -> Vec<Value> {
     let mut generated_tool_id_seq = 0;
@@ -606,6 +1027,117 @@ fn encode_content_block_for_anthropic_with_ids(
             .filter(|text| !text.is_empty())
             .map(text_block)
             .collect(),
+        ContentBlock::Image {
+            source: MediaSource::Base64 { ref media_type, .. },
+            ..
+        } if !matches!(
+            media_type.as_str(),
+            "image/jpeg" | "image/png" | "image/gif" | "image/webp"
+        ) =>
+        {
+            Vec::new()
+        }
+        ContentBlock::Audio { .. } | ContentBlock::Video { .. } => Vec::new(),
+        ContentBlock::File { source, media_type } => {
+            let source = match source {
+                MediaSource::FileId { file_id, .. } => object([
+                    ("type", Value::String("file".into())),
+                    ("file_id", Value::String(file_id)),
+                ]),
+                MediaSource::Base64 {
+                    media_type: source_type,
+                    data,
+                } if source_type == "application/pdf"
+                    && media_type
+                        .as_deref()
+                        .is_none_or(|mime| mime == "application/pdf") =>
+                {
+                    object([
+                        ("type", Value::String("base64".into())),
+                        ("media_type", Value::String("application/pdf".into())),
+                        ("data", Value::String(data)),
+                    ])
+                }
+                MediaSource::Url(url)
+                    if media_type
+                        .as_deref()
+                        .is_none_or(|mime| mime == "application/pdf") =>
+                {
+                    object([
+                        ("type", Value::String("url".into())),
+                        ("url", Value::String(url)),
+                    ])
+                }
+                _ => return Vec::new(),
+            };
+            vec![object([
+                ("type", Value::String("document".into())),
+                ("source", source),
+            ])]
+        }
+        ContentBlock::Document {
+            source,
+            title,
+            context,
+            cache_control,
+        } => {
+            use stravia_runtime_contract::protocol::ir::DocumentSource;
+            let source = match source {
+                DocumentSource::Base64Pdf { data } => object([
+                    ("type", Value::String("base64".into())),
+                    ("media_type", Value::String("application/pdf".into())),
+                    ("data", Value::String(data)),
+                ]),
+                DocumentSource::PlainText { data } => object([
+                    ("type", Value::String("text".into())),
+                    ("media_type", Value::String("text/plain".into())),
+                    ("data", Value::String(data)),
+                ]),
+                DocumentSource::Url(url) => object([
+                    ("type", Value::String("url".into())),
+                    ("url", Value::String(url)),
+                ]),
+                DocumentSource::Blocks { content } => {
+                    let content: Vec<_> = content
+                        .into_iter()
+                        .filter(|block| {
+                            matches!(
+                                block,
+                                ContentBlock::Text { .. } | ContentBlock::Image { .. }
+                            )
+                        })
+                        .flat_map(|block| {
+                            encode_content_block_for_anthropic_with_ids(
+                                block,
+                                generated_tool_id_seq,
+                                supplied_tool_ids,
+                            )
+                        })
+                        .collect();
+                    if content.is_empty() {
+                        return Vec::new();
+                    }
+                    object([
+                        ("type", Value::String("content".into())),
+                        ("content", Value::Array(content)),
+                    ])
+                }
+            };
+            let mut block = object([
+                ("type", Value::String("document".into())),
+                ("source", source),
+            ]);
+            if let Some(title) = title {
+                block["title"] = Value::String(title);
+            }
+            if let Some(context) = context {
+                block["context"] = Value::String(context);
+            }
+            if let Some(cache_control) = cache_control {
+                block["cache_control"] = serde_json::to_value(cache_control).unwrap_or(Value::Null);
+            }
+            vec![block]
+        }
         other => vec![encode_single_anthropic_content_block(
             other,
             generated_tool_id_seq,
@@ -759,6 +1291,25 @@ fn anthropic_tool_result_content(content: Value, kind: Option<ToolResultContentK
     // 原生 content 只接受文本或内容块；业务 JSON 数组不能冒充原生块数组。
     if kind == Some(ToolResultContentKind::Json) || !(content.is_string() || content.is_array()) {
         Value::String(content.to_string())
+    } else if let Value::Array(blocks) = content {
+        Value::Array(
+            blocks
+                .into_iter()
+                .filter(|block| {
+                    matches!(
+                        block.get("type").and_then(Value::as_str),
+                        Some(
+                            "text"
+                                | "image"
+                                | "document"
+                                | "search_result"
+                                | "tool_reference"
+                                | "browser_state"
+                        )
+                    )
+                })
+                .collect(),
+        )
     } else {
         content
     }
@@ -809,6 +1360,19 @@ fn anthropic_tool_result_payload(
                                 block,
                                 generated_tool_id_seq,
                                 supplied_tool_ids,
+                            )
+                        })
+                        .filter(|block| {
+                            matches!(
+                                block.get("type").and_then(Value::as_str),
+                                Some(
+                                    "text"
+                                        | "image"
+                                        | "document"
+                                        | "search_result"
+                                        | "tool_reference"
+                                        | "browser_state"
+                                )
                             )
                         })
                         .collect(),

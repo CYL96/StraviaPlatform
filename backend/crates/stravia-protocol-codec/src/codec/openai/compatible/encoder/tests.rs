@@ -1,6 +1,150 @@
 use super::*;
 
 #[test]
+fn anthropic_controls_convert_to_chat_with_exact_tool_strict_values() {
+    use crate::transform::ProtocolTransform;
+    use stravia_runtime_contract::protocol::ids::{
+        ANTHROPIC_MESSAGES_2023_06_01, OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+    };
+
+    let schema = serde_json::json!({
+        "type": "object", "properties": {"answer": {"type": "string"}},
+        "required": ["answer"], "additionalProperties": false
+    });
+    let pair = ProtocolTransform::global()
+        .bind(
+            ANTHROPIC_MESSAGES_2023_06_01,
+            OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+        )
+        .expect("bind reverse controls");
+    for disabled in [false, true] {
+        let request = pair
+            .decode_request(serde_json::json!({
+                "model": "model", "max_tokens": 1024,
+                "messages": [{"role": "user", "content": "hello"}],
+                "tool_choice": {"type": "auto", "disable_parallel_tool_use": disabled},
+                "stop_sequences": ["END", "DONE"],
+                "output_config": {"format": {"type": "json_schema", "schema": schema}},
+                "tools": [
+                    {"name": "strict", "input_schema": schema, "strict": true},
+                    {"name": "non_strict", "input_schema": schema, "strict": false},
+                    {"name": "unspecified", "input_schema": schema}
+                ]
+            }))
+            .expect("decode Anthropic controls");
+        let body = pair
+            .encode_request(request)
+            .expect("encode Chat controls")
+            .body;
+        assert_eq!(body["tool_choice"], "auto");
+        assert_eq!(body["parallel_tool_calls"], !disabled);
+        assert_eq!(body["stop"], serde_json::json!(["END", "DONE"]));
+        assert_eq!(body["response_format"]["type"], "json_schema");
+        assert_eq!(body["response_format"]["json_schema"]["schema"], schema);
+        assert_eq!(body["response_format"]["json_schema"]["strict"], true);
+        assert_eq!(body["tools"][0]["function"]["strict"], true);
+        assert_eq!(body["tools"][1]["function"]["strict"], false);
+        assert!(body["tools"][2]["function"].get("strict").is_none());
+    }
+}
+
+#[test]
+fn tool_result_payload_kind_controls_chat_text_projection() {
+    use stravia_runtime_contract::protocol::ir::ToolResultContentKind;
+
+    let business_array = serde_json::json!([
+        {"type": "text", "text": "business", "extra": [1, 2]},
+        {"type": "image", "source": {"type": "url", "url": "https://example.invalid/business"}},
+        {"type": "unrecognized", "payload": true}
+    ]);
+    for (content, kind, expected) in [
+        (
+            serde_json::json!([
+                {"type": "text", "text": "first"},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "image-data"}},
+                {"type": "unknown", "raw": {"private": "discard"}},
+                {"type": "unrecognized", "payload": "discard"},
+                {"type": "text", "text": "second"}
+            ]),
+            Some(ToolResultContentKind::ContentBlocks),
+            Some("firstsecond".to_owned()),
+        ),
+        (
+            business_array.clone(),
+            Some(ToolResultContentKind::Json),
+            Some(business_array.to_string()),
+        ),
+        (
+            serde_json::json!([
+                {"type": "image", "source": {"type": "url", "url": "https://example.invalid/image"}},
+                {"type": "unknown", "raw": {"private": "discard"}}
+            ]),
+            Some(ToolResultContentKind::ContentBlocks),
+            None,
+        ),
+        (
+            serde_json::json!("literal result"),
+            Some(ToolResultContentKind::ContentBlocks),
+            Some("literal result".into()),
+        ),
+        (
+            serde_json::json!([]),
+            Some(ToolResultContentKind::ContentBlocks),
+            None,
+        ),
+    ] {
+        let request = AiRequest::new(
+            "model",
+            vec![
+                AiItem {
+                    role: Role::Assistant,
+                    content: MessageContent::Text("".to_owned().into()),
+                    tool_calls: Some(vec![ToolCall {
+                        id: "call_lookup".into(),
+                        name: "lookup".into(),
+                        arguments: "{}".into(),
+                    }]),
+                    tool_call_id: None,
+                    meta: None,
+                },
+                AiItem {
+                    role: Role::Tool,
+                    content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                        tool_use_id: "call_lookup".into(),
+                        content,
+                        content_kind: kind,
+                        is_error: None,
+                        cache_control: None,
+                    }]),
+                    tool_calls: None,
+                    tool_call_id: Some("call_lookup".into()),
+                    meta: None,
+                },
+            ],
+        );
+        let (body, _) = OpenAIEncoder
+            .encode_request(request)
+            .expect("encode tool result");
+        let results: Vec<_> = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| message["role"] == "tool")
+            .collect();
+        if let Some(expected) = expected {
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0]["tool_call_id"], "call_lookup");
+            assert_eq!(results[0]["content"], expected);
+        } else {
+            assert!(
+                results.is_empty(),
+                "unsupported tool results must not become JSON text"
+            );
+        }
+    }
+}
+
+#[test]
 fn request_roundtrip_preserves_escaped_text_and_multimodal_parts() {
     use crate::codec::openai::compatible::chat_completions::OpenAIChatCompletionsV1;
     use crate::transform::{ProtocolAdapter, ProtocolTransform};
@@ -537,7 +681,7 @@ fn responses_reasoning_effort_maps_to_chat_without_loss() {
 }
 
 #[test]
-fn generic_toggle_without_provider_adapter_is_rejected() {
+fn generic_toggle_without_provider_adapter_is_omitted() {
     let mut request = AiRequest::new(
         "custom-model",
         vec![AiItem {
@@ -553,20 +697,18 @@ fn generic_toggle_without_provider_adapter_is_rejected() {
     request.meta.source_protocol =
         Some(stravia_runtime_contract::protocol::ids::OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1);
 
-    let error = crate::transform::ProtocolTransform::global()
+    let encoded = crate::transform::ProtocolTransform::global()
         .bind(
             stravia_runtime_contract::protocol::ids::OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
             stravia_runtime_contract::protocol::ids::OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
         )
         .unwrap()
         .encode_request(request)
-        .unwrap_err();
-
-    assert!(
-        error
-            .to_string()
-            .contains("cannot preserve: reasoning.target_control")
-    );
+        .unwrap();
+    assert!(encoded.body.get("reasoning").is_none());
+    assert!(encoded.body.get("thinking").is_none());
+    assert!(encoded.body.get("enable_thinking").is_none());
+    assert_eq!(encoded.body["messages"][0]["content"], "hello");
 }
 
 #[test]

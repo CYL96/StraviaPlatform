@@ -4,7 +4,7 @@
 //! endpoint that exchanges protobuf frames (`application/connect+proto`),
 //! not JSON. Request encoding is byte-oriented and embeds the session
 //! credential inside `ClientMetadata`. The vendor owns the binary encoder
-//! and stream decoder; shared representability checks run before upstream I/O.
+//! and stream decoder; the plugin projects its private wire capabilities before I/O.
 
 pub(crate) mod connect;
 pub mod proto;
@@ -24,7 +24,6 @@ pub use request::decode_cli_model_configs;
 pub use request::devin_upstream_provider_name;
 pub use request::encode_assign_model_request_with_platform;
 pub use request::encode_client_metadata_request_with_platform;
-pub use request::encode_get_chat_message_request_with_platform;
 pub use request::session_shape;
 pub use stream::DevinConnectStreamParser;
 
@@ -63,39 +62,64 @@ impl ThinkingReplay {
 
 const CUSTOM_TOOL_META: &str = "__devin_custom_tool";
 
-use stravia_protocol_codec::transform::ProtocolTransform;
-use stravia_runtime_contract::protocol::ids::DEVIN_CONNECT_GET_CHAT_MESSAGE_V1;
-use stravia_runtime_contract::protocol::ids::EndpointCapabilities;
-use stravia_runtime_contract::protocol::ids::StreamCaps;
-use stravia_runtime_contract::protocol::ids::VendorFieldPolicy;
-use stravia_runtime_contract::protocol::ir::AiRequest;
+use stravia_runtime_contract::protocol::ir::{AiRequest, ProtocolExt};
+use stravia_runtime_contract::thinking::TargetThinkingControl;
 
-const CAPS: EndpointCapabilities = EndpointCapabilities {
-    streaming: true,
-    tools: true,
-    // Thinking deltas stream natively (#9); there is no request-side
-    // thinking control on the wire.
-    reasoning: true,
-    embeddings: false,
-    override_model_in_body: false,
-    ingress_routes: &[],
-    multimodal: true,
-    structured_output: false,
-    function_calling: true,
-    // #11/#12 (disable_parallel_tool_calls / tool_choice) are unconfirmed
-    // tags the reference client deliberately omits.
-    parallel_tool_calls: false,
-    extended_reasoning: false,
-    deterministic_seed: false,
-    stream: StreamCaps {
-        server_sent_events: false,
-        usage_in_stream: true,
-        requires_stream_flag: false,
-    },
-    unknown_field_policy: VendorFieldPolicy::Drop,
-};
-
-pub fn validate_request(request: &AiRequest) -> anyhow::Result<()> {
-    ProtocolTransform::validate_request_for(DEVIN_CONNECT_GET_CHAT_MESSAGE_V1, &CAPS, request)?;
-    request::validate_request_fields(request)
+/// 私有协议能力只在插件中投影；正文编码器逐项省略不支持的内容。
+pub(crate) fn prepare_request(request: &mut AiRequest) {
+    request.embedding = None;
+    // 私有 wire 没有这些控制；正文与受保护思考由本插件的编码器投影。
+    request.tool_choice = None;
+    request.parallel_tool_calls = None;
+    request.disable_parallel_tool_calls = None;
+    request.generation.seed = None;
+    request.generation.stop = None;
+    request.generation.presence_penalty = None;
+    request.generation.frequency_penalty = None;
+    request.response_format = None;
+    // Effort is consumed by the provider's model selector, not sent as a wire control.
+    if request
+        .reasoning
+        .target_control
+        .as_ref()
+        .is_some_and(|control| !matches!(control, TargetThinkingControl::Effort { .. }))
+    {
+        request.reasoning.target_control = None;
+    }
+    match request.ext.as_mut() {
+        Some(ProtocolExt::OpenAiChat(extension)) => {
+            extension.n = None;
+            extension.logit_bias = None;
+            extension.logprobs = None;
+            extension.top_logprobs = None;
+            extension.prediction = None;
+            extension.prompt_cache_retention = None;
+            extension.verbosity = None;
+        }
+        Some(ProtocolExt::OpenResponses(extension)) => {
+            extension.background = None;
+            extension.max_tool_calls = None;
+            extension.top_logprobs = None;
+            extension.truncation = None;
+            extension.text = None;
+            extension.tool_choice_ext = None;
+            extension.passthrough_body.remove("context_management");
+        }
+        Some(ProtocolExt::Anthropic(extension)) => {
+            extension.top_k = None;
+            extension.output_config = None;
+            extension.service_tier = None;
+        }
+        Some(ProtocolExt::Google(extension)) => {
+            extension.top_k = None;
+            extension.candidate_count = None;
+            extension.response_logprobs = None;
+            extension.logprobs = None;
+            extension.response_mime_type = None;
+            extension.response_json_schema = None;
+            extension.tool_config = None;
+            extension.thinking_config = None;
+        }
+        None => {}
+    }
 }

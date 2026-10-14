@@ -22,7 +22,7 @@ fn search_url(search: &SearchQuery) -> Url {
     let query = search.query_with_allowed_domains();
     Url::parse_with_params(
         BAIDU_SEARCH_URL,
-        &[("wd", query.as_ref()), ("ie", "utf-8"), ("rn", "10")],
+        [("wd", query.as_ref()), ("ie", "utf-8"), ("rn", "10")],
     )
     .expect("Baidu search URL is valid")
 }
@@ -54,7 +54,7 @@ fn source_url(el: &ElementRef) -> anyhow::Result<String> {
 }
 
 pub fn request_autocomplete(query: &str, _client: &HttpClient) -> anyhow::Result<Request> {
-    let url = Url::parse_with_params(BAIDU_AUTOCOMPLETE_URL, &[("prod", "pc"), ("wd", query)])
+    let url = Url::parse_with_params(BAIDU_AUTOCOMPLETE_URL, [("prod", "pc"), ("wd", query)])
         .expect("Baidu autocomplete URL is valid");
     Ok(Request::new(wreq::Method::GET, url.as_str().parse()?))
 }

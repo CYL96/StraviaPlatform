@@ -170,7 +170,9 @@ impl AnthropicContentBlock {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AnthropicImageSource {
     #[serde(rename = "type")]
-    pub source_type: String, // "base64" | "url"
+    pub source_type: String, // "base64" | "url" | "file"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub media_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -182,7 +184,9 @@ pub struct AnthropicImageSource {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DocumentSource {
     #[serde(rename = "type")]
-    pub kind: String, // "base64" | "text" | "url" | "content"
+    pub kind: String, // "base64" | "text" | "url" | "content" | "file"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub media_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

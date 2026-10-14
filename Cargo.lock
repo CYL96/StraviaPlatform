@@ -7779,7 +7779,6 @@ dependencies = [
  "tungstenite 0.28.0",
  "url",
  "uuid",
- "windows-sys 0.52.0",
  "zip 8.6.0",
  "zstd 0.13.3",
 ]
@@ -7899,6 +7898,7 @@ name = "stravia-protocol-codec"
 version = "0.4.0"
 dependencies = [
  "anyhow",
+ "base64 0.23.1",
  "chrono",
  "http",
  "inventory",

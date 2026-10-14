@@ -80,7 +80,9 @@ anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true, features = ["alloc", "unbounded_depth"] }
 stravia-runtime-contract = { workspace = true }
-# 在实际构建脚本中统一宿主依赖特性，避免两端的过程宏和契约库生成不同产物。
+# 这些依赖通过 feature 合并参与构建，不由 build.rs 直接引用。
+# 保持 host/target 的基础库特性一致，避免不同 feature 组合导致重复编译；
+# Cargo 的 unused_dependencies 只检查直接使用，不能据此删除这些声明。
 base64-022 = { workspace = true }
 foldhash = { workspace = true }
 serde_core = { workspace = true }
@@ -93,9 +95,6 @@ regex-automata = { workspace = true }
 byteorder = { workspace = true }
 url = { workspace = true }
 stable_deref_trait = { workspace = true }
-
-[target.'cfg(target_os = "windows")'.build-dependencies]
-windows-sys-052 = { workspace = true, features = ["Win32_Networking_WinSock", "Win32_Security_Cryptography", "Win32_System_Diagnostics_Debug", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_LibraryLoader", "Win32_System_Performance", "Win32_System_SystemServices"] }
 
 [dev-dependencies]
 sqlx = { workspace = true, features = ["sqlite-deserialize"] }

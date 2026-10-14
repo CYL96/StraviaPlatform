@@ -20,10 +20,7 @@
 // SOFTWARE.
 use serde_json::{Value, json};
 
-use super::{
-    ProtocolTransform, ThinkingCarrierFacts, TransformError, adapter, request_loss_paths,
-    response_loss_paths, stream_loss_paths,
-};
+use super::{ProtocolTransform, ThinkingCarrierFacts, TransformError};
 use stravia_runtime_contract::protocol::ids::ANTHROPIC_MESSAGES_2023_06_01;
 use stravia_runtime_contract::protocol::ids::GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA;
 use stravia_runtime_contract::protocol::ids::OPEN_RESPONSES_2026_04_24;
@@ -37,6 +34,169 @@ use stravia_runtime_contract::protocol::ir::MediaSource;
 use stravia_runtime_contract::protocol::ir::MessageContent;
 use stravia_runtime_contract::protocol::ir::Role;
 use stravia_runtime_contract::protocol::ir::ToolCall;
+
+#[test]
+fn gemini_canonical_sampling_changes_override_retained_native_config() {
+    let pair = ProtocolTransform::global()
+        .bind(
+            GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA,
+            GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA,
+        )
+        .unwrap();
+    let mut request = pair
+        .decode_request(json!({
+            "contents":[{"role":"user","parts":[{"text":"hello"}]}],
+            "generationConfig":{
+                "stopSequences":["old"], "seed":100,
+                "frequencyPenalty":0.1, "presencePenalty":0.2, "topK":11
+            }
+        }))
+        .unwrap();
+    request.generation.stop = Some(vec!["new".into()]);
+    request.generation.seed = Some(-7);
+    request.generation.frequency_penalty = Some(0.6);
+    request.generation.presence_penalty = Some(-0.4);
+    let body = pair.encode_request(request).unwrap().body;
+    assert_eq!(body["generationConfig"]["stopSequences"], json!(["new"]));
+    assert_eq!(body["generationConfig"]["seed"], -7);
+    assert_eq!(body["generationConfig"]["frequencyPenalty"], 0.6);
+    assert_eq!(body["generationConfig"]["presencePenalty"], -0.4);
+    assert_eq!(body["generationConfig"]["topK"].as_f64(), Some(11.0));
+    assert_eq!(body["contents"][0]["parts"][0]["text"], "hello");
+}
+
+#[test]
+fn document_conversion_keeps_files_and_supported_nested_content() {
+    for target in [
+        OPEN_RESPONSES_2026_04_24,
+        OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+        GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA,
+    ] {
+        let pair = ProtocolTransform::global()
+            .bind(ANTHROPIC_MESSAGES_2023_06_01, target)
+            .unwrap();
+        let request = pair.decode_request(json!({
+            "model":"model", "max_tokens":100,
+            "messages":[{"role":"user","content":[
+                {"type":"document","source":{"type":"base64","media_type":"application/pdf","data":"JVBERg=="},"title":"report.pdf"},
+                {"type":"document","source":{"type":"text","media_type":"text/plain","data":"plain document"}},
+                {"type":"document","source":{"type":"content","content":[
+                    {"type":"text","text":"nested text"},
+                    {"type":"image","source":{"type":"base64","media_type":"image/png","data":"aGk="}}
+                ]}}
+            ]}]
+        })).unwrap();
+        let body = pair.encode_request(request).unwrap().body;
+        let parts = if target == GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA {
+            body["contents"][0]["parts"].as_array().unwrap()
+        } else if target == OPEN_RESPONSES_2026_04_24 {
+            body["input"][0]["content"].as_array().unwrap()
+        } else {
+            body["messages"][0]["content"].as_array().unwrap()
+        };
+        assert_eq!(parts.len(), 4, "{target}: {body}");
+        assert!(
+            parts.iter().any(|part| part["text"] == "nested text"),
+            "{target}: {body}"
+        );
+        let wire = body.to_string();
+        assert!(wire.contains("JVBERg=="), "{target}: {body}");
+        assert!(wire.contains("cGxhaW4gZG9jdW1lbnQ="), "{target}: {body}");
+        assert!(wire.contains("aGk="), "{target}: {body}");
+    }
+}
+
+#[test]
+fn native_anthropic_server_tool_blocks_survive_projection_and_encoding() {
+    let pair = ProtocolTransform::global()
+        .bind(ANTHROPIC_MESSAGES_2023_06_01, ANTHROPIC_MESSAGES_2023_06_01)
+        .unwrap();
+    let response = pair.decode_response(json!({
+        "id":"msg_1", "type":"message", "role":"assistant", "model":"model",
+        "content":[
+            {"type":"server_tool_use","id":"srv_1","name":"web_search","input":{"query":"hello"}},
+            {"type":"web_search_tool_result","tool_use_id":"srv_1","content":[{"type":"web_search_result","url":"https://example.com","title":"Example","encrypted_content":"opaque"}]}
+        ],
+        "stop_reason":"end_turn", "usage":{"input_tokens":1,"output_tokens":1}
+    })).unwrap();
+    let before = serde_json::to_value(&response).unwrap();
+    assert!(matches!(
+        super::prune_response(pair, &response),
+        std::borrow::Cow::Borrowed(_)
+    ));
+    let encoded = pair.encode_response(&response).unwrap();
+    assert_eq!(encoded["content"][0]["type"], "server_tool_use");
+    assert_eq!(encoded["content"][1]["type"], "web_search_tool_result");
+    assert_eq!(encoded["content"][1]["tool_use_id"], "srv_1");
+    assert_eq!(serde_json::to_value(&response).unwrap(), before);
+}
+
+#[test]
+fn tool_output_keeps_supported_blocks_distinct_from_business_json() {
+    let pair = ProtocolTransform::global()
+        .bind(ANTHROPIC_MESSAGES_2023_06_01, OPEN_RESPONSES_2026_04_24)
+        .unwrap();
+    let request = pair.decode_request(json!({
+        "model":"model", "max_tokens":100,
+        "messages":[
+            {"role":"user","content":"inspect"},
+            {"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"read","input":{}}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[
+                {"type":"text","text":"kept","future_hint":"omit"},
+                {"type":"image","source":{"type":"base64","media_type":"image/png","data":"aGk="}},
+                {"type":"future_part","payload":"cannot-carry"}
+            ]}]}
+        ]
+    })).unwrap();
+    let encoded = pair.encode_request(request).unwrap().body;
+    let output = encoded["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["type"] == "function_call_output")
+        .unwrap();
+    assert_eq!(output["call_id"], "call_1");
+    assert_eq!(
+        output["output"],
+        json!([
+            {"type":"input_text","text":"kept"},
+            {"type":"input_image","image_url":"data:image/png;base64,aGk="}
+        ])
+    );
+
+    let business = json!([{"type":"input_image","image_url":"this is business data"}]);
+    let request = AiRequest::new(
+        "model",
+        vec![AiItem {
+            role: Role::Tool,
+            content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                tool_use_id: "business_call".into(),
+                content: business.clone(),
+                content_kind: Some(
+                    stravia_runtime_contract::protocol::ir::ToolResultContentKind::Json,
+                ),
+                is_error: None,
+                cache_control: None,
+            }]),
+            tool_calls: None,
+            tool_call_id: Some("business_call".into()),
+            meta: None,
+        }],
+    );
+    let encoded = ProtocolTransform::global()
+        .bind(
+            GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA,
+            OPEN_RESPONSES_2026_04_24,
+        )
+        .unwrap()
+        .encode_request(request)
+        .unwrap()
+        .body;
+    assert_eq!(
+        serde_json::from_str::<Value>(encoded["input"][0]["output"].as_str().unwrap()).unwrap(),
+        business
+    );
+}
 
 #[test]
 fn historical_reasoning_replay_is_target_local_and_keeps_readable_parts() {
@@ -806,10 +966,12 @@ fn replay_drops_only_empty_thinking_and_retains_tools_and_hard_fields() {
         encrypted_content: "compaction-secret".into(),
     });
     assert!(!super::prepare_thinking_replay(&mut request, |_| false));
-    assert!(matches!(
-        pair.encode_request(request),
-        Err(TransformError::Unrepresentable { .. })
-    ));
+    let body = pair.encode_request(request).unwrap().body;
+    assert!(
+        !body.to_string().contains("compaction-secret"),
+        "native compaction state the target cannot carry is dropped, not forwarded"
+    );
+    assert_eq!(body["messages"][0]["tool_calls"][0]["id"], "call_1");
 }
 
 #[test]
@@ -927,22 +1089,6 @@ fn thinking_replay_native_reasoning_keeps_ciphertext_but_moves_content_before_to
     );
     assert_eq!(body["input"][2]["type"], "function_call");
     assert_eq!(body["input"][2]["call_id"], "call_1");
-
-    let pair = ProtocolTransform::global()
-        .bind(
-            OPEN_RESPONSES_2026_04_24,
-            OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
-        )
-        .unwrap();
-    assert!(super::prepare_thinking_replay(&mut request, |_| false));
-    request.items[1].content = MessageContent::Blocks(vec![ContentBlock::Unknown {
-        raw: json!({"type":"future_hard_content"}),
-    }]);
-    assert!(!super::prepare_thinking_replay(&mut request, |_| false));
-    assert!(matches!(
-        pair.encode_request(request),
-        Err(TransformError::Unrepresentable { .. })
-    ));
 }
 
 #[test]
@@ -1052,7 +1198,7 @@ fn provider_message_metadata_does_not_interrupt_chat_delivery() {
 }
 
 #[test]
-fn native_compaction_controls_and_state_cannot_be_lossily_converted() {
+fn native_compaction_state_is_dropped_from_requests_responses_and_streams() {
     let outbound = ProtocolTransform::global()
         .bind(
             OPEN_RESPONSES_2026_04_24,
@@ -1060,16 +1206,19 @@ fn native_compaction_controls_and_state_cannot_be_lossily_converted() {
         )
         .unwrap();
     for body in [
-        json!({"model":"codex","input":[{"type":"compaction","id":"cmp_1","encrypted_content":"opaque"}]}),
-        json!({"model":"codex","input":[{"type":"compaction_trigger"}]}),
+        json!({"model":"codex","input":[{"type":"compaction","id":"cmp_1","encrypted_content":"opaque"},{"role":"user","content":"hello"}]}),
+        json!({"model":"codex","input":[{"type":"compaction_trigger"},{"role":"user","content":"hello"}]}),
         json!({"model":"codex","input":"hello","context_management":[]}),
         json!({"model":"codex","input":"hello","context_management":null}),
     ] {
         let request = outbound.decode_request(body).unwrap();
-        assert!(matches!(
-            outbound.encode_request(request),
-            Err(TransformError::Unrepresentable { .. })
-        ));
+        let encoded = outbound.encode_request(request).unwrap().body;
+        let text = encoded.to_string();
+        assert!(!text.contains("opaque") && !text.contains("context_management"));
+        assert_eq!(
+            encoded["messages"].as_array().unwrap().last().unwrap()["content"],
+            "hello"
+        );
     }
     let inbound = ProtocolTransform::global()
         .bind(
@@ -1087,18 +1236,16 @@ fn native_compaction_controls_and_state_cannot_be_lossily_converted() {
             Value::Null,
         ))
         .unwrap();
-    assert!(matches!(
-        inbound.encode_response(&response),
-        Err(TransformError::Unrepresentable { .. })
-    ));
+    let encoded = inbound.encode_response(&response).unwrap();
+    assert!(!encoded.to_string().contains("opaque"));
     let (_, mut encoder) = inbound.stream().unwrap().into_parts();
-    assert!(matches!(
-        encoder.encode_deltas(&[AiStreamDelta::ItemDone {
-            index: 0, item: response.items[0].clone(),
-        }]),
-        Err(TransformError::Unrepresentable { lost, .. })
-            if lost == ["deltas[0].native_compaction"]
-    ));
+    let events = encoder
+        .encode_deltas(&[AiStreamDelta::ItemDone {
+            index: 0,
+            item: response.items[0].clone(),
+        }])
+        .unwrap();
+    assert!(events.iter().all(|event| !event.data.contains("opaque")));
 }
 
 #[test]
@@ -1387,7 +1534,7 @@ fn responses_same_protocol_preserves_rolling_extensions() {
 }
 
 #[test]
-fn responses_to_chat_rejects_required_hosted_tools() {
+fn responses_to_chat_drops_required_hosted_tools() {
     let pair = ProtocolTransform::global()
         .bind(
             OPEN_RESPONSES_2026_04_24,
@@ -1403,29 +1550,42 @@ fn responses_to_chat_rejects_required_hosted_tools() {
         }))
         .expect("rolling Responses request");
 
-    let error = pair
+    let body = pair
         .encode_request(request)
-        .expect_err("required hosted tools are a hard constraint");
+        .expect("hosted tools the target cannot run are dropped")
+        .body;
 
-    assert!(matches!(
-        error,
-        TransformError::Unrepresentable { lost, .. } if lost == vec!["tools"]
-    ));
+    assert!(body.get("tool_choice").is_none());
+    assert!(body.get("tools").is_none());
+    assert_eq!(body["messages"][0]["content"], "hello");
 }
 
 #[test]
-fn responses_rejects_unrepresentable_hard_tool_choices_before_provider_call() {
+fn responses_converts_supported_tool_choices() {
     let cases = [
-        (ANTHROPIC_MESSAGES_2023_06_01, json!("none")),
-        (GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA, json!("none")),
-        (GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA, json!("required")),
+        (
+            ANTHROPIC_MESSAGES_2023_06_01,
+            json!("none"),
+            json!({"type":"none"}),
+        ),
+        (
+            GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA,
+            json!("none"),
+            json!({"mode":"NONE"}),
+        ),
+        (
+            GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA,
+            json!("required"),
+            json!({"mode":"ANY"}),
+        ),
         (
             GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA,
             json!({"type": "function", "name": "lookup"}),
+            json!({"mode":"ANY", "allowedFunctionNames":["lookup"]}),
         ),
     ];
 
-    for (target, tool_choice) in cases {
+    for (target, tool_choice, expected) in cases {
         let pair = ProtocolTransform::global()
             .bind(OPEN_RESPONSES_2026_04_24, target)
             .expect("registered protocol pair");
@@ -1438,14 +1598,20 @@ fn responses_rejects_unrepresentable_hard_tool_choices_before_provider_call() {
             }))
             .expect("valid Responses request");
 
-        let error = pair
+        let body = pair
             .encode_request(request)
-            .expect_err("hard tool choice must not be silently dropped");
-        assert!(matches!(
-            error,
-            TransformError::Unrepresentable { ref lost, .. }
-                if lost == &vec!["tool_choice".to_string()]
-        ));
+            .expect("a supported tool choice is converted")
+            .body;
+        if target == ANTHROPIC_MESSAGES_2023_06_01 {
+            assert_eq!(body["tool_choice"], expected);
+            assert_eq!(body["tools"][0]["name"], "lookup");
+        } else {
+            assert_eq!(body["toolConfig"]["functionCallingConfig"], expected);
+            assert_eq!(
+                body["tools"][0]["functionDeclarations"][0]["name"],
+                "lookup"
+            );
+        }
     }
 }
 
@@ -1484,7 +1650,7 @@ fn gemini_auto_tool_config_translates_to_openai_tool_choice() {
 }
 
 #[test]
-fn gemini_constrained_auto_tool_config_remains_unrepresentable() {
+fn gemini_auto_tool_config_keeps_mode_when_unsupported_constraint_is_omitted() {
     let pair = ProtocolTransform::global()
         .bind(
             GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA,
@@ -1512,19 +1678,67 @@ fn gemini_constrained_auto_tool_config_remains_unrepresentable() {
         }))
         .expect("valid Gemini request");
 
-    let error = pair
+    let body = pair
         .encode_request(request)
-        .expect_err("constrained Gemini tool selection must remain fail-closed");
+        .expect("supported auto mode is retained")
+        .body;
 
-    assert!(matches!(
-        error,
-        TransformError::Unrepresentable { ref lost, .. }
-            if lost == &vec!["tool_config".to_string()]
-    ));
+    assert_eq!(body["tool_choice"], "auto");
+    assert_eq!(body["tools"].as_array().map(Vec::len), Some(2));
 }
 
 #[test]
-fn responses_cross_protocol_distinguishes_advisory_and_hard_controls() {
+fn target_native_continuation_survives_foreign_client_ingress() {
+    let native = ProtocolTransform::global()
+        .bind(OPEN_RESPONSES_2026_04_24, OPEN_RESPONSES_2026_04_24)
+        .unwrap();
+    let target_state = native
+        .decode_request(json!({
+            "model": "model",
+            "previous_response_id": "resp-target",
+            "input": [{
+                "type": "compaction",
+                "id": "cmp-target",
+                "encrypted_content": "protected-target-state"
+            }]
+        }))
+        .unwrap();
+    let responses = ProtocolTransform::global()
+        .bind(ANTHROPIC_MESSAGES_2023_06_01, OPEN_RESPONSES_2026_04_24)
+        .unwrap();
+    let mut request = responses
+        .decode_request(json!({
+            "model": "model",
+            "max_tokens": 128,
+            "messages": [{"role": "user", "content": "continue"}]
+        }))
+        .unwrap();
+    request.ext = target_state.ext;
+    request.items.splice(0..0, target_state.items);
+
+    let body = responses.encode_request(request.clone()).unwrap().body;
+    assert_eq!(body["previous_response_id"], "resp-target");
+    assert_eq!(body["input"][0]["type"], "compaction");
+    assert_eq!(
+        body["input"][0]["encrypted_content"],
+        "protected-target-state"
+    );
+    assert_eq!(body["input"][1]["content"][0]["text"], "continue");
+
+    let chat = ProtocolTransform::global()
+        .bind(
+            ANTHROPIC_MESSAGES_2023_06_01,
+            OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+        )
+        .unwrap();
+    let body = chat.encode_request(request).unwrap().body;
+    assert!(body.get("previous_response_id").is_none());
+    assert!(!body.to_string().contains("protected-target-state"));
+    assert_eq!(body["messages"][0]["content"], "continue");
+}
+
+#[test]
+fn responses_cross_protocol_drops_controls_the_target_cannot_carry() {
     let pair = ProtocolTransform::global()
         .bind(
             OPEN_RESPONSES_2026_04_24,
@@ -1554,18 +1768,71 @@ fn responses_cross_protocol_distinguishes_advisory_and_hard_controls() {
         });
         body[field] = value;
         let request = pair.decode_request(body).expect("valid Responses request");
-        let error = pair
+        let encoded = pair
             .encode_request(request)
-            .expect_err("hard control must not be silently dropped");
-        assert!(matches!(
-            error,
-            TransformError::Unrepresentable { lost, .. } if lost == vec![field]
-        ));
+            .expect("a control the target cannot carry is dropped")
+            .body;
+        assert!(encoded.get(field).is_none(), "{field}");
+        assert_eq!(encoded["messages"][0]["content"], "hello");
     }
 }
 
 #[test]
-fn pair_bound_adapter_rejects_cross_protocol_candidate_loss() {
+fn responses_disabled_truncation_preserves_anthropic_tool_continuation() {
+    let pair = ProtocolTransform::global()
+        .bind(OPEN_RESPONSES_2026_04_24, ANTHROPIC_MESSAGES_2023_06_01)
+        .expect("registered protocol pair");
+    let request = pair
+        .decode_request(json!({
+            "model": "claude-sonnet-5-5",
+            "truncation": "disabled",
+            "max_output_tokens": 128,
+            "input": [
+                {"role": "user", "content": "retain the first turn"},
+                {"type": "function_call", "call_id": "call_read", "name": "read", "arguments": "{\"path\":\"a\"}"},
+                {"type": "function_call_output", "call_id": "call_read", "output": "retained tool result"},
+                {"role": "user", "content": "continue with all history"}
+            ]
+        }))
+        .expect("valid Responses request");
+    let encoded = pair
+        .encode_request(request)
+        .expect("Anthropic preserves complete input when truncation is disabled");
+    assert_eq!(
+        encoded.body["messages"],
+        json!([
+            {"role": "user", "content": [{"type": "text", "text": "retain the first turn"}]},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "call_read", "name": "read", "input": {"path": "a"}}]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "call_read", "content": "retained tool result"},
+                {"type": "text", "text": "continue with all history"}
+            ]}
+        ])
+    );
+}
+
+#[test]
+fn responses_auto_truncation_is_omitted_for_anthropic() {
+    let pair = ProtocolTransform::global()
+        .bind(OPEN_RESPONSES_2026_04_24, ANTHROPIC_MESSAGES_2023_06_01)
+        .expect("registered protocol pair");
+    let request = pair
+        .decode_request(json!({
+            "model": "claude-sonnet-5-5",
+            "input": "retain context handling semantics",
+            "truncation": "auto"
+        }))
+        .expect("valid Responses request");
+    let body = pair.encode_request(request).unwrap().body;
+    assert!(body.get("truncation").is_none());
+    assert_eq!(
+        body["messages"][0]["content"][0]["text"],
+        "retain context handling semantics"
+    );
+}
+
+#[test]
+fn pair_bound_adapter_omits_unsupported_candidate_count() {
     let pair = ProtocolTransform::global()
         .bind(
             OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
@@ -1580,24 +1847,9 @@ fn pair_bound_adapter_rejects_cross_protocol_candidate_loss() {
         }))
         .expect("valid OpenAI request");
 
-    let error = pair
-        .encode_request(request)
-        .expect_err("Anthropic cannot represent multiple candidates");
-
-    match error {
-        TransformError::Unrepresentable {
-            ingress,
-            egress,
-            direction,
-            lost,
-        } => {
-            assert_eq!(ingress, OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1);
-            assert_eq!(egress, ANTHROPIC_MESSAGES_2023_06_01);
-            assert_eq!(direction, "client_request");
-            assert_eq!(lost, ["n"]);
-        }
-        other => panic!("expected typed representability error, got {other:?}"),
-    }
+    let body = pair.encode_request(request).unwrap().body;
+    assert!(body.get("n").is_none());
+    assert_eq!(body["messages"][0]["content"][0]["text"], "compare");
 }
 
 #[test]
@@ -2112,7 +2364,7 @@ fn donor_responses_reasoning_summary_stream_maps_to_anthropic_thinking() {
 }
 
 #[test]
-fn canonical_video_is_native_for_gemini_and_rejected_for_anthropic() {
+fn canonical_video_is_native_for_gemini_and_omitted_for_anthropic() {
     let request = AiRequest::new(
         "gemini-video",
         vec![AiItem {
@@ -2139,19 +2391,45 @@ fn canonical_video_is_native_for_gemini_and_rejected_for_anthropic() {
         "video/mp4"
     );
 
-    let error = ProtocolTransform::global()
+    for source in [
+        MediaSource::Url("https://example.com/video.mp4".into()),
+        MediaSource::Base64 {
+            media_type: "video/mp4".into(),
+            data: "dmlkZW8=".into(),
+        },
+    ] {
+        let mut native_request = request.clone();
+        native_request.items[0].content = MessageContent::Blocks(vec![ContentBlock::Video {
+            source: source.clone(),
+            media_type: Some("video/mp4".into()),
+        }]);
+        let responses = ProtocolTransform::global()
+            .bind(
+                GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA,
+                OPEN_RESPONSES_2026_04_24,
+            )
+            .unwrap()
+            .encode_request(native_request)
+            .unwrap();
+        let video = &responses.body["input"][0]["content"][0];
+        assert_eq!(video["type"], "input_video");
+        let expected = match source {
+            MediaSource::Url(url) => url,
+            MediaSource::Base64 { media_type, data } => format!("data:{media_type};base64,{data}"),
+            _ => unreachable!(),
+        };
+        assert_eq!(video["video_url"], expected);
+    }
+
+    let encoded = ProtocolTransform::global()
         .bind(
             GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA,
             ANTHROPIC_MESSAGES_2023_06_01,
         )
-        .expect("Anthropic protocol pair")
+        .unwrap()
         .encode_request(request)
-        .expect_err("Anthropic must reject native video");
-    assert!(matches!(
-        error,
-        TransformError::Unrepresentable { lost, .. }
-            if lost == vec!["messages[0].content[0]"]
-    ));
+        .unwrap();
+    assert!(!encoded.body.to_string().contains("video.mp4"));
 }
 #[test]
 fn responses_reasoning_before_tool_call_is_preserved_for_openai_compatible() {
@@ -2231,7 +2509,7 @@ fn responses_replay_preserves_canonical_reasoning_item() {
 }
 
 #[test]
-fn strict_function_tool_is_omitted_when_target_cannot_express_it() {
+fn strict_function_tool_keeps_supported_strict_and_schema_constraints() {
     let source = ProtocolTransform::global()
         .bind(OPEN_RESPONSES_2026_04_24, OPEN_RESPONSES_2026_04_24)
         .expect("registered source pair");
@@ -2262,8 +2540,19 @@ fn strict_function_tool_is_omitted_when_target_cannot_express_it() {
             .encode_request(request.clone())
             .expect("function tool strict is an advisory hint");
         let tool = &encoded.body["tools"][0];
-        assert!(!tool.to_string().contains("strict"), "{tool}");
-        assert!(tool.to_string().contains("lookup"), "{tool}");
+        if target == ANTHROPIC_MESSAGES_2023_06_01 {
+            assert_eq!(tool["name"], "lookup");
+            assert_eq!(tool["strict"], true);
+            assert_eq!(tool["input_schema"]["additionalProperties"], false);
+        } else {
+            let declaration = &tool["functionDeclarations"][0];
+            assert_eq!(declaration["name"], "lookup");
+            assert!(declaration.get("strict").is_none());
+            assert_eq!(
+                declaration["parametersJsonSchema"]["additionalProperties"],
+                false
+            );
+        }
     }
 }
 /// Chat 与 Anthropic 省略 `strict` 表示非严格，而 Responses 省略表示由上游自动严格化。
@@ -2382,7 +2671,7 @@ fn responses_ingress_keeps_omitted_strict_for_responses_target() {
 }
 
 #[test]
-fn refusal_semantics_fail_closed_for_protocols_without_refusal_items() {
+fn refusal_is_omitted_while_text_survives() {
     let pair = ProtocolTransform::global()
         .bind(
             OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
@@ -2402,18 +2691,85 @@ fn refusal_semantics_fail_closed_for_protocols_without_refusal_items() {
     ]);
     response.items.push(mixed);
 
-    assert_eq!(
-        response_loss_paths(pair, &response),
-        vec!["items[0].refusal"]
-    );
-    assert_eq!(
-        stream_loss_paths(pair, &[AiStreamDelta::RefusalDelta("cannot comply".into())]),
-        vec!["deltas[0].refusal"]
+    let encoded = pair.encode_response(&response).unwrap();
+    assert_eq!(encoded["choices"][0]["message"]["content"], "visible");
+    assert!(!encoded.to_string().contains("cannot comply"));
+    let (_, mut encoder) = pair.stream().unwrap().into_parts();
+    let events = encoder
+        .encode_deltas(&[
+            AiStreamDelta::TextDelta("visible".into()),
+            AiStreamDelta::RefusalDelta("cannot comply".into()),
+        ])
+        .unwrap();
+    assert!(events.iter().any(|event| event.data.contains("visible")));
+    assert!(
+        events
+            .iter()
+            .all(|event| !event.data.contains("cannot comply"))
     );
 }
 
 #[test]
-fn response_annotations_and_logprobs_fail_closed_outside_open_responses() {
+fn cross_protocol_native_alternates_are_first_only_without_private_leaks() {
+    let chat = crate::codec::openai::compatible::stream::OpenAIResponseParser
+        .parse_response(json!({"choices": [{"message": {"content": "first"}}, {"index": 1, "message": {"content": "alternate"}}]})).unwrap();
+    let gemini = crate::codec::google::gemini::stream::GoogleResponseParser
+        .parse_response(json!({"candidates": [{"content": {"parts": [{"text": "first"}]}}, {"index": 1, "content": {"parts": [{"text": "alternate"}]}}]})).unwrap();
+    for (source, target, response, marker) in [
+        (
+            OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+            GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA,
+            chat,
+            "__openai_native_choices",
+        ),
+        (
+            GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA,
+            OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+            gemini,
+            "__google_native_candidates",
+        ),
+    ] {
+        let pair = ProtocolTransform::global().bind(target, source).unwrap();
+        let encoded = pair.encode_response(&response).unwrap();
+        assert!(encoded.to_string().contains("first"));
+        assert!(!encoded.to_string().contains("alternate"));
+        assert!(!encoded.to_string().contains(marker));
+        let (_, mut encoder) = pair.stream().unwrap().into_parts();
+        let events = encoder
+            .encode_deltas(&[
+                AiStreamDelta::TextDelta("first".into()),
+                AiStreamDelta::Unknown {
+                    raw: json!({(marker): [{"index": 1, "text": "alternate"}]}).to_string(),
+                },
+                AiStreamDelta::Usage(stravia_runtime_contract::protocol::ir::usage::Usage {
+                    prompt_tokens: 2,
+                    completion_tokens: 3,
+                    total_tokens: 5,
+                    required_components_known: true,
+                    ..Default::default()
+                }),
+                AiStreamDelta::Done {
+                    stop_reason: "stop".into(),
+                },
+            ])
+            .unwrap();
+        assert!(events.iter().any(|event| event.data.contains("first")));
+        assert!(
+            events
+                .iter()
+                .all(|event| !event.data.contains("alternate") && !event.data.contains(marker))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.data.contains("promptTokenCount")
+                    || event.data.contains("prompt_tokens"))
+        );
+    }
+}
+
+#[test]
+fn chat_response_preserves_logprobs_but_omits_responses_annotations() {
     let pair = ProtocolTransform::global()
         .bind(
             OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
@@ -2434,14 +2790,17 @@ fn response_annotations_and_logprobs_fail_closed_outside_open_responses() {
     let mut response = AiResponse::new("resp-metadata", "logical-model");
     response.items.push(item);
 
+    let encoded = pair.encode_response(&response).unwrap();
+    assert_eq!(encoded["choices"][0]["message"]["content"], "answer");
+    assert!(!encoded.to_string().contains("url_citation"));
     assert_eq!(
-        response_loss_paths(pair, &response),
-        vec!["items[0].annotations", "items[0].logprobs"]
+        encoded["choices"][0]["logprobs"]["content"][0]["token"],
+        "answer"
     );
 }
 
 #[test]
-fn dated_stream_metadata_rejects_semantics_but_allows_padding() {
+fn dated_stream_metadata_preserves_text_and_omits_unsupported_metadata() {
     let pair = ProtocolTransform::global()
         .bind(
             OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
@@ -2449,27 +2808,28 @@ fn dated_stream_metadata_rejects_semantics_but_allows_padding() {
         )
         .expect("registered protocol pair");
 
-    assert_eq!(
-        stream_loss_paths(
-            pair,
-            &[
-                AiStreamDelta::TextDeltaWithMetadata {
-                    text: "answer".into(),
-                    logprobs: vec![json!({"token": "answer"})],
-                    obfuscation: Some("pad".into()),
-                    output_index: None,
-                    content_index: None,
-                },
-                AiStreamDelta::ReasoningSummaryDelta {
-                    text: "summary".into(),
-                    obfuscation: None,
-                    output_index: None,
-                    content_index: None,
-                },
-            ],
-        ),
-        vec!["deltas[0].logprobs"]
-    );
+    let (_, mut encoder) = pair.stream().unwrap().into_parts();
+    let events = encoder
+        .encode_deltas(&[
+            AiStreamDelta::TextDeltaWithMetadata {
+                text: "answer".into(),
+                logprobs: vec![json!({"token":"answer"})],
+                obfuscation: Some("pad".into()),
+                output_index: None,
+                content_index: None,
+            },
+            AiStreamDelta::ReasoningSummaryDelta {
+                text: "summary".into(),
+                obfuscation: None,
+                output_index: None,
+                content_index: None,
+            },
+        ])
+        .unwrap();
+    assert!(events.iter().any(|event| event.data.contains("answer")));
+    assert!(events.iter().any(|event| event.data.contains("summary")));
+    assert!(events.iter().any(|event| event.data.contains("logprobs")));
+    assert!(events.iter().all(|event| !event.data.contains("pad")));
 }
 
 #[test]
@@ -2489,23 +2849,6 @@ fn openai_compatible_projects_reasoning_without_losing_server_continuation_state
         ),
         AiItem::output_text("answer"),
     ];
-
-    assert!(response_loss_paths(pair, &response).is_empty());
-    assert!(
-        stream_loss_paths(
-            pair,
-            &[
-                AiStreamDelta::ReasoningSummaryDelta {
-                    text: "visible reasoning".into(),
-                    obfuscation: None,
-                    output_index: Some(0),
-                    content_index: Some(0),
-                },
-                AiStreamDelta::ThinkingSignature("opaque".into()),
-            ],
-        )
-        .is_empty()
-    );
 
     let encoded = pair
         .encode_response(&response)
@@ -2584,18 +2927,16 @@ fn gemini_stream_accepts_responses_reasoning_summary() {
         )
         .expect("registered protocol pair");
 
-    assert!(
-        stream_loss_paths(
-            pair,
-            &[AiStreamDelta::ReasoningSummaryDelta {
-                text: "summary".into(),
-                obfuscation: None,
-                output_index: Some(0),
-                content_index: Some(0),
-            }],
-        )
-        .is_empty()
-    );
+    let (_, mut encoder) = pair.stream().unwrap().into_parts();
+    let events = encoder
+        .encode_deltas(&[AiStreamDelta::ReasoningSummaryDelta {
+            text: "summary".into(),
+            obfuscation: None,
+            output_index: Some(0),
+            content_index: Some(0),
+        }])
+        .unwrap();
+    assert!(events.iter().any(|event| event.data.contains("summary")));
 }
 #[test]
 fn cross_protocol_omits_advisory_text_and_stream_controls() {
@@ -2625,7 +2966,7 @@ fn cross_protocol_omits_advisory_text_and_stream_controls() {
     assert!(encoded.body.get("text").is_none());
 }
 #[test]
-fn open_responses_client_rejects_unknown_provider_output_items() {
+fn open_responses_client_omits_unknown_provider_output_items() {
     let pair = ProtocolTransform::global()
         .bind(
             OPEN_RESPONSES_2026_04_24,
@@ -2637,7 +2978,13 @@ fn open_responses_client_rejects_unknown_provider_output_items() {
         json!({"type": "executable_code", "code": "1 + 1"}),
     ));
 
-    assert_eq!(response_loss_paths(pair, &response), vec!["items[0]"]);
+    response.items.push(AiItem::output_text("preserved answer"));
+    let encoded = pair.encode_response(&response).unwrap();
+    assert_eq!(
+        encoded["output"][0]["content"][0]["text"],
+        "preserved answer"
+    );
+    assert!(!encoded.to_string().contains("executable_code"));
 }
 
 #[test]
@@ -2841,7 +3188,7 @@ fn google_structured_output_is_representable_for_open_responses_requests() {
         "application/json"
     );
     assert_eq!(
-        encoded.body["generationConfig"]["responseSchema"]["properties"]["answer"]["type"],
+        encoded.body["generationConfig"]["responseJsonSchema"]["properties"]["answer"]["type"],
         "string"
     );
 
@@ -2863,14 +3210,24 @@ fn google_structured_output_is_representable_for_open_responses_requests() {
             }
         }))
         .expect("dated request");
-    assert!(matches!(
-        pair.encode_request(lossy),
-        Err(TransformError::Unrepresentable { .. })
-    ));
+    let body = pair.encode_request(lossy).unwrap().body;
+    assert_eq!(
+        body["generationConfig"]["responseMimeType"],
+        "application/json"
+    );
+    assert_eq!(
+        body["generationConfig"]["responseJsonSchema"]["properties"]["answer"]["type"],
+        "string"
+    );
+    assert_eq!(
+        body["generationConfig"]["responseJsonSchema"]["additionalProperties"],
+        false
+    );
+    assert_eq!(body["contents"][0]["parts"][0]["text"], "hello");
 }
 
 #[test]
-fn open_responses_client_rejects_assistant_image_output() {
+fn open_responses_client_omits_assistant_image_output() {
     let pair = ProtocolTransform::global()
         .bind(
             OPEN_RESPONSES_2026_04_24,
@@ -2892,11 +3249,19 @@ fn open_responses_client_rejects_assistant_image_output() {
         meta: None,
     });
 
-    assert_eq!(response_loss_paths(pair, &response), vec!["items[0]"]);
+    response
+        .items
+        .push(AiItem::output_text("image description"));
+    let encoded = pair.encode_response(&response).unwrap();
+    assert_eq!(
+        encoded["output"][0]["content"][0]["text"],
+        "image description"
+    );
+    assert!(!encoded.to_string().contains("image.png"));
 }
 
 #[test]
-fn open_responses_client_rejects_unrepresentable_tool_output_blocks() {
+fn open_responses_client_omits_unsupported_tool_output_blocks() {
     let pair = ProtocolTransform::global()
         .bind(
             OPEN_RESPONSES_2026_04_24,
@@ -2930,10 +3295,10 @@ fn open_responses_client_rejects_unrepresentable_tool_output_blocks() {
         meta: None,
     });
 
-    assert_eq!(
-        response_loss_paths(pair, &response),
-        vec!["items[0]", "items[1]"]
-    );
+    response.items.push(AiItem::output_text("preserved"));
+    let encoded = pair.encode_response(&response).unwrap();
+    assert!(encoded.to_string().contains("preserved"));
+    assert!(!encoded.to_string().contains("image.png"));
 }
 
 #[test]
@@ -3028,7 +3393,7 @@ fn aggregated_google_stream_keeps_metadata_out_of_four_protocol_content() {
 }
 
 #[test]
-fn canonical_google_stream_metadata_is_advisory_but_unknown_items_are_not() {
+fn canonical_google_stream_omits_unknown_items_and_preserves_text() {
     let pair = ProtocolTransform::global()
         .bind(
             OPEN_RESPONSES_2026_04_24,
@@ -3049,10 +3414,19 @@ fn canonical_google_stream_metadata_is_advisory_but_unknown_items_are_not() {
         raw: json!({"type": "executable_code", "code": "1 + 1"}).to_string(),
     };
 
-    assert!(stream_loss_paths(pair, &[metadata]).is_empty());
-    assert_eq!(
-        stream_loss_paths(pair, &[unknown_item]),
-        vec!["deltas[0].unknown"]
+    let (_, mut encoder) = pair.stream().unwrap().into_parts();
+    let events = encoder
+        .encode_deltas(&[
+            metadata,
+            unknown_item,
+            AiStreamDelta::TextDelta("preserved".into()),
+        ])
+        .unwrap();
+    assert!(events.iter().any(|event| event.data.contains("preserved")));
+    assert!(
+        events
+            .iter()
+            .all(|event| !event.data.contains("executable_code"))
     );
 }
 
@@ -3065,104 +3439,21 @@ fn open_responses_reasoning_signatures_are_canonical() {
         )
         .expect("registered protocol pair");
 
+    let response = AiResponse {
+        items: vec![AiItem::thinking("", Some("opaque".into()))],
+        ..AiResponse::new("response", "model")
+    };
+    assert!(pair.encode_response(&response).is_ok());
+    let (_, mut encoder) = pair.stream().unwrap().into_parts();
     assert!(
-        response_loss_paths(
-            pair,
-            &AiResponse {
-                items: vec![AiItem::thinking("", Some("opaque".into()))],
-                ..AiResponse::new("response", "model")
-            }
-        )
-        .is_empty()
-    );
-    assert!(
-        stream_loss_paths(pair, &[AiStreamDelta::ThinkingSignature("opaque".into())]).is_empty()
+        encoder
+            .encode_deltas(&[AiStreamDelta::ThinkingSignature("opaque".into())])
+            .is_ok()
     );
 }
 
 #[test]
-fn malformed_tool_arguments_are_unrepresentable_for_object_typed_egress() {
-    let malformed_request = || {
-        let mut request = AiRequest::new("model", Vec::new());
-        request.items.push(AiItem::function_call(ToolCall {
-            id: "call-1".into(),
-            name: "local_probe".into(),
-            arguments: "{\"path\":\"/tmp/x\"".into(),
-        }));
-        request
-    };
-
-    for target in [
-        ANTHROPIC_MESSAGES_2023_06_01,
-        GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA,
-    ] {
-        let pair = ProtocolTransform::global()
-            .bind(OPEN_RESPONSES_2026_04_24, target)
-            .expect("registered protocol pair");
-        let capabilities = adapter(target).expect("registered adapter").capabilities();
-        assert_eq!(
-            request_loss_paths(pair, &malformed_request(), capabilities),
-            vec!["messages[0].tool_calls[0].arguments"],
-            "object-typed tool input must not silently fabricate {{}}"
-        );
-    }
-
-    // 字符串类型目标保留逐字字节。
-    let target = OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1;
-    let pair = ProtocolTransform::global()
-        .bind(OPEN_RESPONSES_2026_04_24, target)
-        .expect("registered protocol pair");
-    let capabilities = adapter(target).expect("registered adapter").capabilities();
-    assert!(request_loss_paths(pair, &malformed_request(), capabilities).is_empty());
-}
-
-#[test]
-fn malformed_tool_arguments_are_unrepresentable_from_object_typed_ingress() {
-    let malformed_response = || {
-        let mut response = AiResponse::new("resp-1", "model");
-        response.items.push(AiItem::function_call(ToolCall {
-            id: "call-1".into(),
-            name: "local_probe".into(),
-            arguments: "{\"path\":\"/tmp/x\"".into(),
-        }));
-        response
-    };
-
-    for ingress in [
-        ANTHROPIC_MESSAGES_2023_06_01,
-        GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA,
-    ] {
-        let pair = ProtocolTransform::global()
-            .bind(ingress, OPEN_RESPONSES_2026_04_24)
-            .expect("registered protocol pair");
-        assert_eq!(
-            response_loss_paths(pair, &malformed_response()),
-            vec!["items[0].tool_calls[0].arguments"]
-        );
-        // 同协议回传的重编码同样要求对象入参。
-        let relay = ProtocolTransform::global()
-            .bind(ingress, ingress)
-            .expect("registered protocol pair");
-        assert_eq!(
-            response_loss_paths(relay, &malformed_response()),
-            vec!["items[0].tool_calls[0].arguments"]
-        );
-    }
-
-    // 字符串类型出参保留逐字字节；CC 同协议回传同样逐字。
-    let pair = ProtocolTransform::global()
-        .bind(
-            OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
-            OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
-        )
-        .expect("registered protocol pair");
-    assert!(response_loss_paths(pair, &malformed_response()).is_empty());
-}
-
-#[test]
-fn gemini_stream_encode_fails_on_unrepresentable_tool_arguments() {
-    // 截断的入参字节永远无法成为 functionCall args 对象：终态必须显式失败，
-    // 不能伪造 {}、丢弃调用或发出假 STOP。
+fn gemini_stream_encode_omits_invalid_tool_arguments() {
     let pair = ProtocolTransform::global()
         .bind(
             GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA,
@@ -3184,24 +3475,29 @@ fn gemini_stream_encode_fails_on_unrepresentable_tool_arguments() {
             },
         ])
         .expect("mid-stream fragments stay pending until done");
-    let error = encoder
-        .encode_deltas(&[AiStreamDelta::Done {
-            stop_reason: "stop".into(),
-        }])
-        .expect_err("unrepresentable arguments must fail the terminal state");
+    let events = encoder
+        .encode_deltas(&[
+            AiStreamDelta::TextDelta("preserved text".into()),
+            AiStreamDelta::Done {
+                stop_reason: "stop".into(),
+            },
+        ])
+        .unwrap();
     assert!(
-        matches!(
-            error,
-            TransformError::Unrepresentable { ref lost, .. }
-                if lost.iter().any(|path| path == "tool_calls[0].arguments")
-        ),
-        "unexpected transform error: {error}"
+        events
+            .iter()
+            .any(|event| event.data.contains("preserved text"))
     );
+    assert!(
+        events
+            .iter()
+            .all(|event| !event.data.contains("functionCall"))
+    );
+    assert!(events.iter().any(|event| event.data.contains("STOP")));
 }
 
 #[test]
-fn gemini_stream_encode_fails_on_argumentless_tool_call() {
-    // 空字节串也不是 {}：无参调用同样不可表达，终态显式失败。
+fn gemini_stream_encode_omits_argumentless_tool_call() {
     let pair = ProtocolTransform::global()
         .bind(
             GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA,
@@ -3217,12 +3513,406 @@ fn gemini_stream_encode_fails_on_argumentless_tool_call() {
             name: "local_probe".into(),
         }])
         .expect("tool call start stays pending");
-    let error = encoder
+    let events = encoder
+        .encode_deltas(&[
+            AiStreamDelta::TextDelta("preserved text".into()),
+            AiStreamDelta::Done {
+                stop_reason: "stop".into(),
+            },
+        ])
+        .unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.data.contains("preserved text"))
+    );
+    assert!(
+        events
+            .iter()
+            .all(|event| !event.data.contains("functionCall"))
+    );
+    assert!(events.iter().any(|event| event.data.contains("STOP")));
+}
+
+#[test]
+fn request_boundary_preserves_mixed_content_and_drops_invalid_calls_with_their_results() {
+    for target in [
+        ANTHROPIC_MESSAGES_2023_06_01,
+        GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA,
+    ] {
+        let pair = ProtocolTransform::global()
+            .bind(OPEN_RESPONSES_2026_04_24, target)
+            .unwrap();
+        for arguments in ["", "{", "[]", "null", "42"] {
+            let mut mixed = AiItem::output_text("preserved assistant");
+            mixed.content = MessageContent::Blocks(vec![
+                ContentBlock::Text {
+                    text: "preserved assistant".to_owned().into(),
+                    cache_control: None,
+                },
+                ContentBlock::Video {
+                    source: MediaSource::Url("https://example.test/video.mp4".into()),
+                    media_type: Some("video/mp4".into()),
+                },
+            ]);
+            mixed.tool_calls = Some(vec![
+                ToolCall {
+                    id: "bad-call".into(),
+                    name: "invalid_probe".into(),
+                    arguments: arguments.into(),
+                },
+                ToolCall {
+                    id: "good-call".into(),
+                    name: "valid_probe".into(),
+                    arguments: "{\"key\":\"value\"}".into(),
+                },
+            ]);
+            let mut bad_result = AiItem::output_text("unsupported associated result");
+            bad_result.role = Role::Tool;
+            bad_result.tool_call_id = Some("bad-call".into());
+            let mut good_result = AiItem::output_text("preserved associated result");
+            good_result.role = Role::Tool;
+            good_result.tool_call_id = Some("good-call".into());
+            let request = AiRequest::new(
+                "model",
+                vec![
+                    mixed,
+                    bad_result,
+                    good_result,
+                    AiItem {
+                        role: Role::User,
+                        content: MessageContent::Text("continue".to_owned().into()),
+                        tool_calls: None,
+                        tool_call_id: None,
+                        meta: None,
+                    },
+                ],
+            );
+            let body = pair.encode_request(request).unwrap().body;
+            let wire = body.to_string();
+            assert!(wire.contains("preserved assistant"));
+            assert!(wire.contains("valid_probe"));
+            assert!(wire.contains("preserved associated result"));
+            assert!(wire.contains("continue"));
+            assert!(!wire.contains("invalid_probe"));
+            assert!(!wire.contains("bad-call"));
+            assert!(!wire.contains("unsupported associated result"));
+            if target == ANTHROPIC_MESSAGES_2023_06_01 {
+                assert!(!wire.contains("video.mp4"));
+            } else {
+                assert!(wire.contains("video.mp4"));
+            }
+        }
+    }
+}
+
+#[test]
+fn response_and_stream_boundaries_select_first_candidate() {
+    let pair = ProtocolTransform::global()
+        .bind(
+            ANTHROPIC_MESSAGES_2023_06_01,
+            OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+        )
+        .unwrap();
+    let response = pair.decode_response(json!({
+        "id":"multi", "model":"model",
+        "choices":[
+            {"index":0,"message":{"role":"assistant","content":"first candidate"},"finish_reason":"stop"},
+            {"index":1,"message":{"role":"assistant","content":"second candidate"},"finish_reason":"stop"}
+        ]
+    })).unwrap();
+    let encoded = pair.encode_response(&response).unwrap();
+    assert!(encoded.to_string().contains("first candidate"));
+    assert!(!encoded.to_string().contains("second candidate"));
+
+    let (mut decoder, mut encoder) = pair.stream().unwrap().into_parts();
+    let chunk = json!({"id":"multi", "model":"model", "choices":[
+        {"index":0,"delta":{"role":"assistant","content":"first candidate"},"finish_reason":null},
+        {"index":1,"delta":{"role":"assistant","content":"second candidate"},"finish_reason":null}
+    ]});
+    let deltas = decoder
+        .decode_chunk(format!("data: {chunk}\n\n").as_bytes())
+        .unwrap();
+    let events = encoder.encode_deltas(&deltas).unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.data.contains("first candidate"))
+    );
+    assert!(
+        events
+            .iter()
+            .all(|event| !event.data.contains("second candidate"))
+    );
+}
+
+#[test]
+fn invalid_source_wire_still_errors() {
+    let pair = ProtocolTransform::global()
+        .bind(
+            OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+            ANTHROPIC_MESSAGES_2023_06_01,
+        )
+        .unwrap();
+    assert!(matches!(
+        pair.decode_request(json!({"model":"model", "messages":"not an array"})),
+        Err(TransformError::Wire { .. })
+    ));
+}
+
+#[test]
+fn chat_to_anthropic_stream_projects_only_complete_object_tool_inputs() {
+    let pair = ProtocolTransform::global()
+        .bind(
+            ANTHROPIC_MESSAGES_2023_06_01,
+            OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+        )
+        .unwrap();
+    let (mut decoder, mut encoder) = pair.stream().unwrap().into_parts();
+    let mut events = Vec::new();
+    let frames = [
+        json!({"id":"chat_1","model":"model","choices":[{"index":0,"delta":{
+        "content":"<think>thinking</think>answer",
+        "tool_calls":[
+            {"index":7,"id":"call_object_a","function":{"name":"lookup","arguments":" {\"query\":"}},
+            {"index":2,"id":"call_array","function":{"name":"array","arguments":"[1,"}},
+            {"index":9,"id":"call_object_b","function":{"name":"other","arguments":"{\"ok\":"}},
+            {"index":4,"id":"call_bad","function":{"name":"bad","arguments":"{oops"}},
+            {"index":5,"id":"call_null","function":{"name":"null","arguments":"null"}}
+        ]}}]}),
+        json!({"choices":[{"index":0,"delta":{"tool_calls":[
+            {"index":9,"function":{"arguments":"true}"}},
+            {"index":2,"function":{"arguments":"2]"}},
+            {"index":7,"function":{"arguments":"\"hello\"} "}}
+        ]}}]}),
+        json!({"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}),
+        json!({"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":17,"total_tokens":28}}),
+    ];
+    for frame in frames {
+        let wire = format!("data: {frame}\n\n");
+        for chunk in wire.as_bytes().chunks(7) {
+            events.extend(
+                encoder
+                    .encode_deltas(&decoder.decode_chunk(chunk).unwrap())
+                    .unwrap(),
+            );
+        }
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.data.contains("\"tool_use\"")),
+            "tools must wait for a complete stream terminal, not a finish_reason"
+        );
+    }
+    assert!(events.iter().any(|event| event.data.contains("answer")));
+    assert!(
+        events
+            .iter()
+            .any(|event| event.data.contains("thinking_delta"))
+    );
+    events.extend(
+        encoder
+            .encode_deltas(&decoder.decode_chunk(b"data: [DONE]\n\n").unwrap())
+            .unwrap(),
+    );
+    events.extend(encoder.encode_deltas(&decoder.finish().unwrap()).unwrap());
+    events.extend(encoder.finish().unwrap());
+
+    // Reconstruct inputs the way an Anthropic SSE consumer does: concatenate
+    // partial_json by content block index and parse on content_block_stop.
+    let mut pending = std::collections::BTreeMap::new();
+    let mut tools = std::collections::BTreeMap::new();
+    let mut terminal = None;
+    for event in &events {
+        let data: Value = serde_json::from_str(&event.data).unwrap();
+        let index = data["index"].as_u64().unwrap_or(0);
+        match data["type"].as_str().unwrap() {
+            "content_block_start" if data["content_block"]["type"] == "tool_use" => {
+                pending.insert(
+                    index,
+                    (
+                        data["content_block"]["id"].as_str().unwrap().to_owned(),
+                        String::new(),
+                    ),
+                );
+            }
+            "content_block_delta" if data["delta"]["type"] == "input_json_delta" => {
+                pending
+                    .get_mut(&index)
+                    .unwrap()
+                    .1
+                    .push_str(data["delta"]["partial_json"].as_str().unwrap());
+            }
+            "content_block_stop" => {
+                if let Some((id, raw)) = pending.remove(&index) {
+                    let input: Value =
+                        serde_json::from_str(&raw).expect("SDK-consumable object input");
+                    assert!(input.is_object());
+                    tools.insert(id, (input, raw));
+                }
+            }
+            "message_delta" => terminal = Some(data),
+            _ => {}
+        }
+    }
+    assert!(pending.is_empty());
+    assert_eq!(tools.len(), 2);
+    assert_eq!(
+        tools["call_object_a"],
+        (json!({"query":"hello"}), " {\"query\":\"hello\"} ".into())
+    );
+    assert_eq!(tools["call_object_b"].0, json!({"ok":true}));
+    for bad in ["call_array", "call_bad", "call_null", "{oops"] {
+        assert!(!events.iter().any(|event| event.data.contains(bad)));
+    }
+    let terminal = terminal.unwrap();
+    assert_eq!(terminal["usage"]["input_tokens"], 11);
+    assert_eq!(terminal["usage"]["output_tokens"], 17);
+    assert_eq!(terminal["delta"]["stop_reason"], "tool_use");
+    assert!(
+        events
+            .iter()
+            .any(|event| event.event.as_deref() == Some("message_stop"))
+    );
+}
+
+#[test]
+fn anthropic_projection_validates_explicit_tool_completions() {
+    let pair = ProtocolTransform::global()
+        .bind(
+            ANTHROPIC_MESSAGES_2023_06_01,
+            OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+        )
+        .unwrap();
+    let (_, mut encoder) = pair.stream().unwrap().into_parts();
+    for (index, id, arguments) in [
+        (3, "call_complete", "{\"value\":1}"),
+        (4, "call_nonobject", "[]"),
+        (5, "call_malformed", "{"),
+    ] {
+        assert!(
+            encoder
+                .encode_deltas(&[
+                    AiStreamDelta::ToolCallStart {
+                        index,
+                        id: id.into(),
+                        name: "lookup".into()
+                    },
+                    AiStreamDelta::ToolCallDelta {
+                        index,
+                        arguments: arguments.into()
+                    },
+                ])
+                .unwrap()
+                .is_empty()
+        );
+        let events = encoder
+            .encode_deltas(&[AiStreamDelta::ToolCallComplete {
+                index,
+                tool_call: ToolCall {
+                    id: id.into(),
+                    name: "lookup".into(),
+                    arguments: arguments.into(),
+                },
+            }])
+            .unwrap();
+        assert_eq!(
+            events.iter().any(|event| event.data.contains(id)),
+            index == 3
+        );
+    }
+    let terminal = encoder
         .encode_deltas(&[AiStreamDelta::Done {
             stop_reason: "stop".into(),
         }])
-        .expect_err("argumentless call is unrepresentable for gemini args");
-    assert!(matches!(error, TransformError::Unrepresentable { .. }));
+        .unwrap();
+    assert!(
+        !terminal
+            .iter()
+            .any(|event| event.data.contains("call_complete")),
+        "explicitly completed calls must not be replayed at global completion"
+    );
+}
+
+#[test]
+fn chat_to_anthropic_stream_does_not_complete_tools_on_eof_or_error() {
+    let pair = ProtocolTransform::global()
+        .bind(
+            ANTHROPIC_MESSAGES_2023_06_01,
+            OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+        )
+        .unwrap();
+    for error in [false, true] {
+        let (mut decoder, mut encoder) = pair.stream().unwrap().into_parts();
+        let frame = json!({"choices":[{"index":0,"delta":{"content":"answer","tool_calls":[
+            {"index":0,"id":"call_unfinished","function":{"name":"lookup","arguments":"{\"ok\":true}"}}
+        ]}}]});
+        let mut events = encoder
+            .encode_deltas(
+                &decoder
+                    .decode_chunk(format!("data: {frame}\n\n").as_bytes())
+                    .unwrap(),
+            )
+            .unwrap();
+        if error {
+            events.extend(
+                encoder
+                    .encode_deltas(
+                        &decoder
+                            .decode_chunk(
+                                b"data: {\"error\":{\"message\":\"upstream failed\"}}\n\n",
+                            )
+                            .unwrap(),
+                    )
+                    .unwrap(),
+            );
+        }
+        events.extend(encoder.encode_deltas(&decoder.finish().unwrap()).unwrap());
+        events.extend(encoder.finish().unwrap());
+        assert!(events.iter().any(|event| event.data.contains("answer")));
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.data.contains("call_unfinished"))
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.event.as_deref() == Some("message_stop"))
+        );
+        assert_eq!(
+            events
+                .iter()
+                .any(|event| event.event.as_deref() == Some("error")),
+            error
+        );
+    }
+    let (mut decoder, _) = pair.stream().unwrap().into_parts();
+    assert!(decoder.decode_chunk(b"data: not-json\n\n").is_err());
+}
+
+#[test]
+fn native_anthropic_empty_tool_input_keeps_immediate_wire_delivery() {
+    let pair = ProtocolTransform::global()
+        .bind(ANTHROPIC_MESSAGES_2023_06_01, ANTHROPIC_MESSAGES_2023_06_01)
+        .unwrap();
+    let (mut decoder, mut encoder) = pair.stream().unwrap().into_parts();
+    let wire = b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call_native\",\"name\":\"lookup\",\"input\":{}}}\n\n";
+    let mut events = Vec::new();
+    for chunk in wire.chunks(5) {
+        events.extend(
+            encoder
+                .encode_deltas(&decoder.decode_chunk(chunk).unwrap())
+                .unwrap(),
+        );
+    }
+    let start = events
+        .iter()
+        .find(|event| event.data.contains("call_native"))
+        .unwrap();
+    let data: Value = serde_json::from_str(&start.data).unwrap();
+    assert_eq!(data["content_block"]["input"], json!({}));
+    assert_eq!(data["content_block"]["id"], "call_native");
 }
 
 #[test]

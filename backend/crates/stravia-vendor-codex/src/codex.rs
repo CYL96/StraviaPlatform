@@ -16,6 +16,8 @@ use super::{
 };
 
 const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+// Retire reusable sessions before the upstream's one-hour connection limit.
+const WEBSOCKET_REUSE_MAX_AGE_MILLIS: u64 = 55 * 60 * 1000;
 const ORIGINATOR: &str = "codex_cli_rs";
 
 pub(super) fn prepare_body(body: &mut Value) -> Result<(), stravia_vendor_sdk::PluginError> {
@@ -70,7 +72,7 @@ fn append_forwarded_client_headers(
 ) {
     for (name, value) in &provider.client_headers {
         let name = name.to_ascii_lowercase();
-        if matches!(
+        if (matches!(
             name.as_str(),
             "accept"
                 | "accept-language"
@@ -81,12 +83,8 @@ fn append_forwarded_client_headers(
                 | "conversation_id"
                 | "thread-id"
                 | "x-client-request-id"
-                | "x-codex-beta-features"
-                | "x-codex-installation-id"
-                | "x-codex-turn-metadata"
-                | "x-codex-turn-state"
-                | "x-codex-window-id"
-        ) && !value.contains(['\r', '\n'])
+        ) || super::CODEX_CLIENT_HEADER_NAMES.contains(&name.as_str()))
+            && !value.contains(['\r', '\n'])
         {
             set_header(headers, &name, value.clone());
         }
@@ -217,6 +215,7 @@ pub(super) fn infer_websocket(
         headers,
         protocols: Vec::new(),
         continuation_id,
+        reuse_max_age_millis: Some(WEBSOCKET_REUSE_MAX_AGE_MILLIS),
     })?;
     let mut frame = body.clone();
     let object = frame

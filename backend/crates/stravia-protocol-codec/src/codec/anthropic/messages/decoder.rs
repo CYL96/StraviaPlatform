@@ -65,8 +65,8 @@ impl AnthropicDecoder {
             _ => false,
         };
 
-        // `strict` 与 `tool_result.is_error` 只经原样快照到达同协议上游：IR 不承载
-        // 它们，写入 IR 会改变跨协议路由（strict 丢失校验、OpenAI 严格模式等）。
+        // 原样快照保留 cache_control 和工具原生字段；strict 同时进入 IR，
+        // 以便跨协议保留官方严格工具调用约束。
         let needs_raw_tools = req
             .tools
             .as_ref()
@@ -153,7 +153,7 @@ impl AnthropicDecoder {
                         name: format!("__builtin__{}", tool_type),
                         description: t.description,
                         parameters: t.input_schema.unwrap_or(Value::Object(Default::default())),
-                        strict: None,
+                        strict: t.strict,
                         cache_control: t.cache_control.as_ref().map(map_cache_control),
                         meta: None,
                     });
@@ -162,7 +162,7 @@ impl AnthropicDecoder {
                         name: t.name,
                         description: t.description,
                         parameters: schema,
-                        strict: None,
+                        strict: t.strict,
                         cache_control: t.cache_control.as_ref().map(map_cache_control),
                         meta: None,
                     });
@@ -171,7 +171,18 @@ impl AnthropicDecoder {
         }
 
         // ── tool_choice ───────────────────────────────────────────────────────
+        let disable_parallel_tool_calls = req
+            .tool_choice
+            .as_ref()
+            .and_then(|choice| choice.get("disable_parallel_tool_use"))
+            .map(|value| {
+                value.as_bool().ok_or_else(|| {
+                    anyhow::anyhow!("Anthropic disable_parallel_tool_use must be a boolean")
+                })
+            })
+            .transpose()?;
         let tool_choice = req.tool_choice.map(parse_tool_choice);
+        let response_format = parse_output_format(req.output_config.as_ref())?;
 
         // ── Reasoning config ──────────────────────────────────────────────────
         let output_effort = parse_output_effort(req.output_config.as_ref())?;
@@ -220,6 +231,7 @@ impl AnthropicDecoder {
 
         // ── AnthropicExt ──────────────────────────────────────────────────────
         let ant_ext = AnthropicExt {
+            output_config: req.output_config,
             top_k: req.top_k,
             container: req.container.as_ref().map(|c| Value::String(c.clone())),
             service_tier: req.service_tier.clone(),
@@ -291,6 +303,9 @@ impl AnthropicDecoder {
         };
         ai_req.tools = tools_opt;
         ai_req.tool_choice = tool_choice;
+        ai_req.disable_parallel_tool_calls = disable_parallel_tool_calls;
+        ai_req.parallel_tool_calls = disable_parallel_tool_calls.map(|disabled| !disabled);
+        ai_req.response_format = response_format;
         ai_req.reasoning = reasoning;
         ai_req.ext = Some(ProtocolExt::Anthropic(ant_ext));
         ai_req.meta.source_protocol = Some(ANTHROPIC_MESSAGES_2023_06_01);
@@ -361,7 +376,7 @@ fn decode_message(msg: AnthropicMessage) -> Result<Vec<AiItem>> {
                         ..
                     } => {
                         content_blocks.push(ContentBlock::Image {
-                            source: map_image_source(source),
+                            source: map_image_source(source)?,
                             detail: None,
                             cache_control: cache_control.as_ref().map(map_cache_control),
                         });
@@ -413,12 +428,12 @@ fn decode_message(msg: AnthropicMessage) -> Result<Vec<AiItem>> {
                         cache_control,
                         ..
                     } => {
-                        content_blocks.push(ContentBlock::Document {
-                            source: map_doc_source(source),
+                        content_blocks.push(map_document_block(
+                            source,
                             title,
                             context,
-                            cache_control: cache_control.as_ref().map(map_cache_control),
-                        });
+                            cache_control,
+                        )?);
                     }
                     AnthropicContentBlock::InputAudio { source, .. } => {
                         content_blocks.push(ContentBlock::Audio {
@@ -495,9 +510,12 @@ fn decode_user_blocks(blocks: Vec<AnthropicContentBlock>) -> Result<Vec<AiItem>>
             AnthropicContentBlock::ToolResult {
                 tool_use_id,
                 content,
+                is_error,
+                cache_control,
                 ..
             } => {
-                let content_kind = if content.as_ref().is_some_and(Value::is_array) {
+                let content = content.unwrap_or_else(|| Value::String(String::new()));
+                let content_kind = if content.is_array() {
                     "content_blocks"
                 } else {
                     "json"
@@ -509,14 +527,25 @@ fn decode_user_blocks(blocks: Vec<AnthropicContentBlock>) -> Result<Vec<AiItem>>
                         }),
                     ),
                 );
-                let tool_text = match content.unwrap_or(Value::Null) {
-                    Value::String(s) => s,
-                    Value::Null => String::new(),
-                    other => other.to_string(),
+                let content = match content {
+                    Value::String(text) if is_error.is_none() && cache_control.is_none() => {
+                        MessageContent::Text(text.into())
+                    }
+                    content => MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                        tool_use_id: tool_use_id.clone().into(),
+                        content,
+                        content_kind: Some(if content_kind == "content_blocks" {
+                            stravia_runtime_contract::protocol::ir::ToolResultContentKind::ContentBlocks
+                        } else {
+                            stravia_runtime_contract::protocol::ir::ToolResultContentKind::Json
+                        }),
+                        is_error,
+                        cache_control: cache_control.as_ref().map(map_cache_control),
+                    }]),
                 };
                 messages.push(AiItem {
                     role: Role::Tool,
-                    content: MessageContent::Text(tool_text.into()),
+                    content,
                     tool_calls: None,
                     tool_call_id: Some((tool_use_id).into()),
                     meta,
@@ -551,7 +580,7 @@ fn decode_user_blocks(blocks: Vec<AnthropicContentBlock>) -> Result<Vec<AiItem>>
                 ..
             } => {
                 user_blocks.push(ContentBlock::Image {
-                    source: map_image_source(source),
+                    source: map_image_source(source)?,
                     detail: None,
                     cache_control: cache_control.as_ref().map(map_cache_control),
                 });
@@ -577,12 +606,7 @@ fn decode_user_blocks(blocks: Vec<AnthropicContentBlock>) -> Result<Vec<AiItem>>
                 cache_control,
                 ..
             } => {
-                user_blocks.push(ContentBlock::Document {
-                    source: map_doc_source(source),
-                    title,
-                    context,
-                    cache_control: cache_control.as_ref().map(map_cache_control),
-                });
+                user_blocks.push(map_document_block(source, title, context, cache_control)?);
             }
             AnthropicContentBlock::InputAudio { source, .. } => {
                 user_blocks.push(ContentBlock::Audio {
@@ -630,36 +654,139 @@ fn map_cache_control(
     }
 }
 
-fn map_image_source(src: AnthropicImageSource) -> MediaSource {
-    match src.source_type.as_str() {
-        "base64" => MediaSource::Base64 {
-            media_type: src.media_type.unwrap_or_default(),
-            data: src.data.unwrap_or_default(),
+fn map_image_source(src: AnthropicImageSource) -> Result<MediaSource> {
+    Ok(match src.source_type.as_str() {
+        "base64" => {
+            let media_type = src
+                .media_type
+                .ok_or_else(|| anyhow::anyhow!("Anthropic base64 image requires media_type"))?;
+            anyhow::ensure!(
+                matches!(
+                    media_type.as_str(),
+                    "image/jpeg" | "image/png" | "image/gif" | "image/webp"
+                ),
+                "Unsupported Anthropic image MIME type: {media_type}"
+            );
+            MediaSource::Base64 {
+                media_type,
+                data: src
+                    .data
+                    .ok_or_else(|| anyhow::anyhow!("Anthropic base64 image requires data"))?,
+            }
+        }
+        "url" => MediaSource::Url(
+            src.url
+                .ok_or_else(|| anyhow::anyhow!("Anthropic URL image requires url"))?,
+        ),
+        "file" => MediaSource::FileId {
+            file_id: src
+                .file_id
+                .ok_or_else(|| anyhow::anyhow!("Anthropic file image requires file_id"))?,
+            detail: None,
         },
-        "url" => MediaSource::Url(src.url.unwrap_or_default()),
-        _ => MediaSource::Base64 {
-            media_type: src.media_type.unwrap_or_default(),
-            data: src.data.unwrap_or_default(),
-        },
-    }
+        kind => anyhow::bail!("Unsupported Anthropic image source type: {kind}"),
+    })
 }
 
-fn map_doc_source(src: WireDocumentSource) -> IrDocumentSource {
-    match src.kind.as_str() {
-        "base64" => IrDocumentSource::Base64Pdf {
-            data: src.data.unwrap_or_default(),
-        },
-        "text" => IrDocumentSource::PlainText {
-            data: src.data.unwrap_or_default(),
-        },
-        "url" => IrDocumentSource::Url(src.url.unwrap_or_default()),
-        "content" => IrDocumentSource::Blocks {
-            content: Vec::new(), // encoder uses raw JSON; best-effort stub
-        },
-        _ => IrDocumentSource::PlainText {
-            data: src.data.unwrap_or_default(),
-        },
+fn map_document_block(
+    source: WireDocumentSource,
+    title: Option<String>,
+    context: Option<String>,
+    cache_control: Option<WireCacheControl>,
+) -> Result<ContentBlock> {
+    if source.kind == "file" {
+        return Ok(ContentBlock::File {
+            source: MediaSource::FileId {
+                file_id: source
+                    .file_id
+                    .ok_or_else(|| anyhow::anyhow!("Anthropic file document requires file_id"))?,
+                detail: None,
+            },
+            media_type: None,
+        });
     }
+    Ok(ContentBlock::Document {
+        source: map_doc_source(source)?,
+        title,
+        context,
+        cache_control: cache_control.as_ref().map(map_cache_control),
+    })
+}
+
+fn map_doc_source(src: WireDocumentSource) -> Result<IrDocumentSource> {
+    Ok(match src.kind.as_str() {
+        "base64" => {
+            anyhow::ensure!(
+                src.media_type.as_deref() == Some("application/pdf"),
+                "Anthropic base64 document requires application/pdf MIME type"
+            );
+            IrDocumentSource::Base64Pdf {
+                data: src
+                    .data
+                    .ok_or_else(|| anyhow::anyhow!("Anthropic base64 document requires data"))?,
+            }
+        }
+        "text" => {
+            anyhow::ensure!(
+                src.media_type.as_deref() == Some("text/plain"),
+                "Anthropic text document requires text/plain MIME type"
+            );
+            IrDocumentSource::PlainText {
+                data: src
+                    .data
+                    .ok_or_else(|| anyhow::anyhow!("Anthropic text document requires data"))?,
+            }
+        }
+        "url" => IrDocumentSource::Url(
+            src.url
+                .ok_or_else(|| anyhow::anyhow!("Anthropic URL document requires url"))?,
+        ),
+        "content" => {
+            let content = match src.content {
+                Some(Value::String(text)) => vec![ContentBlock::Text {
+                    text: text.into(),
+                    cache_control: None,
+                }],
+                Some(Value::Array(values)) => {
+                    let mut content = Vec::with_capacity(values.len());
+                    for value in values {
+                        if !matches!(
+                            value.get("type").and_then(Value::as_str),
+                            Some("text" | "image")
+                        ) {
+                            continue;
+                        }
+                        match serde_json::from_value::<AnthropicContentBlock>(value)? {
+                            AnthropicContentBlock::Text {
+                                text,
+                                cache_control,
+                            } => {
+                                content.push(ContentBlock::Text {
+                                    text: text.into(),
+                                    cache_control: cache_control.as_ref().map(map_cache_control),
+                                });
+                            }
+                            AnthropicContentBlock::Image {
+                                source,
+                                cache_control,
+                            } => {
+                                content.push(ContentBlock::Image {
+                                    source: map_image_source(source)?,
+                                    detail: None,
+                                    cache_control: cache_control.as_ref().map(map_cache_control),
+                                });
+                            }
+                            _ => unreachable!("document content was filtered to text and image"),
+                        }
+                    }
+                    content
+                }
+                _ => anyhow::bail!("Anthropic document content must be a string or block array"),
+            };
+            IrDocumentSource::Blocks { content }
+        }
+        kind => anyhow::bail!("Unsupported Anthropic document source type: {kind}"),
+    })
 }
 
 fn parse_tool_choice(v: Value) -> ToolChoice {
@@ -680,6 +807,33 @@ fn parse_tool_choice(v: Value) -> ToolChoice {
     }
 }
 
+fn parse_output_format(
+    output_config: Option<&Value>,
+) -> Result<Option<stravia_runtime_contract::protocol::ir::ResponseFormat>> {
+    let Some(format) = output_config
+        .and_then(|config| config.get("format"))
+        .filter(|format| !format.is_null())
+    else {
+        return Ok(None);
+    };
+    if format.get("type").and_then(Value::as_str) != Some("json_schema") {
+        anyhow::bail!("unsupported Anthropic output_config.format type");
+    }
+    let schema = format
+        .get("schema")
+        .filter(|schema| schema.is_object())
+        .ok_or_else(|| {
+            anyhow::anyhow!("Anthropic output_config.format.schema must be an object")
+        })?;
+    Ok(Some(
+        stravia_runtime_contract::protocol::ir::ResponseFormat::JsonSchema {
+            name: "response".into(),
+            schema: schema.clone(),
+            strict: Some(true),
+        },
+    ))
+}
+
 fn parse_output_effort(output_config: Option<&Value>) -> Result<Option<String>> {
     let Some(output_config) = output_config else {
         return Ok(None);
@@ -689,6 +843,7 @@ fn parse_output_effort(output_config: Option<&Value>) -> Result<Option<String>> 
         .ok_or_else(|| anyhow::anyhow!("Anthropic output_config must be an object"))?;
     output_config
         .get("effort")
+        .filter(|effort| !effort.is_null())
         .map(|effort| {
             effort
                 .as_str()

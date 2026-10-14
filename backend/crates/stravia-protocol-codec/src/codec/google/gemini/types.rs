@@ -148,8 +148,10 @@ pub struct GoogleGenerationConfig {
     pub response_mime_type: Option<String>,
     #[serde(rename = "responseSchema", skip_serializing_if = "Option::is_none")]
     pub response_schema: Option<Value>,
+    #[serde(rename = "responseJsonSchema", skip_serializing_if = "Option::is_none")]
+    pub response_json_schema: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub seed: Option<u32>,
+    pub seed: Option<i64>,
     #[serde(rename = "presencePenalty", skip_serializing_if = "Option::is_none")]
     pub presence_penalty: Option<f64>,
     #[serde(rename = "frequencyPenalty", skip_serializing_if = "Option::is_none")]
@@ -167,6 +169,140 @@ pub struct GoogleGenerationConfig {
     pub media_resolution: Option<String>,
     #[serde(rename = "routingConfig", skip_serializing_if = "Option::is_none")]
     pub routing_config: Option<Value>,
+}
+
+// Normalize the two official schema dialects without resolving references. In
+// particular, visiting only schema-bearing keywords leaves property names and
+// literal enum values untouched.
+pub(super) fn normalize_json_schema(mut schema: Value) -> Value {
+    fn pointer_key(key: &str) -> String {
+        key.replace('~', "~0").replace('/', "~1")
+    }
+
+    fn normalize(value: &mut Value, path: &str, refs: &mut Vec<(String, String)>) {
+        let Some(map) = value.as_object_mut() else {
+            return;
+        };
+        if let Some(Value::String(kind)) = map.get_mut("type") {
+            *kind = kind.to_ascii_lowercase();
+        }
+        if map.remove("nullable").and_then(|v| v.as_bool()) == Some(true) {
+            if let Some(kind) = map.get_mut("type") {
+                match kind {
+                    Value::Array(kinds) => {
+                        if !kinds.iter().any(|kind| kind == "null") {
+                            kinds.push(Value::String("null".into()));
+                        }
+                    }
+                    Value::String(name) if name != "null" => {
+                        let original = std::mem::take(kind);
+                        *kind = Value::Array(vec![original, Value::String("null".into())]);
+                    }
+                    _ => {}
+                }
+            } else {
+                let original = Value::Object(std::mem::take(map));
+                map.insert(
+                    "anyOf".into(),
+                    serde_json::json!([original, {"type": "null"}]),
+                );
+            }
+        }
+        // OpenAPI Schema represents these int64 fields as decimal strings.
+        for key in ["minItems", "maxItems"] {
+            if let Some(value) = map.get_mut(key)
+                && let Some(number) = value.as_str().and_then(|s| s.parse::<u64>().ok())
+            {
+                *value = number.into();
+            }
+        }
+        if let Some(Value::Object(definitions)) = map.remove("definitions") {
+            let defs = map.entry("$defs").or_insert_with(|| serde_json::json!({}));
+            if let Some(defs) = defs.as_object_mut() {
+                for (key, definition) in definitions {
+                    let mut target = key.clone();
+                    while defs.contains_key(&target) {
+                        target.insert(0, '_');
+                    }
+                    refs.push((
+                        format!("#{path}/definitions/{}", pointer_key(&key)),
+                        format!("#{path}/$defs/{}", pointer_key(&target)),
+                    ));
+                    defs.insert(target, definition);
+                }
+            }
+        }
+        for key in ["properties", "$defs"] {
+            if let Some(Value::Object(children)) = map.get_mut(key) {
+                for (name, child) in children {
+                    normalize(child, &format!("{path}/{key}/{}", pointer_key(name)), refs);
+                }
+            }
+        }
+        for key in ["items", "additionalProperties"] {
+            if let Some(child) = map.get_mut(key) {
+                normalize(child, &format!("{path}/{key}"), refs);
+            }
+        }
+        for key in ["prefixItems", "anyOf", "oneOf", "allOf"] {
+            if let Some(Value::Array(children)) = map.get_mut(key) {
+                for (index, child) in children.iter_mut().enumerate() {
+                    normalize(child, &format!("{path}/{key}/{index}"), refs);
+                }
+            }
+        }
+    }
+
+    fn rewrite_refs(value: &mut Value, refs: &[(String, String)]) {
+        match value {
+            Value::Object(map) => {
+                if let Some(Value::String(reference)) = map.get_mut("$ref") {
+                    while let Some((from, to)) = refs.iter().find(|(from, _)| {
+                        reference.as_str() == from.as_str()
+                            || reference
+                                .strip_prefix(from.as_str())
+                                .is_some_and(|suffix| suffix.starts_with('/'))
+                    }) {
+                        *reference = format!("{to}{}", &reference[from.len()..]);
+                    }
+                }
+                for key in ["properties", "$defs"] {
+                    if let Some(Value::Object(children)) = map.get_mut(key) {
+                        for child in children.values_mut() {
+                            rewrite_refs(child, refs);
+                        }
+                    }
+                }
+                for key in [
+                    "items",
+                    "additionalProperties",
+                    "prefixItems",
+                    "anyOf",
+                    "oneOf",
+                    "allOf",
+                ] {
+                    if let Some(child) = map.get_mut(key) {
+                        rewrite_refs(child, refs);
+                    }
+                }
+            }
+            Value::Array(children) => {
+                for child in children {
+                    rewrite_refs(child, refs);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut refs = Vec::new();
+    normalize(&mut schema, "", &mut refs);
+    if !refs.is_empty() {
+        // A reference to a nested definition takes precedence over its parent.
+        refs.sort_by_key(|(from, _)| std::cmp::Reverse(from.len()));
+        rewrite_refs(&mut schema, &refs);
+    }
+    schema
 }
 
 // ── Tools ─────────────────────────────────────────────────────────────────────
@@ -198,6 +334,11 @@ pub struct GoogleFunctionDecl {
     pub description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parameters: Option<Value>,
+    #[serde(
+        rename = "parametersJsonSchema",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub parameters_json_schema: Option<Value>,
 }
 
 // ── Safety ────────────────────────────────────────────────────────────────────

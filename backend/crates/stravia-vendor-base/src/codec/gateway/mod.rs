@@ -295,13 +295,12 @@ impl ProtocolAdapter for GatewayLanguageModelV4 {
                 _ => {}
             }
             for call in item.tool_calls.as_deref().unwrap_or_default() {
-                content.push(json!({
-                    "type": "tool-call",
-                    "toolCallId": call.id,
-                    "toolName": call.name,
-                    "input": serde_json::from_str::<Value>(&call.arguments)
-                        .unwrap_or_else(|_| Value::String(call.arguments.clone())),
-                }));
+                if let Ok(input) = serde_json::from_str::<Value>(&call.arguments) {
+                    content.push(json!({
+                        "type": "tool-call", "toolCallId": call.id,
+                        "toolName": call.name, "input": input,
+                    }));
+                }
             }
         }
         json!({
@@ -393,18 +392,31 @@ fn decode_message(message: &Value) -> anyhow::Result<AiItem> {
                 let output = part
                     .get("output")
                     .context("Gateway tool result is missing output")?;
-                let text = output
-                    .get("value")
+                let (content, content_kind, is_error) = match output
+                    .get("type")
                     .and_then(Value::as_str)
-                    .map(str::to_string)
-                    .unwrap_or_else(|| output.to_string());
+                {
+                    Some("text" | "error-text") => (
+                        Value::String(required_string(output, "value")?),
+                        None,
+                        output.get("type").and_then(Value::as_str) == Some("error-text"),
+                    ),
+                    Some("json" | "error-json") => (
+                        output
+                            .get("value")
+                            .context("Gateway JSON tool output is missing value")?
+                            .clone(),
+                        Some(stravia_runtime_contract::protocol::ir::ToolResultContentKind::Json),
+                        output.get("type").and_then(Value::as_str) == Some("error-json"),
+                    ),
+                    Some(other) => bail!("unsupported Gateway tool output type `{other}`"),
+                    None => bail!("Gateway tool output is missing type"),
+                };
                 blocks.push(ContentBlock::ToolResult {
                     tool_use_id: (tool_call_id.clone().unwrap_or_default()).into(),
-                    content: Value::String(text),
-                    content_kind: Some(
-                        stravia_runtime_contract::protocol::ir::ToolResultContentKind::Json,
-                    ),
-                    is_error: None,
+                    content,
+                    content_kind,
+                    is_error: is_error.then_some(true),
                     cache_control: None,
                 });
             }
@@ -521,40 +533,66 @@ fn encode_message(
     tool_names: &BTreeMap<String, String>,
 ) -> anyhow::Result<Option<Value>> {
     match item.role {
-        Role::System | Role::Developer => Ok(Some(
-            json!({"role": "system", "content": text_content(&item.content)?}),
-        )),
-        Role::User => Ok(Some(
-            json!({"role": "user", "content": encode_content_parts(&item.content, false)?}),
-        )),
+        Role::System | Role::Developer => {
+            let content = text_content(&item.content)?;
+            Ok((!content.is_empty()).then_some(json!({"role": "system", "content": content})))
+        }
+        Role::User => {
+            let content = encode_content_parts(&item.content, false)?;
+            Ok((!content.is_empty()).then_some(json!({"role": "user", "content": content})))
+        }
         Role::Assistant => {
             let mut content = encode_content_parts(&item.content, true)?;
             for call in item.tool_calls.as_deref().unwrap_or_default() {
-                content.push(json!({
-                    "type": "tool-call",
-                    "toolCallId": call.id,
-                    "toolName": call.name,
-                    "input": serde_json::from_str::<Value>(&call.arguments)
-                        .unwrap_or_else(|_| Value::String(call.arguments.clone())),
-                }));
+                if let Ok(input) = serde_json::from_str::<Value>(&call.arguments) {
+                    content.push(json!({
+                        "type": "tool-call", "toolCallId": call.id,
+                        "toolName": call.name, "input": input,
+                    }));
+                }
             }
             Ok((!content.is_empty()).then_some(json!({"role": "assistant", "content": content})))
         }
         Role::Tool => {
-            let tool_call_id = item
-                .tool_call_id
-                .as_deref()
-                .context("Gateway tool result is missing tool_call_id")?;
-            let tool_name = tool_names
-                .get(tool_call_id)
-                .context("Gateway tool result has no matching preceding tool call")?;
+            let output = match &item.content {
+                MessageContent::Blocks(blocks) => match blocks.as_slice() {
+                    [ContentBlock::ToolResult {
+                        content, content_kind: Some(stravia_runtime_contract::protocol::ir::ToolResultContentKind::Json),
+                        is_error, ..
+                    }] => json!({
+                        "type": if is_error == &Some(true) { "error-json" } else { "json" },
+                        "value": content,
+                    }),
+                    [ContentBlock::ToolResult {
+                        content: Value::String(text), is_error, ..
+                    }] => json!({
+                        "type": if is_error == &Some(true) { "error-text" } else { "text" },
+                        "value": text,
+                    }),
+                    _ => {
+                        let text = tool_result_text(&item.content)?;
+                        if text.is_empty() { return Ok(None); }
+                        let is_error = blocks.iter().any(|block| matches!(block,
+                            ContentBlock::ToolResult { is_error: Some(true), .. }
+                        ));
+                        json!({"type": if is_error { "error-text" } else { "text" }, "value": text})
+                    }
+                },
+                MessageContent::Text(text) => json!({"type": "text", "value": text}),
+            };
+            let Some(tool_call_id) = item.tool_call_id.as_deref() else {
+                return Ok(None);
+            };
+            let Some(tool_name) = tool_names.get(tool_call_id) else {
+                return Ok(None);
+            };
             Ok(Some(json!({
                 "role": "tool",
                 "content": [{
                     "type": "tool-result",
                     "toolCallId": tool_call_id,
                     "toolName": tool_name,
-                    "output": {"type": "text", "value": tool_result_text(&item.content)?},
+                    "output": output,
                 }],
             })))
         }
@@ -605,7 +643,7 @@ fn encode_content_parts(content: &MessageContent, assistant: bool) -> anyhow::Re
             | ContentBlock::Video {
                 source,
                 media_type: None,
-            } => encode_file_part(source, "application/octet-stream")?,
+            } if !assistant => encode_file_part(source, "application/octet-stream")?,
             ContentBlock::File {
                 source,
                 media_type: Some(media_type),
@@ -613,14 +651,8 @@ fn encode_content_parts(content: &MessageContent, assistant: bool) -> anyhow::Re
             | ContentBlock::Video {
                 source,
                 media_type: Some(media_type),
-            } => encode_file_part(source, media_type)?,
-            ContentBlock::Audio { .. } => {
-                bail!("Gateway v4 codec does not represent audio content")
-            }
-            other => bail!(
-                "Gateway v4 cannot represent content block `{}`",
-                content_block_name(other)
-            ),
+            } if !assistant => encode_file_part(source, media_type)?,
+            _ => continue,
         };
         parts.push(part);
     }
@@ -641,34 +673,36 @@ fn encode_file_part(source: &MediaSource, media_type: &str) -> anyhow::Result<Va
 fn text_content(content: &MessageContent) -> anyhow::Result<String> {
     match content {
         MessageContent::Text(text) => Ok(text.as_ref().clone()),
-        MessageContent::Blocks(blocks) => blocks
+        MessageContent::Blocks(blocks) => Ok(blocks
             .iter()
-            .map(|block| match block {
-                ContentBlock::Text { text, .. } => Ok(text.as_str()),
-                ContentBlock::Thinking { thinking, .. } => Ok(thinking.as_str()),
-                other => bail!(
-                    "Gateway system message cannot represent `{}`",
-                    content_block_name(other)
-                ),
+            .filter_map(|block| match block {
+                ContentBlock::Text { text, .. } => Some(text.as_str()),
+                _ => None,
             })
-            .collect(),
+            .collect::<String>()),
     }
 }
 
 fn tool_result_text(content: &MessageContent) -> anyhow::Result<String> {
     match content {
         MessageContent::Text(text) => Ok(text.as_ref().clone()),
-        MessageContent::Blocks(blocks) => blocks
-            .iter()
-            .map(|block| match block {
-                ContentBlock::Text { text, .. } => Ok(text.as_ref().clone()),
-                ContentBlock::ToolResult { content, .. } => Ok(serde_json::to_string(content)?),
-                other => bail!(
-                    "Gateway tool result cannot represent `{}`",
-                    content_block_name(other)
-                ),
-            })
-            .collect(),
+        MessageContent::Blocks(blocks) => {
+            let mut text = String::new();
+            for block in blocks {
+                match block {
+                    ContentBlock::Text { text: value, .. } => text.push_str(value),
+                    ContentBlock::ToolResult {
+                        content,
+                        content_kind,
+                        ..
+                    } => {
+                        text.push_str(&super::tool_result_text_value(content, *content_kind)?);
+                    }
+                    _ => {}
+                }
+            }
+            Ok(text)
+        }
     }
 }
 
@@ -751,33 +785,6 @@ fn required_string(value: &Value, key: &str) -> anyhow::Result<String> {
         .and_then(Value::as_str)
         .map(str::to_string)
         .with_context(|| format!("Gateway payload is missing string `{key}`"))
-}
-
-fn content_block_name(block: &ContentBlock) -> &'static str {
-    match block {
-        ContentBlock::Text { .. } => "text",
-        ContentBlock::Image { .. } => "image",
-        ContentBlock::Audio { .. } => "audio",
-        ContentBlock::File { .. } => "file",
-        ContentBlock::Video { .. } => "video",
-        ContentBlock::Thinking { .. } => "thinking",
-        ContentBlock::Reasoning { .. } => "reasoning",
-        ContentBlock::Compaction { .. } => "compaction",
-        ContentBlock::CompactionTrigger {} => "compaction_trigger",
-        ContentBlock::RedactedThinking { .. } => "redacted_thinking",
-        ContentBlock::ToolUse { .. } => "tool_use",
-        ContentBlock::ToolResult { .. } => "tool_result",
-        ContentBlock::ServerToolUse { .. } => "server_tool_use",
-        ContentBlock::ServerToolResult { .. } => "server_tool_result",
-        ContentBlock::Document { .. } => "document",
-        ContentBlock::SearchResult { .. } => "search_result",
-        ContentBlock::Citation { .. } => "citation",
-        ContentBlock::ExecutableCode { .. } => "executable_code",
-        ContentBlock::CodeExecutionResult { .. } => "code_execution_result",
-        ContentBlock::ContainerUpload { .. } => "container_upload",
-        ContentBlock::Refusal { .. } => "refusal",
-        ContentBlock::Unknown { .. } => "unknown",
-    }
 }
 
 pub struct GatewayStreamParser {

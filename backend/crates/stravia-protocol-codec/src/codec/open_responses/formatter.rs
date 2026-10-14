@@ -13,112 +13,128 @@ use stravia_runtime_contract::protocol::ir::vendor_ext::CHAT_REASONING_FIELD_MET
 pub struct ResponsesResponseFormatter;
 
 impl ResponsesResponseFormatter {
+    pub(crate) fn format_output_items(&self, items: &[AiItem], resp_id: &str) -> Vec<Value> {
+        let mut output: Vec<Value> = Vec::new();
+
+        for original in items {
+            let projected = split_assistant_output(original);
+            for item in projected
+                .as_deref()
+                .unwrap_or(std::slice::from_ref(original))
+            {
+                if let Some(native) = super::native_compaction_item(item) {
+                    output.push(native);
+                    continue;
+                }
+                if item.role == Role::Assistant
+                    && item
+                        .tool_calls
+                        .as_ref()
+                        .is_none_or(|calls| calls.is_empty())
+                    && let Some(content) = wire_message_content(item)
+                {
+                    let mut message = serde_json::json!({
+                        "type": "message",
+                        "id": item.id_ref().map(str::to_owned).unwrap_or_else(|| gateway_item_id("msg", resp_id, output.len())),
+                        "status": item.status().map(|status| status.as_str()).unwrap_or("completed"),
+                        "role": "assistant",
+                        "content": content,
+                    });
+                    if let Some(phase) = item.meta.as_ref().and_then(|meta| meta.get("phase")) {
+                        message["phase"] = phase.clone();
+                    }
+                    super::encoder::insert_item_metadata(&mut message, item, true);
+                    output.push(message);
+                    continue;
+                }
+                let output_start = output.len();
+                if let Some((summary, content, signature)) = item.reasoning_ref() {
+                    let mut reasoning = serde_json::json!({
+                        "type": "reasoning",
+                        "id": item.id_ref().map(str::to_owned).unwrap_or_else(|| {
+                            gateway_item_id("rs", resp_id, output.len())
+                        }),
+                        "summary": summary.iter().map(|text| serde_json::json!({
+                            "type": "summary_text",
+                            "text": text
+                        })).collect::<Vec<_>>()
+                    });
+                    if !content.is_empty() {
+                        reasoning["content"] = Value::Array(
+                            content
+                                .iter()
+                                .map(|text| {
+                                    serde_json::json!({
+                                        "type": "reasoning_text",
+                                        "text": text
+                                    })
+                                })
+                                .collect(),
+                        );
+                    }
+                    if let Some(signature) = signature {
+                        reasoning["encrypted_content"] = Value::String(signature.to_owned());
+                    }
+                    output.push(reasoning);
+                } else if let Some((text, _)) = item.thinking_ref() {
+                    let mut reasoning = serde_json::json!({
+                        "type": "reasoning",
+                        "id": item.id_ref().map(str::to_owned).unwrap_or_else(|| {
+                            gateway_item_id("rs", resp_id, output.len())
+                        }),
+                        "summary": []
+                    });
+                    if !text.is_empty() {
+                        reasoning["content"] = serde_json::json!([{
+                            "type": "reasoning_text",
+                            "text": text
+                        }]);
+                    }
+                    output.push(reasoning);
+                } else if let Some(call) = item.function_call_ref() {
+                    output.push(serde_json::json!({
+                        "type": "function_call",
+                        "id": item.id_ref().map(str::to_owned).unwrap_or_else(|| gateway_item_id("fc", resp_id, output.len())),
+                        "call_id": call.id,
+                        "name": call.name,
+                        "arguments": call.arguments,
+                        "status": item.status().map(|status| status.as_str()).unwrap_or("completed")
+                    }));
+                } else if let Some((call_id, content)) = item.function_call_output_ref() {
+                    let Some(output_value) = function_output_value(content) else {
+                        continue;
+                    };
+                    output.push(serde_json::json!({
+                        "type": "function_call_output",
+                        "id": item.id_ref().map(str::to_owned).unwrap_or_else(|| gateway_item_id("fco", resp_id, output.len())),
+                        "call_id": call_id,
+                        "output": output_value,
+                        "status": item.status().map(|status| status.as_str()).unwrap_or("completed")
+                    }));
+                } else if let Some(raw) = item.unknown_ref() {
+                    output.push(wire_extension_item(
+                        raw,
+                        resp_id,
+                        output.len(),
+                        item.id_ref(),
+                    ));
+                }
+                if output.len() > output_start {
+                    super::encoder::insert_item_metadata(&mut output[output_start], item, false);
+                }
+            }
+        }
+
+        output
+    }
+
     pub fn format_response(&self, resp: &AiResponse) -> Value {
         let resp_id = if resp.id.is_empty() {
             stravia_runtime_contract::identifier::new_id()
         } else {
             resp.id.clone()
         };
-
-        let mut output: Vec<Value> = Vec::new();
-
-        for item in &resp.items {
-            if let Some(native) = super::native_compaction_item(item) {
-                output.push(native);
-                continue;
-            }
-            if item.role == Role::Assistant
-                && item.tool_calls.is_none()
-                && let Some(content) = wire_message_content(item)
-            {
-                let mut message = serde_json::json!({
-                    "type": "message",
-                    "id": item.id_ref().map(str::to_owned).unwrap_or_else(|| gateway_item_id("msg", &resp_id, output.len())),
-                    "status": item.status().map(|status| status.as_str()).unwrap_or("completed"),
-                    "role": "assistant",
-                    "content": content,
-                });
-                if let Some(phase) = item.meta.as_ref().and_then(|meta| meta.get("phase")) {
-                    message["phase"] = phase.clone();
-                }
-                super::encoder::insert_item_metadata(&mut message, item, true);
-                output.push(message);
-                continue;
-            }
-            let output_start = output.len();
-            if let Some((summary, content, signature)) = item.reasoning_ref() {
-                let mut reasoning = serde_json::json!({
-                    "type": "reasoning",
-                    "id": item.id_ref().map(str::to_owned).unwrap_or_else(|| {
-                        gateway_item_id("rs", &resp_id, output.len())
-                    }),
-                    "summary": summary.iter().map(|text| serde_json::json!({
-                        "type": "summary_text",
-                        "text": text
-                    })).collect::<Vec<_>>()
-                });
-                if !content.is_empty() {
-                    reasoning["content"] = Value::Array(
-                        content
-                            .iter()
-                            .map(|text| {
-                                serde_json::json!({
-                                    "type": "reasoning_text",
-                                    "text": text
-                                })
-                            })
-                            .collect(),
-                    );
-                }
-                if let Some(signature) = signature {
-                    reasoning["encrypted_content"] = Value::String(signature.to_owned());
-                }
-                output.push(reasoning);
-            } else if let Some((text, _)) = item.thinking_ref() {
-                let mut reasoning = serde_json::json!({
-                    "type": "reasoning",
-                    "id": item.id_ref().map(str::to_owned).unwrap_or_else(|| {
-                        gateway_item_id("rs", &resp_id, output.len())
-                    }),
-                    "summary": []
-                });
-                if !text.is_empty() {
-                    reasoning["content"] = serde_json::json!([{
-                        "type": "reasoning_text",
-                        "text": text
-                    }]);
-                }
-                output.push(reasoning);
-            } else if let Some(call) = item.function_call_ref() {
-                output.push(serde_json::json!({
-                        "type": "function_call",
-                        "id": item.id_ref().map(str::to_owned).unwrap_or_else(|| gateway_item_id("fc", &resp_id, output.len())),
-                        "call_id": call.id,
-                        "name": call.name,
-                        "arguments": call.arguments,
-                        "status": item.status().map(|status| status.as_str()).unwrap_or("completed")
-                    }));
-            } else if let Some((call_id, content)) = item.function_call_output_ref() {
-                output.push(serde_json::json!({
-                        "type": "function_call_output",
-                        "id": item.id_ref().map(str::to_owned).unwrap_or_else(|| gateway_item_id("fco", &resp_id, output.len())),
-                        "call_id": call_id,
-                        "output": function_output_value(content),
-                        "status": item.status().map(|status| status.as_str()).unwrap_or("completed")
-                    }));
-            } else if let Some(raw) = item.unknown_ref() {
-                output.push(wire_extension_item(
-                    raw,
-                    &resp_id,
-                    output.len(),
-                    item.id_ref(),
-                ));
-            }
-            if output.len() > output_start {
-                super::encoder::insert_item_metadata(&mut output[output_start], item, false);
-            }
-        }
-
+        let output = self.format_output_items(&resp.items, &resp_id);
         let usage_known = resp.usage.required_components_known;
         let usage = if usage_known {
             let mut input_tokens_details = serde_json::json!({
@@ -226,6 +242,129 @@ impl ResponsesResponseFormatter {
     }
 }
 
+pub(crate) fn split_assistant_output(item: &AiItem) -> Option<Vec<AiItem>> {
+    if item.role != Role::Assistant
+        || item.unknown_ref().is_some()
+        || item.is_compaction()
+        || item.is_compaction_trigger()
+    {
+        return None;
+    }
+    let blocks = match &item.content {
+        MessageContent::Blocks(blocks) => Some(blocks.as_slice()),
+        MessageContent::Text(_) => None,
+    };
+    let has_calls = item
+        .tool_calls
+        .as_ref()
+        .is_some_and(|calls| !calls.is_empty());
+    let has_mixed_blocks = blocks.is_some_and(|blocks| {
+        let reasoning = blocks
+            .iter()
+            .filter(|block| {
+                matches!(
+                    block,
+                    ContentBlock::Reasoning { .. }
+                        | ContentBlock::Thinking { .. }
+                        | ContentBlock::ToolUse { .. }
+                )
+            })
+            .count();
+        reasoning > 1
+            || (reasoning > 0 && blocks.len() > 1)
+            || blocks.iter().any(|block| {
+                !matches!(
+                    block,
+                    ContentBlock::Text { .. }
+                        | ContentBlock::Refusal { .. }
+                        | ContentBlock::Reasoning { .. }
+                        | ContentBlock::Thinking { .. }
+                )
+            })
+    });
+    if !has_mixed_blocks && !has_calls {
+        return None;
+    }
+    // A single call with no message content already has a native carrier.
+    if item.function_call_ref().is_some() && !has_mixed_blocks {
+        return None;
+    }
+    let mut parts = Vec::new();
+    let mut message = Vec::new();
+    let mut represented_calls = Vec::new();
+    let flush = |parts: &mut Vec<AiItem>, message: &mut Vec<ContentBlock>| {
+        if !message.is_empty() {
+            parts.push(AiItem {
+                role: Role::Assistant,
+                content: MessageContent::Blocks(std::mem::take(message)),
+                tool_calls: None,
+                tool_call_id: None,
+                meta: None,
+            });
+        }
+    };
+    if let Some(blocks) = blocks {
+        for block in blocks {
+            match block {
+                ContentBlock::Text { .. } | ContentBlock::Refusal { .. } => {
+                    message.push(block.clone())
+                }
+                ContentBlock::Reasoning { .. } | ContentBlock::Thinking { .. } => {
+                    flush(&mut parts, &mut message);
+                    parts.push(AiItem {
+                        role: Role::Assistant,
+                        content: MessageContent::Blocks(vec![block.clone()]),
+                        tool_calls: None,
+                        tool_call_id: None,
+                        meta: None,
+                    });
+                }
+                ContentBlock::ToolUse {
+                    id, name, input, ..
+                } => {
+                    flush(&mut parts, &mut message);
+                    if !represented_calls.contains(id) {
+                        represented_calls.push(id.clone());
+                        parts.push(AiItem::function_call(
+                            stravia_runtime_contract::protocol::ir::ToolCall {
+                                id: id.clone(),
+                                name: name.clone(),
+                                arguments: input.to_string(),
+                            },
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
+    } else if let MessageContent::Text(text) = &item.content
+        && !text.is_empty()
+    {
+        message.push(ContentBlock::Text {
+            text: text.clone(),
+            cache_control: None,
+        });
+    }
+    flush(&mut parts, &mut message);
+    if let Some(calls) = &item.tool_calls {
+        for call in calls {
+            if !represented_calls.contains(&call.id) {
+                represented_calls.push(call.id.clone());
+                parts.push(AiItem::function_call(call.clone()));
+            }
+        }
+    }
+    for part in &mut parts {
+        part.set_graph_metadata(
+            None,
+            item.status(),
+            AiItemProvenance::Provider,
+            AiItemAudience::Client,
+        );
+    }
+    Some(parts)
+}
+
 fn wire_message_content(
     item: &stravia_runtime_contract::protocol::ir::AiItem,
 ) -> Option<Vec<Value>> {
@@ -239,7 +378,7 @@ fn wire_message_content(
         })],
         MessageContent::Blocks(blocks) => blocks
             .iter()
-            .map(|block| match block {
+            .filter_map(|block| match block {
                 ContentBlock::Text { text, .. } => Some(serde_json::json!({
                     "type": "output_text",
                     "text": text,
@@ -252,8 +391,11 @@ fn wire_message_content(
                 })),
                 _ => None,
             })
-            .collect::<Option<Vec<_>>>()?,
+            .collect::<Vec<_>>(),
     };
+    if generated.is_empty() {
+        return None;
+    }
     let Some(original) = item
         .meta
         .as_ref()
@@ -287,9 +429,8 @@ fn wire_message_content(
     Some(preserved)
 }
 
-pub(crate) fn function_output_value(content: &MessageContent) -> Value {
+pub(crate) fn function_output_value(content: &MessageContent) -> Option<Value> {
     super::encoder::encode_response_tool_output(content)
-        .expect("function output passed the Open Responses representability gate")
 }
 
 pub fn gateway_item_id(prefix: &str, response_id: &str, output_index: usize) -> String {
@@ -302,7 +443,14 @@ pub fn stamp_output_graph_ids(resp: &AiResponse) -> Vec<AiItem> {
     } else {
         resp.id.clone()
     };
-    let mut items = resp.items.clone();
+    let mut items = Vec::with_capacity(resp.items.len());
+    for item in &resp.items {
+        if let Some(parts) = split_assistant_output(item) {
+            items.extend(parts);
+        } else {
+            items.push(item.clone());
+        }
+    }
     let mut output_index = 0usize;
     for item in &mut items {
         let Some(prefix) = output_item_prefix(item) else {
@@ -324,7 +472,10 @@ pub fn stamp_output_graph_ids(resp: &AiResponse) -> Vec<AiItem> {
 
 fn output_item_prefix(item: &AiItem) -> Option<&'static str> {
     if item.role == Role::Assistant
-        && item.tool_calls.is_none()
+        && item
+            .tool_calls
+            .as_ref()
+            .is_none_or(|calls| calls.is_empty())
         && wire_message_content(item).is_some()
     {
         return Some("msg");

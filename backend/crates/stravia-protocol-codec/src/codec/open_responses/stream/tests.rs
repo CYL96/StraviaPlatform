@@ -948,6 +948,150 @@ fn empty_name_tool_call_starts_on_same_index_merge() {
 }
 
 #[test]
+fn streamed_tool_outputs_omit_unsupported_and_preserve_supported_parts() {
+    use stravia_runtime_contract::protocol::ir::{
+        AiItem, ContentBlock, MessageContent, Role, ToolResultContentKind,
+    };
+    let content_blocks = |call_id: &str, content| AiItem {
+        role: Role::Tool,
+        content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
+            tool_use_id: call_id.into(),
+            content,
+            content_kind: Some(ToolResultContentKind::ContentBlocks),
+            is_error: None,
+            cache_control: None,
+        }]),
+        tool_calls: None,
+        tool_call_id: Some(call_id.into()),
+        meta: None,
+    };
+    let mut formatter = ResponsesStreamFormatter::new();
+    let events = formatter.format_deltas(&[
+        AiStreamDelta::MessageStart {
+            id: "resp-output".into(),
+            model: "model".into(),
+        },
+        AiStreamDelta::ItemDone {
+            index: 0,
+            item: stravia_runtime_contract::protocol::ir::AiItem::function_call_output(
+                "business",
+                serde_json::json!({"rows": 2}),
+            ),
+        },
+        AiStreamDelta::ItemDone {
+            index: 1,
+            item: content_blocks(
+                "kept",
+                serde_json::json!([
+                    {"type": "input_audio", "data": "aGk="},
+                    {"type": "input_text", "text": "kept"}
+                ]),
+            ),
+        },
+        AiStreamDelta::ItemDone {
+            index: 2,
+            item: content_blocks(
+                "dropped",
+                serde_json::json!([{"type": "input_audio", "data": "aGk="}]),
+            ),
+        },
+        AiStreamDelta::Done {
+            stop_reason: "stop".into(),
+        },
+    ]);
+    let history = completed_history(&events);
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[0]["call_id"], "business");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(history[0]["output"].as_str().unwrap()).unwrap(),
+        serde_json::json!({"rows": 2})
+    );
+    assert_eq!(history[1]["call_id"], "kept");
+    assert_eq!(
+        history[1]["output"],
+        serde_json::json!([
+            {"type": "input_text", "text": "kept"}
+        ])
+    );
+    let bodies = event_bodies(&events);
+    assert!(
+        !bodies
+            .iter()
+            .any(|body| body["item"]["call_id"] == "dropped")
+    );
+    let terminal = bodies
+        .iter()
+        .find(|body| body["type"] == "response.completed")
+        .unwrap();
+    assert_eq!(terminal["response"]["output"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn mixed_item_done_preserves_all_native_portions_on_distinct_indices() {
+    use stravia_runtime_contract::protocol::ir::{AiItem, ToolCall};
+    let mut item = AiItem::reasoning(
+        vec!["summary".into()],
+        vec!["thought".into()],
+        Some("cipher".into()),
+    );
+    let MessageContent::Blocks(blocks) = &mut item.content else {
+        unreachable!()
+    };
+    blocks.push(ContentBlock::Text {
+        text: std::sync::Arc::new("answer".into()),
+        cache_control: None,
+    });
+    item.tool_calls = Some(vec![
+        ToolCall {
+            id: "first".into(),
+            name: "lookup".into(),
+            arguments: "{}".into(),
+        },
+        ToolCall {
+            id: "second".into(),
+            name: "read".into(),
+            arguments: "{}".into(),
+        },
+    ]);
+    let mut formatter = ResponsesStreamFormatter::new();
+    let events = formatter.format_deltas(&[
+        AiStreamDelta::MessageStart {
+            id: "resp-mixed-native".into(),
+            model: "model".into(),
+        },
+        AiStreamDelta::ItemDone { index: 0, item },
+        AiStreamDelta::Done {
+            stop_reason: "stop".into(),
+        },
+    ]);
+    let history = completed_history(&events);
+    assert_eq!(history.len(), 4);
+    assert_eq!(history[0]["type"], "reasoning");
+    assert_eq!(history[0]["content"][0]["text"], "thought");
+    assert_eq!(history[1]["content"][0]["text"], "answer");
+    assert_eq!(history[2]["call_id"], "first");
+    assert_eq!(history[3]["call_id"], "second");
+    let bodies = event_bodies(&events);
+    let done: Vec<_> = bodies
+        .iter()
+        .filter(|body| body["type"] == "response.output_item.done")
+        .collect();
+    for (index, body) in done.iter().enumerate() {
+        assert_eq!(body["output_index"], index);
+        assert!(
+            !done[..index]
+                .iter()
+                .any(|previous| previous["item"]["id"] == body["item"]["id"])
+        );
+    }
+    let terminal = bodies
+        .iter()
+        .find(|body| body["type"] == "response.completed")
+        .unwrap();
+    assert_eq!(terminal["response"]["output"].as_array().unwrap(), &history);
+}
+
+#[test]
 fn function_call_item_done_preserves_incomplete_status() {
     let mut formatter = ResponsesStreamFormatter::new();
     let completed = stravia_runtime_contract::protocol::ir::AiItem::function_call(

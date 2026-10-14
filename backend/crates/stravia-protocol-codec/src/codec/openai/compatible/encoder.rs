@@ -24,10 +24,12 @@ impl OpenAIEncoder {
 
         let normalized_messages =
             normalize_messages_for_openai(req.items, req.instructions, tools_opt);
-        let messages: Vec<Value> = normalized_messages
-            .into_iter()
-            .map(encode_message)
-            .collect::<Result<Vec<_>>>()?;
+        let mut messages = Vec::with_capacity(normalized_messages.len());
+        for message in normalized_messages {
+            if let Some(message) = encode_message(message)? {
+                messages.push(message);
+            }
+        }
 
         let mut ingress = req.meta.vendor.ingress;
         let responses_ingress = req.meta.source_protocol == Some(OPEN_RESPONSES_2026_04_24);
@@ -48,6 +50,45 @@ impl OpenAIEncoder {
         }
         if let Some(p) = req.generation.top_p {
             obj.insert("top_p".into(), p.into());
+        }
+        if let Some(stop) = req.generation.stop {
+            obj.insert(
+                "stop".into(),
+                Value::Array(stop.into_iter().map(Value::String).collect()),
+            );
+        }
+        if let Some(parallel) = req
+            .disable_parallel_tool_calls
+            .map(|disabled| !disabled)
+            .or(req.parallel_tool_calls)
+        {
+            obj.insert("parallel_tool_calls".into(), Value::Bool(parallel));
+        }
+        if let Some(format) = req.response_format {
+            use stravia_runtime_contract::protocol::ir::ResponseFormat;
+
+            let format = match format {
+                ResponseFormat::Text => object([("type", Value::String("text".into()))]),
+                ResponseFormat::JsonObject => {
+                    object([("type", Value::String("json_object".into()))])
+                }
+                ResponseFormat::JsonSchema {
+                    name,
+                    schema,
+                    strict,
+                } => {
+                    let mut json_schema =
+                        object([("name", Value::String(name)), ("schema", schema)]);
+                    if let Some(strict) = strict {
+                        json_schema["strict"] = Value::Bool(strict);
+                    }
+                    object([
+                        ("type", Value::String("json_schema".into())),
+                        ("json_schema", json_schema),
+                    ])
+                }
+            };
+            obj.insert("response_format".into(), format);
         }
         match req.reasoning.target_control {
             Some(stravia_runtime_contract::thinking::TargetThinkingControl::Effort { value }) => {
@@ -787,7 +828,7 @@ fn tool_message_hint(msg: &AiItem) -> Option<stravia_runtime_contract::protocol:
     None
 }
 
-fn encode_message(msg: AiItem) -> Result<Value> {
+fn encode_message(msg: AiItem) -> Result<Option<Value>> {
     let role = match msg.role {
         Role::System => "system",
         Role::Developer => "developer",
@@ -801,6 +842,9 @@ fn encode_message(msg: AiItem) -> Result<Value> {
 
     if msg.role == Role::Tool {
         let (tool_content, hinted_tool_call_id) = tool_message_payload(msg.content);
+        let Some(tool_content) = tool_content else {
+            return Ok(None);
+        };
         map.insert("content".into(), Value::String(tool_content));
         let resolved_tool_call_id = msg
             .tool_call_id
@@ -812,7 +856,7 @@ fn encode_message(msg: AiItem) -> Result<Value> {
                 Value::String(tool_call_id.into_string()),
             );
         }
-        return Ok(obj);
+        return Ok(Some(obj));
     }
 
     match msg.content {
@@ -918,7 +962,7 @@ fn encode_message(msg: AiItem) -> Result<Value> {
         map.insert("content".into(), Value::String(String::new()));
     }
 
-    Ok(obj)
+    Ok(Some(obj))
 }
 
 fn encode_content_block_for_openai(b: ContentBlock) -> Value {
@@ -967,6 +1011,19 @@ fn encode_content_block_for_openai(b: ContentBlock) -> Value {
                 ),
             ]),
         },
+        ContentBlock::Document { source, title, .. } => {
+            let Some(source) = crate::codec::document_media_source(source) else {
+                return Value::Null;
+            };
+            let mut encoded = encode_content_block_for_openai(ContentBlock::File {
+                source,
+                media_type: None,
+            });
+            if let Some(title) = title {
+                encoded["file"]["filename"] = Value::String(title);
+            }
+            encoded
+        }
         ContentBlock::File { source, .. } => {
             let file = match source {
                 MediaSource::Base64 { .. } => object([
@@ -1049,14 +1106,31 @@ fn media_source_to_url(source: MediaSource) -> String {
     }
 }
 
+pub(crate) fn tool_result_content_is_supported(
+    content: &Value,
+    kind: Option<stravia_runtime_contract::protocol::ir::ToolResultContentKind>,
+) -> bool {
+    if content.is_string()
+        || kind
+            != Some(stravia_runtime_contract::protocol::ir::ToolResultContentKind::ContentBlocks)
+    {
+        return true;
+    }
+    content.as_array().is_some_and(|blocks| {
+        blocks
+            .iter()
+            .any(|block| block["type"].as_str() == Some("text") && block["text"].is_string())
+    })
+}
+
 fn tool_message_payload(
     content: MessageContent,
 ) -> (
-    String,
+    Option<String>,
     Option<stravia_runtime_contract::protocol::ir::ToolCallId>,
 ) {
     match content {
-        MessageContent::Text(t) => (Arc::unwrap_or_clone(t), None),
+        MessageContent::Text(t) => (Some(Arc::unwrap_or_clone(t)), None),
         MessageContent::Blocks(blocks) => {
             if !blocks
                 .iter()
@@ -1066,9 +1140,9 @@ fn tool_message_payload(
                     ContentBlock::Text { text, .. } => Some(Arc::unwrap_or_clone(text)),
                     _ => None,
                 });
-                let mut text = texts.next().unwrap_or_default();
+                let mut text = texts.next();
                 for next in texts {
-                    text.push_str(&next);
+                    text.as_mut().expect("first text exists").push_str(&next);
                 }
                 return (text, None);
             }
@@ -1076,13 +1150,35 @@ fn tool_message_payload(
                 if let ContentBlock::ToolResult {
                     tool_use_id,
                     content,
+                    content_kind,
                     ..
                 } = block
                 {
                     let text = match content {
-                        Value::String(s) => s,
-                        Value::Null => String::new(),
-                        other => other.to_string(),
+                        Value::String(s) => Some(s),
+                        Value::Array(blocks)
+                            if content_kind
+                                == Some(stravia_runtime_contract::protocol::ir::ToolResultContentKind::ContentBlocks) =>
+                        {
+                            let mut text: Option<String> = None;
+                            for block in blocks {
+                                if let Ok(ContentBlock::Text { text: next, .. }) =
+                                    serde_json::from_value::<ContentBlock>(block)
+                                {
+                                    let next = Arc::unwrap_or_clone(next);
+                                    if let Some(text) = &mut text {
+                                        text.push_str(&next);
+                                    } else {
+                                        text = Some(next);
+                                    }
+                                }
+                            }
+                            text
+                        }
+                        _ if content_kind
+                            == Some(stravia_runtime_contract::protocol::ir::ToolResultContentKind::ContentBlocks) => None,
+                        Value::Null if content_kind.is_none() => Some(String::new()),
+                        other => Some(other.to_string()),
                     };
                     let hinted_id = if tool_use_id.trim().is_empty() {
                         None

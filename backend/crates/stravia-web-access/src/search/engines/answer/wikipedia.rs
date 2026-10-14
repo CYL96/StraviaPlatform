@@ -27,7 +27,7 @@ pub async fn request(search: &SearchQuery) -> anyhow::Result<RequestResponse> {
 
     let url = Url::parse_with_params(
         "https://en.wikipedia.org/w/api.php",
-        &[
+        [
             ("format", "json"),
             ("action", "query"),
             ("prop", "extracts|pageimages"),

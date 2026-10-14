@@ -51,25 +51,11 @@ pub fn endpoint(protocol: &str) -> Result<ProtocolEndpoint, PluginError> {
         })
 }
 
-/// 拒绝无法兑现的原生压缩要求，避免把能力缺失误报为普通输入错误。
-pub fn ensure_no_native_compaction(request: &AiRequest) -> Result<(), PluginError> {
-    if stravia_protocol_codec::codec::compaction::native_compaction_requested(request) {
-        return Err(plugin_error(
-            ErrorKind::Unsupported,
-            "native compaction requires the Open Responses protocol",
-        ));
-    }
-    Ok(())
-}
-
 pub fn encode_inference_request(
     protocol: &str,
     request: AiRequest,
 ) -> Result<EncodedRequest, PluginError> {
     let egress = endpoint(protocol)?;
-    if egress.protocol != Protocol::OpenResponses {
-        ensure_no_native_compaction(&request)?;
-    }
     let ingress = ProtocolTransform::inferred_ingress(&request).unwrap_or(egress);
     ProtocolTransform::global()
         .bind(ingress, egress)
@@ -915,7 +901,7 @@ pub fn map_request_transform_error(error: TransformError) -> PluginError {
         TransformError::Unsupported { .. } | TransformError::UnsupportedOperation { .. } => {
             ErrorKind::Unsupported
         }
-        TransformError::Unrepresentable { .. } | TransformError::Wire { .. } => ErrorKind::Invalid,
+        TransformError::Wire { .. } => ErrorKind::Invalid,
         TransformError::StreamClosed { .. } => ErrorKind::Trapped,
     };
     plugin_error(kind, error.to_string())
@@ -927,9 +913,7 @@ pub fn map_response_transform_error(error: TransformError) -> PluginError {
         TransformError::Unsupported { .. } | TransformError::UnsupportedOperation { .. } => {
             plugin_error(ErrorKind::Unsupported, message)
         }
-        TransformError::Wire { .. } | TransformError::Unrepresentable { .. } => {
-            model_error(AiErrorKind::ServerError, message)
-        }
+        TransformError::Wire { .. } => model_error(AiErrorKind::ServerError, message),
         TransformError::StreamClosed { .. } => plugin_error(ErrorKind::Trapped, message),
     }
 }

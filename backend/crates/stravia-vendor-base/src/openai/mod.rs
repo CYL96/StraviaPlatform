@@ -50,6 +50,7 @@ fn openai_descriptor() -> ProviderDescriptor {
             default_models_source: None,
             consumes_catalog_models: false,
             capabilities: capabilities.clone(),
+            client_header_names: BTreeSet::new(),
             model_capabilities: BTreeSet::new(),
         }],
         capabilities,
@@ -419,6 +420,7 @@ fn infer_responses_websocket(
         headers,
         protocols: Vec::new(),
         continuation_id,
+        reuse_max_age_millis: None,
     })?;
     let mut frame = body.clone();
     let object = frame

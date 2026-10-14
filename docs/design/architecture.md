@@ -322,11 +322,13 @@ stravia-server::start_http_server() → 绑定 listener 并提供优雅关闭
 - **请求生命周期追踪**：`RequestContext` 携带 request_id、deadline、cancellation token、outcome，以及请求范围扩展，端到端贯穿 dispatcher 与 handler。
 - **确定性协议协商**：`negotiate()`（`proxy/planner/negotiator.rs`）实现三级 egress 解析（Exact → Same-family → Provider Default），`ProtocolRegistry` 只暴露 endpoint identity、capabilities、alias 与 ingress route 查询。
 - **Pair-bound Protocol Conversion**：crate-private `ProtocolTransform::bind(ingress, egress)` 返回 `ProtocolPair`；调用方只通过 `decode_request` / `encode_request`、`decode_response` / `encode_response` 和有状态 stream session 转换 wire 与 canonical IR，不能直接取得 codec。
-- **请求编码所有权**：Rust 请求编码接口消费 `AiRequest`，语义损失与能力校验仍先借用输入完成。四类标准 codec 取出唯一归属的文本、移入已拥有的 JSON 子树；共享文本、历史快照、工具关联、原生字段优先级和 metadata 隔离语义保持不变，不提供旧借用编码兼容路径。
+- **请求编码所有权**：Rust 请求编码接口消费 `AiRequest`，编码入口先按目标能力形成保留可表达部分、省略不可表达部分的此次编码视图；标准协议共用准备入口，私有 wire 由所属插件准备。四类标准 codec 取出唯一归属的文本、移入已拥有的 JSON 子树；共享文本、历史快照、工具关联、原生字段优先级和 metadata 隔离语义保持不变，不提供旧借用编码兼容路径。
 - **内容解码所有权**：Canonical `MessageContent` 与 Chat 文本/parts 通过直接 Serde visitor 接收已有 `String` 或 typed sequence，避免 untagged 缓冲再借用复制。来自 wire 字节的文本仍按需要拥有缓冲；保留现有 JSON 形状、原生工具 JSON、任意精度 wire 数字和非法内容拒绝行为，不更换 JSON backend。
-- **Fail-closed representability**：跨协议 encode 前按实际 `AiRequest`、`AiResponse` 或 delta 检查语义损失并返回 typed `ProtocolLossyRejected`；同 endpoint 路径不套用跨协议 loss policy。
+- **Compatibility-first representability**：request、response 与 stream delta encode 保留目标可表达的内容、控制与扩展，默认省略无法表达的部分，不因语义损失整体拒绝、不提供严格模式开关。同协议可承载字段保持；此次编码的准备视图不改写共享 canonical 历史。非法源 wire、解析错误、安全与凭据校验及网络错误仍报错。
+- **私有协议投影归属**：共享转换器负责标准协议的表达能力；Devin Connect-RPC、Command Code 等私有 wire 的请求准备与逐项省略由各自 Vendor Plugin 编解码器实现，不向共享转换器添加供应商专属能力表。统一省略政策不允许共享标准规则误删插件可以原生回放的思考项或工具历史。
+- **不透明插件身份与上下文权限**：私有上游仅使用 `ProtocolIdentity` 字符串，不进入共享协议枚举、endpoint 常量或宿主终态/媒体特判。未识别 endpoint 的媒体准备提供 canonical inline 字节；思考来源与客户端 endpoint 不匹配时按通用 Marker 契约保留。客户端额外头由已选 channel 的 `client_header_names` 精确声明，SDK 校验与执行筛选都拒绝凭据及 hop-by-hop 头，Core 不维护供应商私有头白名单，见 [插件请求头契约](vendor-plugins.md#客户端请求头读取声明)。
 - **Canonical-only 推理**：所有推理请求都经过 ingress decode、canonical IR、Vendor Plugin canonical execution 与 ingress encode；不提供以 wire raw request/response 绕过 HookRuntime 的路径。
-- **显式字段映射**：每个 codec 明确处理已知字段；允许的 vendor-specific 字段走 ExtensionBag，不隐式丢弃或把原始字节暴露给 hook。
+- **显式字段映射**：每个 codec 明确处理已知字段；允许的 vendor-specific 字段走 ExtensionBag，目标可表达时保留、不可表达时按转换政策省略，不把原始字节暴露给 hook。
 - **唯一推理 seam**：`GatewayBuilder` 显式注入固定顺序的 `HookRuntime` hooks 与 `PlatformTool`，dispatcher 只通过 `HookRuntime` 处理推理扩展；`Gateway::execute_vendor` 是唯一供应商执行 seam，且只调用已安装的 Wasm Vendor Plugin，不保留 native adapter。
 - **固定事件面**：`Request`、`UpstreamResponse`、`ToolResult`、`ClientOutput` 四个规范化事件，以及每个 HookSession 内的 `StreamTransformer` 流式事件。
 
@@ -699,7 +701,7 @@ pair.encode_response(&response) -> Value
 pair.stream()                   -> StreamSession
 ```
 
-Request/response encode 和 stream delta encode 在跨协议时执行 per-value representability 检查；不可表示语义返回 typed `ProtocolLossyRejected`。同 endpoint 路径仍经过同一 canonical IR 和 adapter，但不套用跨协议 loss policy。`StreamSession` 拆成同一 pair 绑定的 decoder/encoder state，流式解析继续位于 protocol module，Vendor guest 只接收 canonical 语义并通过版本化 WIT 返回 canonical delta。
+Request/response encode 和 stream delta encode 按目标协议的 per-value representability 保留可表达部分，默认省略不可表达内容、控制、扩展与硬约束，包括 continuation 历史；同 endpoint 路径仍经过同一 canonical IR 和 adapter，保留可承载字段。不可表达 delta 的省略不制造失败终态，也不丢弃同 delta 可承载的文本；不默认缓冲完整跨协议流。只接受对象工具参数的目标省略不可表达的整个调用与关联结果，不伪造 `{}` 或 stringify 冒充支持；实际观测 usage 保留，不合成零值。多候选到单候选仅保留目标可承载候选。因此转换可能损失图片、工具、硬约束、多候选和历史，不宣称无损。非法源输入与解析、安全/凭据及网络失败仍沿真实错误路径处理。`StreamSession` 拆成同一 pair 绑定的 decoder/encoder state，流式解析继续位于 protocol module，Vendor guest 只接收 canonical 语义并通过版本化 WIT 返回 canonical delta。
 
 ### 5.3 EndpointCapabilities 矩阵
 
@@ -765,7 +767,7 @@ model_turn/                  ← 路由与尝试策略；只调用 Gateway::exec
 
 ### 6.1 Descriptor 与操作入口
 
-WIT 契约为 `stravia:vendor@0.2.0`。`VendorDescriptor` 声明稳定 `vendor_id`、版本、展示元数据、canonical format 版本、`kind`（fallback 或 dedicated）及 `providers`；每个 `ProviderDescriptor` 独立声明 `provider_id`、可选 `catalog_id`、展示元数据、channels、能力、配置字段、网络权限与数据兼容版本。fallback descriptor 的 Vendor 身份必须为 `base`；dedicated descriptor 只能有一个 profile，且其 `provider_id` 必须等于 `vendor_id`。管理面和执行面都从 `VendorPlugins` 当前已安装且已加载的 descriptor 读取，不再聚合协议 registry 伪造插件 inventory。
+WIT 契约为 `stravia:vendor@0.5.0`。`VendorDescriptor` 声明稳定 `vendor_id`、版本、展示元数据、canonical format 版本、`kind`（fallback 或 dedicated）及 `providers`；每个 `ProviderDescriptor` 独立声明 `provider_id`、可选 `catalog_id`、展示元数据、channels、能力、配置字段、网络权限与数据兼容版本。fallback descriptor 的 Vendor 身份必须为 `base`；dedicated descriptor 只能有一个 profile，且其 `provider_id` 必须等于 `vendor_id`。管理面和执行面都从 `VendorPlugins` 当前已安装且已加载的 descriptor 读取，不再聚合协议 registry 伪造插件 inventory。
 
 这里的 `provider_id` 是供应商 profile 身份，不是已保存 Provider 连接的数据库 UUID。SDK 与 WIT 的 `ProviderSnapshot.provider_id` 为必填；准入、channel 校验、网络 origin 与 guest 分派都只使用当前 profile，不能合并其他 profile 的声明。基础 guest 按该身份分派，专属 guest 拒绝其他身份。
 
@@ -806,7 +808,7 @@ Wasm guest 不能直接取得宿主网络、存储或任意凭据。host 只提�
 | `PrincipalRpmExceeded` | 429 | API Key 根请求 RPM 超限；`STRAVIA_RPM_LIMIT`，附向上取整的 `Retry-After` |
 | `RouteNotFound` | 404 | 无匹配模型/路由 |
 | `ProtocolUnsupported` | 400 | 协议不支持 |
-| `ProtocolLossyRejected` | 422 | lossy 转换被拒绝 |
+| 目标无法表达的语义 | 不产生转换错误 | 默认省略不可表达部分，保留可表达内容；非法源输入、解析及安全错误不适用此规则 |
 | `ProviderUnavailable` | 503 | 无可用的已安装 Vendor 组件 |
 | `UpstreamStatus` | 上游 status | 上游返回错误 |
 | `UpstreamTimeout` | 504 | 上游超时 |
@@ -971,7 +973,7 @@ Catalog 读取与 Generated Mapping 的准备在事务前完成，事务中的�
 
 WebUI 的只读模型规格组件消费这一语义，列表与 Target 使用紧凑密度，详情展开模态、Effort 和结构化价格。数字按十进制无损缩写，不能简短精确表达时保留千位分隔全数；输入输出方向始终分开。可用模型规格筛选在既有状态中保存上下文下限、输入模态、输出模态和 Effort 的 AND 条件，使用原始整数做包含等于边界的下限比较，并要求选中值存在于 Core 返回的有效规格中，其中缺失模态的模型可以匹配文本输入和文本输出；未选维度不限制。列表一次响应提供展示和筛选所需数据，不逐行请求详情，也不从实时目录或平台能力覆盖已保存规格。
 
-模型元数据删除不关闭协议中的附件、推理、工具调用、结构化输出或采样控制。Web Search、Media 与模型轮次不再以模型 `tool_call` 声明判断工具资格；服务启用、有效可用状态、模态、平台权限及真实协议可表达性仍按各自执行路径校验，不支持的请求由协议或上游明确拒绝，不伪造模型支持声明。请求 `max_tokens` / `max_output_tokens` 与 `reasoning_content` 编解码继续存在。Route 和客户端配置不再派生或导出模型最大输出上限，也不以 context 代替输出上限。
+模型元数据删除不关闭协议中的附件、推理、工具调用、结构化输出或采样控制。Web Search、Media 与模型轮次不再以模型 `tool_call` 声明判断工具资格；服务启用、有效可用状态、模态、平台权限及真实协议可表达性仍按各自执行路径校验，目标协议不能表达的部分按转换政策省略，上游实际错误仍明确返回，不伪造模型支持声明。请求 `max_tokens` / `max_output_tokens` 与 `reasoning_content` 编解码继续存在。Route 和客户端配置不再派生或导出模型最大输出上限，也不以 context 代替输出上限。
 
 `0006_model_specification` 在 SQLite 与 PostgreSQL 上保数据增量升级：删除旧投影列和 JSON 键，只从旧 Effort 规格提取明确值；已存在的新 Effort 列表优先。迁移不改 Provider、Route 绑定或任何现有 Target 映射，包括旧 Generated 开关／预算映射。显式 re-import 才按新规格刷新 Generated，仍保留 Overridden。升级前按部署流程备份数据库，不修改冻结基线或重置历史。
 

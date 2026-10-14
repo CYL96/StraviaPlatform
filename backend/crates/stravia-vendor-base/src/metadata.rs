@@ -664,6 +664,7 @@ fn channel(
         default_models_source: None,
         consumes_catalog_models: false,
         capabilities,
+        client_header_names: BTreeSet::new(),
         model_capabilities: BTreeSet::new(),
     }
 }

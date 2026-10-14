@@ -53,7 +53,6 @@
 //!   match `[A-Za-z0-9_-]` or the request fails upstream with a vague
 //!   `invalid_argument` — both are handled before encoding.
 
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
 
@@ -71,6 +70,7 @@ use super::{CUSTOM_TOOL_META, ThinkingReplay};
 use stravia_runtime_contract::protocol::ir::AiItem;
 use stravia_runtime_contract::protocol::ir::AiRequest;
 use stravia_runtime_contract::protocol::ir::ContentBlock;
+use stravia_runtime_contract::protocol::ir::DocumentSource;
 use stravia_runtime_contract::protocol::ir::MediaSource;
 use stravia_runtime_contract::protocol::ir::MessageContent;
 use stravia_runtime_contract::protocol::ir::Role;
@@ -211,7 +211,27 @@ fn uuid_from_seed(root: &[u8; 32], salt: u32) -> String {
 /// embedded SINGLE inside `ClientMetadata` — the doubling is only for the
 /// HTTP `Authorization` header, which the vendor owns. `assignment_jwt`
 /// comes from a prior `AssignModel` call and rides at #26.
-pub fn encode_get_chat_message_request_with_platform(
+#[cfg(test)]
+pub(crate) fn encode_get_chat_message_request_with_platform(
+    req: &AiRequest,
+    session_token: &str,
+    shape: &SessionShape,
+    assignment_jwt: Option<&str>,
+    platform: DevinClientPlatform,
+) -> anyhow::Result<Vec<u8>> {
+    let mut encoding_request = req.clone();
+    super::prepare_request(&mut encoding_request);
+
+    encode_prepared_request(
+        &encoding_request,
+        session_token,
+        shape,
+        assignment_jwt,
+        platform,
+    )
+}
+
+pub(crate) fn encode_prepared_request(
     req: &AiRequest,
     session_token: &str,
     shape: &SessionShape,
@@ -221,49 +241,6 @@ pub fn encode_get_chat_message_request_with_platform(
     if session_token.trim().is_empty() {
         bail!("Devin Connect request is missing the session token");
     }
-    super::validate_request(req)?;
-
-    encode_validated_request(req, session_token, shape, assignment_jwt, platform)
-}
-
-pub(super) fn validate_request_fields(req: &AiRequest) -> anyhow::Result<()> {
-    if req.embedding.is_some() {
-        bail!("Devin Connect does not expose an embeddings endpoint");
-    }
-    // A zero penalty (±0.0) is a no-op upstreams often send unconditionally
-    // — encode it as absent. The vendor removes unsupported optional controls
-    // before validation; the raw encoder still rejects unnormalized input.
-    if req.generation.seed.is_some()
-        || req
-            .generation
-            .presence_penalty
-            .is_some_and(|penalty| penalty != 0.0)
-        || req
-            .generation
-            .frequency_penalty
-            .is_some_and(|penalty| penalty != 0.0)
-        || req.generation.stop.is_some()
-    {
-        bail!(
-            "Devin Connect cannot represent seed, nonzero presence/frequency penalties, or stop sequences"
-        );
-    }
-    if req.response_format.is_some() {
-        bail!("Devin Connect does not expose a model-neutral response format");
-    }
-    if req.safety_settings.is_some() {
-        bail!("Devin Connect does not expose safety settings");
-    }
-    Ok(())
-}
-
-fn encode_validated_request(
-    req: &AiRequest,
-    session_token: &str,
-    shape: &SessionShape,
-    assignment_jwt: Option<&str>,
-    platform: DevinClientPlatform,
-) -> anyhow::Result<Vec<u8>> {
     let mut hits = sanitize::SanitizeHits::default();
     let mut system_prompt = sanitize::sanitize_prompt_text(&collect_system_prompt(req), &mut hits);
     let mut chat_messages = collect_chat_messages(req)?;
@@ -635,7 +612,15 @@ fn collect_system_prompt(req: &AiRequest) -> String {
     }
     for item in &req.items {
         if matches!(item.role, Role::System | Role::Developer) {
-            let text = item.content.to_text();
+            let mut text = String::new();
+            match &item.content {
+                MessageContent::Text(value) => text.push_str(value),
+                MessageContent::Blocks(blocks) => {
+                    for block in blocks {
+                        append_visible_content(block, &mut text, None);
+                    }
+                }
+            }
             let trimmed = text.trim();
             if !trimmed.is_empty() {
                 parts.push(trimmed.to_string());
@@ -720,6 +705,13 @@ impl ChatMsg {
 }
 
 fn push_message(out: &mut Vec<ChatMsg>, mut message: ChatMsg) {
+    if message.text.is_empty()
+        && message.images.is_empty()
+        && message.tool_calls.is_empty()
+        && !message.has_thinking()
+    {
+        return;
+    }
     // Responses 把正文、reasoning 和每个 call 拆成独立项；这里只恢复上游回合，
     // 不修改 canonical 历史。同一响应的签名增量已由 decoder 聚合，
     // 这里不能再拼接或覆盖历史中的独立思考块。
@@ -760,7 +752,7 @@ fn collect_chat_messages(req: &AiRequest) -> anyhow::Result<Vec<ChatMsg>> {
         }
     }
     let mut out = pair_tool_calls_with_results(out);
-    demote_orphan_tool_results(&mut out);
+    drop_orphan_tool_results(&mut out);
     Ok(out)
 }
 
@@ -807,7 +799,7 @@ fn pair_tool_calls_with_results(prompts: Vec<ChatMsg>) -> Vec<ChatMsg> {
                 }
             }
         }
-        // Orphan results keep their relative order rather than being dropped.
+        // Keep unmatched results ordered until the orphan filter removes them.
         for result in &prompts[results_start..index] {
             if !consumed.iter().any(|c| std::ptr::eq(*c, result)) {
                 out.push((*result).clone());
@@ -817,32 +809,19 @@ fn pair_tool_calls_with_results(prompts: Vec<ChatMsg>) -> Vec<ChatMsg> {
     out
 }
 
-/// A source=4 result with no matching assistant tool call is rejected with
-/// invalid_argument upstream — demote it to a user-text turn so the result
-/// content survives (e.g. after client-side history compaction dropped the
-/// originating call).
-fn demote_orphan_tool_results(prompts: &mut [ChatMsg]) {
+/// Results without a matching call cannot be represented upstream.
+fn drop_orphan_tool_results(prompts: &mut Vec<ChatMsg>) {
     let call_ids: std::collections::HashSet<String> = prompts
         .iter()
         .flat_map(|prompt| prompt.tool_call_ids())
         .collect();
-    for prompt in prompts.iter_mut() {
-        if prompt.source != SOURCE_TOOL_RESULT {
-            continue;
-        }
-        let matched = prompt
-            .tool_call_id
-            .as_ref()
-            .is_some_and(|id| call_ids.contains(id));
-        if matched {
-            continue;
-        }
-        let text = std::mem::take(&mut prompt.text);
-        prompt.source = SOURCE_USER;
-        prompt.text = format!("[tool result, original call lost]\n{text}");
-        prompt.tool_call_id = None;
-        prompt.tool_error = false;
-    }
+    prompts.retain(|prompt| {
+        prompt.source != SOURCE_TOOL_RESULT
+            || prompt
+                .tool_call_id
+                .as_ref()
+                .is_some_and(|id| call_ids.contains(id))
+    });
 }
 
 impl ChatMsg {
@@ -885,11 +864,15 @@ fn encode_user_item(item: &AiItem, out: &mut Vec<ChatMsg>) -> anyhow::Result<()>
                 current.text.push_str(text);
             }
             ContentBlock::Image { source, .. } => {
-                current.images.push(encode_inline_image(source)?);
+                current.images.extend(encode_inline_image(source));
+            }
+            ContentBlock::Document { .. } => {
+                append_visible_content(block, &mut current.text, Some(&mut current.images));
             }
             ContentBlock::ToolResult {
                 tool_use_id,
                 content,
+                content_kind,
                 is_error,
                 ..
             } => {
@@ -899,22 +882,22 @@ fn encode_user_item(item: &AiItem, out: &mut Vec<ChatMsg>) -> anyhow::Result<()>
                     push_message(out, std::mem::take(&mut current));
                     current.source = SOURCE_USER;
                 }
-                push_message(
-                    out,
-                    ChatMsg {
-                        source: SOURCE_TOOL_RESULT,
-                        text: tool_result_text(content),
-                        tool_call_id: Some(tool_use_id.clone().into_string()),
-                        tool_error: *is_error == Some(true),
-                        ..ChatMsg::default()
-                    },
+                let mut result = ChatMsg {
+                    source: SOURCE_TOOL_RESULT,
+                    tool_call_id: Some(tool_use_id.clone().into_string()),
+                    tool_error: *is_error == Some(true),
+                    ..ChatMsg::default()
+                };
+                append_tool_result_content(
+                    content,
+                    *content_kind,
+                    &mut result.text,
+                    &mut result.images,
                 );
+                push_message(out, result);
                 has_content = false;
             }
-            other => bail!(
-                "Devin Connect cannot represent user content block `{}`",
-                content_block_name(other)
-            ),
+            _ => continue,
         }
     }
     if has_content && (!current.text.is_empty() || !current.images.is_empty()) {
@@ -945,10 +928,14 @@ fn encode_assistant_item(item: &AiItem, out: &mut Vec<ChatMsg>) -> anyhow::Resul
                     }
                     msg.text.push_str(text);
                 }
+                ContentBlock::Document { .. } => {
+                    append_visible_content(block, &mut msg.text, Some(&mut msg.images));
+                }
                 ContentBlock::Thinking { .. }
                 | ContentBlock::RedactedThinking { .. }
                 | ContentBlock::Reasoning { .. } => {
-                    if !msg.text.is_empty() || !msg.tool_calls.is_empty() {
+                    if !msg.text.is_empty() || !msg.tool_calls.is_empty() || !msg.images.is_empty()
+                    {
                         push_message(out, std::mem::take(&mut msg));
                         msg.source = SOURCE_ASSISTANT;
                     }
@@ -959,31 +946,24 @@ fn encode_assistant_item(item: &AiItem, out: &mut Vec<ChatMsg>) -> anyhow::Resul
                 ContentBlock::ToolUse {
                     id, name, input, ..
                 } => {
-                    msg.tool_calls.push(encode_tool_call(
-                        id,
-                        name,
-                        &serde_json::to_string(input).unwrap_or_else(|_| input.to_string()),
-                        custom,
-                    )?);
+                    msg.tool_calls
+                        .extend(encode_tool_call(id, name, &input.to_string(), custom));
                 }
-                other => bail!(
-                    "Devin Connect cannot represent assistant content block `{}`",
-                    content_block_name(other)
-                ),
+                _ => continue,
             }
         }
     } else {
         msg.text = item.content.to_text();
     }
     for call in item.tool_calls.as_deref().unwrap_or_default() {
-        msg.tool_calls.push(encode_tool_call(
+        msg.tool_calls.extend(encode_tool_call(
             &call.id,
             &call.name,
             &call.arguments,
             custom,
-        )?);
+        ));
     }
-    if !msg.text.is_empty() || !msg.tool_calls.is_empty() {
+    if !msg.text.is_empty() || !msg.tool_calls.is_empty() || !msg.images.is_empty() {
         push_message(out, msg);
     }
     Ok(())
@@ -1052,113 +1032,191 @@ fn encode_tool_result_item(item: &AiItem, out: &mut Vec<ChatMsg>) -> anyhow::Res
         MessageContent::Text(value) => value.as_ref().clone(),
         MessageContent::Blocks(blocks) => {
             let mut text = String::new();
-            let mut separator = "";
             for block in blocks {
-                let fragment = match block {
-                    ContentBlock::Text { text, .. } => Cow::Borrowed(text.as_str()),
+                match block {
+                    ContentBlock::Text { text: fragment, .. } => {
+                        append_result_text(&mut text, fragment)
+                    }
                     ContentBlock::ToolResult {
-                        content, is_error, ..
+                        content,
+                        content_kind,
+                        is_error,
+                        ..
                     } => {
                         tool_error |= *is_error == Some(true);
-                        Cow::Owned(tool_result_text(content))
+                        append_tool_result_content(content, *content_kind, &mut text, &mut images);
+                    }
+                    ContentBlock::Document { .. } => {
+                        append_visible_content(block, &mut text, Some(&mut images));
                     }
                     ContentBlock::Image { source, .. } => {
-                        images.push(encode_inline_image(source)?);
-                        continue;
+                        images.extend(encode_inline_image(source));
                     }
-                    other => bail!(
-                        "Devin Connect cannot represent tool result content block `{}`",
-                        content_block_name(other)
-                    ),
-                };
-                text.push_str(separator);
-                text.push_str(&fragment);
-                separator = "\n";
+                    _ => continue,
+                }
             }
             text
         }
     };
-    let text = if text.is_empty() {
-        "[tool result]".to_string()
-    } else {
-        text
+    let Some(tool_call_id) = item.tool_call_id.as_deref() else {
+        return Ok(());
     };
-    match item.tool_call_id.as_deref() {
-        Some(tool_call_id) => push_message(
-            out,
-            ChatMsg {
-                source: SOURCE_TOOL_RESULT,
-                text,
-                tool_call_id: Some(tool_call_id.to_string()),
-                tool_error,
-                images,
-                ..ChatMsg::default()
-            },
-        ),
-        // No id to echo: fold into a user turn like the reference's
-        // emulation path instead of dropping the result.
-        None => push_message(
-            out,
-            ChatMsg {
-                source: SOURCE_USER,
-                text: format!("[tool result]: {text}"),
-                images,
-                ..ChatMsg::default()
-            },
-        ),
+    if text.is_empty() && images.is_empty() {
+        return Ok(());
     }
+    push_message(
+        out,
+        ChatMsg {
+            source: SOURCE_TOOL_RESULT,
+            text,
+            tool_call_id: Some(tool_call_id.to_string()),
+            tool_error,
+            images,
+            ..ChatMsg::default()
+        },
+    );
     Ok(())
 }
 
-fn tool_result_text(content: &Value) -> String {
-    let text = match content {
-        Value::String(text) => text.clone(),
-        other => serde_json::to_string(other).unwrap_or_else(|_| other.to_string()),
-    };
-    // An empty tool result still needs a body — the reference emits a
-    // placeholder rather than a zero-length #3.
-    if text.is_empty() {
-        "[tool result]".to_string()
-    } else {
-        text
+/// Documents reuse the role's text/image carriers; other nested blocks have no wire form.
+fn append_visible_content(
+    block: &ContentBlock,
+    text: &mut String,
+    mut images: Option<&mut Vec<Vec<u8>>>,
+) {
+    match block {
+        ContentBlock::Text { text: fragment, .. } => append_result_text(text, fragment),
+        ContentBlock::Image { source, .. } => {
+            if let Some(images) = images {
+                images.extend(encode_inline_image(source));
+            }
+        }
+        ContentBlock::Document { source, .. } => match source {
+            DocumentSource::PlainText { data } => append_result_text(text, data),
+            DocumentSource::Blocks { content } => {
+                for block in content {
+                    append_visible_content(block, text, images.as_deref_mut());
+                }
+            }
+            _ => {}
+        },
+        _ => {}
     }
 }
 
-fn encode_inline_image(source: &MediaSource) -> anyhow::Result<Vec<u8>> {
-    let MediaSource::Base64 { media_type, data } = source else {
-        bail!("Devin Connect accepts only inline image bytes");
+fn append_result_text(text: &mut String, fragment: &str) {
+    if fragment.is_empty() {
+        return;
+    }
+    if !text.is_empty() {
+        text.push('\n');
+    }
+    text.push_str(fragment);
+}
+
+fn append_tool_result_content(
+    content: &Value,
+    kind: Option<stravia_runtime_contract::protocol::ir::ToolResultContentKind>,
+    text: &mut String,
+    images: &mut Vec<Vec<u8>>,
+) {
+    if let Some(fragment) = content.as_str() {
+        append_result_text(text, fragment);
+        return;
+    }
+    if kind != Some(stravia_runtime_contract::protocol::ir::ToolResultContentKind::ContentBlocks) {
+        use std::fmt::Write as _;
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        let _ = write!(text, "{content}");
+        return;
+    }
+    let Some(blocks) = content.as_array() else {
+        return;
     };
+    append_result_blocks(blocks, text, images);
+}
+
+fn append_result_blocks(blocks: &[Value], text: &mut String, images: &mut Vec<Vec<u8>>) {
+    for block in blocks {
+        match block.get("type").and_then(Value::as_str) {
+            Some("document") => {
+                let Some(source) = block.get("source") else {
+                    continue;
+                };
+                match source.get("type").and_then(Value::as_str) {
+                    Some("plain_text") => {
+                        if let Some(data) = source.get("data").and_then(Value::as_str) {
+                            append_result_text(text, data);
+                        }
+                    }
+                    Some("blocks") => {
+                        if let Some(content) = source.get("content").and_then(Value::as_array) {
+                            append_result_blocks(content, text, images);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Some("text") => {
+                if let Some(fragment) = block.get("text").and_then(Value::as_str) {
+                    append_result_text(text, fragment);
+                }
+            }
+            Some("image") => {
+                let Some(source) = block.get("source") else {
+                    continue;
+                };
+                if source.get("type").and_then(Value::as_str) != Some("base64") {
+                    continue;
+                }
+                if let (Some(media_type), Some(data)) = (
+                    source.get("media_type").and_then(Value::as_str),
+                    source.get("data").and_then(Value::as_str),
+                ) {
+                    images.push(encode_inline_image_data(media_type, data));
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn encode_inline_image(source: &MediaSource) -> Option<Vec<u8>> {
+    let MediaSource::Base64 { media_type, data } = source else {
+        return None;
+    };
+    Some(encode_inline_image_data(media_type, data))
+}
+
+fn encode_inline_image_data(media_type: &str, data: &str) -> Vec<u8> {
     // ImageData{#1 base64 text, #2 mime} — verified from wire: #1 carries the
     // base64 STRING, not raw image bytes.
     let mut out = Vec::new();
     write_string_field(&mut out, 1, data);
     write_string_field(&mut out, 2, media_type);
-    Ok(out)
+    out
 }
 
-fn encode_tool_call(
-    id: &str,
-    name: &str,
-    args_json: &str,
-    custom: bool,
-) -> anyhow::Result<Vec<u8>> {
+fn encode_tool_call(id: &str, name: &str, args_json: &str, custom: bool) -> Option<Vec<u8>> {
+    if !valid_tool_name(name) {
+        return None;
+    }
     // ChatToolCall{#1 id, #2 name, #3 arguments JSON} — only #3 is a JSON
     // string; the envelope around it is protobuf.
     let mut call = Vec::new();
     write_string_field(&mut call, 1, id);
     write_string_field(&mut call, 2, name);
     if custom {
-        let arguments: Value = serde_json::from_str(args_json)?;
-        let input = arguments
-            .get("input")
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow::anyhow!("Devin custom tool arguments require a string input"))?;
+        let arguments: Value = serde_json::from_str(args_json).ok()?;
+        let input = arguments.get("input").and_then(Value::as_str)?;
         write_string_field(&mut call, 4, input);
         write_varint_field(&mut call, 6, 1);
     } else {
         write_string_field(&mut call, 3, args_json);
     }
-    Ok(call)
+    Some(call)
 }
 
 /// Wire-encoded ToolDef bodies plus `(name, sanitized description)` pairs for
@@ -1166,10 +1224,8 @@ fn encode_tool_call(
 type EncodedToolDefs = (Vec<Vec<u8>>, Vec<(String, String)>);
 
 /// Returns the wire-encoded ToolDefs plus `(name, sanitized description)`
-/// pairs for system-prompt relocation. Tool names are validated locally:
-/// upstream only accepts `[A-Za-z0-9_-]` and answers anything else with a
-/// vague `invalid_argument`. Names are never rewritten — renaming would
-/// break the tool_call name echo in replayed history.
+/// pairs for system-prompt relocation. Tools with names outside the upstream's
+/// `[A-Za-z0-9_-]` carrier are omitted; names are never rewritten.
 fn encode_tool_defs(
     req: &AiRequest,
     hits: &mut sanitize::SanitizeHits,
@@ -1179,9 +1235,7 @@ fn encode_tool_defs(
     for tool in req.tools.as_deref().unwrap_or_default() {
         let name = tool.name.trim();
         if !valid_tool_name(name) {
-            bail!(
-                "Devin Connect rejects tool name {name:?}: characters outside [A-Za-z0-9_-] fail upstream"
-            );
+            continue;
         }
         let mut def = Vec::new();
         write_string_field(&mut def, 1, name);
@@ -1543,33 +1597,6 @@ fn strip_schema_annotations(value: &Value, in_properties: bool) -> Value {
     }
 }
 
-fn content_block_name(block: &ContentBlock) -> &'static str {
-    match block {
-        ContentBlock::Text { .. } => "text",
-        ContentBlock::Image { .. } => "image",
-        ContentBlock::Audio { .. } => "audio",
-        ContentBlock::File { .. } => "file",
-        ContentBlock::Video { .. } => "video",
-        ContentBlock::Thinking { .. } => "thinking",
-        ContentBlock::Reasoning { .. } => "reasoning",
-        ContentBlock::Compaction { .. } => "compaction",
-        ContentBlock::CompactionTrigger {} => "compaction_trigger",
-        ContentBlock::RedactedThinking { .. } => "redacted_thinking",
-        ContentBlock::ToolUse { .. } => "tool_use",
-        ContentBlock::ToolResult { .. } => "tool_result",
-        ContentBlock::ServerToolUse { .. } => "server_tool_use",
-        ContentBlock::ServerToolResult { .. } => "server_tool_result",
-        ContentBlock::Document { .. } => "document",
-        ContentBlock::SearchResult { .. } => "search_result",
-        ContentBlock::Citation { .. } => "citation",
-        ContentBlock::ExecutableCode { .. } => "executable_code",
-        ContentBlock::CodeExecutionResult { .. } => "code_execution_result",
-        ContentBlock::ContainerUpload { .. } => "container_upload",
-        ContentBlock::Refusal { .. } => "refusal",
-        ContentBlock::Unknown { .. } => "unknown",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1624,6 +1651,19 @@ mod tests {
 
     fn shape(req: &AiRequest) -> SessionShape {
         session_shape(req, "tok")
+    }
+
+    #[test]
+    fn prepared_encoder_rejects_missing_session_credentials() {
+        let mut request = AiRequest::new("m", vec![text_item(Role::User, "hello")]);
+        super::super::prepare_request(&mut request);
+        let shape = shape(&request);
+        for token in ["", " \t"] {
+            assert!(
+                encode_prepared_request(&request, token, &shape, None, DevinClientPlatform::Linux,)
+                    .is_err()
+            );
+        }
     }
 
     fn top_level(req: &AiRequest) -> Vec<crate::codec::devin_connect::proto::ProtoField<'static>> {
@@ -2084,7 +2124,7 @@ mod tests {
     // 原生保留为一条 prompt，不会降级也不会丢成空消息。
     #[test]
     fn redacted_only_item_keeps_native_prompt() {
-        let request = AiRequest::new(
+        let mut request = AiRequest::new(
             "swe-2",
             vec![
                 text_item(Role::User, "go"),
@@ -2099,6 +2139,8 @@ mod tests {
                 },
             ],
         );
+        request.generation.stop = Some(vec!["unsupported stop".into()]);
+        let snapshot = serde_json::to_value(&request).unwrap();
         let prompts: Vec<_> = top_level(&request)
             .iter()
             .filter(|field| field.number == 3)
@@ -2124,6 +2166,7 @@ mod tests {
         for number in [3, 11] {
             assert!(!redacted.iter().any(|field| field.number == number));
         }
+        assert_eq!(serde_json::to_value(&request).unwrap(), snapshot);
     }
 
     /// The upstream rejects "all calls, then all results" groupings and
@@ -2131,7 +2174,7 @@ mod tests {
     /// the assistant prompt carrying their call, and unmatched results drop
     /// to user text — both live-verified `invalid_argument` triggers.
     #[test]
-    fn tool_calls_pair_with_results_and_orphans_demote() {
+    fn tool_calls_pair_with_results_and_orphans_drop() {
         let mut assistant = text_item(Role::Assistant, "");
         assistant.tool_calls = Some(vec![
             ToolCall {
@@ -2177,18 +2220,12 @@ mod tests {
                 .find(|f| f.number == 7 && f.wire_type == 2)
                 .map(|f| String::from_utf8_lossy(f.bytes).into_owned())
         };
-        // user, assistant{2 calls}, result c1, result c2, demoted ghost.
-        assert_eq!(prompts.len(), 5);
+        // user, assistant{2 calls}, result c1, result c2; orphan omitted.
+        assert_eq!(prompts.len(), 4);
         assert_eq!(source_of(&prompts[1]), Some(SOURCE_ASSISTANT));
         assert_eq!(prompts[1].iter().filter(|f| f.number == 6).count(), 2);
         assert_eq!(call_id_of(&prompts[2]).as_deref(), Some("c1"));
         assert_eq!(call_id_of(&prompts[3]).as_deref(), Some("c2"));
-        assert_eq!(source_of(&prompts[4]), Some(SOURCE_USER));
-        assert!(
-            prompts[4]
-                .iter()
-                .any(|f| f.number == 3 && f.bytes.starts_with(b"[tool result, original call lost]"))
-        );
     }
 
     #[test]
@@ -2227,6 +2264,81 @@ mod tests {
                 .iter()
                 .any(|field| field.number == 2 && field.bytes == b"image/png")
         );
+    }
+
+    #[test]
+    fn nested_tool_result_keeps_text_image_error_and_call_identity() {
+        let request = AiRequest::new("swe-2", vec![
+            text_item(Role::User, "Read the image."),
+            AiItem::function_call(ToolCall {
+                id: "read-image".into(),
+                name: "read".into(),
+                arguments: "{}".into(),
+            }),
+            AiItem {
+                role: Role::User,
+                content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                    tool_use_id: "read-image".into(),
+                    content: serde_json::json!([
+                        {"type": "text", "text": "Image from read."},
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "aGk="}},
+                        {"type": "video", "source": {"type": "url", "url": "https://example.test/clip.mp4"}}
+                    ]),
+                    content_kind: Some(stravia_runtime_contract::protocol::ir::ToolResultContentKind::ContentBlocks),
+                    is_error: Some(true),
+                    cache_control: None,
+                }]),
+                tool_calls: None,
+                tool_call_id: None,
+                meta: None,
+            },
+        ]);
+        let fields = top_level(&request);
+        let prompts: Vec<_> = fields
+            .iter()
+            .filter(|field| field.number == 3 && field.wire_type == 2)
+            .map(|field| parse_fields(field.bytes).unwrap())
+            .collect();
+        let result = prompts
+            .iter()
+            .find(|prompt| {
+                prompt
+                    .iter()
+                    .any(|field| field.number == 2 && field.scalar == SOURCE_TOOL_RESULT)
+            })
+            .expect("nested tool result reaches the native result turn");
+        assert!(
+            result
+                .iter()
+                .any(|field| field.number == 3 && field.bytes == b"Image from read.")
+        );
+        assert!(
+            result
+                .iter()
+                .any(|field| field.number == 7 && field.bytes == b"read-image")
+        );
+        assert!(
+            result
+                .iter()
+                .any(|field| field.number == 9 && field.scalar == 1)
+        );
+        let image = sub_message(result, 10, 0);
+        assert!(
+            image
+                .iter()
+                .any(|field| field.number == 1 && field.bytes == b"aGk=")
+        );
+        assert!(
+            image
+                .iter()
+                .any(|field| field.number == 2 && field.bytes == b"image/png")
+        );
+        assert!(!fields.iter().any(|field| {
+            field
+                .bytes
+                .windows(b"clip.mp4".len())
+                .any(|bytes| bytes == b"clip.mp4")
+        }));
     }
 
     #[test]
@@ -2456,14 +2568,21 @@ mod tests {
     }
 
     #[test]
-    fn invalid_tool_name_fails_fast() {
+    fn invalid_tool_name_is_omitted() {
         let mut req = AiRequest::new("m", vec![text_item(Role::User, "hi")]);
         req.tools = Some(vec![tool(
             "mcp::search",
             None,
             serde_json::json!({"type": "object"}),
         )]);
-        assert!(encode_test_chat_request(&req, "tok", &shape(&req), None).is_err());
+        let fields = top_level(&req);
+        assert!(fields.iter().all(|field| field.number != 10));
+        let prompt = sub_message(&fields, 3, 0);
+        assert!(
+            prompt
+                .iter()
+                .any(|field| field.number == 3 && field.bytes == b"hi")
+        );
     }
 
     #[test]
@@ -2485,32 +2604,211 @@ mod tests {
     }
 
     #[test]
-    fn empty_tool_result_folds_to_user_without_id() {
-        let item = text_item(Role::Tool, "");
-        let req = AiRequest::new("m", vec![item]);
+    fn empty_tool_result_without_id_is_omitted() {
+        let req = AiRequest::new(
+            "m",
+            vec![
+                text_item(Role::Tool, ""),
+                text_item(Role::User, "preserved"),
+            ],
+        );
         let fields = top_level(&req);
+        let messages: Vec<_> = fields
+            .iter()
+            .filter(|f| f.number == 3 && f.wire_type == 2)
+            .collect();
+        assert_eq!(messages.len(), 1);
         let msg = sub_message(&fields, 3, 0);
-        assert!(msg.iter().any(|f| f.number == 2 && f.scalar == SOURCE_USER));
+        assert!(msg.iter().any(|f| f.number == 3 && f.bytes == b"preserved"));
+    }
+
+    #[test]
+    fn documents_project_text_and_inline_images_for_each_role() {
+        let document = |source| ContentBlock::Document {
+            source,
+            title: None,
+            context: None,
+            cache_control: None,
+        };
+        let image = ContentBlock::Image {
+            source: MediaSource::Base64 {
+                media_type: "image/png".into(),
+                data: "aW1hZ2U=".into(),
+            },
+            detail: None,
+            cache_control: None,
+        };
+        let mut items = Vec::new();
+        for role in [Role::System, Role::User, Role::Assistant, Role::Tool] {
+            let mut item = text_item(role, "");
+            item.content = MessageContent::Blocks(vec![
+                document(DocumentSource::PlainText {
+                    data: "plain document".into(),
+                }),
+                document(DocumentSource::Blocks {
+                    content: vec![
+                        ContentBlock::Text {
+                            text: "nested document".to_owned().into(),
+                            cache_control: None,
+                        },
+                        image.clone(),
+                        ContentBlock::CompactionTrigger {},
+                    ],
+                }),
+                document(DocumentSource::Base64Pdf {
+                    data: "unsupported pdf".into(),
+                }),
+            ]);
+            if role == Role::Assistant {
+                item.tool_calls = Some(vec![ToolCall {
+                    id: "doc-call".into(),
+                    name: "read".into(),
+                    arguments: "{}".into(),
+                }]);
+            }
+            if role == Role::Tool {
+                item.tool_call_id = Some("doc-call".into());
+            }
+            items.push(item);
+        }
+        let req = AiRequest::new("m", items);
+        let snapshot = serde_json::to_value(&req).unwrap();
+        let fields = top_level(&req);
         assert!(
-            msg.iter()
-                .any(|f| f.number == 3 && f.bytes == b"[tool result]: [tool result]")
+            fields
+                .iter()
+                .any(|f| f.number == 2 && f.bytes == b"plain document\nnested document")
+        );
+        let prompts: Vec<_> = fields
+            .iter()
+            .filter(|f| f.number == 3)
+            .map(|f| parse_fields(f.bytes).unwrap())
+            .collect();
+        assert_eq!(prompts.len(), 3);
+        for prompt in prompts {
+            assert!(
+                prompt
+                    .iter()
+                    .any(|f| f.number == 3 && f.bytes == b"plain document\nnested document")
+            );
+            assert_eq!(prompt.iter().filter(|f| f.number == 10).count(), 1);
+        }
+        assert_eq!(serde_json::to_value(&req).unwrap(), snapshot);
+    }
+
+    #[test]
+    fn serialized_tool_documents_preserve_only_convertible_children() {
+        let content = serde_json::json!([
+            {"type":"document", "source":{"type":"plain_text", "data":"plain"}},
+            {"type":"document", "source":{"type":"blocks", "content":[
+                {"type":"text", "text":"nested"},
+                {"type":"image", "source":{"type":"base64", "media_type":"image/png", "data":"aW1hZ2U="}},
+                {"type":"video", "source":{"type":"url", "url":"https://example.test/video"}}
+            ]}},
+            {"type":"document", "source":{"type":"base64_pdf", "data":"unsupported pdf"}}
+        ]);
+        let mut text = String::new();
+        let mut images = Vec::new();
+        append_tool_result_content(
+            &content,
+            Some(stravia_runtime_contract::protocol::ir::ToolResultContentKind::ContentBlocks),
+            &mut text,
+            &mut images,
+        );
+        assert_eq!(text, "plain\nnested");
+        assert_eq!(images.len(), 1);
+        assert!(
+            parse_fields(&images[0])
+                .unwrap()
+                .iter()
+                .any(|f| f.number == 1 && f.bytes == b"aW1hZ2U=")
         );
     }
 
     #[test]
-    fn unrepresentable_generation_fields_fail() {
+    fn unsupported_generation_fields_are_pruned_without_mutating_snapshot() {
         let mut req = AiRequest::new("m", vec![text_item(Role::User, "hi")]);
         req.generation.seed = Some(1);
-        assert!(encode_test_chat_request(&req, "t", &shape(&req), None).is_err());
-
-        // Raw codec callers must normalize unsupported optional controls first.
-        let mut req = AiRequest::new("m", vec![text_item(Role::User, "hi")]);
         req.generation.presence_penalty = Some(0.5);
-        assert!(encode_test_chat_request(&req, "t", &shape(&req), None).is_err());
-
-        let mut req = AiRequest::new("m", vec![text_item(Role::User, "hi")]);
         req.generation.frequency_penalty = Some(-0.5);
-        assert!(encode_test_chat_request(&req, "t", &shape(&req), None).is_err());
+        req.generation.stop = Some(vec!["unsupported stop".into()]);
+        let snapshot = serde_json::to_value(&req).unwrap();
+        let fields = top_level(&req);
+        let prompt = sub_message(&fields, 3, 0);
+        assert!(
+            prompt
+                .iter()
+                .any(|field| field.number == 3 && field.bytes == b"hi")
+        );
+        assert_eq!(serde_json::to_value(&req).unwrap(), snapshot);
+    }
+
+    #[test]
+    fn mixed_content_is_pruned_only_on_encoding_copy() {
+        let mut item = text_item(Role::User, "");
+        item.content = MessageContent::Blocks(vec![
+            ContentBlock::Text {
+                text: "preserved prompt".to_owned().into(),
+                cache_control: None,
+            },
+            ContentBlock::CompactionTrigger {},
+            ContentBlock::Video {
+                source: stravia_runtime_contract::protocol::ir::MediaSource::Url(
+                    "https://example.test/video.mp4".into(),
+                ),
+                media_type: Some("video/mp4".into()),
+            },
+        ]);
+        let req = AiRequest::new("m", vec![item]);
+        let snapshot = serde_json::to_value(&req).unwrap();
+        let fields = top_level(&req);
+        let prompt = sub_message(&fields, 3, 0);
+        assert!(
+            prompt
+                .iter()
+                .any(|field| field.number == 3 && field.bytes == b"preserved prompt")
+        );
+        assert_eq!(serde_json::to_value(&req).unwrap(), snapshot);
+    }
+
+    #[test]
+    fn unsupported_tool_result_payload_is_omitted_without_fabrication() {
+        let mut assistant = text_item(Role::Assistant, "");
+        assistant.tool_calls = Some(vec![ToolCall {
+            id: "call-result".into(),
+            name: "read".into(),
+            arguments: "{}".into(),
+        }]);
+        let mut result = text_item(Role::Tool, "");
+        result.tool_call_id = Some("call-result".into());
+        result.content = MessageContent::Blocks(vec![
+            ContentBlock::Text {
+                text: "preserved result".to_owned().into(),
+                cache_control: None,
+            },
+            ContentBlock::ToolResult {
+                tool_use_id: "call-result".into(),
+                content: serde_json::json!([{"type":"input_audio","data":"aGk="}]),
+                content_kind: Some(
+                    stravia_runtime_contract::protocol::ir::ToolResultContentKind::ContentBlocks,
+                ),
+                is_error: None,
+                cache_control: None,
+            },
+        ]);
+        let req = AiRequest::new("m", vec![assistant, result]);
+        let fields = top_level(&req);
+        let result = sub_message(&fields, 3, 1);
+        assert!(
+            result
+                .iter()
+                .any(|field| field.number == 7 && field.bytes == b"call-result")
+        );
+        assert!(
+            result
+                .iter()
+                .any(|field| field.number == 3 && field.bytes == b"preserved result")
+        );
     }
 
     /// Zero penalties (including -0.0) are sampling no-ops upstreams send

@@ -227,6 +227,7 @@ impl HostServices for Services {
         _: Vec<(String, String)>,
         _: Vec<String>,
         _: Option<String>,
+        _: Option<u64>,
     ) -> Result<Arc<dyn HostWebSocket>, HostFailure> {
         Err(HostFailure::new(
             ErrorKind::Unsupported,

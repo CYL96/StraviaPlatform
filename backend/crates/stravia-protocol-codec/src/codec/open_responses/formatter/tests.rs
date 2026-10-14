@@ -58,6 +58,149 @@ fn chat_reasoning_presence_keeps_real_reasoning_and_opaque_items() {
 }
 
 #[test]
+fn tool_outputs_omit_unsupported_payloads_and_keep_supported_parts() {
+    let content_blocks = |call_id: &str, content| AiItem {
+        role: stravia_runtime_contract::protocol::ir::Role::Tool,
+        content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
+            tool_use_id: call_id.into(),
+            content,
+            content_kind: Some(
+                stravia_runtime_contract::protocol::ir::ToolResultContentKind::ContentBlocks,
+            ),
+            is_error: None,
+            cache_control: None,
+        }]),
+        tool_calls: None,
+        tool_call_id: Some(call_id.into()),
+        meta: None,
+    };
+    let mut response = AiResponse::new("resp_tools", "model");
+    response.items = vec![
+        AiItem::function_call_output("business", serde_json::json!({"rows": 2})),
+        content_blocks(
+            "dropped",
+            serde_json::json!([{"type": "input_audio", "data": "aGk="}]),
+        ),
+        content_blocks(
+            "mixed",
+            serde_json::json!([
+                {"type": "input_text", "text": "kept"},
+                {"type": "input_audio", "data": "aGk="},
+                {"type": "input_image", "image_url": "https://example.test/img.png", "detail": "auto"},
+                {"type": "input_file", "file_url": "https://example.test/file.pdf"}
+            ]),
+        ),
+        AiItem::function_call_output("empty_string", serde_json::json!("")),
+    ];
+    let formatted = ResponsesResponseFormatter.format_response(&response);
+    let output = formatted["output"].as_array().unwrap();
+    assert_eq!(output.len(), 3);
+    assert_eq!(output[0]["call_id"], "business");
+    assert_eq!(
+        serde_json::from_str::<Value>(output[0]["output"].as_str().unwrap()).unwrap(),
+        serde_json::json!({"rows": 2})
+    );
+    assert_eq!(output[1]["call_id"], "mixed");
+    assert_eq!(
+        output[1]["output"],
+        serde_json::json!([
+            {"type": "input_text", "text": "kept"},
+            {"type": "input_image", "image_url": "https://example.test/img.png", "detail": "auto"},
+            {"type": "input_file", "file_url": "https://example.test/file.pdf"}
+        ])
+    );
+    assert_eq!(output[2]["call_id"], "empty_string");
+    assert_eq!(output[2]["output"], "");
+}
+
+#[test]
+fn mixed_assistant_response_keeps_text_when_media_is_unsupported() {
+    let mut item = AiItem::output_text("unused");
+    item.content = MessageContent::Blocks(vec![
+        ContentBlock::Image {
+            source: stravia_runtime_contract::protocol::ir::MediaSource::Url(
+                "https://example.test/img.png".into(),
+            ),
+            detail: None,
+            cache_control: None,
+        },
+        ContentBlock::Text {
+            text: std::sync::Arc::new("kept".into()),
+            cache_control: None,
+        },
+    ]);
+    let mut response = AiResponse::new("resp_mixed", "model");
+    response.items = vec![item];
+    let formatted = ResponsesResponseFormatter.format_response(&response);
+    assert_eq!(formatted["output"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        formatted["output"][0]["content"].as_array().unwrap().len(),
+        1
+    );
+    assert_eq!(formatted["output"][0]["content"][0]["text"], "kept");
+}
+
+#[test]
+fn mixed_assistant_response_preserves_reasoning_text_and_all_unique_calls() {
+    let mut item = AiItem::reasoning(
+        vec!["summary".into()],
+        vec!["thought".into()],
+        Some("cipher".into()),
+    );
+    let MessageContent::Blocks(blocks) = &mut item.content else {
+        unreachable!()
+    };
+    blocks.push(ContentBlock::Text {
+        text: std::sync::Arc::new("answer".into()),
+        cache_control: None,
+    });
+    blocks.push(ContentBlock::ToolUse {
+        id: "first".into(),
+        name: "lookup".into(),
+        input: serde_json::json!({"q": "x"}),
+        cache_control: None,
+    });
+    item.tool_calls = Some(vec![
+        stravia_runtime_contract::protocol::ir::ToolCall {
+            id: "first".into(),
+            name: "lookup".into(),
+            arguments: "{}".into(),
+        },
+        stravia_runtime_contract::protocol::ir::ToolCall {
+            id: "second".into(),
+            name: "read".into(),
+            arguments: "{}".into(),
+        },
+    ]);
+    let mut response = AiResponse::new("resp_mixed_native", "model");
+    response.items.push(item);
+    let formatted = ResponsesResponseFormatter.format_response(&response);
+    let output = formatted["output"].as_array().unwrap();
+    assert_eq!(output.len(), 4);
+    assert_eq!(output[0]["type"], "reasoning");
+    assert_eq!(output[0]["content"][0]["text"], "thought");
+    assert_eq!(output[0]["encrypted_content"], "cipher");
+    assert_eq!(output[1]["type"], "message");
+    assert_eq!(output[1]["content"][0]["text"], "answer");
+    assert_eq!(output[2]["call_id"], "first");
+    assert_eq!(output[3]["call_id"], "second");
+    assert_eq!(
+        serde_json::from_str::<Value>(output[2]["arguments"].as_str().unwrap()).unwrap(),
+        serde_json::json!({"q": "x"})
+    );
+    for (index, item) in output.iter().enumerate() {
+        assert!(
+            !output[..index]
+                .iter()
+                .any(|previous| previous["id"] == item["id"])
+        );
+    }
+    let stamped = stamp_output_graph_ids(&response);
+    assert_eq!(stamped.len(), 4);
+    assert!(stamped.iter().all(|item| item.id_ref().is_some()));
+}
+
+#[test]
 fn formats_cache_write_tokens_when_known() {
     let mut response = AiResponse::new("resp_usage", "model");
     response.usage = Usage {

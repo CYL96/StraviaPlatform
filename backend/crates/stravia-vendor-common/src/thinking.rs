@@ -510,8 +510,10 @@ mod tests {
     }
 
     #[test]
-    fn undeclared_toggle_fails_closed() {
-        let mut unknown = AiRequest::new("custom-model", Vec::new());
+    fn undeclared_toggle_is_omitted_without_losing_messages() {
+        let mut message = stravia_runtime_contract::protocol::ir::AiItem::output_text("hello");
+        message.role = stravia_runtime_contract::protocol::ir::Role::User;
+        let mut unknown = AiRequest::new("custom-model", vec![message]);
         unknown.reasoning.target_control = Some(TargetThinkingControl::Enabled);
         apply(
             "custom",
@@ -521,13 +523,16 @@ mod tests {
             &mut unknown,
         )
         .unwrap();
-        assert!(
-            common::encode_inference_request(
-                &OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1.to_string(),
-                unknown
-            )
-            .is_err()
-        );
+        let encoded = common::encode_inference_request(
+            &OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1.to_string(),
+            unknown,
+        )
+        .unwrap();
+        assert_eq!(encoded.body["messages"][0]["role"], "user");
+        assert_eq!(encoded.body["messages"][0]["content"], "hello");
+        assert!(encoded.body.get("thinking").is_none());
+        assert!(encoded.body.get("enable_thinking").is_none());
+        assert!(encoded.body.get("reasoning").is_none());
     }
 
     #[test]

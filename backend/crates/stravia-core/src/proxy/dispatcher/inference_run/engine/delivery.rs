@@ -163,7 +163,7 @@ impl DeliveryAdapter {
                     Err(error) => {
                         let output = protocol_error_json(*ingress, &error);
                         BufferedDelivery {
-                            response: (StatusCode::UNPROCESSABLE_ENTITY, Json(output))
+                            response: (protocol_error_classification(&error).0, Json(output))
                                 .into_response(),
                             progress: BufferedDeliveryProgress::ProtocolFailed,
                         }
@@ -230,7 +230,7 @@ impl DeliveryAdapter {
                 let terminal_events =
                     encoder.fail(stravia_runtime_contract::protocol::ir::AiError::new(
                         stravia_runtime_contract::protocol::ir::AiErrorKind::StreamMidError,
-                        format!("STRAVIA_PROTOCOL_LOSSY_REJECTED: {error}"),
+                        format!("{}: {error}", protocol_error_classification(&error).1),
                     ));
                 *failed = true;
                 for event in terminal_events {
@@ -384,26 +384,58 @@ fn stream_encoder(ingress: ProtocolId, egress: ProtocolId) -> StreamEncodeStage 
         .1
 }
 
+fn protocol_error_classification(error: &TransformError) -> (StatusCode, &'static str) {
+    match error {
+        TransformError::Unsupported { .. } | TransformError::UnsupportedOperation { .. } => {
+            (StatusCode::BAD_REQUEST, "STRAVIA_PROTOCOL_UNSUPPORTED")
+        }
+        TransformError::Wire {
+            direction: "client_request",
+            ..
+        } => (StatusCode::BAD_REQUEST, "STRAVIA_BAD_REQUEST"),
+        TransformError::Wire {
+            direction: "upstream_response",
+            ..
+        } => (StatusCode::BAD_GATEWAY, "STRAVIA_UPSTREAM_ERROR"),
+        TransformError::Wire {
+            direction: "upstream_stream",
+            ..
+        } => (StatusCode::BAD_GATEWAY, "STRAVIA_STREAM_PARSE_ERROR"),
+        TransformError::Wire { .. } | TransformError::StreamClosed { .. } => {
+            (StatusCode::INTERNAL_SERVER_ERROR, "STRAVIA_INTERNAL_ERROR")
+        }
+    }
+}
+
 fn protocol_error_json(ingress: ProtocolId, error: &TransformError) -> serde_json::Value {
+    let (status, code) = protocol_error_classification(error);
+    let error_type = if status.is_server_error() {
+        match ingress.protocol {
+            Protocol::AnthropicMessages => "api_error",
+            _ => "server_error",
+        }
+    } else {
+        "invalid_request_error"
+    };
     match ingress.protocol {
         Protocol::AnthropicMessages => serde_json::json!({
             "type": "error",
             "error": {
-                "type": "invalid_request_error",
+                "type": error_type,
                 "message": error.to_string(),
-                "code": "STRAVIA_PROTOCOL_LOSSY_REJECTED"
+                "code": code
             }
         }),
         Protocol::OpenResponses => serde_json::json!({
             "type": "error",
-            "code": "STRAVIA_PROTOCOL_LOSSY_REJECTED",
+            "code": code,
             "message": error.to_string()
         }),
         _ => serde_json::json!({
             "error": {
-                "code": "STRAVIA_PROTOCOL_LOSSY_REJECTED",
+                "code": code,
                 "message": error.to_string(),
-                "type": "invalid_request_error"
+                "type": error_type
             }
         }),
     }
@@ -513,12 +545,10 @@ fn terminal_payload_delivered(egress: ProtocolId, payload: &str) -> bool {
                 || payload.contains(r#""type":"message_stop""#)
         }
         Protocol::GoogleGemini => payload.contains(r#""finishReason":"#),
-        Protocol::BedrockConverse | Protocol::DevinConnect => false,
+        Protocol::BedrockConverse => false,
         Protocol::CohereChat => payload.contains(r#""type":"message-end""#),
         Protocol::WatsonxTextChat => payload.contains(r#""finish_reason":"#),
-        Protocol::GatewayLanguageModel | Protocol::CommandCode => {
-            payload.contains(r#""type":"finish""#)
-        }
+        Protocol::GatewayLanguageModel => payload.contains(r#""type":"finish""#),
     }
 }
 
@@ -859,8 +889,71 @@ mod tests {
         assert_eq!(delivery.take_confirmed_terminal_delivery(), None);
     }
 
+    #[test]
+    fn delivery_errors_classify_invalid_wire_by_direction() {
+        for (direction, status, code) in [
+            (
+                "client_request",
+                StatusCode::BAD_REQUEST,
+                "STRAVIA_BAD_REQUEST",
+            ),
+            (
+                "upstream_response",
+                StatusCode::BAD_GATEWAY,
+                "STRAVIA_UPSTREAM_ERROR",
+            ),
+            (
+                "upstream_stream",
+                StatusCode::BAD_GATEWAY,
+                "STRAVIA_STREAM_PARSE_ERROR",
+            ),
+            (
+                "client_response",
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "STRAVIA_INTERNAL_ERROR",
+            ),
+        ] {
+            let error = TransformError::Wire {
+                endpoint: OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+                direction,
+                source: anyhow::anyhow!("malformed payload"),
+            };
+            assert_eq!(protocol_error_classification(&error), (status, code));
+            let body = protocol_error_json(OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1, &error);
+            assert_eq!(body["error"]["code"], code);
+            assert!(
+                body["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("malformed payload")
+            );
+        }
+        for error in [
+            TransformError::Unsupported {
+                endpoint: OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+            },
+            TransformError::UnsupportedOperation {
+                endpoint: OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+                operation: "stream",
+            },
+        ] {
+            assert_eq!(
+                protocol_error_classification(&error),
+                (StatusCode::BAD_REQUEST, "STRAVIA_PROTOCOL_UNSUPPORTED")
+            );
+        }
+        let closed = TransformError::StreamClosed {
+            endpoint: OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+            direction: "client_response",
+        };
+        assert_eq!(
+            protocol_error_classification(&closed),
+            (StatusCode::INTERNAL_SERVER_ERROR, "STRAVIA_INTERNAL_ERROR")
+        );
+    }
+
     #[tokio::test]
-    async fn non_stream_delivery_enforces_the_selected_protocol_pair() {
+    async fn non_stream_delivery_omits_cross_protocol_metadata_without_failing() {
         let mut response = AiResponse::new("response", "model");
         response.vendor.passthrough_safe.insert(
             "provider_metadata".into(),
@@ -873,20 +966,20 @@ mod tests {
 
         let delivered = delivery.deliver_canonical(&response, StatusCode::OK);
 
-        assert_eq!(
-            delivered.response.status(),
-            StatusCode::UNPROCESSABLE_ENTITY
-        );
+        assert_eq!(delivered.progress, BufferedDeliveryProgress::Prepared);
+        assert_eq!(delivered.response.status(), StatusCode::OK);
         let body = axum::body::to_bytes(delivered.response.into_body(), usize::MAX)
             .await
             .expect("delivery body");
-        let body = std::str::from_utf8(&body).expect("UTF-8 error response");
-        assert!(body.contains("STRAVIA_PROTOCOL_LOSSY_REJECTED"));
-        assert!(body.contains("vendor.passthrough_safe.provider_metadata"));
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("JSON response");
+        assert_eq!(body["id"], "response");
+        assert_eq!(body["model"], "model");
+        assert!(body.get("provider_metadata").is_none());
+        assert!(body.get("error").is_none());
     }
 
     #[tokio::test]
-    async fn live_stream_delivery_enforces_the_selected_protocol_pair() {
+    async fn live_stream_delivery_omits_unknown_deltas_and_preserves_text() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let (preflight_tx, _preflight_rx) = tokio::sync::oneshot::channel();
         let (commit_tx, commit_rx) = tokio::sync::oneshot::channel();
@@ -903,19 +996,22 @@ mod tests {
         });
 
         let progress = delivery
-            .send_deltas(&[AiStreamDelta::Unknown {
-                raw: "event: provider_metadata".into(),
-            }])
+            .send_deltas(&[
+                AiStreamDelta::Unknown {
+                    raw: "event: provider_metadata".into(),
+                },
+                AiStreamDelta::TextDelta("representable text".into()),
+            ])
             .await;
 
-        assert_eq!(progress, DeliveryProgress::ProtocolFailed);
-        let event = rx
-            .recv()
-            .await
-            .expect("protocol error event")
-            .expect("infallible protocol event");
-        assert!(event.contains("STRAVIA_PROTOCOL_LOSSY_REJECTED"));
-        assert!(event.contains("deltas[0].unknown"));
+        assert_eq!(progress, DeliveryProgress::Sent);
+        let mut events = String::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push_str(&event.expect("infallible protocol event"));
+        }
+        assert!(events.contains("representable text"));
+        assert!(!events.contains("provider_metadata"));
+        assert!(!events.contains("error"));
     }
 
     #[tokio::test]
@@ -964,8 +1060,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn open_responses_post_commit_loss_has_failed_terminal_sequence() {
-        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    async fn open_responses_upstream_error_keeps_failed_terminal_sequence() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(32);
         let (preflight_tx, _preflight_rx) = tokio::sync::oneshot::channel();
         let (commit_tx, commit_rx) = tokio::sync::oneshot::channel();
         let (_terminal_delivery_tx, terminal_delivery_rx) = tokio::sync::oneshot::channel();
@@ -981,18 +1077,29 @@ mod tests {
         });
 
         let progress = delivery
-            .send_deltas(&[AiStreamDelta::Unknown {
-                raw: "event: provider_metadata".into(),
-            }])
+            .send_deltas(&[
+                AiStreamDelta::TextDelta("already delivered".into()),
+                AiStreamDelta::StreamError {
+                    error: stravia_runtime_contract::protocol::ir::AiError::new(
+                        stravia_runtime_contract::protocol::ir::AiErrorKind::StreamMidError,
+                        "upstream interrupted",
+                    ),
+                },
+            ])
             .await;
+        assert_eq!(
+            delivery.finish_stream("stop".into()).await,
+            DeliveryProgress::Sent
+        );
         let mut wire = String::new();
         while let Ok(event) = rx.try_recv() {
             wire.push_str(&event.expect("infallible protocol event"));
         }
 
-        assert_eq!(progress, DeliveryProgress::ProtocolFailed);
-        assert!(wire.contains("event: error"));
+        assert_eq!(progress, DeliveryProgress::Sent);
+        assert!(wire.contains("already delivered"));
         assert!(wire.contains("event: response.failed"));
+        assert!(!wire.contains("event: response.completed"));
         assert!(wire.contains("data: [DONE]"));
     }
     #[tokio::test]

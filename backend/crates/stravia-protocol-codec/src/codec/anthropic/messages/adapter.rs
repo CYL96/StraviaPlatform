@@ -19,6 +19,8 @@ pub struct AnthropicMessages2023;
 const CAPS: EndpointCapabilities = EndpointCapabilities {
     streaming: true,
     tools: true,
+    structured_output: true,
+    deterministic_seed: false,
     reasoning: true,
     embeddings: false,
     override_model_in_body: false,

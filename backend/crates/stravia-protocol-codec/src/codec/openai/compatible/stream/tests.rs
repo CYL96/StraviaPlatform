@@ -3,6 +3,271 @@ use stravia_runtime_contract::protocol::ir::AiResponse;
 use stravia_runtime_contract::protocol::ir::AiStreamDelta;
 
 #[test]
+fn native_choices_keep_current_first_projection_and_private_alternates() {
+    let extra = serde_json::json!({"index": 1, "message": {"content": "alternate"}, "finish_reason": "stop"});
+    let mut response = OpenAIResponseParser
+        .parse_response(serde_json::json!({
+            "choices": [{"index": 0, "message": {"content": "first"}}, extra.clone()],
+            "usage": {"prompt_tokens": 2, "completion_tokens": 3}
+        }))
+        .unwrap();
+    response.items = vec![AiItem::output_text("edited")];
+    let native = OpenAIResponseFormatter.format_response(&response);
+    assert_eq!(native["choices"][0]["message"]["content"], "edited");
+    assert_eq!(native["choices"][1], extra);
+    assert!(native.get("__openai_native_choices").is_none());
+    response.vendor.egress.remove("__openai_native_choices");
+    assert_eq!(
+        OpenAIResponseFormatter.format_response(&response)["choices"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn native_stream_choices_are_incremental_and_do_not_mix_canonical_text() {
+    let mut parser = OpenAIStreamParser::new();
+    let mut formatter = OpenAIStreamFormatter::new();
+    let deltas = parser.parse_chunk(&data_sse(r#"{"id":"chat","model":"m","choices":[{"index":0,"delta":{"content":"first"}},{"index":1,"delta":{"content":"other"}}],"usage":{"prompt_tokens":2,"completion_tokens":3}}"#)).unwrap();
+    assert!(
+        deltas
+            .iter()
+            .any(|delta| matches!(delta, AiStreamDelta::TextDelta(text) if text == "first"))
+    );
+    assert!(
+        !deltas
+            .iter()
+            .any(|delta| matches!(delta, AiStreamDelta::TextDelta(text) if text == "other"))
+    );
+    assert!(
+        deltas.iter().any(
+            |delta| matches!(delta, AiStreamDelta::Usage(usage) if usage.completion_tokens == 3)
+        )
+    );
+    let events = formatter.format_deltas(&deltas);
+    assert!(events.iter().any(|event| serde_json::from_str::<Value>(&event.data).unwrap()["choices"][0]["delta"]["content"] == "other"));
+    let deltas = parser
+        .parse_chunk(&data_sse(
+            r#"{"choices":[{"index":1,"delta":{"content":" next"},"finish_reason":"stop"}]}"#,
+        ))
+        .unwrap();
+    assert!(
+        deltas
+            .iter()
+            .all(|delta| matches!(delta, AiStreamDelta::Unknown { .. }))
+    );
+    let events = formatter.format_deltas(&deltas);
+    assert_eq!(
+        serde_json::from_str::<Value>(&events[0].data).unwrap()["choices"][0]["index"],
+        1
+    );
+    let public: Vec<_> = deltas
+        .into_iter()
+        .filter(|delta| !matches!(delta, AiStreamDelta::Unknown { .. }))
+        .collect();
+    assert!(
+        OpenAIStreamFormatter::new()
+            .format_deltas(&public)
+            .is_empty()
+    );
+}
+
+#[test]
+fn choice_terminal_waits_for_global_done_and_late_alternates() {
+    let mut parser = OpenAIStreamParser::new();
+    let mut formatter = OpenAIStreamFormatter::new();
+    let first = parser
+        .parse_chunk(&data_sse(
+            r#"{"choices":[{"index":0,"delta":{"content":"first"},"finish_reason":"length"}]}"#,
+        ))
+        .unwrap();
+    assert!(
+        !first
+            .iter()
+            .any(|delta| matches!(delta, AiStreamDelta::Done { .. }))
+    );
+    assert!(
+        formatter
+            .format_deltas(&first)
+            .iter()
+            .all(|event| event.data != "[DONE]")
+    );
+    let extra = parser.parse_chunk(&data_sse(r#"{"choices":[{"index":1,"delta":{"content":"late"},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":3}}"#)).unwrap();
+    assert!(
+        formatter
+            .format_deltas(&extra)
+            .iter()
+            .any(|event| event.data.contains("late"))
+    );
+    let done = parser.parse_chunk(&data_sse("[DONE]")).unwrap();
+    assert!(matches!(&done[0], AiStreamDelta::Done { stop_reason } if stop_reason == "length"));
+    let events = formatter.format_deltas(&done);
+    assert!(events.iter().all(|event| event.data != "[DONE]"));
+    assert_eq!(formatter.format_done()[0].data, "[DONE]");
+    assert!(formatter.format_done().is_empty());
+    let mut incomplete = OpenAIStreamParser::new();
+    incomplete
+        .parse_chunk(&data_sse(
+            r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+        ))
+        .unwrap();
+    assert!(
+        !incomplete
+            .finish()
+            .unwrap()
+            .iter()
+            .any(|delta| matches!(delta, AiStreamDelta::Done { .. }))
+    );
+}
+
+#[test]
+fn reordered_unary_choices_keep_distinct_consumer_identities() {
+    use crate::transform::ProtocolTransform;
+    use stravia_runtime_contract::protocol::ids::OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1;
+
+    let pair = ProtocolTransform::global()
+        .bind(
+            OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+            OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+        )
+        .unwrap();
+    let response = pair.decode_response(serde_json::json!({
+        "choices": [
+            {"index": 1, "message": {"content": "one", "tool_calls": [
+                {"id": "call-one", "type": "function", "function": {"name": "one", "arguments": "{\"one\":1}"}}
+            ]}, "finish_reason": "tool_calls"},
+            {"index": 0, "message": {"content": "zero", "tool_calls": [
+                {"id": "call-zero", "type": "function", "function": {"name": "zero", "arguments": "{\"zero\":0}"}}
+            ]}, "finish_reason": "tool_calls"}
+        ]
+    })).unwrap();
+    let wire = pair.encode_response(&response).unwrap();
+    let mut by_index = std::collections::BTreeMap::new();
+    for choice in wire["choices"].as_array().unwrap() {
+        assert!(
+            by_index
+                .insert(choice["index"].as_u64().unwrap(), &choice["message"])
+                .is_none()
+        );
+    }
+    for (index, label) in [(0, "zero"), (1, "one")] {
+        let message = by_index[&index];
+        assert_eq!(message["content"], label);
+        assert_eq!(message["tool_calls"][0]["id"], format!("call-{label}"));
+        assert_eq!(message["tool_calls"][0]["function"]["name"], label);
+        let arguments: Value = serde_json::from_str(
+            message["tool_calls"][0]["function"]["arguments"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(arguments, serde_json::json!({(label): index}));
+    }
+    assert!(!wire.to_string().contains("__openai_native"));
+}
+
+#[test]
+fn first_arriving_choice_one_keeps_text_tools_and_terminals_separate() {
+    use crate::transform::ProtocolTransform;
+    use stravia_runtime_contract::protocol::ids::OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1;
+
+    let upstream = [
+        data_sse(r#"{"id":"chat","model":"m","choices":[{"index":1,"delta":{"content":"one","tool_calls":[{"index":0,"id":"call-one","function":{"name":"one","arguments":"{\"one\":"}}]}}]}"#),
+        data_sse(r#"{"choices":[{"index":0,"delta":{"content":"zero","tool_calls":[{"index":0,"id":"call-zero","function":{"name":"zero","arguments":"{\"zero\":"}}]}},{"index":1,"delta":{"content":"!","tool_calls":[{"index":0,"function":{"arguments":"1}"}}]},"finish_reason":"tool_calls"}]}"#),
+        data_sse(r#"{"choices":[{"index":0,"delta":{"content":"!","tool_calls":[{"index":0,"function":{"arguments":"0}"}}]},"finish_reason":"tool_calls"}]}"#),
+        data_sse("[DONE]"),
+    ].concat();
+    for chunk_size in [1, 7, upstream.len()] {
+        let pair = ProtocolTransform::global()
+            .bind(
+                OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+                OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+            )
+            .unwrap();
+        let (mut decoder, mut encoder) = pair.stream().unwrap().into_parts();
+        let mut events = Vec::new();
+        for bytes in upstream.as_bytes().chunks(chunk_size) {
+            let deltas = decoder.decode_chunk(bytes).unwrap();
+            events.extend(encoder.encode_deltas(&deltas).unwrap());
+        }
+        events.extend(encoder.encode_deltas(&decoder.finish().unwrap()).unwrap());
+        events.extend(encoder.finish().unwrap());
+        // Model a client accumulating content and tool argument bytes by both
+        // candidate index and tool index, rather than merely echoing frames.
+        let mut text = std::collections::BTreeMap::<u64, String>::new();
+        let mut tools = std::collections::BTreeMap::<(u64, u64), (String, String, String)>::new();
+        let mut terminals = std::collections::BTreeMap::new();
+        let mut done = false;
+        for event in events {
+            assert!(!done, "no candidate bytes may follow global DONE");
+            assert!(!event.data.contains("__openai_native"));
+            if event.data == "[DONE]" {
+                done = true;
+                continue;
+            }
+            let frame: Value = serde_json::from_str(&event.data).unwrap();
+            for choice in frame["choices"].as_array().unwrap() {
+                let index = choice["index"].as_u64().unwrap();
+                if let Some(content) = choice["delta"]["content"].as_str() {
+                    text.entry(index).or_default().push_str(content);
+                }
+                if let Some(calls) = choice["delta"]["tool_calls"].as_array() {
+                    for call in calls {
+                        let tool = tools
+                            .entry((index, call["index"].as_u64().unwrap()))
+                            .or_default();
+                        if let Some(id) = call["id"].as_str() {
+                            tool.0.push_str(id);
+                        }
+                        if let Some(name) = call["function"]["name"].as_str() {
+                            tool.1.push_str(name);
+                        }
+                        if let Some(arguments) = call["function"]["arguments"].as_str() {
+                            tool.2.push_str(arguments);
+                        }
+                    }
+                }
+                if let Some(reason) = choice["finish_reason"].as_str() {
+                    assert!(terminals.insert(index, reason.to_string()).is_none());
+                }
+            }
+        }
+        assert!(done);
+        assert_eq!(
+            text,
+            std::collections::BTreeMap::from([(0, "zero!".into()), (1, "one!".into())])
+        );
+        assert_eq!(
+            tools,
+            std::collections::BTreeMap::from([
+                (
+                    (0, 0),
+                    ("call-zero".into(), "zero".into(), r#"{"zero":0}"#.into())
+                ),
+                (
+                    (1, 0),
+                    ("call-one".into(), "one".into(), r#"{"one":1}"#.into())
+                ),
+            ])
+        );
+        assert_eq!(
+            terminals,
+            std::collections::BTreeMap::from([(0, "tool_calls".into()), (1, "tool_calls".into())])
+        );
+    }
+}
+
+#[test]
+fn native_alternate_choices_do_not_bypass_invalid_reasoning_or_tool_terminal() {
+    assert!(OpenAIResponseParser.parse_response_with_reasoning_field(serde_json::json!({
+        "choices": [{"message": {"content": "first"}}, {"message": {"reasoning_content": 42}}]
+    }), Some("reasoning_content")).is_err());
+    assert!(OpenAIStreamParser::new().parse_chunk(&data_sse(r#"{"choices":[{"index":0,"delta":{"content":"first"}},{"index":1,"delta":{},"finish_reason":"tool_calls"}]}"#)).is_err());
+}
+
+#[test]
 fn tool_calls_terminal_requires_a_representable_unary_call() {
     use crate::codec::openai::compatible::chat_completions::OpenAIChatCompletionsV1;
     use crate::transform::ProtocolAdapter;

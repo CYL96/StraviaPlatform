@@ -45,7 +45,7 @@ pub async fn request(search: &SearchQuery) -> anyhow::Result<RequestResponse> {
 fn search_url(query: &str) -> Url {
     Url::parse_with_params(
         SOGOU_WECHAT_SEARCH_URL,
-        &[("type", "2"), ("query", query), ("ie", "utf8")],
+        [("type", "2"), ("query", query), ("ie", "utf8")],
     )
     .expect("Sogou WeChat search URL is valid")
 }

@@ -26,7 +26,7 @@ fn search_url(search: &SearchQuery, cvid: &str) -> Url {
     let query = search.query_with_allowed_domains();
     Url::parse_with_params(
         "https://www.bing.com/search",
-        &[
+        [
             ("q", query.as_ref()),
             ("pq", query.as_ref()),
             ("cvid", cvid),

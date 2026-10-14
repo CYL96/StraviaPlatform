@@ -67,6 +67,58 @@ impl AnthropicResponseParser {
                             }));
                         }
                     }
+                    Some("server_tool_use") => {
+                        if let (Some(id), Some(name), Some(input)) = (
+                            block.get("id").and_then(Value::as_str),
+                            block.get("name").and_then(Value::as_str),
+                            block.get("input"),
+                        ) {
+                            items.push(AiItem {
+                                role: stravia_runtime_contract::protocol::ir::Role::Assistant,
+                                content: MessageContent::Blocks(vec![
+                                    ContentBlock::ServerToolUse {
+                                        id: id.to_owned().into(),
+                                        name: name.to_owned(),
+                                        input: input.clone(),
+                                        server_type: Some("server_tool_use".into()),
+                                        cache_control: None,
+                                    },
+                                ]),
+                                tool_calls: None,
+                                tool_call_id: None,
+                                meta: None,
+                            });
+                        }
+                    }
+                    Some(
+                        kind @ ("web_search_tool_result"
+                        | "web_fetch_tool_result"
+                        | "code_execution_tool_result"
+                        | "bash_code_execution_tool_result"
+                        | "text_editor_code_execution_tool_result"
+                        | "tool_search_tool_result"),
+                    ) => {
+                        if let (Some(id), Some(content)) = (
+                            block.get("tool_use_id").and_then(Value::as_str),
+                            block.get("content"),
+                        ) {
+                            items.push(AiItem {
+                                role: stravia_runtime_contract::protocol::ir::Role::Assistant,
+                                content: MessageContent::Blocks(vec![
+                                    ContentBlock::ServerToolResult {
+                                        tool_use_id: id.to_owned().into(),
+                                        content: content.clone(),
+                                        content_kind: None,
+                                        server_type: Some(kind.to_owned()),
+                                        cache_control: None,
+                                    },
+                                ]),
+                                tool_calls: None,
+                                tool_call_id: None,
+                                meta: None,
+                            });
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -143,9 +195,32 @@ impl AnthropicResponseFormatter {
         for item in &resp.items {
             if let MessageContent::Blocks(blocks) = &item.content {
                 for block in blocks {
-                    if let ContentBlock::RedactedThinking { data } = block {
-                        content
-                            .push(serde_json::json!({"type": "redacted_thinking", "data": data}));
+                    match block {
+                        ContentBlock::RedactedThinking { data } => content
+                            .push(serde_json::json!({"type": "redacted_thinking", "data": data})),
+                        ContentBlock::ServerToolUse {
+                            id,
+                            name,
+                            input,
+                            server_type,
+                            ..
+                        } => {
+                            content.push(serde_json::json!({
+                                "type": server_type.as_deref().unwrap_or("server_tool_use"),
+                                "id": id, "name": name, "input": input,
+                            }));
+                        }
+                        ContentBlock::ServerToolResult {
+                            tool_use_id,
+                            content: result,
+                            server_type: Some(kind),
+                            ..
+                        } => {
+                            content.push(serde_json::json!({
+                                "type": kind, "tool_use_id": tool_use_id, "content": result,
+                            }));
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -174,10 +249,12 @@ impl AnthropicResponseFormatter {
                     content.push(serde_json::json!({"type": "text", "text": text}));
                 }
             } else if let Some(call) = item.function_call_ref() {
-                // response_loss_paths 已在可失败边界拦截不可表达的入参；这里只
-                // 兜底保留原始字节，绝不凭空生成空对象。
-                let input: Value = serde_json::from_str(&call.arguments)
-                    .unwrap_or_else(|_| Value::String(call.arguments.clone()));
+                let Ok(input) = serde_json::from_str::<Value>(&call.arguments) else {
+                    continue;
+                };
+                if !input.is_object() {
+                    continue;
+                }
                 content.push(serde_json::json!({
                     "type": "tool_use",
                     "id": call.id,

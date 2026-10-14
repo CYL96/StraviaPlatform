@@ -25,6 +25,7 @@ use stravia_runtime_contract::protocol::ir::AiRequest;
 use stravia_runtime_contract::protocol::ir::AiResponse;
 use stravia_runtime_contract::protocol::ir::AiStreamDelta;
 use stravia_runtime_contract::protocol::ir::ContentBlock;
+use stravia_runtime_contract::protocol::ir::DocumentSource;
 use stravia_runtime_contract::protocol::ir::MediaSource;
 use stravia_runtime_contract::protocol::ir::MessageContent;
 use stravia_runtime_contract::protocol::ir::Role;
@@ -93,29 +94,35 @@ impl ProtocolAdapter for BedrockConverseV1 {
     }
 
     fn encode_request(&self, request: AiRequest) -> anyhow::Result<(Value, HeaderMap)> {
-        if request.generation.seed.is_some()
-            || request.generation.frequency_penalty.is_some()
-            || request.generation.presence_penalty.is_some()
-        {
-            bail!("Bedrock Converse cannot represent seed, frequency_penalty, or presence_penalty");
-        }
-        if request.reasoning.enabled {
-            bail!(
-                "Bedrock Converse reasoning requires model-specific additionalModelRequestFields"
-            );
-        }
-        if request.response_format.is_some() {
-            bail!("Bedrock Converse does not expose a model-neutral response format");
-        }
         let mut body =
             Map::from_iter([("messages".into(), Value::Array(encode_messages(&request)?))]);
+        let mut system = Vec::new();
         if let Some(instructions) = &request.instructions
             && !instructions.trim().is_empty()
         {
-            body.insert(
-                "system".into(),
-                Value::Array(vec![json!({"text": instructions})]),
-            );
+            system.push(json!({"text": instructions}));
+        }
+        for item in &request.items {
+            if matches!(item.role, Role::System | Role::Developer) {
+                match &item.content {
+                    MessageContent::Text(text) if !text.trim().is_empty() => {
+                        system.push(json!({"text": text}));
+                    }
+                    MessageContent::Blocks(blocks) => {
+                        for block in blocks {
+                            if let ContentBlock::Text { text, .. } = block
+                                && !text.trim().is_empty()
+                            {
+                                system.push(json!({"text": text}));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if !system.is_empty() {
+            body.insert("system".into(), Value::Array(system));
         }
         let inference_config = encode_inference_config(&request);
         if !inference_config.is_empty() {
@@ -226,13 +233,12 @@ impl ProtocolAdapter for BedrockConverseV1 {
                 _ => {}
             }
             for call in item.tool_calls.as_deref().unwrap_or_default() {
-                content.push(json!({
-                    "toolUse": {
-                        "toolUseId": call.id,
-                        "name": call.name,
-                        "input": serde_json::from_str::<Value>(&call.arguments).unwrap_or_else(|_| Value::String(call.arguments.clone())),
-                    }
-                }));
+                if let Ok(input @ Value::Object(_)) = serde_json::from_str::<Value>(&call.arguments)
+                {
+                    content.push(json!({"toolUse": {
+                        "toolUseId": call.id, "name": call.name, "input": input,
+                    }}));
+                }
             }
         }
         json!({
@@ -467,10 +473,13 @@ fn encode_messages(request: &AiRequest) -> anyhow::Result<Vec<Value>> {
     let mut messages = Vec::new();
     for item in &request.items {
         match item.role {
-            Role::System => bail!("Bedrock system messages must be supplied through instructions"),
-            Role::Developer => bail!("Bedrock Converse cannot represent developer messages"),
-            Role::User => messages
-                .push(json!({"role": "user", "content": encode_user_content(&item.content)?})),
+            Role::System | Role::Developer => {}
+            Role::User => {
+                let content = encode_user_content(&item.content)?;
+                if !content.is_empty() {
+                    messages.push(json!({"role": "user", "content": content}));
+                }
+            }
             Role::Assistant => {
                 let content = encode_assistant_content(item)?;
                 // 只含无法承载的受保护推理载荷（且无 tool call）的条目编码为空；
@@ -481,7 +490,10 @@ fn encode_messages(request: &AiRequest) -> anyhow::Result<Vec<Value>> {
                 }
             }
             Role::Tool => {
-                messages.push(json!({"role": "user", "content": encode_tool_result(item)?}))
+                let content = encode_tool_result(item)?;
+                if !content.is_empty() {
+                    messages.push(json!({"role": "user", "content": content}));
+                }
             }
         }
     }
@@ -491,19 +503,151 @@ fn encode_messages(request: &AiRequest) -> anyhow::Result<Vec<Value>> {
 fn encode_user_content(content: &MessageContent) -> anyhow::Result<Vec<Value>> {
     match content {
         MessageContent::Text(text) => Ok(vec![json!({"text": text})]),
-        MessageContent::Blocks(blocks) => blocks.iter().map(|block| match block {
-            ContentBlock::Text { text, .. } => Ok(json!({"text": text})),
-            ContentBlock::Image { source, .. } => match source {
-                MediaSource::Base64 { media_type, data } => Ok(json!({"image": {"format": bedrock_image_format(media_type)?, "source": {"bytes": data}}})),
-                MediaSource::Url(_) | MediaSource::FileId { .. } => bail!("Bedrock Converse accepts only inline image bytes"),
-            },
-            ContentBlock::ToolResult { tool_use_id, content, is_error, .. } => Ok(json!({"toolResult": {
-                "toolUseId": tool_use_id,
-                "content": [{"text": value_as_text(content)?}],
-                "status": is_error.is_some_and(|error| error).then_some("error"),
-            }})),
-            other => bail!("Bedrock cannot represent user content block `{}`", content_block_name(other)),
-        }).collect(),
+        MessageContent::Blocks(blocks) => {
+            let mut parts = Vec::new();
+            for block in blocks {
+                match block {
+                    ContentBlock::Text { text, .. } => parts.push(json!({"text": text})),
+                    ContentBlock::Image {
+                        source: MediaSource::Base64 { media_type, data },
+                        ..
+                    } => {
+                        if let Ok(format) = bedrock_image_format(media_type) {
+                            parts.push(
+                                json!({"image": {"format": format, "source": {"bytes": data}}}),
+                            );
+                        }
+                    }
+                    ContentBlock::Document {
+                        source,
+                        title,
+                        context,
+                        ..
+                    } => {
+                        let document = match source {
+                            DocumentSource::Base64Pdf { data } if !data.is_empty() => {
+                                Some(bedrock_document(
+                                    "pdf",
+                                    json!({"bytes": data}),
+                                    title.as_deref(),
+                                    context.as_deref(),
+                                ))
+                            }
+                            DocumentSource::PlainText { data } => Some(bedrock_document(
+                                "txt",
+                                json!({"text": data}),
+                                title.as_deref(),
+                                context.as_deref(),
+                            )),
+                            // URLs require fetching or S3 access; Blocks are flattened upstream.
+                            _ => None,
+                        };
+                        if let Some(document) = document {
+                            parts.push(document);
+                        }
+                    }
+                    ContentBlock::File {
+                        source:
+                            MediaSource::Base64 {
+                                media_type: source_type,
+                                data,
+                            },
+                        media_type,
+                    } if !data.is_empty() => {
+                        if let Some(format) =
+                            bedrock_document_format(media_type.as_deref().unwrap_or(source_type))
+                        {
+                            parts.push(bedrock_document(
+                                format,
+                                json!({"bytes": data}),
+                                None,
+                                None,
+                            ));
+                        }
+                    }
+                    ContentBlock::ToolResult {
+                        tool_use_id,
+                        content,
+                        content_kind,
+                        is_error,
+                        ..
+                    } => {
+                        let content = bedrock_tool_result_content(content, *content_kind);
+                        if !content.is_empty() {
+                            parts.push(json!({"toolResult": {
+                                "toolUseId": tool_use_id,
+                                "content": content,
+                                "status": is_error.is_some_and(|error| error).then_some("error"),
+                            }}));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            // Converse requires a text sibling for documents. Its ContentBlock.text
+            // shape is unconstrained String (unlike SystemContentBlock's NonEmptyString).
+            // An empty carrier adds no instructions or third-party title/context text.
+            if parts.iter().any(|part| part.get("document").is_some())
+                && !parts.iter().any(|part| part.get("text").is_some())
+            {
+                parts.push(json!({"text": ""}));
+            }
+            Ok(parts)
+        }
+    }
+}
+
+// DocumentBlock: https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_DocumentBlock.html
+// DocumentSource bytes are already base64 on the JSON wire; text is a native source.
+fn bedrock_document(
+    format: &str,
+    source: Value,
+    title: Option<&str>,
+    context: Option<&str>,
+) -> Value {
+    let name = title
+        .filter(|name| bedrock_document_name_valid(name))
+        .unwrap_or("document");
+    let mut document = json!({"format": format, "name": name, "source": source});
+    if let Some(context) = context {
+        document["context"] = json!(context);
+    }
+    json!({"document": document})
+}
+
+fn bedrock_document_name_valid(name: &str) -> bool {
+    let mut previous_whitespace = false;
+    let mut length = 0;
+    for character in name.chars() {
+        length += 1;
+        if length > 200 {
+            return false;
+        }
+        let whitespace = character.is_whitespace();
+        if (whitespace && previous_whitespace)
+            || !(character.is_alphanumeric()
+                || whitespace
+                || matches!(character, '-' | '(' | ')' | '[' | ']'))
+        {
+            return false;
+        }
+        previous_whitespace = whitespace;
+    }
+    length > 0
+}
+
+fn bedrock_document_format(media_type: &str) -> Option<&'static str> {
+    match media_type {
+        "application/pdf" => Some("pdf"),
+        "text/csv" | "application/csv" => Some("csv"),
+        "application/msword" => Some("doc"),
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document" => Some("docx"),
+        "application/vnd.ms-excel" => Some("xls"),
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" => Some("xlsx"),
+        "text/html" => Some("html"),
+        "text/plain" => Some("txt"),
+        "text/markdown" | "text/x-markdown" => Some("md"),
+        _ => None,
     }
 }
 
@@ -566,22 +710,21 @@ fn encode_assistant_content(item: &AiItem) -> anyhow::Result<Vec<Value>> {
                     ContentBlock::RedactedThinking { .. } => {}
                     ContentBlock::ToolUse {
                         id, name, input, ..
-                    } => parts
+                    } if input.is_object() => parts
                         .push(json!({"toolUse": {"toolUseId": id, "name": name, "input": input}})),
-                    other => bail!(
-                        "Bedrock cannot represent assistant content block `{}`",
-                        content_block_name(other)
-                    ),
+                    _ => {}
                 }
             }
             parts
         }
     };
-    content.extend(item.tool_calls.as_deref().unwrap_or(&[]).iter().map(|call| json!({"toolUse": {
-        "toolUseId": call.id,
-        "name": call.name,
-        "input": serde_json::from_str::<Value>(&call.arguments).unwrap_or_else(|_| Value::String(call.arguments.clone())),
-    }})));
+    for call in item.tool_calls.as_deref().unwrap_or_default() {
+        if let Ok(input @ Value::Object(_)) = serde_json::from_str::<Value>(&call.arguments) {
+            content.push(json!({"toolUse": {
+                "toolUseId": call.id, "name": call.name, "input": input,
+            }}));
+        }
+    }
     Ok(content)
 }
 
@@ -605,15 +748,103 @@ fn reasoning_plaintext(summary: &[String], content: &[String]) -> String {
         .join("\n")
 }
 
+fn bedrock_tool_result_content(
+    content: &Value,
+    kind: Option<stravia_runtime_contract::protocol::ir::ToolResultContentKind>,
+) -> Vec<Value> {
+    use stravia_runtime_contract::protocol::ir::ToolResultContentKind;
+    if kind != Some(ToolResultContentKind::ContentBlocks) {
+        return vec![json!({"json": content})];
+    }
+    if let Some(text) = content.as_str() {
+        return (!text.is_empty())
+            .then(|| json!({"text": text}))
+            .into_iter()
+            .collect();
+    }
+    let mut parts = Vec::new();
+    for block in content.as_array().into_iter().flatten() {
+        if let Some(text) = super::tool_result_block_text(block) {
+            if !text.is_empty() {
+                parts.push(json!({"text": text}));
+            }
+            continue;
+        }
+        match block.get("type").and_then(Value::as_str) {
+            None => {
+                if let Some(value) = block.get("json") {
+                    parts.push(json!({"json": value}));
+                } else if let Some(image) = block.get("image")
+                    && matches!(
+                        image.get("format").and_then(Value::as_str),
+                        Some("png" | "jpeg" | "gif" | "webp")
+                    )
+                    && image
+                        .pointer("/source/bytes")
+                        .and_then(Value::as_str)
+                        .is_some()
+                {
+                    parts.push(json!({"image": image}));
+                }
+            }
+            Some("image") => {
+                if let Some(source) = block.get("source")
+                    && source.get("type").and_then(Value::as_str) == Some("base64")
+                    && let (Some(media_type), Some(data)) = (
+                        source.get("media_type").and_then(Value::as_str),
+                        source.get("data").and_then(Value::as_str),
+                    )
+                    && let Ok(format) = bedrock_image_format(media_type)
+                {
+                    parts.push(json!({"image": {"format": format, "source": {"bytes": data}}}));
+                }
+            }
+            _ => {}
+        }
+    }
+    parts
+}
+
 fn encode_tool_result(item: &AiItem) -> anyhow::Result<Vec<Value>> {
-    let tool_use_id = item
-        .tool_call_id
-        .as_deref()
-        .context("Bedrock tool message is missing tool_call_id")?;
-    Ok(vec![json!({"toolResult": {
-        "toolUseId": tool_use_id,
-        "content": [{"text": value_as_text(&match &item.content { MessageContent::Text(text) => Value::String(text.as_ref().clone()), MessageContent::Blocks(blocks) => Value::Array(blocks.iter().filter_map(ContentBlock::as_text).map(|text| Value::String(text.into())).collect()) })?}],
-    }} )])
+    let Some(tool_use_id) = item.tool_call_id.as_deref() else {
+        return Ok(Vec::new());
+    };
+    let mut is_error = false;
+    let content = match &item.content {
+        MessageContent::Text(text) => vec![json!({"text": text})],
+        MessageContent::Blocks(blocks) => {
+            let mut parts = Vec::new();
+            for block in blocks {
+                match block {
+                    ContentBlock::Text { text, .. } => parts.push(json!({"text": text})),
+                    ContentBlock::ToolResult {
+                        content,
+                        content_kind,
+                        is_error: error,
+                        ..
+                    } => {
+                        let projected = bedrock_tool_result_content(content, *content_kind);
+                        if !projected.is_empty() {
+                            is_error |= *error == Some(true);
+                            parts.extend(projected);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            parts
+        }
+    };
+    Ok((!content.is_empty())
+        .then(|| {
+            let mut result = json!({"toolUseId": tool_use_id, "content": content});
+            if is_error {
+                result["status"] = json!("error");
+            }
+            json!({"toolResult": result})
+        })
+        .into_iter()
+        .collect())
 }
 
 fn encode_inference_config(request: &AiRequest) -> Map<String, Value> {
@@ -649,10 +880,7 @@ fn encode_tool_config(request: &AiRequest) -> anyhow::Result<Option<Value>> {
             ToolChoice::Auto => json!({"auto": {}}),
             ToolChoice::Required => json!({"any": {}}),
             ToolChoice::Named { name } => json!({"tool": {"name": name}}),
-            ToolChoice::None => {
-                bail!("Bedrock cannot represent tool_choice none while tools are present")
-            }
-            ToolChoice::Raw(_) => bail!("Bedrock cannot represent raw tool_choice"),
+            ToolChoice::None | ToolChoice::Raw(_) => return Ok(Some(Value::Object(tool_config))),
         };
         tool_config.insert("toolChoice".into(), choice);
     }
@@ -831,13 +1059,6 @@ fn map_finish_reason(reason: &str) -> &str {
         "tool_use" => "tool_calls",
         "content_filtered" | "guardrail_intervened" => "content_filter",
         _ => "other",
-    }
-}
-
-fn value_as_text(value: &Value) -> anyhow::Result<String> {
-    match value {
-        Value::String(text) => Ok(text.clone()),
-        other => serde_json::to_string(other).context("serialize structured Bedrock tool result"),
     }
 }
 

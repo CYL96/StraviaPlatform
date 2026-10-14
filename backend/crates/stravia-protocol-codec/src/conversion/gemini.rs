@@ -124,6 +124,9 @@ fn gemini_stream_formatter_keeps_tool_name_for_argument_deltas() {
             index: 0,
             arguments: "{\"command\":\"ls -la\"}".to_string(),
         },
+        IrStreamDelta::Done {
+            stop_reason: "tool_calls".to_string(),
+        },
     ];
     let events = fmt.format_deltas(&deltas);
     let mut saw_named_call = false;
@@ -175,6 +178,7 @@ fn gemini_stream_formatter_normalizes_common_tool_argument_aliases() {
             index: 0,
             arguments: "{\"include_pattern\":\"**/*.py\",\"search_root\":\"/tmp/work\",\"exclude_pattern\":\"**/.venv/**\"}".to_string(),
         },
+        IrStreamDelta::Done { stop_reason: "tool_calls".to_string() },
     ];
     let events = fmt.format_deltas(&deltas);
     let payload = events
@@ -212,7 +216,7 @@ fn gemini_stream_formatter_normalizes_common_tool_argument_aliases() {
     );
 }
 #[test]
-fn gemini_encoder_sanitizes_unsupported_json_schema_fields() {
+fn gemini_tool_json_schema_retains_argument_constraints_and_local_references() {
     let messages = vec![AiItem {
         role: IrRole::User,
         content: IrMessageContent::Text("hello".to_string().into()),
@@ -261,16 +265,14 @@ fn gemini_encoder_sanitizes_unsupported_json_schema_fields() {
         .and_then(|v| v.get("functionDeclarations"))
         .and_then(|v| v.as_array())
         .and_then(|arr| arr.first())
-        .and_then(|v| v.get("parameters"))
+        .and_then(|v| v.get("parametersJsonSchema"))
         .cloned()
-        .expect("parameters");
+        .expect("JSON-schema parameters");
 
-    let rendered = params.to_string();
-    assert!(!rendered.contains("$schema"));
-    assert!(!rendered.contains("additionalProperties"));
-    assert!(!rendered.contains("$ref"));
-    assert!(!rendered.contains("\"ref\""));
-    assert!(!rendered.contains("$defs"));
+    let validator = jsonschema::validator_for(&params).expect("valid projected schema");
+    assert!(validator.is_valid(&serde_json::json!({"pattern":"*.rs", "items":["one"]})));
+    assert!(!validator.is_valid(&serde_json::json!({"pattern":"*.rs", "items":[1]})));
+    assert!(!validator.is_valid(&serde_json::json!({"pattern":"*.rs", "extra":"not permitted"})));
 }
 #[test]
 fn gemini_file_data_round_trip_preserves_uri_and_mime_type() {

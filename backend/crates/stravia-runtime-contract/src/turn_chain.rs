@@ -104,34 +104,6 @@ impl std::fmt::Display for TurnNodeId {
     }
 }
 
-#[cfg(test)]
-mod reference_tests {
-    use super::*;
-
-    #[test]
-    fn turn_reference_uses_exact_stravia_uri() {
-        let id = "a".repeat(crate::identifier::ID_LEN);
-        let path = format!("stravia://turns/{id}");
-        assert_eq!(TurnNodeId::from_reference(&path).unwrap().as_str(), id);
-        assert_eq!(TurnNodeId::new(&id).reference(), path);
-
-        for invalid in [
-            id.clone(),
-            format!("stravia://artifacts/{id}"),
-            format!("stravia://turns/{id}/sources/1"),
-            format!("stravia://turns/{id}/extra"),
-            format!("stravia://turns/{id}?x=1"),
-            format!("stravia://turns/{id}#fragment"),
-            format!("stravia://turns/{}", "A".repeat(crate::identifier::ID_LEN)),
-        ] {
-            assert!(
-                TurnNodeId::from_reference(&invalid).is_err(),
-                "accepted {invalid}"
-            );
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TurnNodeKind {
@@ -522,4 +494,32 @@ pub trait TurnChainStore: Send + Sync {
     }
 
     async fn sweep_expired(&self) -> Result<u64, TurnUnavailable>;
+}
+
+#[cfg(test)]
+mod reference_tests {
+    use super::*;
+
+    #[test]
+    fn turn_reference_uses_exact_stravia_uri() {
+        let id = "a".repeat(crate::identifier::ID_LEN);
+        let path = format!("stravia://turns/{id}");
+        assert_eq!(TurnNodeId::from_reference(&path).unwrap().as_str(), id);
+        assert_eq!(TurnNodeId::new(&id).reference(), path);
+
+        for invalid in [
+            id.clone(),
+            format!("stravia://artifacts/{id}"),
+            format!("stravia://turns/{id}/sources/1"),
+            format!("stravia://turns/{id}/extra"),
+            format!("stravia://turns/{id}?x=1"),
+            format!("stravia://turns/{id}#fragment"),
+            format!("stravia://turns/{}", "A".repeat(crate::identifier::ID_LEN)),
+        ] {
+            assert!(
+                TurnNodeId::from_reference(&invalid).is_err(),
+                "accepted {invalid}"
+            );
+        }
+    }
 }

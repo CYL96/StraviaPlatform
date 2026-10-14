@@ -14,13 +14,7 @@ fn encodes_generate_envelope() {
             meta: None,
         }],
     );
-    let (body, headers) = CommandCodeGenerateV1.encode_request(request).unwrap();
-
-    assert_eq!(
-        CommandCodeGenerateV1.request_path("anything", false),
-        "/alpha/generate"
-    );
-    assert!(headers.is_empty());
+    let body = CommandCodeGenerateV1.encode_request(request).unwrap();
     assert_eq!(body["mode"], "agent");
     assert_eq!(body["permissionMode"], "standard");
     assert_eq!(body["params"]["model"], "deepseek/deepseek-v4-flash");
@@ -52,7 +46,7 @@ fn encodes_tools_without_type_and_aliases_names() {
         meta: None,
     }]);
     request.tool_choice = Some(ToolChoice::Required);
-    let (body, _) = CommandCodeGenerateV1.encode_request(request).unwrap();
+    let body = CommandCodeGenerateV1.encode_request(request).unwrap();
     assert_eq!(body["params"]["system"][0]["text"], "be brief");
     assert_eq!(body["params"]["tools"][0]["name"], "shell_output");
     assert!(body["params"]["tools"][0].get("type").is_none());
@@ -78,7 +72,7 @@ fn owned_encoding_preserves_shared_text_and_system_order() {
             item(Role::Assistant, Arc::new("answer".into())),
         ],
     );
-    let (body, _) = CommandCodeGenerateV1.encode_request(request).unwrap();
+    let body = CommandCodeGenerateV1.encode_request(request).unwrap();
     assert_eq!(shared.as_str(), "shared system");
     assert_eq!(body["params"]["system"][0]["text"], "shared system\n");
     assert_eq!(body["params"]["system"][1]["text"], "last system");
@@ -260,7 +254,7 @@ fn thinking_replay_keeps_readable_reasoning_native_and_omits_protected_payloads(
     for preserve in [false, true] {
         let mut request = original.clone();
         stravia_protocol_codec::transform::prepare_thinking_replay(&mut request, |_| preserve);
-        let (body, _) = CommandCodeGenerateV1.encode_request(request).unwrap();
+        let body = CommandCodeGenerateV1.encode_request(request).unwrap();
         let messages = body["params"]["messages"].as_array().unwrap();
         assert_eq!(
             messages[1]["content"],
@@ -314,4 +308,220 @@ fn trailing_tool_input_end_after_bare_tool_call_is_tolerated() {
         .filter(|d| matches!(d, AiStreamDelta::ToolCallComplete { .. }))
         .count();
     assert_eq!(completes, 1);
+}
+
+#[test]
+fn private_projection_keeps_document_siblings_and_omits_empty_messages() {
+    let blocks = || {
+        serde_json::from_value::<Vec<ContentBlock>>(json!([
+            {"type":"unknown", "raw":{"type":"private_future"}},
+            {"type":"document", "source":{"type":"plain_text", "data":"document text"}},
+            {"type":"document", "source":{"type":"blocks", "content":[
+                {"type":"text", "text":"nested text"},
+                {"type":"image", "source":{"type":"url", "url":"https://example.com/image.png"}},
+                {"type":"image", "source":{"type":"file_id", "file_id":"file-private"}}
+            ]}}
+        ]))
+        .unwrap()
+    };
+    let item = |role, blocks| AiItem {
+        role,
+        content: MessageContent::Blocks(blocks),
+        tool_calls: None,
+        tool_call_id: None,
+        meta: None,
+    };
+    let unsupported = || {
+        vec![ContentBlock::RedactedThinking {
+            data: "secret".into(),
+        }]
+    };
+    let request = AiRequest::new(
+        "model",
+        vec![
+            item(Role::System, blocks()),
+            item(Role::User, blocks()),
+            item(Role::Assistant, blocks()),
+            item(Role::User, unsupported()),
+            item(Role::Assistant, unsupported()),
+        ],
+    );
+    let body = CommandCodeGenerateV1.encode_request(request).unwrap();
+    assert_eq!(
+        body["params"]["system"],
+        json!([
+            {"type":"text", "text":"document text\n"},
+            {"type":"text", "text":"nested text"}
+        ])
+    );
+    assert_eq!(
+        body["params"]["messages"],
+        json!([
+            {"role":"user", "content":[
+                {"type":"text", "text":"document text"},
+                {"type":"text", "text":"nested text"},
+                {"type":"image", "image":"https://example.com/image.png"}
+            ]},
+            {"role":"assistant", "content":[
+                {"type":"text", "text":"document text"},
+                {"type":"text", "text":"nested text"}
+            ]}
+        ])
+    );
+}
+
+#[test]
+fn private_tool_projection_preserves_json_identity_errors_and_nested_text() {
+    use stravia_runtime_contract::protocol::ir::ToolResultContentKind;
+    let result = |id: &str, content, kind, error| AiItem {
+        role: Role::Tool,
+        content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
+            tool_use_id: id.into(),
+            content,
+            content_kind: Some(kind),
+            is_error: error,
+            cache_control: None,
+        }]),
+        tool_calls: None,
+        tool_call_id: Some(id.into()),
+        meta: None,
+    };
+    let nested = json!([
+        {"type":"redacted_thinking", "data":"secret"},
+        {"type":"document", "source":{"type":"plain_text", "data":"visible"}}
+    ]);
+    let request = AiRequest::new(
+        "model",
+        vec![
+            result(
+                "business",
+                json!({"type":"business", "value":42}),
+                ToolResultContentKind::Json,
+                Some(true),
+            ),
+            result("nested", nested, ToolResultContentKind::ContentBlocks, None),
+            result(
+                "omitted",
+                json!([{"type":"redacted_thinking", "data":"secret"}]),
+                ToolResultContentKind::ContentBlocks,
+                None,
+            ),
+        ],
+    );
+    let body = CommandCodeGenerateV1.encode_request(request).unwrap();
+    let messages = body["params"]["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0]["content"][0]["toolCallId"], "business");
+    assert_eq!(messages[0]["content"][0]["output"]["type"], "error-text");
+    assert_eq!(
+        serde_json::from_str::<Value>(
+            messages[0]["content"][0]["output"]["value"]
+                .as_str()
+                .unwrap()
+        )
+        .unwrap(),
+        json!({"type":"business", "value":42})
+    );
+    assert_eq!(messages[1]["content"][0]["toolCallId"], "nested");
+    assert_eq!(
+        messages[1]["content"][0]["output"],
+        json!({"type":"text", "value":"visible"})
+    );
+
+    let malformed = AiRequest::new(
+        "model",
+        vec![result(
+            "bad",
+            json!({"not":"blocks"}),
+            ToolResultContentKind::ContentBlocks,
+            None,
+        )],
+    );
+    let error = CommandCodeGenerateV1.encode_request(malformed).unwrap_err();
+    assert_eq!(
+        error
+            .downcast_ref::<serde_json::Error>()
+            .unwrap()
+            .classify(),
+        serde_json::error::Category::Data
+    );
+    let error = CommandCodeStreamParser::new()
+        .parse_chunk("{bad json}\n")
+        .unwrap_err();
+    assert_eq!(
+        error
+            .downcast_ref::<serde_json::Error>()
+            .unwrap()
+            .classify(),
+        serde_json::error::Category::Syntax
+    );
+}
+
+#[test]
+fn private_projection_preserves_tool_calls_without_inventing_arguments() {
+    let blocks: Vec<ContentBlock> = serde_json::from_value(json!([
+        {"type":"redacted_thinking", "data":"secret"},
+        {"type":"tool_use", "id":"call-native", "name":"lookup", "input":{"key":"value"}}
+    ]))
+    .unwrap();
+    let request = AiRequest::new(
+        "model",
+        vec![
+            AiItem {
+                role: Role::Assistant,
+                content: MessageContent::Blocks(blocks),
+                tool_calls: None,
+                tool_call_id: None,
+                meta: None,
+            },
+            AiItem {
+                role: Role::Tool,
+                content: MessageContent::Text("result".to_owned().into()),
+                tool_calls: None,
+                tool_call_id: Some("call-native".into()),
+                meta: None,
+            },
+        ],
+    );
+    let body = CommandCodeGenerateV1.encode_request(request).unwrap();
+    assert_eq!(
+        body["params"]["messages"][0]["content"],
+        json!([
+            {"type":"tool-call", "toolCallId":"call-native", "toolName":"lookup", "input":{"key":"value"}}
+        ])
+    );
+    assert_eq!(
+        body["params"]["messages"][1]["content"][0]["toolName"],
+        "lookup"
+    );
+    assert_eq!(
+        body["params"]["messages"][1]["content"][0]["toolCallId"],
+        "call-native"
+    );
+}
+
+#[test]
+fn private_thinking_control_only_encodes_effort() {
+    use stravia_runtime_contract::thinking::TargetThinkingControl;
+    let mut request = AiRequest::new("model", Vec::new());
+    request.reasoning.target_control = Some(TargetThinkingControl::Effort {
+        value: "high".into(),
+    });
+    let body = CommandCodeGenerateV1
+        .encode_request(request.clone())
+        .unwrap();
+    assert_eq!(body["params"]["reasoning_effort"], "high");
+    for control in [
+        TargetThinkingControl::Budget { value: 1024 },
+        TargetThinkingControl::Enabled,
+        TargetThinkingControl::Disabled,
+        TargetThinkingControl::Hidden,
+    ] {
+        request.reasoning.target_control = Some(control);
+        let body = CommandCodeGenerateV1
+            .encode_request(request.clone())
+            .unwrap();
+        assert!(body["params"].get("reasoning_effort").is_none());
+        assert!(body["params"].get("thinking").is_none());
+    }
 }
