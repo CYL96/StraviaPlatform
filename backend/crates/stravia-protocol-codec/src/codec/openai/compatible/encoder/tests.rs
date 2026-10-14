@@ -1,6 +1,47 @@
 use super::*;
 
 #[test]
+fn json_schema_description_survives_without_overriding_canonical_controls() {
+    use crate::transform::ProtocolTransform;
+    use stravia_runtime_contract::protocol::ids::OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1;
+    use stravia_runtime_contract::protocol::ir::ResponseFormat;
+
+    let pair = ProtocolTransform::global()
+        .bind(
+            OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+            OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+        )
+        .expect("bind Chat schema round trip");
+    let mut request = pair
+        .decode_request(serde_json::json!({
+            "model": "model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "response_format": {"type": "json_schema", "json_schema": {
+                "name": "original", "description": "Describe the answer",
+                "schema": {"type": "object"}, "strict": false
+            }}
+        }))
+        .expect("decode described schema");
+    let schema =
+        serde_json::json!({"type": "object", "properties": {"answer": {"type": "string"}}});
+    request.response_format = Some(ResponseFormat::JsonSchema {
+        name: "changed".into(),
+        schema: schema.clone(),
+        strict: Some(true),
+    });
+    let body = pair
+        .encode_request(request)
+        .expect("encode canonical schema changes")
+        .body;
+    assert_eq!(
+        body["response_format"]["json_schema"],
+        serde_json::json!({
+            "name": "changed", "description": "Describe the answer", "schema": schema, "strict": true
+        })
+    );
+}
+
+#[test]
 fn anthropic_controls_convert_to_chat_with_exact_tool_strict_values() {
     use crate::transform::ProtocolTransform;
     use stravia_runtime_contract::protocol::ids::{

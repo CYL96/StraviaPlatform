@@ -82,6 +82,16 @@ impl OpenAIEncoder {
                     if let Some(strict) = strict {
                         json_schema["strict"] = Value::Bool(strict);
                     }
+                    // The description lives in the protected fidelity copy, not
+                    // the canonical format. Keep canonical schema controls authoritative.
+                    if let Some(description) = ingress
+                        .get_mut("response_format")
+                        .and_then(|format| format.get_mut("json_schema"))
+                        .and_then(Value::as_object_mut)
+                        .and_then(|schema| schema.remove("description"))
+                    {
+                        json_schema["description"] = description;
+                    }
                     object([
                         ("type", Value::String("json_schema".into())),
                         ("json_schema", json_schema),

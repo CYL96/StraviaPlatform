@@ -282,7 +282,7 @@ def test_raw_encoder_carriers_are_protected_without_losing_fidelity(
 
 @pytest.mark.e2e
 @pytest.mark.admin
-def test_anthropic_encoded_tool_blocks_preserve_wire_shape_and_media(
+def test_anthropic_tool_blocks_protect_text_without_rewriting_media(
     admin_env: dict[str, Any],
 ) -> None:
     credential = "Q8n4Vk7sT2p9X5a3Lc6D0h1R"
@@ -318,8 +318,13 @@ def test_anthropic_encoded_tool_blocks_preserve_wire_shape_and_media(
             actual = received[-1]["body"]
             reference = REFERENCE.findall(actual["messages"][-1]["content"][0]["text"])[0]
             result = actual["messages"][2]["content"][0]
-            assert isinstance(result["content"], str)
-            assert json.loads(result["content"]) == [
+            assert result["tool_use_id"] == "call-media"
+            # Protect readable text and preserve opaque media regardless of whether
+            # the encoder carries the blocks natively or as encoded Tool Text.
+            content = result["content"]
+            if isinstance(content, str):
+                content = json.loads(content)
+            assert content == [
                 {"type": "text", "text": f"api_key={reference}"},
                 {"type": "image", "source": {
                     "type": "base64", "media_type": "image/png", "data": credential,

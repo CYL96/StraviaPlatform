@@ -43,6 +43,8 @@
 
 ### Fixed
 
+- OpenAI-compatible JSON-schema response formats now retain their protected `description` alongside canonical name, schema and strict controls instead of losing the description during encoding. Rebuild and re-import affected standalone Vendor plugins to receive the fix.
+- Admin and Chromium CI now prepare isolated test-host server artifacts and use the standard E2E tasks, avoiding missing server binaries and rejected test-only catalog arguments. Compaction and media-protection regressions now distinguish unsupported standalone operations from inline protocol omission and verify content semantics without requiring an incidental string carrier.
 - Removed Core's unused `windows-sys` 0.52 build dependency and obsolete workspace alias. Retained verified host/target feature-unification dependencies; other package features and runtime Windows APIs remain unchanged.
 - Removed redundant search URL parameter borrows and placed search configuration/policy tests after production items to satisfy strict Clippy checks. URL encoding, response parsing, and persisted search-policy behavior remain unchanged.
 - Cross-protocol request pruning now preserves verified target-native extensions and Responses compaction state instead of discarding them solely because the client ingress differs. Anthropic client histories, combined assistant/tool turns, and equal provider-visible redacted histories again retain native Responses continuation; parent, target, history, expiry, and security checks remain unchanged. Unsupported target state is still omitted. Rebuild and re-import affected standalone plugins.

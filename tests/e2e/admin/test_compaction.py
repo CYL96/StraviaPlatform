@@ -611,17 +611,49 @@ def test_registered_state_rejects_changed_target_configuration(admin_env, compac
 
 @pytest.mark.e2e
 @pytest.mark.admin
-def test_unsupported_target_does_not_silently_drop_native_semantics(admin_env):
+def test_unsupported_target_rejects_standalone_compaction_without_upstream_request(admin_env):
     from tests.e2e.admin.test_observations import _create_route
     model = "native-unsupported-target"
-    route, key = _create_route(admin_env, model)
-    for extra in [{"compact": True}, {"context_management": [{"type": "compaction", "compact_threshold": 2000}]}]:
-        status, body = _request(admin_env, key, model, [{"role": "user", "content": "native semantics required"}], **extra)
-        assert status == 400, body
-        assert body["error"]["code"] == "compaction_unsupported", body
-    status, body = _request(admin_env, key, model, [{"type": "compaction_trigger"}])
+    _route, key = _create_route(admin_env, model, protocol="openai-compatible")
+    captured = admin_env["mock_server"].captured_requests
+    before = len(captured)
+    status, body = _request(admin_env, key, model, [{"role": "user", "content": "native semantics required"}], compact=True)
     assert status == 400, body
     assert body["error"]["code"] == "compaction_unsupported", body
+    assert len(captured) == before, "unsupported standalone compaction must not become ordinary inference"
+
+
+@pytest.mark.e2e
+@pytest.mark.admin
+@pytest.mark.parametrize("mode", ["controls", "trigger"])
+def test_chat_target_omits_unrepresentable_inline_compaction_and_preserves_business_text(admin_env, mode):
+    from tests.e2e.admin.test_observations import _create_route
+    model = f"native-inline-omitted-{mode}"
+    _route, key = _create_route(admin_env, model, protocol="openai-compatible")
+    text = f"continue the business request without native compaction {mode}"
+    items = [{"role": "user", "content": text}]
+    extra = {}
+    if mode == "controls":
+        extra["context_management"] = [{"type": "compaction", "compact_threshold": 2000}]
+    else:
+        items.append({"type": "compaction_trigger"})
+    captured = admin_env["mock_server"].captured_requests
+    before = len(captured)
+    # ADR-0006 omits unrepresentable inference controls; it does not emulate compact.
+    result = _success(admin_env, key, model, items, **extra)
+    assert result["status"] == "completed", result
+    assert not any(item["type"] == "compaction" for item in result["output"])
+    assert any(part.get("text") == "mock-ok-0" for item in result["output"]
+               if item["type"] == "message" for part in item["content"]), result
+    outbound = captured[before:]
+    assert len(outbound) == 1, "omitted compaction must not cause a retry or additional operation"
+    request = outbound[0]
+    assert "context_management" not in request
+    assert "input" not in request
+    assert any(message.get("role") == "user" and message.get("content") == text
+               for message in request["messages"]), request
+    assert not any(message.get("type") in ("compaction", "compaction_trigger")
+                   for message in request["messages"]), request
 
 
 @pytest.mark.e2e

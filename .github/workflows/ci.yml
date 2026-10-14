@@ -301,13 +301,12 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends pkg-config libssl-dev cmake clang libclang-dev python3
 
-      # Build serially: debug and release otherwise compete on a cold runner.
+      # 串行准备隔离产物，避免生产构建覆盖带 test-harness 的测试服务。
       - name: Compile E2E cache dependencies
         if: matrix.suite == 'admin'
         run: |
-          task build:server:debug
-          task build:devtools:debug
-          task build:server
+          task build:test:development
+          task build:test:services
 
       - name: Preserve successfully compiled dependencies
         if: matrix.suite == 'admin'
@@ -323,12 +322,9 @@ jobs:
         if: matrix.suite != 'admin'
         run: task test:e2e:${{ matrix.suite }}
 
-      # Both embedded-WebUI and dev-origin binaries were built above.
       - name: Run Admin E2E with prepared binaries
         if: matrix.suite == 'admin'
-        env:
-          STRAVIA_BINARY: ${{ github.workspace }}/target/release/stravia-server
-        run: uv run --locked --default-index https://pypi.org/simple --group test python -m pytest tests/e2e/admin -q -m admin
+        run: task test:e2e:admin
 
   postgres-e2e:
     if: ${{ (github.event_name != 'workflow_dispatch' || inputs.cache_warm == '' || inputs.cache_warm == 'none') }}
@@ -470,14 +466,13 @@ jobs:
           sudo rm -f /etc/apt/sources.list.d/google-chrome*
           bun run playwright:install:web -- --with-deps chromium
 
-      - name: Build production server
-        run: task build:server
+      - name: Prepare production and test-host servers
+        run: |
+          task build:test:release
+          task build:test:services
 
       - name: Run WebUI E2E tests
-        env:
-          # task build:server already built this exact dist for the release binary.
-          PLAYWRIGHT_USE_PREBUILT: '1'
-        run: bun run test:e2e:web
+        run: task test:e2e:web
 
   desktop-smoke:
     if: ${{ github.event_name != 'workflow_dispatch' || inputs.cache_warm == '' || inputs.cache_warm == 'none' || inputs.cache_warm == 'windows-debug' }}

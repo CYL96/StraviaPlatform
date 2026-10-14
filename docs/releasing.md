@@ -31,6 +31,8 @@ bunx --bun tauri signer generate -- -w /secure/offline/stravia-updater.key
 
 发布回归必须遵循当前产品契约：已开始的 Responses 流只以单个 `response.failed` 收口，并保留部分输出和原生错误详情；重启恢复用例必须在上游请求仍受事件门控、尚未交付时模拟进程中断，不能以固定延迟或优雅关闭后的已完成请求代替崩溃场景。修复失败后先运行对应定向检查，再重新执行完整发布矩阵。
 
+CI 的 Admin 与 Chromium E2E 复用 `task test:e2e:admin` 和 `task test:e2e:web`，不直接以生产 `target/release/stravia-server` 替代测试服务。Admin 先串行准备 `build:test:development` 与 `build:test:services`；Chromium 先串行准备 `build:test:release` 与 `build:test:services`。`target/test-artifacts/services/` 保留带 `test-harness` 的独立服务副本，支持 loopback catalog 等测试参数；生产副本与开发模式副本独立保存，后续不同 feature graph 的构建不能覆盖正在验证的测试服务。
+
 `stravia-updater.json` 使用版本化 Release asset URL，并内联每个平台 `.sig` 的内容。普通安装包、`.sig`、清单和 `SHA256SUMS` 会一起上传到同一个精确版本 Release。
 
 ## 公钥轮换与恢复限制
