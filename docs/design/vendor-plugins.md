@@ -28,6 +28,12 @@
 
 `openai-codex` 的 `credits.balance` 与 `spend_control.individual_limit` 金额按官方客户端语义使用 credits，输出现有 `unit="credits"` 且不声明 currency；保留数值和小数，不将点数当作 USD，不推测兑换率或缩放。WebUI 沿用通用额度单位本地化，中文显示「点」、英文显示 `credits`。更新独立 Codex 组件后刷新额度，既有 guard key、认证与数据库 schema 不变。固定官方源码证据、数值边界与验证见 [Codex 额度字段单位研究](../research/codex-credit-units.md)。
 
+### Devin 耗尽窗口
+
+Devin 的 `GetUserStatus` 在 `PlanStatus` 中报告每日、每周剩余百分比和重置时间。按照 [Protobuf 的隐式字段存在性规则](https://protobuf.dev/programming-guides/field_presence/)，剩余百分比为零时可以省略对应字段；只要上游仍报告该窗口的非零重置时间，插件就保留窗口，输出已用 `100%`、耗尽状态和原重置时间。明确编码的零值也保留；比例和非零重置时间都未报告时，不凭空生成额度窗口。
+
+修复位于独立 `devin` 插件，Desktop 与 Server 共用该解析行为。已安装实例需要重新构建并导入 Devin Wasm 包，再刷新额度；单独更新宿主不会替换已安装插件。既有 `daily`、`weekly` guard key、凭据、路由和数据库 schema 不变。
+
 ### Cline Pass 接入
 
 Cline Pass 不再是专属插件。`cline-pass` 是 `base` 的目录 Provider Profile，随内嵌供应商清单注册，推理复用标准 OpenAI-compatible codec；没有独立的 Wasm 包，也不发布专属 Release 附件。
