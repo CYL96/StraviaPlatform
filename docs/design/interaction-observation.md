@@ -39,7 +39,7 @@ Observation 使用统一平台身份契约：随机不透明 ID 是由密码学�
 2. 无法归入已有 Interaction、且不含 User item 的合法根请求也开启新的 Interaction。
 3. 客户端公开工具调用结束当前 Inference Run。同一 Principal 下精确续接父响应、没有新增 User item 的请求继续原 Interaction；请求 delta 的当前输入尾段提交父历史中尚未得到结果的工具调用所对应的结果时，即使夹带新增 User item 也继续原 Interaction，不限时间。当前尾段从 delta 最后一个 Assistant item 之后开始；顶层工具返回与 User 内容块中的 ToolResult 使用相同判定。此外，Observation 独立核验完整输入当前尾段的工具结果：若唯一对应同 Principal 已交付来源的待完成调用，则优先归入该来源 Interaction，并以来源 Run 作为观测父节点，即使严格前缀退回较早 Generation parent。完整历史中的旧工具结果不构成归并证据，历史编辑导致父节点退回更早位置也不例外。
 4. 同一父响应的并发续接属于同一 Interaction，并在详情中形成 Run 子树。
-5. 同一 Principal 下精确续接父响应的新请求，其 ingress 接收时间距父响应完整交付时间在 `[0, 2000]` 毫秒内时，即使包含新增 User item 或父 Interaction 已完成，也继续原 Interaction；已完成交互重新进入活动状态。时间不取 admission 处理时间或可变的 `last_active_at`。这项规则仅表示快速续接，不识别或信任 harness hook，真人快速追问同样归并。其他新增 User item 开启新 Interaction；仅此时原 Interaction 中尚无最终响应、且尚无续接 Run 的执行分支标记为 `user_interrupted`；已被续接的等待分支记为 `superseded`，不当作中断。
+5. 同一 Principal 下精确续接父响应的新请求，其 ingress 接收时间距父响应完整交付时间在 `[0, 2000]` 毫秒内时，即使包含新增 User item 或父 Interaction 已完成，也继续原 Interaction；已完成交互重新进入活动状态。时间不取 admission 处理时间或可变的 `last_active_at`。该父 Generation node 已被其他 Run 续接（失败且未向客户端输出的尝试除外）时，后到的带 User 请求是并行分支，不适用快速续接，按下一条创建 child Interaction，避免旁路请求（如 harness 的 side-channel 询问）污染主 Interaction 的摘要与用量。这项规则仅表示快速续接，不识别或信任 harness hook，真人快速追问同样归并。其他新增 User item 开启新 Interaction；仅此时原 Interaction 中尚无最终响应、且尚无续接 Run 的执行分支标记为 `user_interrupted`；已被续接的等待分支记为 `superseded`，不当作中断。
 6. 有明确 Generation Chain parent、无新 User item 的失败重试恢复原 Interaction，并保留失败 Run。
 7. 无 parent 的失败根 Run 只在以下条件全部满足时归并：
    - Principal 相同；
@@ -893,7 +893,7 @@ Rust workspace 新增：
 - 超出快速续接窗口且不提交待完成工具结果的新 User 输入创建子 Interaction；原未完成分支显示 user interrupted。
 - 工具结果夹带 User 提醒时仍归入原 Interaction，工具执行耗时不影响判断；历史中的旧工具结果不能触发此规则。
 - 精确父响应完整交付后 2,000 毫秒到达的新 User 输入归并，2,001 毫秒到达且不满足工具续接的请求分开；排队处理耗时不改变判定。
-- 已完成响应后两秒内精确续接可重新激活原 Interaction；真人快速追问与自动提醒遵循同一规则，原 Run 完成记录不变。
+- 已完成响应后两秒内精确续接可重新激活原 Interaction（父 node 已有其他续接时除外，该请求作为 child Interaction）；真人快速追问与自动提醒遵循同一规则，原 Run 完成记录不变。
 - 明确 Generation parent 的失败重试恢复原 Interaction。
 - 无 parent 根失败在两分钟、同 Principal、精确 fingerprint、无 Client Output Commit 时归并；超时、不同 Principal、已有 output commit、并发相同请求均不归并。
 - 同一父 Interaction 的两个不满足归并条件的新 User 分支在画布真实分叉，不复制祖先。

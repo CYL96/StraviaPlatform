@@ -44,6 +44,7 @@
 
 ### Fixed
 
+- Observation no longer merges a side request (for example an agent's progress-check) into the main Interaction through the two-second rapid-continuation rule when its parent Generation node was already continued. It now becomes a child Interaction, so the main Interaction's preview, usage and activity time are no longer polluted. See [interaction observation](docs/design/interaction-observation.md).
 - OpenAI-compatible JSON-schema response formats now retain their protected `description` alongside canonical name, schema and strict controls instead of losing the description during encoding. Rebuild and re-import affected standalone Vendor plugins to receive the fix.
 - Admin and Chromium CI now prepare isolated test-host server artifacts and use the standard E2E tasks, avoiding missing server binaries and rejected test-only catalog arguments. Compaction and media-protection regressions now distinguish unsupported standalone operations from inline protocol omission and verify content semantics without requiring an incidental string carrier.
 - Devin's daily and weekly allowance windows no longer disappear when exhausted: the plugin recognizes an omitted zero remaining percentage when the upstream still reports the window's reset time, while leaving unreported windows absent. Rebuild and re-import the standalone `devin` plugin, then refresh allowances; existing guard keys and account configuration remain unchanged.
