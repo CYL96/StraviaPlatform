@@ -124,8 +124,8 @@ POST /providers/{id}/models/sync
 ## 4. 实际验证
 
 1. `task build:vendors:all`：成功生成八个自包含 Wasm 组件。
-2. `cargo test --locked --jobs 4 -p stravia-vendor-antigravity --test contract oauth_and_inference_enforce_native_wire_at_real_http_boundary -- --exact --ignored --nocapture`：1 passed；实际加载 Wasm，经过 loopback HTTP 发现账号 ID、过滤 internal，并验证 OAuth、项目 operation、推理协议边界等。没有连接 Google。
-3. 临时 `cargo run --locked --jobs 4 -p stravia-vendor-antigravity --example model-mapping-smoke`：包含原始 catalog/client/auth 模块，给解析器传入合成双 ID 同名目录；输出保留 `gemini-3.1-pro-high` 与 `gemini-pro-agent` 两条，context 均为 1048576，模态均为 text/image/video 输入、text 输出，selector 均为 None。临时入口首次缺失 client 模块而编译失败；补齐原模块后运行成功，之后已删除入口，没有增加永久测试。
+2. `cargo test --locked -p stravia-vendor-antigravity --test contract oauth_and_inference_enforce_native_wire_at_real_http_boundary -- --exact --ignored --nocapture`：1 passed；实际加载 Wasm，经过 loopback HTTP 发现账号 ID、过滤 internal，并验证 OAuth、项目 operation、推理协议边界等。没有连接 Google。
+3. 临时 `cargo run --locked -p stravia-vendor-antigravity --example model-mapping-smoke`：包含原始 catalog/client/auth 模块，给解析器传入合成双 ID 同名目录；输出保留 `gemini-3.1-pro-high` 与 `gemini-pro-agent` 两条，context 均为 1048576，模态均为 text/image/video 输入、text 输出，selector 均为 None。临时入口首次缺失 client 模块而编译失败；补齐原模块后运行成功，之后已删除入口，没有增加永久测试。
 4. 官方 Linux 归档哈希校验、内嵌 protobuf 字段解码与上述函数的静态反汇编完成。Linux CLI 未执行，临时二进制分析文件已清理，不随仓库保存。
 
 ## 5. 官方 Windows CLI 的账号清单验证
@@ -258,10 +258,10 @@ gpt-oss-120b-medium
 
 实际验证：
 
-- `cargo test --locked --jobs 4 -p stravia-vendor-antigravity --lib`：15 passed。覆盖 Agent 引用筛选、其他用途排除、默认档位、重复引用、同名身份分离、真实重定向与循环拒绝、规格交集及未登记 Effort 拒绝。
+- `cargo test --locked -p stravia-vendor-antigravity --lib`：15 passed。覆盖 Agent 引用筛选、其他用途排除、默认档位、重复引用、同名身份分离、真实重定向与循环拒绝、规格交集及未登记 Effort 拒绝。
 - `task build:vendors:all`：增量重建 Antigravity，生成八个自包含组件。
-- `cargo test --locked --jobs 4 -p stravia-vendor-antigravity --test contract oauth_and_inference_enforce_native_wire_at_real_http_boundary -- --exact --ignored --nocapture`：历史验证 1 passed。当时实际 Wasm 与 loopback HTTP 验证默认/Low/Medium/High 的 envelope ID，以及未登记 Effort 不发送 HTTP；原有 OAuth、签名、SSE 和错误边界通过。后续 CLI 1.3.2 对齐已将回归断言改为同时保护 ID、variant 预算、独立摘要和显式控制优先级；此处不把历史结果视为新断言的执行结果。
-- `cargo clippy --locked --jobs 4 -p stravia-vendor-antigravity --all-targets -- -D warnings`：通过。
+- `cargo test --locked -p stravia-vendor-antigravity --test contract oauth_and_inference_enforce_native_wire_at_real_http_boundary -- --exact --ignored --nocapture`：历史验证 1 passed。当时实际 Wasm 与 loopback HTTP 验证默认/Low/Medium/High 的 envelope ID，以及未登记 Effort 不发送 HTTP；原有 OAuth、签名、SSE 和错误边界通过。后续 CLI 1.3.2 对齐已将回归断言改为同时保护 ID、variant 预算、独立摘要和显式控制优先级；此处不把历史结果视为新断言的执行结果。
+- `cargo clippy --locked -p stravia-vendor-antigravity --all-targets -- -D warnings`：通过。
 - 在全新临时 SQLite 实例导入实际构建的插件，重放第 6 节响应中已去除账号信息的模型字段。OAuth 测试状态直接在隔离存储中预置假 token 与假 project；没有重新登录或读取真实账号凭据。真实同步返回 `added=7`，模型 API 输出七个家族。浏览器实际点击添加 Pro 家族，保存的 Route 仅支持 `low`、`high`；Flash 家族支持 `low`、`medium`、`high`。
 - 经真实 Server 的 `/v1/chat/completions` 向 loopback 上游发送请求：Pro 缺省与 High 为 `gemini-pro-agent`，Low 为 `gemini-3.1-pro-low`，Flash Medium 为 `gemini-3.8-flash-medium`；校验上游捕获的 envelope 与客户端响应一致。
 - Chromium 实际页面核对英文深色桌面表格、中文浅色 390px 移动列表，Pro 只有一行并显示 `low, high`，Flash 同行显示三档；未显示 Gemini 2.5 Pro 等非 Agent 项，浏览器无错误。复用现有 Svelte 页面，没有修改前端源码。

@@ -19,10 +19,10 @@
 | WebUI 单测 | `bun run --filter stravia-webui test:unit` | 329 passed，0 failed。 |
 | WebUI 静态检查 | `bun run check:web`、`bun run lint:web`、`bun run format:check:web`；更新组件 `svelte-autofixer` | 类型检查 0 errors / 0 warnings；lint、格式检查退出 0；autofixer 无 issues / suggestions。 |
 | 完整设置页 Chromium 回归 | `PLAYWRIGHT_USE_PREBUILT=1`，`bun run --filter stravia-webui test:e2e settings.spec.ts --workers=1 --retries=0` | 29 passed，48.7 秒。 |
-| Core 全量 lib 单测 | `cargo test --locked --jobs 4 -p stravia-core -p stravia-web-access -p stravia-desktop --lib` | Core 1164 passed、1 failed、4 ignored；失败为下述 compaction 超时，Cargo 随后停止该组合命令。 |
-| Desktop lib 单测 | `cargo test --locked --jobs 4 -p stravia-desktop -p stravia-web-access --lib --no-fail-fast` 的 Desktop 部分 | 44 passed；包括真实本机 HTTP redirect / bypass 和更新独立选择回归。 |
-| Local Web lib 单测 | 修正新增 bypass 反例及移除内部 timeout 错误类型断言后，`cargo test --locked --jobs 4 -p stravia-web-access --lib` | 133 passed，7 ignored；未缩短产品超时、增加重试或放宽 SSRF 检查。 |
-| 受影响 Rust targets | `cargo clippy --locked --jobs 4 -p stravia-core -p stravia-web-access -p stravia-server -p stravia-desktop --all-targets -- -D warnings` | 退出 0。受影响文件按各 crate 的实际 edition 单独执行 rustfmt check，退出 0。 |
+| Core 全量 lib 单测 | `cargo test --locked -p stravia-core -p stravia-web-access -p stravia-desktop --lib` | Core 1164 passed、1 failed、4 ignored；失败为下述 compaction 超时，Cargo 随后停止该组合命令。 |
+| Desktop lib 单测 | `cargo test --locked -p stravia-desktop -p stravia-web-access --lib --no-fail-fast` 的 Desktop 部分 | 44 passed；包括真实本机 HTTP redirect / bypass 和更新独立选择回归。 |
+| Local Web lib 单测 | 修正新增 bypass 反例及移除内部 timeout 错误类型断言后，`cargo test --locked -p stravia-web-access --lib` | 133 passed，7 ignored；未缩短产品超时、增加重试或放宽 SSRF 检查。 |
+| 受影响 Rust targets | `cargo clippy --locked -p stravia-core -p stravia-web-access -p stravia-server -p stravia-desktop --all-targets -- -D warnings` | 退出 0。受影响文件按各 crate 的实际 edition 单独执行 rustfmt check，退出 0。 |
 | 管理 HTTP 代理回归 | `STRAVIA_BINARY=target/test-artifacts/services/stravia-server.exe`，`uv run --locked --group test python -m pytest tests/e2e/admin/test_admin.py -k proxy -q --tb=short` | 7 passed，39 deselected；真实 SQLite INSERT/UPDATE trigger 拒绝写入后，整行旧配置不变。测试显式关闭外部 SQLite connection，避免 Windows teardown 文件锁。 |
 | 双后端迁移与完整存储矩阵 | 先执行 `tests/e2e/storage/test_outbound_proxy_migration.py`，再执行 `uv run --locked --group test python -m pytest tests/e2e/storage -q --tb=short` | 迁移 2 passed；完整 SQLite/PostgreSQL 存储矩阵 32 passed，126.15 秒。使用独立 loopback PostgreSQL/Redis 容器，不连接用户数据库。 |
 | 双后端结构参考 | `stravia-tools dump-schema --backend sqlite --output docs/database/sqlite.sql`；同命令 PostgreSQL 后端输出 `docs/database/postgres.sql` | 两次退出 0；PostgreSQL 临时导出数据库已清理。 |

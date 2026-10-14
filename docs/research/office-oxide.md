@@ -88,7 +88,7 @@ IR 块级 `Element` 枚举：`Heading(1-6)`、`Paragraph`、`Table`（`TableRow`
 - 最新 **0.1.11**，发布于 2026-09-11；首个版本 0.1.0 发布于 2026-04-28；约 4.5 个月 12 个版本——节奏很活跃。**无 yanked 版本**（crates.io 版本历史）。
 - 总下载约 577k，近期约 501k；**12 个 dependent**（crates.io）。数字可能被项目自身的多绑定 CI 抬高；真实 dependent 有 `kreuzberg`（见 PR #63 讨论）。
 - 仓库：https://github.com/yfedoseev/office_oxide ——创建于 2026-03-01，约 86–125 star、14–18 fork、5 个 open issue，实质单作者（Yury Fedoseev）。文档站 https://office.oxide.fyi/。在 6,062 个真实文件上做 corpus 测试（BENCHMARKS.md：98.4% 通过，失败均为非法输入）。存在 cargo-fuzz target。dep 树中的 RustSec advisory 在 v0.1.3/v0.1.4 中被及时清理。
-- `rust-version = "1.88"`、`edition = "2024"`（workspace Cargo.toml）——与本仓库 pinned Rust 1.98.1 兼容。
+- `rust-version = "1.88"`、`edition = "2024"`（workspace Cargo.toml）——与本仓库锁定的 Rust 工具链（见 [`rust-toolchain.toml`](../../rust-toolchain.toml)）兼容。
 
 ## 5. 许可证
 

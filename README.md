@@ -15,7 +15,7 @@ history, and usage — desktop app or single binary.
 [![Release](https://img.shields.io/github/v/release/Stravia-AI/StraviaPlatform)](https://github.com/Stravia-AI/StraviaPlatform/releases)
 [![License: AGPL-3.0-only](https://img.shields.io/badge/license-AGPL--3.0--only-blue)](LICENSE)
 [![CI](https://github.com/Stravia-AI/StraviaPlatform/actions/workflows/ci.yml/badge.svg)](https://github.com/Stravia-AI/StraviaPlatform/actions/workflows/ci.yml)
-[![Rust](https://img.shields.io/badge/rust-1.98.1-orange)](rust-toolchain.toml)
+[![Rust](https://img.shields.io/badge/rust-toolchain-orange)](rust-toolchain.toml)
 
 [Releases](https://github.com/Stravia-AI/StraviaPlatform/releases) · [Changelog](CHANGELOG.md) · [中文文档](README_CN.md)
 
@@ -178,7 +178,7 @@ The same Rust core powers both; the management surface is the same WebUI.
 
 ## Development
 
-Rust `1.98.1` · Bun `1.4.2` · Task `3.52.0` · uv for Python E2E.
+Rust toolchain: [`rust-toolchain.toml`](rust-toolchain.toml) · Bun `1.4.2` · Task `3.52.0` · uv for Python E2E.
 
 Project JavaScript development, build, and test commands use Bun. Rust and Python tests retain their native runners.
 

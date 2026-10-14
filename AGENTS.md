@@ -93,10 +93,10 @@ Platform Tools 在 Stravia 内部执行，可将结果交给后续模型轮次�
 
 | 测试类型 | 定向命令 |
 |---|---|
-| Rust 单元测试 | `cargo test --locked --jobs 4 -p <crate> --lib <完整测试名> -- --exact` |
+| Rust 单元测试 | `cargo test --locked -p <crate> --lib <完整测试名> -- --exact` |
 | WebUI 单元测试 | `bun test --cwd frontend/stravia-webui <测试文件> -t "<测试名>"` |
 | HTTP E2E | `uv run --locked --group test python -m pytest "<文件>::<函数>" -q` |
-| Chromium E2E | `bun run --filter stravia-webui test:e2e <测试文件> --grep "<测试名>" --workers=1 --retries=0` |
+| Chromium E2E | `bun run --filter stravia-webui test:e2e <测试文件> --grep "<测试名>" --retries=0` |
 
 - E2E 先按 `Taskfile.yml` 对应任务的 `deps` / `env` 准备构建与环境，成功后再定向执行；源码变更后重新校验缓存。WebUI 单元测试需要的生成物未准备时，先运行 `test:unit`；Rust 集成测试将 `--lib` 换成 `--test <文件名，不含 .rs>`。
 - 确认目标用例确实执行并通过；零测试或全部被过滤不算通过。

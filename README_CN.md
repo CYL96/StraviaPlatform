@@ -15,7 +15,7 @@
 [![Release](https://img.shields.io/github/v/release/Stravia-AI/StraviaPlatform)](https://github.com/Stravia-AI/StraviaPlatform/releases)
 [![License: AGPL-3.0-only](https://img.shields.io/badge/license-AGPL--3.0--only-blue)](LICENSE)
 [![CI](https://github.com/Stravia-AI/StraviaPlatform/actions/workflows/ci.yml/badge.svg)](https://github.com/Stravia-AI/StraviaPlatform/actions/workflows/ci.yml)
-[![Rust](https://img.shields.io/badge/rust-1.98.1-orange)](rust-toolchain.toml)
+[![Rust](https://img.shields.io/badge/rust-toolchain-orange)](rust-toolchain.toml)
 
 [发布版本](https://github.com/Stravia-AI/StraviaPlatform/releases) · [更新日志](CHANGELOG.md) · [English](README.md)
 
@@ -178,7 +178,7 @@ OpenAI（含 Codex OAuth）· Anthropic（API Key；Claude Pro/Max 订阅 OAuth 
 
 ## 开发
 
-Rust `1.98.1` · Bun `1.4.2` · Task `3.52.0` · Python E2E 需要 uv。
+Rust 工具链以 [`rust-toolchain.toml`](rust-toolchain.toml) 为准 · Bun `1.4.2` · Task `3.52.0` · Python E2E 需要 uv。
 
 项目的 JavaScript 开发、构建与测试命令统一使用 Bun。Rust 和 Python 测试保留各自的原生运行器。
 
