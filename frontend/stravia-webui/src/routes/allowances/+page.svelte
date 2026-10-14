@@ -58,7 +58,7 @@ import { Switch } from '$lib/components/ui/switch'
 import * as Table from '$lib/components/ui/table'
 import * as ToggleGroup from '$lib/components/ui/toggle-group'
 import * as Tooltip from '$lib/components/ui/tooltip'
-import AllowanceSuspensionBanner from '$lib/components/allowance-suspension.svelte'
+import AllowanceSuspension from '$lib/components/allowance-suspension.svelte'
 import { cn } from '$lib/utils'
 
 interface VisibleProvider extends ProviderAllowanceReadEntry {
@@ -542,7 +542,6 @@ function allowanceErrorMessage(category: ProviderAllowanceErrorCategory): string
 
 {#snippet providerAlerts(provider: VisibleProvider)}
   {@const snapshot = provider.snapshot}
-  {@const suspension = snapshot ? snapshot.suspension : provider.target.suspension}
   {#if provider.credentialInvalid}
     <Alert.Root
       variant={snapshot?.status === 'stale' ? 'warning' : 'destructive'}
@@ -567,9 +566,6 @@ function allowanceErrorMessage(category: ProviderAllowanceErrorCategory): string
           snapshot.error.category,
         )}</Alert.Description
       ></Alert.Root>
-  {/if}
-  {#if suspension}
-    <AllowanceSuspensionBanner {suspension} />
   {/if}
   {#if snapshot?.missing_guarded_keys?.length}
     <Alert.Root variant="warning">
@@ -683,7 +679,6 @@ function allowanceErrorMessage(category: ProviderAllowanceErrorCategory): string
   {@const hasAlerts =
     provider.credentialInvalid ||
     Boolean(snapshot?.error) ||
-    Boolean(suspension) ||
     Boolean(snapshot?.missing_guarded_keys?.length) ||
     provider.guardError != null}
   <li class="@container border-b last:border-b-0" data-testid={`allowance-provider-${providerId}`}>
@@ -726,6 +721,10 @@ function allowanceErrorMessage(category: ProviderAllowanceErrorCategory): string
                   class="text-xs"
                   label={conditionLabel(providerCondition)}
                   tone={conditionStatusTone(providerCondition)} />
+              {/if}
+              {#if suspension}
+                <!-- 独立定位上下文让提示入口位于整行展开命中区之上。 -->
+                <span class="relative z-10"><AllowanceSuspension {suspension} /></span>
               {/if}
               {#if presentation}<Badge variant={presentation.variant}>{presentation.label}</Badge>{/if}
               {#if snapshot?.plan_label}<span class="text-xs text-muted-foreground">{snapshot.plan_label}</span>{/if}

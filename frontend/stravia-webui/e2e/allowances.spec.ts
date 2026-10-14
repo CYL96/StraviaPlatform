@@ -323,6 +323,14 @@ for (const locale of ['en-US', 'zh-CN']) {
     })
     // 暂停状态属于必须立即可见的异常，不能藏在默认折叠的详情里
     await expect(page.getByTestId('allowance-suspension').first()).toBeVisible()
+    const pause = page
+      .getByRole('button', { name: locale === 'en-US' ? 'Allowance paused' : '额度暂停', exact: true })
+      .first()
+    await pause.click()
+    await expect(page.getByRole('tooltip')).toContainText('credits_balance')
+    await expect(weekly).toHaveCount(0)
+    await pause.press('Escape')
+    await expect(page.getByRole('tooltip')).not.toBeVisible()
     await expect(weekly).toHaveCount(0)
     await page
       .getByRole('button', { name: locale === 'en-US' ? 'Alpha account allowance details' : 'Alpha account 额度详情' })

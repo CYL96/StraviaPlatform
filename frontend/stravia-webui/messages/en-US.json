@@ -143,7 +143,6 @@
   "allowances_suspension_trigger": "Pause trigger",
   "allowances_suspended_since": "Paused since {time}",
   "allowances_suspension_triggers": "Triggered by: {keys}",
-  "allowances_suspension_recovery": "Routing resumes only after a successful allowance read confirms recovery, not when the reset time arrives.",
   "allowances_guard_item": "Pause this service when {item} is exhausted",
   "allowances_guard_column": "Pause when exhausted",
   "allowances_guard_help_label": "About pause when exhausted",

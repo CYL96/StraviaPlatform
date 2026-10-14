@@ -6,7 +6,8 @@ use thiserror::Error;
 use super::*;
 use crate::plugin::{VendorCallContext, VendorPublicationFence, VendorRequest};
 
-const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
+// 后台与手动检查共用完整发现预算，包含凭据准备及全部分页；慢目录不应被普通短查询的上限截断。
+const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_DISCOVERY_PAGES: usize = 1024;
 
 #[derive(Debug, Error)]

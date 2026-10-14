@@ -41,10 +41,20 @@ for (const locale of ['en-US', 'zh-CN']) {
         .filter({ hasText: locale === 'en-US' ? 'Credential invalid' : '凭据失效' })
         .first(),
     ).toBeVisible()
-    await expect(page.getByTestId('allowance-suspension').first()).toContainText('weekly')
-    await expect(page.getByTestId('allowance-suspension').first()).toContainText(
-      locale === 'en-US' ? 'Allowance paused' : '额度暂停',
-    )
+    const pauseLabel = locale === 'en-US' ? 'Allowance paused' : '额度暂停'
+    const pause = page.getByRole('button', { name: pauseLabel, exact: true }).first()
+    await expect(pause).toBeVisible()
+    const row = page.getByRole('row').filter({ has: pause })
+    const height = (await row.boundingBox())!.height
+    expect(height).toBeLessThan(100)
+    await pause.hover()
+    await expect(page.getByRole('tooltip')).toContainText('weekly')
+    expect((await row.boundingBox())!.height).toBe(height)
+    await pause.press('Escape')
+    await expect(page.getByRole('tooltip')).not.toBeVisible()
+    await pause.press('Tab')
+    await pause.focus()
+    await expect(page.getByRole('tooltip')).toContainText('weekly')
     await page.goto('/providers/paused-provider?view=connection')
     await expect(
       page
@@ -52,10 +62,22 @@ for (const locale of ['en-US', 'zh-CN']) {
         .filter({ hasText: locale === 'en-US' ? 'Credential invalid' : '凭据失效' })
         .first(),
     ).toBeVisible()
-    await expect(page.getByTestId('allowance-suspension')).toContainText('weekly')
-    await expect(page.getByTestId('allowance-suspension')).toContainText(
-      locale === 'en-US' ? 'Allowance paused' : '额度暂停',
-    )
+    await page.getByRole('button', { name: pauseLabel, exact: true }).focus()
+    await expect(page.getByRole('tooltip')).toContainText('weekly')
+    await page.setViewportSize({ width: 320, height: 850 })
+    await page.goto('/providers')
+    const mobilePause = page.getByRole('button', { name: pauseLabel, exact: true })
+    await mobilePause.click()
+    await expect(page).toHaveURL(/\/providers$/)
+    const tooltip = page.getByRole('tooltip')
+    await expect(tooltip).toContainText('weekly')
+    const bounds = (await tooltip.boundingBox())!
+    expect(bounds.x).toBeGreaterThanOrEqual(0)
+    expect(bounds.x + bounds.width).toBeLessThanOrEqual(320)
+    await mobilePause.press('Escape')
+    await expect(tooltip).not.toBeVisible()
+    await mobilePause.click()
+    await expect(tooltip).toContainText('weekly')
   })
 }
 
