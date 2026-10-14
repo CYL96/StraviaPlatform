@@ -478,10 +478,10 @@ async fn inference_is_sent_in_claude_code_shape_and_tool_names_round_trip() {
             .map(|(_, value)| value.as_str())
     };
     assert_eq!(header("authorization"), Some("Bearer sk-ant-oat01-test"));
-    assert_eq!(
-        header("user-agent"),
-        Some("claude-cli/2.1.280 (external, cli)")
-    );
+    let client_version = header("user-agent")
+        .and_then(|value| value.strip_prefix("claude-cli/"))
+        .and_then(|value| value.strip_suffix(" (external, cli)"))
+        .expect("Claude CLI identity");
     assert!(
         header("anthropic-beta")
             .unwrap()
@@ -490,7 +490,9 @@ async fn inference_is_sent_in_claude_code_shape_and_tool_names_round_trip() {
 
     let body: Value = serde_json::from_slice(&sent.body).unwrap();
     let billing = body["system"][0]["text"].as_str().unwrap();
-    assert!(billing.starts_with("x-anthropic-billing-header: cc_version=2.1.280."));
+    assert!(billing.starts_with(&format!(
+        "x-anthropic-billing-header: cc_version={client_version}."
+    )));
     // cch 的算法正确性由单元测试对照参考向量覆盖；这里确认占位符已被写回。
     assert_ne!(sent_cch(&sent.body), "00000");
     assert_eq!(

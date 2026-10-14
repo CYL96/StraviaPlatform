@@ -7,7 +7,6 @@ use stravia_vendor_sdk::{
 
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const DEFAULT_BASE_URL: &str = "https://api.commandcode.ai";
-const PROTOCOL_VERSION: &str = "1.53.1";
 
 pub(crate) fn execute(
     host: &GuestHost,
@@ -107,7 +106,10 @@ fn commandcode_request(
             ("authorization".into(), format!("Bearer {credential}")),
             ("accept".into(), "application/json".into()),
             ("user-agent".into(), "cli".into()),
-            ("x-command-code-version".into(), PROTOCOL_VERSION.into()),
+            (
+                "x-command-code-version".into(),
+                crate::PROTOCOL_VERSION.into(),
+            ),
             ("x-cli-environment".into(), "production".into()),
         ],
         body: vec![],

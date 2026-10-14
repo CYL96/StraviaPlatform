@@ -28,7 +28,7 @@ use crate::codec::{CommandCodeGenerateV1, CommandCodeStreamParser, DEFAULT_WORKI
 
 const VENDOR_ID: &str = "command-code";
 const CHANNEL_ID: &str = "default";
-const PROTOCOL_VERSION: &str = "1.53.1";
+const PROTOCOL_VERSION: &str = "1.82.1";
 const DEFAULT_BASE_URL: &str = "https://api.commandcode.ai";
 const FP_SALT: &str = "command-code:device-fingerprint:v1";
 const SESSION_TTL_MS: i64 = 12 * 60 * 60 * 1000;

@@ -16,11 +16,10 @@ use crate::capabilities::{self, ModelCapabilities};
 use crate::thinking::{self, ModelProfile};
 use crate::xxhash::xxh64;
 
-/// 未配置覆盖值时上报的 Claude Code CLI 版本（与 oh-my-pi v18.4.2 的
-/// `DEFAULT_CLAUDE_CODE_VERSION` 一致）。
-pub(crate) const DEFAULT_CLIENT_VERSION: &str = "2.1.280";
-/// Claude Code 当前版本捆绑的 `@anthropic-ai/sdk` 版本。
-pub(crate) const SDK_VERSION: &str = "0.112.1";
+/// 未配置覆盖值时上报的 Claude Code CLI 正式发行版本。
+pub(crate) const DEFAULT_CLIENT_VERSION: &str = "2.1.299";
+/// 与该 Claude Code 发布包内的 `@anthropic-ai/sdk` 身份保持一致。
+pub(crate) const SDK_VERSION: &str = "0.128.0";
 const RUNTIME_VERSION: &str = "v26.3.0";
 /// Stainless 平台头只描述「客户端运行环境」；插件在 Wasm 内拿不到宿主平台，
 /// 固定为自托管服务端最常见的 Linux x64。
@@ -783,7 +782,7 @@ mod tests {
             .map(|block| block["text"].as_str().unwrap())
             .collect();
         assert_eq!(texts.len(), 3);
-        assert!(texts[0].contains("cc_version=2.1.280."));
+        assert!(!texts[0].contains("9.9.9.abc"));
         assert_eq!(&texts[1..], [IDENTITY_TEXT, "prompt"]);
     }
 

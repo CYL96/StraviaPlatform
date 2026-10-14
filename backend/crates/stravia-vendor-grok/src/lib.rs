@@ -27,7 +27,7 @@ const CHANNEL_ID: &str = "grok";
 const OPEN_RESPONSES_PROTOCOL: &str = "open-responses/responses/2026-04-24";
 const XAI_CLIENT_ID: &str = "b1a00492-073a-47ea-816f-4c329264a828";
 const XAI_SCOPE: &str = "openid profile email offline_access grok-cli:access api:access";
-const XAI_CLIENT_VERSION: &str = "0.2.120";
+const XAI_CLIENT_VERSION: &str = "1.0.52";
 const XAI_DEVICE_GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
 const MAX_JSON_BODY: usize = 8 * 1024 * 1024;
 

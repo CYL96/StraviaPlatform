@@ -50,7 +50,7 @@ const PLACEHOLDER_TOOL_NAMES: &[&str] = &["bash", "read"];
 
 /// 官方客户端 UA 形态（`opencode/<version>` + ai-sdk/bun runtime 串）。
 /// 可通过 Provider 配置的 `userAgent` 字段覆盖，应对上游抬高版本下限。
-const CLIENT_USER_AGENT: &str = "opencode/1.18.31 ai-sdk/provider-utils/4.0.40 runtime/bun/1.3.14";
+const CLIENT_USER_AGENT: &str = "opencode/1.19.0 ai-sdk/provider-utils/4.0.51 runtime/bun/1.3.14";
 
 fn is_free_tier_model(model: &str) -> bool {
     model.ends_with(FREE_MODEL_SUFFIX) || UNSUFFIXED_FREE_MODELS.contains(&model)

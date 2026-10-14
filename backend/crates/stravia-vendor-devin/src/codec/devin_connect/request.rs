@@ -83,7 +83,7 @@ pub const GET_CHAT_MESSAGE_PATH: &str = "/exa.api_server_pb.ApiServerService/Get
 /// upstream serves a reduced model catalog to older versions, so this must
 /// stay near the current release.
 const CLIENT_NAME: &str = "chisel";
-const CLIENT_VERSION: &str = "3000.10.27";
+const CLIENT_VERSION: &str = "3000.11.3";
 const CLIENT_LANGUAGE: &str = "en";
 
 /// ClientMetadata #5 platform identity.
