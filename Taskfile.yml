@@ -12,6 +12,8 @@ tasks:
 
   install:web:
     desc: Install the locked Bun workspace dependencies.
+    # 并行构建分支共享 node_modules，单次调用内必须只安装一次。
+    run: once
     # The run launcher also routes dependency lifecycle scripts through Bun.
     cmds:
       - bun --bun run bun ci
@@ -117,6 +119,8 @@ tasks:
 
   build:web:
     desc: Build the Stravia WebUI distribution assets.
+    # 并行测试准备分支必须等待同一次构建，避免同时写入生成目录。
+    run: once
     deps: [install:web]
     sources: &web_sources
       - Taskfile.yml

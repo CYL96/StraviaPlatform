@@ -53,6 +53,7 @@ impl PendingUpstream {
     }
 }
 
+#[derive(Clone)]
 struct UpstreamReply {
     status: StatusCode,
     body: Vec<u8>,
@@ -448,12 +449,27 @@ async fn set_guards(
     assert!(confirmed.target.refreshing);
     let request = tokio::time::timeout(std::time::Duration::from_secs(10), upstream.next()).await?;
     assert_eq!(request.operation(), "allowance");
-    request.reply(reply);
-    Ok(gateway
-        .admin()
-        .get_provider_allowance(provider_id)
-        .await?
-        .expect("provider allowance after background guard refresh"))
+    request.reply(reply.clone());
+    // A failed background read may finish before GET joins it. GET then starts
+    // its own read, so serve the same upstream state until that one GET finishes.
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let admin = gateway.admin();
+        let read = admin.get_provider_allowance(provider_id);
+        tokio::pin!(read);
+        loop {
+            tokio::select! {
+                result = &mut read => {
+                    return Ok::<_, anyhow::Error>(result?
+                        .expect("provider allowance after background guard refresh"));
+                }
+                request = upstream.next() => {
+                    assert_eq!(request.operation(), "allowance");
+                    request.reply(reply.clone());
+                }
+            }
+        }
+    })
+    .await?
 }
 
 async fn refresh_allowance(
@@ -614,6 +630,10 @@ async fn allowance_guards_hold_failed_and_missing_evidence_and_recover_only_on_f
         UpstreamReply::json(serde_json::json!({"remaining":"90","second_remaining":"10"})),
     )
     .await?;
+    assert_eq!(
+        recovered.status,
+        stravia_core::admin::provider_allowance::ProviderAllowanceStatus::Fresh
+    );
     assert!(recovered.suspension.is_none());
     set_guards(
         &gateway,
