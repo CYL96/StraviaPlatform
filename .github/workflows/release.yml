@@ -14,7 +14,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  RUST_VERSION: "1.98.1"
+  RUST_VERSION: "1.99.0"
   BUN_VERSION: "1.4.2"
   TASK_VERSION: "3.52.0"
   IMAGE_NAME: ghcr.io/stravia-ai/straviaplatform

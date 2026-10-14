@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7
 
 ARG BUN_VERSION=1.4.2
-ARG RUST_VERSION=1.98.1
+ARG RUST_VERSION=1.99.0
 FROM oven/bun:${BUN_VERSION}-debian AS web-builder
 WORKDIR /src
 
