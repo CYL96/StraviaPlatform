@@ -142,7 +142,7 @@ fn requests_for(monitor: Monitor, credential: &str) -> Vec<HttpRequest> {
             let mut headers = base_headers(monitor, credential);
             match monitor {
                 Monitor::GitHubCopilot => {
-                    headers.push(("editor-version".into(), "vscode/1.96.2".into()));
+                    headers.push(("editor-version".into(), "vscode/1.141.1".into()));
                     headers.push(("x-github-api-version".into(), "2025-04-01".into()));
                 }
                 Monitor::OpenCodeGo => headers.push(("user-agent".into(), "Stravia".into())),

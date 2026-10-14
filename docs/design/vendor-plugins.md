@@ -24,6 +24,25 @@
 | `stravia-vendor-claudecode` | `claude-code` / `dedicated` | `provider_id = claude-code`、`catalog_id = anthropic`、channel `oauth`。 |
 | `stravia-vendor-antigravity` | `antigravity` / `dedicated` | `provider_id = antigravity`、无目录映射、channel `oauth`；模型与额度来自登录账号。 |
 
+### 客户端身份版本
+
+客户端身份固定在插件源码中，不在请求期间查询发行源。版本采用官方已发布渠道，不将预发布版、`Unreleased` 条目、IDE/hub 或独立 SDK 的最新版本冒充对应 CLI。版本字段不是插件包版本，也不改变 OAuth 权限或协议版本。
+
+| 接入 | 当前默认客户端身份 | 官方版本来源 |
+| --- | --- | --- |
+| Codex | `0.162.1` | [官方 npm latest](https://registry.npmjs.org/@openai%2fcodex/latest) |
+| Claude Code | `2.1.299`；Stainless SDK `0.128.0` | [官方 npm latest](https://registry.npmjs.org/@anthropic-ai%2fclaude-code/latest)、[该版本 native manifest](https://downloads.claude.ai/claude-code-releases/2.1.299/manifest.json) |
+| Grok CLI | `1.0.52` | [官方 stable 指针](https://x.ai/cli/stable) |
+| Command Code | `1.82.1` | [官方 npm latest](https://registry.npmjs.org/command-code/latest) |
+| Devin CLI / chisel | `3000.11.3` | [官方 stable changelog](https://docs.devin.ai/cli/changelog/stable) |
+| OpenCode Zen Free | `1.19.0`；provider-utils `4.0.51`、Bun `1.3.14` | [官方 npm latest](https://registry.npmjs.org/opencode-ai/latest)、[发行标签锁文件](https://github.com/anomalyco/opencode/blob/v1.19.0/bun.lock)、[构建运行环境](https://github.com/anomalyco/opencode/blob/v1.19.0/package.json) |
+| Antigravity CLI | `1.3.5`，保留 `/cli/` 身份路径 | [官方 CLI 更新 manifest](https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/manifests/linux_amd64.json) |
+| base / GitHub Copilot 额度 | `editor-version: vscode/1.141.1` | [微软 stable 更新 API](https://update.code.visualstudio.com/api/update/win32-x64/stable/latest) |
+
+Claude Code 的 SDK 标记从对应 Linux/x64 发布二进制中静态核对，OAuth User-Agent 与 Stainless 头使用同一值；既有固定 Linux/x64、Node `v26.3.0` 代表性运行环境保持不变，不声称 Wasm 在运行 Node 或完整复刻 native CLI。OpenCode 的 SDK 与 Bun 标记来自同一发行标签，不跟随独立包的 latest 自动变化。Command Code 的额度、初始化与推理使用同一版本常量。
+
+已安装的独立插件须重新构建并导入才能更新身份；仅升级宿主不会替换旧组件。既有 Claude Code `client_version` 与 OpenCode `userAgent` 显式覆盖仍优先于默认值。历史协议研究及密码学向量保留原始核对版本，不因更新身份而重标来源；离线组件与请求边界验证不能证明真实账号的版本门控、模型可用性或订阅资格。
+
 ### Codex 额度单位
 
 `openai-codex` 的 `credits.balance` 与 `spend_control.individual_limit` 金额按官方客户端语义使用 credits，输出现有 `unit="credits"` 且不声明 currency；保留数值和小数，不将点数当作 USD，不推测兑换率或缩放。WebUI 沿用通用额度单位本地化，中文显示「点」、英文显示 `credits`。更新独立 Codex 组件后刷新额度，既有 guard key、认证与数据库 schema 不变。固定官方源码证据、数值边界与验证见 [Codex 额度字段单位研究](../research/codex-credit-units.md)。
@@ -52,7 +71,7 @@ base 的 Anthropic Profile 仅提供 `default` API-key 通道；旧的 `anthropi
 Claude Pro/Max 订阅由专属插件 `claude-code`（crate `stravia-vendor-claudecode`，channel `oauth`）提供，需从 Release 附件本地导入。旧 `anthropic/claude-code` 连接不会自动归入该插件；改用订阅时新建 `claude-code` 连接、完成登录并重新绑定 Route。
 
 - 登录：授权码 + PKCE，授权页 `https://claude.ai/oauth/authorize`，回调 `http://localhost:54545/callback`（备用 54546，手动粘贴回调 URL 使用 54547）；claude.ai 授权提交会拒绝宿主默认 state，插件自行生成 16 字节小写 hex state 并交宿主做回调校验，因此该插件要求宿主支持插件自带 state；令牌交换与刷新走 `https://api.anthropic.com/v1/oauth/token`。令牌响应缺少账号身份时，向 `/api/claude_cli/bootstrap` 补取账号与组织；该补取失败不影响登录。登录时为连接生成随机 `device_id`，刷新沿用已保存的账号身份与 `device_id`。
-- 推理：上游只接受 Claude Code CLI 形态的订阅请求。插件在 Anthropic Messages 编码结果上改写为 CLI 线上形态：`POST /v1/messages?beta=true`，CLI User-Agent、Stainless 与 `anthropic-beta` 请求头；`system[0]` 为计费头 `x-anthropic-billing-header`（含由首条用户消息计算的版本指纹和对最终请求体计算的 `cch` 校验值），`system[1]` 为 Claude Code 身份块；自定义工具名在请求中加 `_` 前缀、在响应中还原；`metadata.user_id` 由连接的账号身份与会话 ID 重建；缓存断点默认使用 1 小时 TTL；始终流式请求。该形态以 oh-my-pi v18.4.2 的实现与抓包为基准，上报的 CLI 版本默认 `2.1.280`，可在连接高级设置 `client_version` 中调整。
+- 推理：上游只接受 Claude Code CLI 形态的订阅请求。插件在 Anthropic Messages 编码结果上改写为 CLI 线上形态：`POST /v1/messages?beta=true`，CLI User-Agent、Stainless 与 `anthropic-beta` 请求头；`system[0]` 为计费头 `x-anthropic-billing-header`（含由首条用户消息计算的版本指纹和对最终请求体计算的 `cch` 校验值），`system[1]` 为 Claude Code 身份块；自定义工具名在请求中加 `_` 前缀、在响应中还原；`metadata.user_id` 由连接的账号身份与会话 ID 重建；缓存断点默认使用 1 小时 TTL；始终流式请求。该形态以 oh-my-pi v18.4.2 的实现与抓包为基准，上报的 CLI 版本默认 `2.1.299`，可在连接高级设置 `client_version` 中调整。
 - Responses 历史继承或客户端显式声明的 `truncation: "auto"` 与 `truncation: "disabled"` 按目标是否支持统一处理：支持时保留原值，不支持时省略该控制，不因无法表达拒绝转换。Anthropic 不支持该字段，插件不擅自裁剪输入，超出输入窗口仍按 [Anthropic 的默认输入溢出行为](https://platform.claude.com/docs/en/build-with-claude/context-windows#context-window-overflow-behavior)由上游报错；这不保证 `auto` 的自动截断意图仍获执行，也不保证其它内容或 continuation 历史转换无损。已安装的独立 `claude-code` 插件需重新构建并导入才能获得此修复，单独更新宿主不会替换插件中的 codec。
 - 请求头与 CLI 相同，包括 `Accept-Encoding: gzip, deflate, br, zstd`（宿主解码响应）与 `Connection: keep-alive`；工具 `strict` 与 `tool_result.is_error` 原样转发，客户端协议没有 `is_error`（OpenAI、Gemini 等入口）时按 CLI 形态补 `is_error: false`。
 - [Claude 4.6 及以后不支持 assistant prefill](https://platform.claude.com/docs/en/build-with-claude/working-with-messages#prefilling-claudes-response)。Claude Code 插件在发送前按型号规则省略连续的末尾 assistant 消息，思考开启时同样省略不被接受的 prefill；此前的 assistant 历史及已完成的工具调用、结果保持不变。不把助手内容改成 user，也不插入合成的继续提示。代价是末尾响应前缀不会送达该型号；旧型号在思考未开启时仍保留原生 prefill，未知型号不按版本猜测。修复由重新导入构建后的 `claude-code` 插件交付，不在宿主按供应商分支。
