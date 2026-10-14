@@ -33,6 +33,14 @@ pub struct ProviderAllowanceTarget {
     pub suspension: Option<crate::db::models::AllowanceSuspension>,
 }
 
+/// Confirmed guard keys and the non-blocking state after the local commit.
+/// The snapshot may be absent while the registered background read is pending.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ProviderAllowanceGuardUpdate {
+    pub keys: Vec<String>,
+    pub target: ProviderAllowanceTarget,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProviderAllowanceSnapshot {
     pub provider_id: String,

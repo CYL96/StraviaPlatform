@@ -666,7 +666,7 @@ _避免使用_：Provider Plan Usage、Token Usage、Request Usage、Stats Usage
 
 ## Provider Allowance 读取编排
 
-Provider Allowance 读取编排是管理面围绕额度快照读取、手动刷新与守护配置保存的操作协调，区分进行中的操作与已确认的结果。它不定义上游额度、额度暂停或样本事实，也不包含搜索、筛选、摘要与时间轴的展示派生。
+Provider Allowance 读取编排是管理面围绕额度快照读取、手动刷新与守护配置保存的操作协调，区分本地保存确认、后台额度读取与已确认的结果。守护保存确认后立即展示服务器确认集合，后台读取不锁住守护编辑；新增守护的暂停状态仍等待 fresh 证据。它不定义上游额度、额度暂停或样本事实，也不包含搜索、筛选、摘要与时间轴的展示派生。
 _避免使用_：Provider Allowance Monitor、完整额度工作区
 
 ## Provider Allowance Monitor

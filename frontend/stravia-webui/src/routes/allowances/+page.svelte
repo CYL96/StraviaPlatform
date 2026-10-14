@@ -578,12 +578,23 @@ function allowanceErrorMessage(category: ProviderAllowanceErrorCategory): string
               variant="outline"
               size="sm"
               disabled={!provider.canSaveGuards}
+              aria-busy={provider.savingGuards}
               onclick={() => reading.setGuard(snapshot.provider_id, key, false)}
-              >{m.allowances_remove_guard({ key })}</Button>
+              >{#if provider.savingGuards}<Spinner
+                  aria-hidden="true" />{m.allowances_guard_saving()}{:else}{m.allowances_remove_guard({
+                  key,
+                })}{/if}</Button>
           </div>
         {/each}
       </Alert.Description>
     </Alert.Root>
+  {/if}
+  {#if provider.refreshError != null}
+    <Alert.Root variant="warning" role="status"
+      ><Alert.Description>
+        {m.allowances_guard_refresh_failed()}
+        {localizeBackendErrorMessage(provider.refreshError)}
+      </Alert.Description></Alert.Root>
   {/if}
   {#if provider.guardError != null}
     <Alert.Root variant="destructive"
@@ -601,6 +612,7 @@ function allowanceErrorMessage(category: ProviderAllowanceErrorCategory): string
     }
     class="-my-1 -ms-1"
     disabled={!provider.canSaveGuards}
+    aria-busy={provider.savingGuards}
     aria-label={m.allowances_guard_item({ item: allowanceLabel(allowance) })} />
 {/snippet}
 
@@ -680,7 +692,8 @@ function allowanceErrorMessage(category: ProviderAllowanceErrorCategory): string
     provider.credentialInvalid ||
     Boolean(snapshot?.error) ||
     Boolean(snapshot?.missing_guarded_keys?.length) ||
-    provider.guardError != null}
+    provider.guardError != null ||
+    provider.refreshError != null}
   <li class="@container border-b last:border-b-0" data-testid={`allowance-provider-${providerId}`}>
     <Collapsible.Root open={expanded} onOpenChange={(open: boolean) => setProviderExpanded(providerId, open)}>
       <div
@@ -727,6 +740,12 @@ function allowanceErrorMessage(category: ProviderAllowanceErrorCategory): string
                 <span class="relative z-10"><AllowanceSuspension {suspension} /></span>
               {/if}
               {#if presentation}<Badge variant={presentation.variant}>{presentation.label}</Badge>{/if}
+              {#if provider.savingGuards}
+                <span class="inline-flex items-center gap-1 text-xs text-muted-foreground" role="status"
+                  ><Spinner class="size-3" aria-hidden="true" />{m.allowances_guard_saving()}</span>
+              {:else if refreshingProvider}
+                <span class="text-xs text-muted-foreground" role="status">{m.allowances_refreshing()}</span>
+              {/if}
               {#if snapshot?.plan_label}<span class="text-xs text-muted-foreground">{snapshot.plan_label}</span>{/if}
             </div>
             <p class="font-technical mt-0.5 text-xs break-all text-muted-foreground">

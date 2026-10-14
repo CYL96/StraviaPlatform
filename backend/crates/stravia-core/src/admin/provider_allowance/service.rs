@@ -35,6 +35,13 @@ const NO_RESET_SENTINEL_MILLIS: i64 = 253_402_214_400_000;
 type SharedFetch =
     Shared<BoxFuture<'static, Result<Option<ProviderAllowanceSnapshot>, Arc<anyhow::Error>>>>;
 
+struct InflightAllowanceFetch {
+    fetch: SharedFetch,
+    identity: Arc<()>,
+    // A guard save may join only before this read starts observing guard keys.
+    accepts_guard_changes: bool,
+}
+
 #[derive(Clone)]
 pub(crate) struct ProviderAllowanceState {
     inner: Arc<ProviderAllowanceStateInner>,
@@ -144,7 +151,7 @@ struct ProviderAllowanceStateInner {
     changed: tokio::sync::Notify,
     cache: RuntimeCache,
     started_at: Instant,
-    inflight: Mutex<HashMap<String, SharedFetch>>,
+    inflight: Mutex<HashMap<String, InflightAllowanceFetch>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -213,11 +220,13 @@ impl AdminService {
             .and_then(|state| state.suspension()))
     }
 
+    /// Commits guard keys locally and registers a coalesced forced background
+    /// read before returning; never waits for upstream allowance evidence.
     pub async fn replace_provider_allowance_guards(
         &self,
         provider_id: &str,
         mut keys: Vec<String>,
-    ) -> anyhow::Result<Option<ProviderAllowanceSnapshot>> {
+    ) -> anyhow::Result<Option<super::ProviderAllowanceGuardUpdate>> {
         let Some(provider) = self.gw.storage.providers().get(provider_id).await? else {
             return Ok(None);
         };
@@ -271,7 +280,21 @@ impl AdminService {
                 "provider allowance suspension changed"
             );
         }
-        self.refresh_provider_allowance(provider_id).await
+        let state = &self.gw.provider_allowance_state;
+        let previous = state.cached(&identity).await;
+        let mut snapshot = previous.as_ref().map(|entry| entry.snapshot.clone());
+        let refreshing = provider.is_enabled && !provider.credential_invalid();
+        if refreshing {
+            let fetch = register_allowance_fetch(self, &provider, identity, previous, true).await;
+            spawn_registered_allowance_fetch(self, &provider.id, fetch);
+        } else if provider.credential_invalid() {
+            snapshot = Some(invalid_credential_snapshot(self, &provider, &identity).await);
+        }
+        if let Some(snapshot) = snapshot.as_mut() {
+            super::suspension::decorate(self, snapshot).await?;
+        }
+        let target = allowance_target(self, &provider, snapshot, refreshing).await?;
+        Ok(Some(super::ProviderAllowanceGuardUpdate { keys, target }))
     }
     pub async fn list_provider_allowances(&self) -> anyhow::Result<Vec<ProviderAllowanceSnapshot>> {
         list_provider_allowances(self, false).await
@@ -300,7 +323,7 @@ impl AdminService {
             let state = &self.gw.provider_allowance_state;
             let previous = state.cached(&identity).await;
             let fresh = previous.as_ref().is_some_and(|entry| state.is_fresh(entry));
-            let mut snapshot = previous.map(|entry| entry.snapshot.clone());
+            let mut snapshot = previous.as_ref().map(|entry| entry.snapshot.clone());
             if let Some(snapshot) = snapshot.as_mut() {
                 super::suspension::decorate(self, snapshot).await?;
             }
@@ -308,16 +331,27 @@ impl AdminService {
                 targets.push(allowance_target(self, &provider, snapshot, false).await?);
                 continue;
             }
-            if fresh {
-                targets.push(allowance_target(self, &provider, snapshot, false).await?);
+            let inflight_key = format!("{}:{identity}", provider.id);
+            let pending = state
+                .inner
+                .inflight
+                .lock()
+                .await
+                .contains_key(&inflight_key);
+            if fresh || pending {
+                targets.push(allowance_target(self, &provider, snapshot, pending).await?);
             } else {
-                spawn_allowance_fetch(self.clone(), provider.clone());
+                let fetch =
+                    register_allowance_fetch(self, &provider, identity, previous, false).await;
+                spawn_registered_allowance_fetch(self, &provider.id, fetch);
                 targets.push(allowance_target(self, &provider, snapshot, true).await?);
             }
         }
         Ok(targets)
     }
 
+    /// Waits for a registered refresh, including a guard-save refresh, before
+    /// considering the TTL cache. A completed refresh is reused without a new read.
     pub async fn get_provider_allowance(
         &self,
         provider_id: &str,
@@ -384,21 +418,6 @@ fn eligible_allowance_provider(admin: &AdminService, provider: &Provider) -> boo
                 .capabilities
                 .contains(&stravia_vendor_sdk::Capability::Allowance)
     })
-}
-
-fn spawn_allowance_fetch(admin: AdminService, provider: Provider) {
-    let provider_id = provider.id.clone();
-    let lifecycle = admin.gw.lifecycle.clone();
-    let admin = admin.gw.background_clone().admin();
-    lifecycle.spawn(async move {
-        if let Err(error) = fetch_provider_allowance(&admin, provider, false).await {
-            tracing::warn!(
-                provider_id = %provider_id,
-                error = %error,
-                "background provider allowance fetch failed"
-            );
-        }
-    });
 }
 
 async fn allowance_target(
@@ -500,18 +519,59 @@ async fn fetch_provider_allowance(
         ));
     }
     let state = &admin.gw.provider_allowance_state;
-    let previous = state.cached(&identity).await;
-    if !force
-        && let Some(entry) = previous.as_ref()
-        && state.is_fresh(entry)
-    {
-        let mut snapshot = entry.snapshot.clone();
-        super::suspension::decorate(admin, &mut snapshot).await?;
-        return Ok(Some(snapshot));
-    }
-
     let inflight_key = format!("{}:{identity}", provider.id);
-    let shared_fetch = {
+    let pending = state
+        .inner
+        .inflight
+        .lock()
+        .await
+        .get(&inflight_key)
+        .map(|entry| entry.fetch.clone());
+    let shared_fetch = if let Some(fetch) = pending {
+        fetch
+    } else {
+        let previous = state.cached(&identity).await;
+        if !force
+            && let Some(entry) = previous.as_ref()
+            && state.is_fresh(entry)
+        {
+            let mut snapshot = entry.snapshot.clone();
+            super::suspension::decorate(admin, &mut snapshot).await?;
+            return Ok(Some(snapshot));
+        }
+        register_allowance_fetch(admin, &provider, identity, previous, false).await
+    };
+
+    let result = shared_fetch
+        .await
+        .map_err(|error| anyhow::anyhow!("provider allowance revalidation failed: {error:#}"));
+    if let Some(current) = admin.gw.storage.providers().get(&provider.id).await?
+        && eligible_allowance_provider(admin, &current)
+        && current.credential_invalid()
+    {
+        let identity = provider_identity(admin, &current).await?;
+        return Ok(Some(
+            invalid_credential_snapshot(admin, &current, &identity).await,
+        ));
+    }
+    match result {
+        Ok(Some(mut snapshot)) => {
+            super::suspension::decorate(admin, &mut snapshot).await?;
+            Ok(Some(snapshot))
+        }
+        other => other,
+    }
+}
+
+async fn register_allowance_fetch(
+    admin: &AdminService,
+    provider: &Provider,
+    identity: String,
+    previous: Option<Arc<CacheEntry>>,
+    needs_guard_evidence: bool,
+) -> SharedFetch {
+    let inflight_key = format!("{}:{identity}", provider.id);
+    {
         let mut inflight = admin
             .gw
             .provider_allowance_state
@@ -519,15 +579,26 @@ async fn fetch_provider_allowance(
             .inflight
             .lock()
             .await;
-        if let Some(fetch) = inflight.get(&inflight_key) {
-            fetch.clone()
+        if let Some(entry) = inflight.get(&inflight_key)
+            && (!needs_guard_evidence || entry.accepts_guard_changes)
+        {
+            entry.fetch.clone()
         } else {
-            let admin = admin.clone();
+            // The older read already observed guard keys. Queue a new forced
+            // read behind its publication so its cache tail cannot overwrite
+            // the evidence produced for this save; the caller never waits here.
+            let publication_barrier = inflight.get(&inflight_key).map(|entry| entry.fetch.clone());
+            let fetch_identity = Arc::new(());
+            let identity_for_cleanup = fetch_identity.clone();
+            let admin = admin.gw.background_clone().admin();
             let state = admin.gw.provider_allowance_state.clone();
             let identity_for_future = identity.clone();
             let provider_id = provider.id.clone();
             let inflight_key_for_future = inflight_key.clone();
             let fetch = async move {
+                if let Some(barrier) = publication_barrier {
+                    let _ = barrier.await;
+                }
                 let result: anyhow::Result<Option<ProviderAllowanceSnapshot>> = async {
                     let Some(current) = admin.gw.storage.providers().get(&provider_id).await?
                     else {
@@ -684,6 +755,16 @@ async fn fetch_provider_allowance(
                     }
                     if snapshot.status == ProviderAllowanceStatus::Fresh {
                         if let Some(version) = evidence_version {
+                            // Close admission before submit reads persisted keys.
+                            // A later save must receive its own evidence, while
+                            // ordinary GETs can still join this publication.
+                            let mut inflight = state.inner.inflight.lock().await;
+                            if let Some(entry) = inflight.get_mut(&inflight_key_for_future)
+                                && Arc::ptr_eq(&entry.identity, &identity_for_cleanup)
+                            {
+                                entry.accepts_guard_changes = false;
+                            }
+                            drop(inflight);
                             super::suspension::submit(&admin, &snapshot, version, completed_at)
                                 .await;
                             state.notify_changed();
@@ -719,40 +800,41 @@ async fn fetch_provider_allowance(
                     Ok(Some(snapshot))
                 }
                 .await;
-                state
-                    .inner
-                    .inflight
-                    .lock()
-                    .await
-                    .remove(&inflight_key_for_future);
+                let mut inflight = state.inner.inflight.lock().await;
+                if inflight
+                    .get(&inflight_key_for_future)
+                    .is_some_and(|entry| Arc::ptr_eq(&entry.identity, &identity_for_cleanup))
+                {
+                    inflight.remove(&inflight_key_for_future);
+                }
                 result.map_err(Arc::new)
             }
             .boxed()
             .shared();
-            inflight.insert(inflight_key.clone(), fetch.clone());
+            inflight.insert(
+                inflight_key.clone(),
+                InflightAllowanceFetch {
+                    fetch: fetch.clone(),
+                    identity: fetch_identity,
+                    accepts_guard_changes: true,
+                },
+            );
             fetch
         }
-    };
+    }
+}
 
-    let result = shared_fetch
-        .await
-        .map_err(|error| anyhow::anyhow!("provider allowance revalidation failed: {error:#}"));
-    if let Some(current) = admin.gw.storage.providers().get(&provider.id).await?
-        && eligible_allowance_provider(admin, &current)
-        && current.credential_invalid()
-    {
-        let identity = provider_identity(admin, &current).await?;
-        return Ok(Some(
-            invalid_credential_snapshot(admin, &current, &identity).await,
-        ));
-    }
-    match result {
-        Ok(Some(mut snapshot)) => {
-            super::suspension::decorate(admin, &mut snapshot).await?;
-            Ok(Some(snapshot))
+fn spawn_registered_allowance_fetch(admin: &AdminService, provider_id: &str, fetch: SharedFetch) {
+    let provider_id = provider_id.to_owned();
+    admin.gw.lifecycle.spawn(async move {
+        if let Err(error) = fetch.await {
+            tracing::warn!(
+                provider_id = %provider_id,
+                error = %error,
+                "background provider allowance fetch failed"
+            );
         }
-        other => other,
-    }
+    });
 }
 
 async fn invalid_credential_snapshot(

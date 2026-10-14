@@ -82,6 +82,7 @@ import type {
   EligibleMediaGenerationRoute,
   ThinkingLevel,
   ProviderAllowanceSnapshot,
+  ProviderAllowanceGuardUpdate,
   ProviderAllowanceTarget,
   ConfirmPluginUpdate,
   PluginPreview,
@@ -387,7 +388,7 @@ export const admin = {
     refresh: (providerId: string) =>
       request<ProviderAllowanceSnapshot>('POST', `/provider-allowances/${providerId}/refresh`),
     replaceGuards: (providerId: string, keys: string[]) =>
-      request<ProviderAllowanceSnapshot>('PUT', `/provider-allowances/${encodeURIComponent(providerId)}/guards`, {
+      request<ProviderAllowanceGuardUpdate>('PUT', `/provider-allowances/${encodeURIComponent(providerId)}/guards`, {
         keys,
       }),
   },

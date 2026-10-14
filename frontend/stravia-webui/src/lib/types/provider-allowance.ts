@@ -47,6 +47,11 @@ export interface ProviderAllowanceTarget {
   refreshing: boolean
 }
 
+export interface ProviderAllowanceGuardUpdate {
+  keys: string[]
+  target: ProviderAllowanceTarget
+}
+
 export interface ProviderAllowanceSnapshot {
   provider_id: string
   guard_supported: boolean

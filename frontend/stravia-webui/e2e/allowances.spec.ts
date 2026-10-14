@@ -151,9 +151,8 @@ async function selectFilter(page: Page, label: string, option: string): Promise<
 }
 
 function requestGate() {
-  let release!: () => void
-  const promise = new Promise<void>((resolve) => (release = resolve))
-  return { promise, release }
+  const { promise, resolve } = Promise.withResolvers<void>()
+  return { promise, release: resolve }
 }
 
 test('keeps confirmed guards and open details when an older account read finishes after saving', async ({ page }) => {
@@ -172,11 +171,13 @@ test('keeps confirmed guards and open details when an older account read finishe
     const weekly = details.getByRole('switch', { name: 'Pause this service when Weekly window is exhausted' })
     await expect(weekly).not.toBeChecked()
     const oldSnapshot = structuredClone(snapshots[0])
+    let heldReads = 0
     await page.route('**/api/v1/provider-allowances/provider-alpha', async (route) => {
+      const response = ++heldReads === 1 ? oldSnapshot : structuredClone(snapshots[0])
       readStarted.release()
       await releaseRead.promise
       try {
-        await route.fulfill({ json: { data: oldSnapshot } })
+        await route.fulfill({ json: { data: response } })
       } finally {
         readFinished.release()
       }
@@ -187,7 +188,9 @@ test('keeps confirmed guards and open details when an older account read finishe
         ...snapshots[0],
         allowances: snapshots[0].allowances.map((item) => ({ ...item, guarded: keys.includes(item.key) })),
       }
-      await route.fulfill({ json: { data: snapshots[0] } })
+      await route.fulfill({
+        json: { data: { keys, target: { ...snapshots[0], snapshot: snapshots[0], refreshing: true } } },
+      })
     })
     await page.clock.fastForward(180_001)
     await readStarted.promise
@@ -276,6 +279,112 @@ test('publishes successful bulk refreshes and toasts the first target failure ev
 })
 
 for (const locale of ['en-US', 'zh-CN']) {
+  test(`guard confirmation remains editable while upstream and metadata wait (${locale})`, async ({ page }) => {
+    await page.addInitScript((value) => localStorage.setItem('stravia-locale', value), locale)
+    const upstream = requestGate()
+    const metadata = requestGate()
+    const saveGate = requestGate()
+    const saveStarted = requestGate()
+    let saves = 0
+    let lists = 0
+    let snapshot = structuredClone(freshSnapshot)
+    const suspended = {
+      suspended_at: '2026-09-01T12:00:00Z',
+      triggered_keys: ['credits_balance'],
+      earliest_reset_at: null,
+    }
+    await page.route('**/api/v1/provider-allowances**', async (route) => {
+      const path = new URL(route.request().url()).pathname
+      if (route.request().method() === 'PUT') {
+        const { keys } = route.request().postDataJSON() as { keys: string[] }
+        saves += 1
+        saveStarted.release()
+        if (saves === 1) await saveGate.promise
+        snapshot = {
+          ...snapshot,
+          allowances: snapshot.allowances.map((item) => ({ ...item, guarded: keys.includes(item.key) })),
+        }
+        await route.fulfill({ json: { data: { keys, target: { ...snapshot, snapshot, refreshing: true } } } })
+        return
+      }
+      if (path.endsWith('/provider-allowances')) {
+        if (++lists > 1) await metadata.promise
+        await route.fulfill({ json: { data: [{ ...snapshot, snapshot, refreshing: false }] } })
+        return
+      }
+      const captured = structuredClone(snapshot)
+      if (saves > 0) await upstream.promise
+      await route.fulfill({
+        json: {
+          data:
+            saves > 1
+              ? {
+                  ...captured,
+                  suspension: captured.allowances.find((item) => item.key === 'credits_balance')?.guarded
+                    ? suspended
+                    : null,
+                  allowances: captured.allowances.map((item) =>
+                    item.key === 'weekly'
+                      ? { ...item, remaining: { value: 25, unit: 'tokens' }, used_percent: 75 }
+                      : item,
+                  ),
+                }
+              : captured,
+        },
+      })
+    })
+    try {
+      await page.goto('/allowances')
+      const provider = page.getByTestId('allowance-provider-provider-alpha')
+      await provider
+        .getByRole('button', {
+          name: locale === 'en-US' ? 'Alpha account allowance details' : 'Alpha account 额度详情',
+        })
+        .click()
+      const weekly = provider.getByRole('switch', {
+        name: locale === 'en-US' ? 'Pause this service when Weekly window is exhausted' : '每周窗口耗尽时暂停此服务',
+      })
+      await weekly.click()
+      await saveStarted.promise
+      await expect(weekly).toHaveAttribute('aria-busy', 'true')
+      await expect(weekly).not.toBeChecked()
+      await expect(
+        provider.getByText(locale === 'en-US' ? 'Saving pause settings…' : '正在保存暂停设置…'),
+      ).toBeVisible()
+      saveGate.release()
+      await expect(weekly).toBeChecked()
+      await expect(weekly).toBeEnabled()
+      await expect(weekly).toHaveAttribute('aria-busy', 'false')
+      await expect(provider.getByText(locale === 'en-US' ? 'Refreshing allowance…' : '正在刷新额度…')).toBeVisible()
+      const credits = provider
+        .getByRole('switch', {
+          name:
+            locale === 'en-US' ? 'Pause this service when Account balance is exhausted' : '账户余额耗尽时暂停此服务',
+          exact: true,
+        })
+        .first()
+      await credits.click()
+      await expect(credits).toBeChecked()
+      await expect(credits).toBeEnabled()
+      await expect(provider.getByTestId('allowance-suspension')).toHaveCount(0)
+      upstream.release()
+      await expect(provider.getByTestId('allowance-suspension')).toBeVisible()
+      await expect(weekly).toBeChecked()
+      await expect(credits).toBeChecked()
+      await expect(weekly).toBeEnabled()
+      await expect(
+        provider
+          .getByRole('table')
+          .getByRole('progressbar', { name: locale === 'en-US' ? 'Weekly window Remaining' : '每周窗口 剩余' }),
+      ).toHaveAttribute('aria-valuenow', '25')
+      metadata.release()
+    } finally {
+      saveGate.release()
+      upstream.release()
+      metadata.release()
+    }
+  })
+
   test(`guards preserve missing keys and confirmed values (${locale})`, async ({ page }) => {
     await page.addInitScript((value) => localStorage.setItem('stravia-locale', value), locale)
     const submissions: string[][] = []
@@ -303,6 +412,8 @@ for (const locale of ['en-US', 'zh-CN']) {
           missing_guarded_keys: keys.includes('old-window') ? ['old-window'] : [],
           allowances: snapshot.allowances.map((item) => ({ ...item, guarded: keys.includes(item.key) })),
         }
+        await route.fulfill({ json: { data: { keys, target: { ...snapshot, snapshot, refreshing: true } } } })
+        return
       }
       await route.fulfill({
         json: {

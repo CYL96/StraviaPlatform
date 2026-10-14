@@ -21,7 +21,7 @@ pub(super) async fn replace_provider_allowance_guards(
         .replace_provider_allowance_guards(&provider_id, input.keys)
         .await
     {
-        Ok(Some(snapshot)) => Json(serde_json::json!({ "data": snapshot })).into_response(),
+        Ok(Some(update)) => Json(serde_json::json!({ "data": update })).into_response(),
         Ok(None) => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({

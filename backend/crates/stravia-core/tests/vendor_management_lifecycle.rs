@@ -439,24 +439,21 @@ async fn set_guards(
     keys: &[&str],
     reply: UpstreamReply,
 ) -> anyhow::Result<stravia_core::admin::provider_allowance::ProviderAllowanceSnapshot> {
-    let gw = gateway.clone();
-    let id = provider_id.to_owned();
     let keys = keys.iter().map(|key| (*key).to_owned()).collect();
-    let mut work = tokio::spawn(async move {
-        gw.admin()
-            .replace_provider_allowance_guards(&id, keys)
-            .await
-    });
-    let request = tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        tokio::select! {
-            request = upstream.next() => request,
-            result = &mut work => panic!("guard save did not force a fresh read: {result:?}"),
-        }
-    })
-    .await?;
+    let confirmed = gateway
+        .admin()
+        .replace_provider_allowance_guards(provider_id, keys)
+        .await?
+        .expect("provider guard update");
+    assert!(confirmed.target.refreshing);
+    let request = tokio::time::timeout(std::time::Duration::from_secs(10), upstream.next()).await?;
     assert_eq!(request.operation(), "allowance");
     request.reply(reply);
-    Ok(work.await??.expect("provider allowance after guard save"))
+    Ok(gateway
+        .admin()
+        .get_provider_allowance(provider_id)
+        .await?
+        .expect("provider allowance after background guard refresh"))
 }
 
 async fn refresh_allowance(
@@ -1024,30 +1021,26 @@ async fn allowance_reset_reads_once_at_deadline_without_optimistically_resuming(
     assert!(chrono::Utc::now().timestamp_millis() >= reset);
     let held = gateway
         .admin()
-        .get_provider_allowance(&provider.id)
-        .await?
-        .unwrap();
+        .get_provider_allowance_suspension(&provider.id)
+        .await?;
+    assert!(held.is_some(), "the deadline is not recovery evidence");
+    // A normal GET now joins the timer's registered refresh instead of
+    // returning the still-fresh cache while that upstream response is held.
+    let gw = gateway.clone();
+    let id = provider.id.clone();
+    let mut read = tokio::spawn(async move { gw.admin().get_provider_allowance(&id).await });
     assert!(
-        held.suspension.is_some(),
-        "the deadline is not recovery evidence"
+        tokio::time::timeout(std::time::Duration::from_millis(100), &mut read)
+            .await
+            .is_err()
     );
     request.reply(UpstreamReply::json(
         serde_json::json!({"remaining":"0", "resets_at":reset}),
     ));
-    let confirmed = tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        loop {
-            let snapshot = gateway
-                .admin()
-                .get_provider_allowance(&provider.id)
-                .await?
-                .unwrap();
-            if snapshot.fetched_at != initial.fetched_at {
-                break Ok::<_, anyhow::Error>(snapshot);
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await??;
+    let confirmed = tokio::time::timeout(std::time::Duration::from_secs(10), read)
+        .await???
+        .expect("reset allowance evidence");
+    assert_ne!(confirmed.fetched_at, initial.fetched_at);
     assert!(confirmed.suspension.is_some());
     assert!(
         tokio::time::timeout(std::time::Duration::from_millis(250), upstream.next())
@@ -1179,6 +1172,14 @@ async fn allowance_guards_preserve_enabled_intent_models_and_credential_invalid_
         )
         .await?;
     assert!(!disabled.is_enabled);
+    let disabled_save = gateway
+        .admin()
+        .replace_provider_allowance_guards(&provider.id, vec!["requests".into()])
+        .await?
+        .unwrap();
+    assert_eq!(disabled_save.keys, vec!["requests"]);
+    assert!(!disabled_save.target.refreshing);
+    assert!(disabled_save.target.suspension.is_some());
     assert!(
         gateway
             .admin()
@@ -1222,7 +1223,9 @@ async fn allowance_guards_preserve_enabled_intent_models_and_credential_invalid_
         .replace_provider_allowance_guards(&provider.id, vec!["requests".into()])
         .await?
         .unwrap();
-    assert!(held.suspension.is_some());
+    assert_eq!(held.keys, vec!["requests"]);
+    assert!(!held.target.refreshing);
+    assert!(held.target.suspension.is_some());
     let statuses = gateway
         .admin()
         .get_model_target_statuses(&route.model_id)
@@ -1243,7 +1246,7 @@ async fn allowance_guards_preserve_enabled_intent_models_and_credential_invalid_
         .replace_provider_allowance_guards(&provider.id, Vec::new())
         .await?
         .unwrap();
-    assert!(cleared.suspension.is_none());
+    assert!(cleared.target.suspension.is_none());
     assert!(
         gateway
             .admin()
@@ -1313,6 +1316,123 @@ async fn provider_connection_change_forces_allowance_read_without_early_recovery
         .await?
         .unwrap();
     assert!(snapshot.suspension.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn allowance_guard_save_returns_before_upstream_and_get_joins_registered_refresh()
+-> anyhow::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let gateway = new_gateway(directory.path().to_owned()).await?;
+    install(&gateway, "management-v2.wasm", false).await?;
+    let mut upstream = TestUpstream::start().await;
+    let provider = create_oauth_provider(
+        &gateway,
+        &mut upstream,
+        MANAGEMENT_VENDOR,
+        "Background guard save",
+        "guard-token",
+    )
+    .await?;
+    let saved = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        gateway.admin().replace_provider_allowance_guards(
+            &provider.id,
+            vec!["requests".into(), "requests".into()],
+        ),
+    )
+    .await??
+    .expect("guard confirmation without upstream response");
+    assert_eq!(saved.keys, vec!["requests"]);
+    assert!(saved.target.snapshot.is_none());
+    assert!(saved.target.refreshing);
+    let request = tokio::time::timeout(std::time::Duration::from_secs(10), upstream.next()).await?;
+    assert_eq!(request.operation(), "allowance");
+    let gw = gateway.clone();
+    let id = provider.id.clone();
+    let mut read = tokio::spawn(async move { gw.admin().get_provider_allowance(&id).await });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), &mut read)
+            .await
+            .is_err()
+    );
+    upstream.assert_no_request();
+    request.reply(UpstreamReply::allowance("0"));
+    let snapshot = read.await??.expect("fresh guard evidence");
+    assert_eq!(
+        snapshot.status,
+        stravia_core::admin::provider_allowance::ProviderAllowanceStatus::Fresh
+    );
+    assert!(snapshot.allowances[0].guarded);
+    assert!(snapshot.suspension.is_some());
+
+    // Even a fresh cache must trigger one actual forced read on save.
+    let saved = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        gateway
+            .admin()
+            .replace_provider_allowance_guards(&provider.id, vec!["requests".into()]),
+    )
+    .await??
+    .unwrap();
+    assert!(saved.target.refreshing);
+    assert!(saved.target.snapshot.as_ref().unwrap().suspension.is_some());
+    let request = tokio::time::timeout(std::time::Duration::from_secs(10), upstream.next()).await?;
+    assert_eq!(request.operation(), "allowance");
+    let targets = gateway.admin().list_provider_allowance_targets().await?;
+    assert!(
+        targets
+            .iter()
+            .find(|target| target.provider_id == provider.id)
+            .unwrap()
+            .refreshing
+    );
+    let gw = gateway.clone();
+    let id = provider.id.clone();
+    let mut read = tokio::spawn(async move { gw.admin().get_provider_allowance(&id).await });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), &mut read)
+            .await
+            .is_err()
+    );
+    let cleared = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        gateway
+            .admin()
+            .replace_provider_allowance_guards(&provider.id, Vec::new()),
+    )
+    .await??
+    .unwrap();
+    assert!(cleared.keys.is_empty());
+    assert!(cleared.target.refreshing);
+    assert!(cleared.target.suspension.is_none());
+    let projected = cleared.target.snapshot.unwrap();
+    assert!(projected.suspension.is_none());
+    assert!(!projected.allowances[0].guarded);
+    assert!(
+        gateway
+            .admin()
+            .get_provider_allowance_suspension(&provider.id)
+            .await?
+            .is_none()
+    );
+    upstream.assert_no_request();
+    request.reply(UpstreamReply::allowance("0"));
+    let snapshot = read.await??.unwrap();
+    assert_eq!(
+        snapshot.status,
+        stravia_core::admin::provider_allowance::ProviderAllowanceStatus::Fresh
+    );
+    assert!(!snapshot.allowances[0].guarded);
+    assert!(snapshot.suspension.is_none());
+    assert!(snapshot.missing_guarded_keys.is_empty());
+    let cached = gateway
+        .admin()
+        .get_provider_allowance(&provider.id)
+        .await?
+        .unwrap();
+    assert_eq!(cached, snapshot);
+    upstream.assert_no_request();
     Ok(())
 }
 

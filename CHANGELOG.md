@@ -44,6 +44,8 @@
 
 ### Fixed
 
+- Allowance guard toggles now confirm the local save without waiting for an upstream allowance request. The UI distinguishes saving from background refresh, keeps confirmed guards editable while refresh runs, and applies fresh allowance evidence when it arrives; removing the last triggering guard clears the persisted pause immediately. **Breaking — management API:** `PUT /api/v1/provider-allowances/{id}/guards` now returns `{ keys, target }` rather than a post-refresh snapshot. Single-provider GET joins the registered refresh. No database migration or upstream timeout change is required.
+
 - OpenAI-compatible JSON-schema response formats now retain their protected `description` alongside canonical name, schema and strict controls instead of losing the description during encoding. Rebuild and re-import affected standalone Vendor plugins to receive the fix.
 - Admin and Chromium CI now prepare isolated test-host server artifacts and use the standard E2E tasks, avoiding missing server binaries and rejected test-only catalog arguments. Compaction and media-protection regressions now distinguish unsupported standalone operations from inline protocol omission and verify content semantics without requiring an incidental string carrier.
 - Devin's daily and weekly allowance windows no longer disappear when exhausted: the plugin recognizes an omitted zero remaining percentage when the upstream still reports the window's reset time, while leaving unreported windows absent. Rebuild and re-import the standalone `devin` plugin, then refresh allowances; existing guard keys and account configuration remain unchanged.

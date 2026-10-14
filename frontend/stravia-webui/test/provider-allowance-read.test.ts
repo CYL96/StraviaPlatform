@@ -58,8 +58,8 @@ function invalidAllowance(id: string): ProviderAllowanceSnapshot {
   }
 }
 
-function harness(ids: string[], overrides: Partial<ProviderAllowanceReadApi> = {}) {
-  const client = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: Infinity } } })
+function harness(ids: string[], overrides: Partial<ProviderAllowanceReadApi> = {}, staleTime = 0) {
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: Infinity, staleTime } } })
   const calls = { reads: [] as string[], refreshes: [] as string[], guards: [] as { id: string; keys: string[] }[] }
   const deferreds: { finish(): void }[] = []
   function deferred<T>(fallback: T) {
@@ -93,7 +93,9 @@ function harness(ids: string[], overrides: Partial<ProviderAllowanceReadApi> = {
       replaceGuards: (id, keys) => {
         calls.guards.push({ id, keys })
         guardInvoked.resolve()
-        return overrides.replaceGuards?.(id, keys) ?? Promise.resolve(allowance(id, 'saved'))
+        return (
+          overrides.replaceGuards?.(id, keys) ?? Promise.resolve({ keys, target: { ...target(id), refreshing: true } })
+        )
       },
     },
     onSnapshot: () => {
@@ -214,11 +216,13 @@ describe('provider allowance reads', () => {
   })
 
   test('guard saves and manual refresh exclude each other per provider without blocking another provider', async () => {
+    const saved = allowance('a', 'saved')
+    saved.allowances[0].guarded = false
     const h = harness(['a', 'b'], {
       replaceGuards: () => save.promise,
       refresh: (id) => (id === 'a' ? refresh.promise : Promise.resolve(allowance(id, 'other refreshed'))),
     })
-    const save = h.deferred(allowance('a', 'saved'))
+    const save = h.deferred({ keys: ['missing'], target: { ...target('a'), snapshot: saved, refreshing: true } })
     const refresh = h.deferred(allowance('a', 'refreshed'))
     try {
       await h.ready()
@@ -226,7 +230,7 @@ describe('provider allowance reads', () => {
       await h.guardInvoked.promise
       expect(await h.controller.refreshProvider('a')).toEqual({ status: 'ignored' })
       expect(await h.controller.refreshProvider('b')).toEqual({ status: 'refreshed' })
-      save.resolve(allowance('a', 'saved'))
+      save.resolve({ keys: ['missing'], target: { ...target('a'), snapshot: saved, refreshing: true } })
       await saving
       const refreshing = h.controller.refreshProvider('a')
       await h.waitFor(() => h.entry('a').refreshing)
@@ -242,7 +246,7 @@ describe('provider allowance reads', () => {
 
   test('guard edits preserve missing keys and a failed save preserves confirmed guards', async () => {
     const error = new Error('guard write rejected')
-    const h = harness(['a'], { replaceGuards: () => Promise.reject(error) })
+    const h = harness(['a'], { replaceGuards: () => Promise.reject(error) }, 10_000)
     try {
       await h.ready()
       await h.controller.setGuard('a', 'quota', false)
@@ -253,6 +257,7 @@ describe('provider allowance reads', () => {
       await h.controller.setGuard('a', 'new', true)
       expect(new Set(h.calls.guards[1].keys)).toEqual(new Set(['quota', 'missing', 'new']))
       expect(h.entry('a').snapshot?.allowances[0].guarded).toBe(true)
+      expect(h.calls.reads).toEqual(['a'])
     } finally {
       await h.cleanup()
     }
@@ -260,21 +265,30 @@ describe('provider allowance reads', () => {
 
   test('a cancelled late GET cannot overwrite saved guards or remember stale invalid credentials', async () => {
     let reads = 0
+    const lateStarted = Promise.withResolvers<void>()
     const h = harness(['a'], {
-      get: () => (++reads === 2 ? late.promise : Promise.resolve(reads === 1 ? allowance('a') : saved)),
+      get: () => {
+        reads += 1
+        if (reads === 2) {
+          lateStarted.resolve()
+          return late.promise
+        }
+        return Promise.resolve(reads === 1 ? allowance('a') : saved)
+      },
       replaceGuards: () => save.promise,
     })
     const late = h.deferred(invalidAllowance('a'))
     const saved = allowance('a', 'saved guards')
     saved.allowances[0].guarded = false
-    const save = h.deferred(saved)
+    const save = h.deferred({ keys: ['missing'], target: { ...target('a'), snapshot: saved, refreshing: true } })
     try {
       await h.ready()
       const retry = h.controller.retryProvider('a')
+      await lateStarted.promise
       await h.waitFor(() => h.entry('a').refreshing)
       const saving = h.controller.setGuard('a', 'quota', false)
       await h.guardInvoked.promise
-      save.resolve(saved)
+      save.resolve({ keys: ['missing'], target: { ...target('a'), snapshot: saved, refreshing: true } })
       await saving
       late.resolve(invalidAllowance('a'))
       await retry
@@ -283,6 +297,163 @@ describe('provider allowance reads', () => {
       expect(h.entry('a').credentialInvalid).toBe(false)
       expect(await h.controller.refreshProvider('a')).toEqual({ status: 'refreshed' })
       expect(h.calls.refreshes).toEqual(['a'])
+    } finally {
+      await h.cleanup()
+    }
+  })
+
+  test('PUT confirmation unlocks editing while GET and metadata remain pending', async () => {
+    let reads = 0
+    let lists = 0
+    const h = harness(['a'], {
+      get: () => (++reads === 1 ? Promise.resolve(allowance('a')) : background.promise),
+      list: () => (++lists === 1 ? Promise.resolve([target('a')]) : metadata.promise),
+      replaceGuards: () => save.promise,
+    })
+    const save = h.deferred({ keys: ['missing'], target: { ...target('a'), refreshing: true } })
+    const final = allowance('a', 'fresh evidence')
+    final.allowances[0].guarded = false
+    final.suspension = { suspended_at: '2026-09-01T12:00:00Z', triggered_keys: ['missing'], earliest_reset_at: null }
+    const background = h.deferred(final)
+    const metadata = h.deferred([{ ...target('a'), suspension: final.suspension, snapshot: final }])
+    try {
+      await h.ready()
+      const saving = h.controller.setGuard('a', 'quota', false)
+      await h.guardInvoked.promise
+      expect(h.entry('a').savingGuards).toBe(true)
+      expect(h.entry('a').snapshot?.allowances[0].guarded).toBe(true)
+      save.resolve({ keys: ['missing'], target: { ...target('a'), refreshing: true } })
+      await saving
+      expect(h.entry('a').savingGuards).toBe(false)
+      expect(h.entry('a').canSaveGuards).toBe(true)
+      expect(h.entry('a').snapshot?.allowances[0].guarded).toBe(false)
+      expect(h.entry('a').snapshot?.plan_label).toBe('confirmed')
+      expect(h.entry('a').refreshing).toBe(true)
+      background.resolve(final)
+      await h.waitFor(() => h.entry('a').snapshot?.plan_label === 'fresh evidence')
+      expect(h.entry('a').snapshot?.suspension).toEqual(final.suspension)
+      expect(h.entry('a').canSaveGuards).toBe(true)
+      expect(h.calls.refreshes).toEqual([])
+      metadata.resolve([{ ...target('a'), suspension: final.suspension, snapshot: final }])
+    } finally {
+      await h.cleanup()
+    }
+  })
+
+  test('successive saves retain the latest confirmed keys and suspension against late GET', async () => {
+    let reads = 0
+    const paused = allowance('a')
+    paused.suspension = { suspended_at: '2026-09-01T12:00:00Z', triggered_keys: ['quota'], earliest_reset_at: null }
+    const obsolete = { ...invalidAllowance('a'), suspension: paused.suspension }
+    const h = harness(['a'], {
+      get: () => (++reads === 1 ? Promise.resolve(paused) : reads === 2 ? firstRead.promise : lastRead.promise),
+      replaceGuards: (_id, keys) =>
+        Promise.resolve({
+          keys: keys.filter((key) => key !== 'missing'),
+          target: { ...target('a'), refreshing: true },
+        }),
+    })
+    const firstRead = h.deferred(obsolete)
+    const final = allowance('a', 'last evidence')
+    final.allowances[0].guarded = false
+    final.missing_guarded_keys = ['new']
+    const lastRead = h.deferred(final)
+    try {
+      await h.ready()
+      await h.controller.setGuard('a', 'quota', false)
+      expect(h.entry('a').snapshot?.missing_guarded_keys).toEqual([])
+      await h.controller.setGuard('a', 'new', true)
+      expect(h.entry('a').snapshot?.missing_guarded_keys).toEqual(['new'])
+      expect(h.calls.guards[1].keys).toEqual(['new'])
+      firstRead.resolve(obsolete)
+      await firstRead.promise
+      expect(h.entry('a').credentialInvalid).toBe(false)
+      expect(h.entry('a').snapshot?.suspension).toBeNull()
+      expect(h.entry('a').target.suspension).toBeNull()
+      expect(h.entry('a').snapshot?.missing_guarded_keys).toEqual(['new'])
+      expect(h.entry('a').canSaveGuards).toBe(true)
+      lastRead.resolve(final)
+      await h.waitFor(() => h.entry('a').snapshot?.plan_label === 'last evidence')
+      expect(h.entry('a').credentialInvalid).toBe(false)
+      expect(h.entry('a').snapshot?.missing_guarded_keys).toEqual(['new'])
+    } finally {
+      await h.cleanup()
+    }
+  })
+
+  test('a failed second save resumes the first confirmed background read with production stale time', async () => {
+    let reads = 0
+    let saves = 0
+    const initialRead = Promise.withResolvers<void>()
+    const resumedRead = Promise.withResolvers<void>()
+    const error = new Error('second guard write rejected')
+    const final = allowance('a', 'fresh exhausted evidence')
+    final.missing_guarded_keys = []
+    final.allowances[0].remaining = { value: 0, unit: 'requests' }
+    final.allowances[0].condition = 'exhausted'
+    final.suspension = { suspended_at: '2026-09-01T12:00:00Z', triggered_keys: ['quota'], earliest_reset_at: null }
+    const h = harness(
+      ['a'],
+      {
+        get: () => {
+          reads += 1
+          if (reads === 1) return Promise.resolve(allowance('a'))
+          if (reads === 2) initialRead.resolve()
+          else resumedRead.resolve()
+          return background.promise
+        },
+        replaceGuards: (_id, keys) =>
+          ++saves === 1
+            ? Promise.resolve({ keys, target: { ...target('a'), refreshing: true } })
+            : Promise.reject(error),
+      },
+      10_000,
+    )
+    const background = h.deferred(final)
+    try {
+      await h.ready()
+      await h.controller.setGuard('a', 'missing', false)
+      await initialRead.promise
+      expect(h.entry('a').snapshot?.allowances[0].guarded).toBe(true)
+      expect(h.entry('a').snapshot?.missing_guarded_keys).toEqual([])
+      expect(h.entry('a').snapshot?.suspension).toBeNull()
+      await h.controller.setGuard('a', 'quota', false)
+      await resumedRead.promise
+      expect(h.entry('a').guardError).toBe(error)
+      expect(h.entry('a').canSaveGuards).toBe(true)
+      expect(h.entry('a').snapshot?.allowances[0].guarded).toBe(true)
+      expect(h.entry('a').snapshot?.missing_guarded_keys).toEqual([])
+      background.resolve(final)
+      await h.waitFor(() => h.entry('a').snapshot?.plan_label === 'fresh exhausted evidence')
+      expect(h.entry('a').snapshot?.suspension).toEqual(final.suspension)
+      expect(h.entry('a').snapshot?.allowances[0].remaining?.value).toBe(0)
+      expect(h.entry('a').snapshot?.allowances[0].guarded).toBe(true)
+      expect(h.entry('a').snapshot?.missing_guarded_keys).toEqual([])
+      expect(h.entry('a').guardError).toBe(error)
+      expect(h.calls.refreshes).toEqual([])
+    } finally {
+      await h.cleanup()
+    }
+  })
+
+  test('background metadata failure is distinct from a successful guard write', async () => {
+    let lists = 0
+    let reads = 0
+    const error = new Error('background metadata unavailable')
+    const saved = allowance('a')
+    saved.allowances[0].guarded = false
+    const h = harness(['a'], {
+      get: () => Promise.resolve(++reads === 1 ? allowance('a') : saved),
+      list: () => (++lists === 1 ? Promise.resolve([target('a')]) : Promise.reject(error)),
+    })
+    try {
+      await h.ready()
+      await h.controller.setGuard('a', 'quota', false)
+      await h.waitFor(() => h.entry('a').refreshError != null)
+      expect(h.entry('a').guardError).toBeUndefined()
+      expect(h.entry('a').refreshError).toBe(error)
+      expect(h.entry('a').snapshot?.allowances[0].guarded).toBe(false)
+      expect(h.entry('a').canSaveGuards).toBe(true)
     } finally {
       await h.cleanup()
     }
@@ -345,12 +516,6 @@ describe('provider allowance reads', () => {
       await retry
       expect(await refreshing).toEqual({ status: 'ignored' })
       expect(active.notifications()).toBe(notifications)
-      expect(active.client.getQueryData<ProviderAllowanceSnapshot>(['provider-allowance', 'a'])?.plan_label).toBe(
-        'late read',
-      )
-      expect(active.client.getQueryData<ProviderAllowanceSnapshot>(['provider-allowance', 'b'])?.plan_label).toBe(
-        'late write',
-      )
       expect(await active.controller.refreshProvider('a')).toEqual({ status: 'ignored' })
       await active.controller.setGuard('a', 'quota', false)
       expect(active.calls.guards).toEqual([])

@@ -1,5 +1,10 @@
 import { QueryObserver, type QueryClient } from '@tanstack/svelte-query'
-import type { Provider, ProviderAllowanceSnapshot, ProviderAllowanceTarget } from './types'
+import type {
+  Provider,
+  ProviderAllowanceGuardUpdate,
+  ProviderAllowanceSnapshot,
+  ProviderAllowanceTarget,
+} from './types'
 
 const REFRESH_INTERVAL = 180_000
 const CREDENTIAL_INVALID_MESSAGE = 'Credential invalid; allowance fetching is paused until the credential is updated.'
@@ -14,7 +19,7 @@ export interface ProviderAllowanceReadApi {
   list(): Promise<ProviderAllowanceTarget[]>
   get(id: string): Promise<ProviderAllowanceSnapshot>
   refresh(id: string): Promise<ProviderAllowanceSnapshot>
-  replaceGuards(id: string, keys: string[]): Promise<ProviderAllowanceSnapshot>
+  replaceGuards(id: string, keys: string[]): Promise<ProviderAllowanceGuardUpdate>
 }
 
 export interface ProviderAllowanceReadEntry {
@@ -28,6 +33,8 @@ export interface ProviderAllowanceReadEntry {
   canSaveGuards: boolean
   canRetry: boolean
   guardError?: unknown
+  refreshError?: unknown
+  savingGuards: boolean
 }
 
 export interface ProviderAllowanceReadSnapshot {
@@ -65,9 +72,12 @@ export class ProviderAllowanceReadController {
   readonly #snapshots = new Map<string, QueryObserver<ProviderAllowanceSnapshot>>()
   readonly #discoveredInvalidAt = new Map<string, number>()
   readonly #readEpochs = new Map<string, number>()
+  readonly #guardReadEpochs = new Map<string, number>()
   readonly #savingGuards = new Set<string>()
   readonly #refreshingProviders = new Set<string>()
   readonly #guardErrors = new Map<string, unknown>()
+  readonly #refreshErrors = new Map<string, unknown>()
+  #metadataEpoch = 0
   #refreshingAll = false
   #started = false
   #disposed = false
@@ -77,14 +87,23 @@ export class ProviderAllowanceReadController {
     this.#deps = deps
     this.#providers = new QueryObserver<AllowanceProvider[]>(deps.client, {
       queryKey: providersKey,
-      queryFn: () => deps.api.providers(),
+      queryFn: async () => {
+        const epoch = this.#metadataEpoch
+        const providers = await deps.api.providers()
+        return epoch === this.#metadataEpoch
+          ? providers
+          : (deps.client.getQueryData<AllowanceProvider[]>(providersKey) ?? providers)
+      },
       refetchInterval: REFRESH_INTERVAL,
       enabled: false,
     })
     this.#targets = new QueryObserver<ProviderAllowanceTarget[]>(deps.client, {
       queryKey: targetsKey,
       queryFn: async () => {
+        const epoch = this.#metadataEpoch
         const targets = await deps.api.list()
+        if (epoch !== this.#metadataEpoch)
+          return deps.client.getQueryData<ProviderAllowanceTarget[]>(targetsKey) ?? targets
         if (!this.#disposed) {
           for (const target of targets) {
             if (invalidSnapshot(target.snapshot) && !this.#discoveredInvalidAt.has(target.provider_id)) {
@@ -110,9 +129,14 @@ export class ProviderAllowanceReadController {
       const cached = result?.data ?? target.snapshot
       const snapshot = invalid && cached?.status === 'fresh' ? { ...cached, status: 'stale' as const } : cached
       const failed = snapshot == null && Boolean(result?.isError)
-      const refreshing = !invalid && (this.#refreshingProviders.has(id) || Boolean(result?.isFetching))
+      const refreshing =
+        !invalid &&
+        (this.#refreshingProviders.has(id) ||
+          Boolean(result?.isFetching) ||
+          (target.refreshing && (!result?.data || result.dataUpdatedAt < targets.dataUpdatedAt)))
       return {
-        target,
+        // 单项读取只更新自己的query；写targets会重置其180秒轮询计时。
+        target: snapshot ? { ...target, snapshot, suspension: snapshot.suspension, refreshing } : target,
         snapshot,
         pending: snapshot == null && !failed && !invalid,
         failed,
@@ -128,6 +152,8 @@ export class ProviderAllowanceReadController {
         canSaveGuards: !this.#disposed && !this.#busy(id),
         canRetry: !this.#disposed && Boolean(result) && !invalid && !this.#savingGuards.has(id),
         guardError: this.#guardErrors.get(id),
+        refreshError: this.#refreshErrors.get(id),
+        savingGuards: this.#savingGuards.has(id),
       }
     })
     return {
@@ -242,21 +268,76 @@ export class ProviderAllowanceReadController {
     ])
     if (checked) keys.add(key)
     else keys.delete(key)
+    const interruptedGuardRead = this.#guardReadEpochs.has(id)
     this.#savingGuards.add(id)
     this.#guardErrors.delete(id)
     // cancelQueries 阻止旧 GET 写缓存；代际还阻止旧 GET 的凭据失效副作用。
     this.#readEpochs.set(id, (this.#readEpochs.get(id) ?? 0) + 1)
     this.#changed()
+    let confirmed = false
+    let epoch = this.#readEpochs.get(id) ?? 0
     try {
       await this.#deps.client.cancelQueries({ queryKey: snapshotKey(id) })
       if (this.#disposed) return
-      this.#publish(await this.#deps.api.replaceGuards(id, [...keys]))
-      await this.#refreshMetadata()
+      const update = await this.#deps.api.replaceGuards(id, [...keys])
+      if (this.#disposed) return
+      this.#metadataEpoch += 1
+      // 取消已在飞的元数据，不等待网络；防止旧 providers 更新时间洗掉新凭据证据。
+      await Promise.all([
+        this.#deps.client.cancelQueries({ queryKey: providersKey, exact: true }),
+        this.#deps.client.cancelQueries({ queryKey: targetsKey, exact: true }),
+      ])
+      if (this.#disposed) return
+      // 保存响应只确认配置；旧数值的时间戳与 freshness 原样保留。
+      epoch = (this.#readEpochs.get(id) ?? 0) + 1
+      this.#readEpochs.set(id, epoch)
+      const confirmedKeys = new Set(update.keys)
+      const cached = update.target.snapshot ?? current
+      const snapshot = update.target.snapshot ?? {
+        ...cached,
+        suspension: update.target.suspension,
+        allowances: cached.allowances.map((item) => ({ ...item, guarded: confirmedKeys.has(item.key) })),
+        models: cached.models.map((model) => ({
+          ...model,
+          allowances: model.allowances.map((item) => ({ ...item, guarded: confirmedKeys.has(item.key) })),
+        })),
+        missing_guarded_keys: update.keys.filter((key) => !cached.allowances.some((item) => item.key === key)),
+      }
+      this.#deps.client.setQueryData<ProviderAllowanceTarget[]>(targetsKey, (targets) =>
+        targets?.map((target) => (target.provider_id === id ? { ...update.target, snapshot } : target)),
+      )
+      this.#publish(snapshot)
+      this.#refreshErrors.delete(id)
+      confirmed = true
     } catch (error) {
       if (!this.#disposed) this.#guardErrors.set(id, error)
     } finally {
       this.#savingGuards.delete(id)
       this.#changed()
+    }
+    // 失败写入没有改变已确认守护；恢复它打断的那次读取，不对普通保存失败额外读上游。
+    if (confirmed || interruptedGuardRead) void this.#finishGuardRefresh(id, epoch)
+  }
+
+  async #finishGuardRefresh(id: string, epoch: number): Promise<void> {
+    const current = () => !this.#disposed && epoch === this.#readEpochs.get(id)
+    this.#guardReadEpochs.set(id, epoch)
+    try {
+      const result = await this.#snapshots.get(id)?.refetch({ cancelRefetch: false })
+      if (this.#guardReadEpochs.get(id) === epoch) this.#guardReadEpochs.delete(id)
+      if (!current()) return
+      if (result?.isError) throw result.error
+      await this.#refreshMetadata()
+    } catch (error) {
+      if (current()) this.#refreshErrors.set(id, error)
+    } finally {
+      if (this.#guardReadEpochs.get(id) === epoch) this.#guardReadEpochs.delete(id)
+      if (current()) {
+        this.#deps.client.setQueryData<ProviderAllowanceTarget[]>(targetsKey, (targets) =>
+          targets?.map((target) => (target.provider_id === id ? { ...target, refreshing: false } : target)),
+        )
+        this.#changed()
+      }
     }
   }
 
@@ -291,8 +372,8 @@ export class ProviderAllowanceReadController {
 
   async #refreshMetadata(): Promise<void> {
     await Promise.all([
-      this.#deps.client.invalidateQueries({ queryKey: providersKey }),
-      this.#deps.client.invalidateQueries({ queryKey: targetsKey, exact: true }),
+      this.#deps.client.invalidateQueries({ queryKey: providersKey }, { throwOnError: true }),
+      this.#deps.client.invalidateQueries({ queryKey: targetsKey, exact: true }, { throwOnError: true }),
     ])
   }
 
@@ -320,10 +401,10 @@ export class ProviderAllowanceReadController {
             queryFn: async () => {
               const epoch = this.#readEpochs.get(id) ?? 0
               const snapshot = await this.#deps.api.get(id)
-              if (!this.#disposed && epoch === (this.#readEpochs.get(id) ?? 0)) {
-                this.#remember(snapshot)
-                this.#changed()
+              if (this.#disposed || epoch !== (this.#readEpochs.get(id) ?? 0)) {
+                return this.#deps.client.getQueryData<ProviderAllowanceSnapshot>(snapshotKey(id)) ?? snapshot
               }
+              this.#remember(snapshot)
               return snapshot
             },
             initialData: target.snapshot,

@@ -4,6 +4,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Context;
 use base64::Engine as _;
 use rcgen::{CertifiedKey, generate_simple_self_signed};
 use serde_json::{Value, json};
@@ -439,6 +440,236 @@ async fn deepseek_allowance_uses_real_tls_get_and_preserves_multi_currency_unkno
     );
     assert!(request.body.is_empty());
     server.task.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn guard_save_after_suspension_submission_gets_successor_evidence() -> anyhow::Result<()> {
+    let release_successor = Arc::new(Notify::new());
+    let server_release = release_successor.clone();
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let server_calls = calls.clone();
+    let mut server = local_tls_server(2, move |_| {
+        let successor = server_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) != 0;
+        // Devin retains exhausted daily/weekly windows, unlike DeepSeek's
+        // zero-balance currency filtering. Omitted percentages are proto3 zero.
+        let mut plan = proto_u64(1, 17);
+        plan.extend(proto_string(2, "Guard publication contract"));
+        plan.extend(proto_u64(12, 100));
+        plan.extend(proto_u64(13, 10));
+        let mut status = proto_len(1, &plan);
+        if successor {
+            status.extend(proto_u64(14, 10));
+        }
+        status.extend(proto_u64(17, 2_000_000_000));
+        status.extend(proto_u64(18, 2_000_100_000));
+        let user = proto_len(13, &status);
+        let mut response = LocalResponse::protobuf(proto_len(1, &user));
+        if successor {
+            response.release = Some(server_release.clone());
+        }
+        response
+    })
+    .await?;
+    // Exercise the production SQLite provider repository while retaining an
+    // independently gateable memory sample store for the publication boundary.
+    let directory = tempfile::tempdir()?;
+    let mut gateway = Gateway::new(GatewayConfig {
+        data_dir: directory.path().to_path_buf(),
+        ..Default::default()
+    })
+    .await?;
+    // Keep the sample tail independently gateable without locking provider DB writes.
+    gateway.allowance_samples = crate::admin::provider_allowance::AllowanceSampleStore::memory();
+    crate::plugin::test_support::install_distributed_vendor(&gateway, "devin").await?;
+    let root = reqwest::tls::Certificate::from_der(&server.certificate_der)?;
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .https_only(true)
+        .http1_only()
+        .tls_certs_only([root])
+        .dns_resolver(LoopbackOnlyResolver {
+            address: server.address,
+        })
+        .build()?;
+    gateway.vendor_http_client = client.clone();
+    gateway.vendor_websocket_client = client;
+    let authorization = gateway
+        .admin()
+        .init_oauth_session(
+            AuthSessionCandidate {
+                vendor_id: "devin".into(),
+                channel: "devin".into(),
+                provider_id: None,
+                base_url: DEVIN_BASE_URL.into(),
+                protocol: Some("devin-connect".into()),
+                options: Default::default(),
+                credentials: Default::default(),
+                use_proxy: false,
+            },
+            OAuthSessionStartOptions {
+                callback_mode: OAuthCallbackMode::Manual,
+                redirect_uri: "chisel-show-auth-token".into(),
+                listener_port: None,
+                fallback_reason: None,
+            },
+        )
+        .await?;
+    gateway
+        .admin()
+        .complete_oauth_session(
+            &authorization.session_id,
+            AuthCompletionInput {
+                input: AuthCompletionValue::Manual {
+                    value: "session_token=devin-contract-token".into(),
+                },
+            },
+        )
+        .await?;
+    let provider = gateway
+        .admin()
+        .create_provider_with_oauth_session(
+            &authorization.session_id,
+            devin_oauth_provider("Guard publication barrier"),
+        )
+        .await?;
+    let crate::admin::provider_allowance::AllowanceSampleStore::Memory(rows) =
+        &gateway.allowance_samples
+    else {
+        panic!("memory gateway must use the real memory sample store")
+    };
+    // This is the real sample-store write lock: hold A after its suspension
+    // submission but before forecasts/cache publication, without blocking guards.
+    let publication_gate = rows.write().await;
+    let first = gateway
+        .admin()
+        .replace_provider_allowance_guards(&provider.id, vec!["daily".into()])
+        .await
+        .context("guard successor regression: saving A guard keys")?
+        .unwrap();
+    assert!(first.target.refreshing);
+    let request = tokio::time::timeout(Duration::from_secs(10), server.requests.recv())
+        .await
+        .context("guard successor regression: waiting for first upstream request")?
+        .expect("first allowance request");
+    assert_eq!(request.path, DEVIN_ALLOWANCE_PATH);
+    // Observe committed consumer-visible evidence, not inflight internals.
+    // The lifecycle also consumes state.changed(), so its Notify cannot serve
+    // as an exclusive test gate. This bounded yield loop waits only for proof
+    // that A submitted; the held real sample lock keeps its publication pending.
+    let submitted = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(suspension) = gateway
+                .admin()
+                .get_provider_allowance_suspension(&provider.id)
+                .await?
+            {
+                break Ok::<_, anyhow::Error>(suspension);
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .context("guard successor regression: waiting for A persisted suspension")??;
+    assert_eq!(submitted.triggered_keys, vec!["daily"]);
+    let keys = vec!["daily".into(), "weekly".into()];
+    let saved = tokio::time::timeout(
+        Duration::from_secs(5),
+        gateway
+            .admin()
+            .replace_provider_allowance_guards(&provider.id, keys),
+    )
+    .await
+    .context("guard successor regression: waiting for B guard save")??
+    .unwrap();
+    assert_eq!(saved.keys, vec!["daily", "weekly"]);
+    assert!(saved.target.refreshing);
+    // C must merge with B while B waits for A's complete publication.
+    let merged = tokio::time::timeout(
+        Duration::from_secs(5),
+        gateway
+            .admin()
+            .replace_provider_allowance_guards(&provider.id, saved.keys.clone()),
+    )
+    .await
+    .context("guard successor regression: waiting for C guard save")??
+    .unwrap();
+    assert_eq!(merged.keys, saved.keys);
+    assert!(server.requests.try_recv().is_err());
+    let gw = gateway.clone();
+    let id = provider.id.clone();
+    let mut pending = tokio::spawn(async move { gw.admin().get_provider_allowance(&id).await });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut pending)
+            .await
+            .is_err()
+    );
+    drop(publication_gate);
+    let request = tokio::time::timeout(Duration::from_secs(10), server.requests.recv())
+        .await
+        .context("guard successor regression: waiting for successor upstream request")?
+        .expect("successor allowance request");
+    assert_eq!(request.path, DEVIN_ALLOWANCE_PATH);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    // A's cleanup must not remove B: a later GET still joins held B, not A's cache.
+    let gw = gateway.clone();
+    let id = provider.id.clone();
+    let mut later = tokio::spawn(async move { gw.admin().get_provider_allowance(&id).await });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut later)
+            .await
+            .is_err()
+    );
+    release_successor.notify_one();
+    let snapshot = tokio::time::timeout(Duration::from_secs(10), pending)
+        .await
+        .context("guard successor regression: waiting for B snapshot")???
+        .unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(10), later)
+            .await
+            .context("guard successor regression: waiting for later GET snapshot")???
+            .unwrap(),
+        snapshot
+    );
+    assert_eq!(snapshot.status, ProviderAllowanceStatus::Fresh);
+    let daily = snapshot
+        .allowances
+        .iter()
+        .find(|item| item.key == "daily")
+        .unwrap();
+    assert_eq!(daily.used_percent, Some(90.0));
+    assert!(
+        snapshot
+            .allowances
+            .iter()
+            .filter(|item| matches!(item.key.as_str(), "daily" | "weekly"))
+            .all(|item| item.guarded)
+    );
+    assert_eq!(
+        snapshot.suspension.as_ref().unwrap().triggered_keys,
+        vec!["weekly"]
+    );
+    assert_eq!(
+        gateway
+            .admin()
+            .get_provider_allowance_suspension(&provider.id)
+            .await?
+            .unwrap()
+            .triggered_keys,
+        vec!["weekly"]
+    );
+    assert_eq!(
+        gateway
+            .admin()
+            .get_provider_allowance(&provider.id)
+            .await?
+            .unwrap(),
+        snapshot
+    );
+    assert_eq!(server.task.await??.len(), 2);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
     Ok(())
 }
 
