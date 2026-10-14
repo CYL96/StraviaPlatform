@@ -17,7 +17,7 @@ use tokio_rustls::rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 
 use super::Gateway;
 use crate::admin::provider_allowance::{
-    AllowanceKind, ExhaustionForecastStatus, ProviderAllowanceStatus,
+    AllowanceCondition, AllowanceKind, ExhaustionForecastStatus, ProviderAllowanceStatus,
 };
 use crate::auth::types::AuthBindingStatus;
 use crate::auth::{
@@ -310,8 +310,8 @@ fn devin_allowance_fixture() -> Vec<u8> {
 
     let mut status = Vec::new();
     status.extend(proto_len(1, &plan));
-    status.extend(proto_u64(14, 70));
-    status.extend(proto_u64(15, 60));
+    // Proto3 omits the exhausted daily window's zero remaining percentage.
+    status.extend(proto_u64(15, 33));
     status.extend(proto_u64(16, 12_500_000));
     status.extend(proto_u64(17, 2_000_000_000));
     status.extend(proto_u64(18, 2_000_100_000));
@@ -593,6 +593,21 @@ async fn devin_allowance_uses_real_tls_protobuf_request_and_decodes_credit_windo
         .expect("Devin supports allowance");
     assert_eq!(snapshot.status, ProviderAllowanceStatus::Fresh);
     assert_eq!(snapshot.plan_label.as_deref(), Some("Devin Max Contract"));
+    let daily = snapshot
+        .allowances
+        .iter()
+        .find(|allowance| allowance.key == "daily")
+        .expect("exhausted daily window");
+    assert_eq!(daily.used_percent, Some(100.0));
+    assert_eq!(daily.condition, Some(AllowanceCondition::Exhausted));
+    assert_eq!(daily.reset_at, Some(2_000_000_000_000));
+    let weekly = snapshot
+        .allowances
+        .iter()
+        .find(|allowance| allowance.key == "weekly")
+        .expect("weekly window");
+    assert_eq!(weekly.used_percent, Some(67.0));
+    assert_eq!(weekly.reset_at, Some(2_000_100_000_000));
     let prompt = snapshot
         .allowances
         .iter()

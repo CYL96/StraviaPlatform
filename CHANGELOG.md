@@ -43,6 +43,7 @@
 
 ### Fixed
 
+- Devin's daily and weekly allowance windows no longer disappear when exhausted: the plugin recognizes an omitted zero remaining percentage when the upstream still reports the window's reset time, while leaving unreported windows absent. Rebuild and re-import the standalone `devin` plugin, then refresh allowances; existing guard keys and account configuration remain unchanged.
 - Removed Core's unused `windows-sys` 0.52 build dependency and obsolete workspace alias. Retained verified host/target feature-unification dependencies; other package features and runtime Windows APIs remain unchanged.
 - Removed redundant search URL parameter borrows and placed search configuration/policy tests after production items to satisfy strict Clippy checks. URL encoding, response parsing, and persisted search-policy behavior remain unchanged.
 - Cross-protocol request pruning now preserves verified target-native extensions and Responses compaction state instead of discarding them solely because the client ingress differs. Anthropic client histories, combined assistant/tool turns, and equal provider-visible redacted histories again retain native Responses continuation; parent, target, history, expiry, and security checks remain unchanged. Unsupported target state is still omitted. Rebuild and re-import affected standalone plugins.

@@ -84,11 +84,16 @@ fn parse_response(body: &[u8]) -> Result<AllowanceResponse, ()> {
         for (key, percent_field, reset_field, seconds) in
             [("daily", 14, 17, 86_400), ("weekly", 15, 18, 604_800)]
         {
-            if let Some(remaining) = varint(&status, percent_field) {
+            let reset = varint(&status, reset_field);
+            // Proto3 omits zero remaining percentages. A nonzero reset confirms
+            // the window exists; without either field, do not invent a quota.
+            let remaining = varint(&status, percent_field)
+                .or_else(|| reset.filter(|value| *value > 0).map(|_| 0));
+            if let Some(remaining) = remaining {
                 let mut allowance = item(key, window_label(key), "quota_window");
                 set_percent(&mut allowance, Some((100.0 - remaining as f64).max(0.0)));
                 allowance.window_seconds = Some(seconds);
-                allowance.resets_at_unix_ms = varint(&status, reset_field)
+                allowance.resets_at_unix_ms = reset
                     .and_then(|value| value.checked_mul(1000))
                     .and_then(|value| i64::try_from(value).ok());
                 allowances.push(allowance);
@@ -329,6 +334,79 @@ fn error(kind: ErrorKind, message: impl Into<String>) -> PluginError {
 mod tests {
     use super::parse_response;
     use crate::codec::devin_connect::proto::{write_message_field, write_varint_field};
+
+    #[test]
+    fn reports_exhausted_windows_when_zero_remaining_percent_is_omitted() {
+        for (key, reset_field, window_seconds, other_percent_field) in
+            [("daily", 17, 86_400, 15), ("weekly", 18, 604_800, 14)]
+        {
+            let mut plan_status = Vec::new();
+            write_varint_field(&mut plan_status, reset_field, 2_000_000_000);
+            write_varint_field(&mut plan_status, other_percent_field, 33);
+            let mut user_status = Vec::new();
+            write_message_field(&mut user_status, 13, &plan_status);
+            let mut body = Vec::new();
+            write_message_field(&mut body, 1, &user_status);
+
+            let parsed = parse_response(&body).expect("exhausted quota should parse");
+            let allowance = parsed
+                .allowances
+                .iter()
+                .find(|allowance| allowance.key == key)
+                .expect("exhausted quota window should remain visible");
+            assert_eq!(allowance.used_percent.as_deref(), Some("100"));
+            assert_eq!(allowance.condition.as_deref(), Some("exhausted"));
+            assert_eq!(allowance.window_seconds, Some(window_seconds));
+            assert_eq!(allowance.resets_at_unix_ms, Some(2_000_000_000_000));
+        }
+    }
+
+    #[test]
+    fn reports_explicit_zero_remaining_without_a_reset() {
+        for (key, percent_field) in [("daily", 14), ("weekly", 15)] {
+            let mut plan_status = Vec::new();
+            write_varint_field(&mut plan_status, percent_field, 0);
+            let mut user_status = Vec::new();
+            write_message_field(&mut user_status, 13, &plan_status);
+            let mut body = Vec::new();
+            write_message_field(&mut body, 1, &user_status);
+
+            let parsed = parse_response(&body).expect("explicit zero quota should parse");
+            let allowance = parsed
+                .allowances
+                .iter()
+                .find(|allowance| allowance.key == key)
+                .expect("explicit zero quota window");
+            assert_eq!(allowance.used_percent.as_deref(), Some("100"));
+            assert_eq!(allowance.condition.as_deref(), Some("exhausted"));
+            assert_eq!(allowance.resets_at_unix_ms, None);
+        }
+    }
+
+    #[test]
+    fn does_not_invent_windows_without_percent_or_nonzero_reset() {
+        for reset in [None, Some(0)] {
+            let mut plan_status = Vec::new();
+            write_varint_field(&mut plan_status, 16, 1_000_000);
+            if let Some(reset) = reset {
+                write_varint_field(&mut plan_status, 17, reset);
+                write_varint_field(&mut plan_status, 18, reset);
+            }
+            let mut user_status = Vec::new();
+            write_message_field(&mut user_status, 13, &plan_status);
+            let mut body = Vec::new();
+            write_message_field(&mut body, 1, &user_status);
+
+            let parsed = parse_response(&body).expect("balance-only status should parse");
+            assert!(
+                !parsed
+                    .allowances
+                    .iter()
+                    .any(|allowance| matches!(allowance.key.as_str(), "daily" | "weekly")),
+                "an unreported quota window must not be treated as exhausted"
+            );
+        }
+    }
 
     #[test]
     fn reports_negative_overage_balance() {
