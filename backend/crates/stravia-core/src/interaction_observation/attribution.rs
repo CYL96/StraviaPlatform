@@ -1193,6 +1193,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rapid_window_does_not_apply_to_a_node_already_continued() {
+        for (first_failed_without_output, expected) in
+            [(false, "new_user"), (true, "rapid_exact_continuation")]
+        {
+            let mut evidence = MemoryEvidence::default();
+            evidence.parents.insert(
+                "node".into(),
+                (
+                    "owner".into(),
+                    observed_parent("interaction", "parent-run", Some(10_000)),
+                ),
+            );
+            let mut attribution = RunAttribution::new(evidence);
+            let mut first = facts(vec![user("tool result")]);
+            first.generation_parent_id = Some("node".into());
+            first.has_new_user = false;
+            let first_assigned = attribution
+                .admit(&start("first"), &mut first.prepare("first"), 10_050, 10_050)
+                .await;
+            assert_eq!(first_assigned.grouping_reason, "exact_continuation");
+            if first_failed_without_output {
+                attribution.grouping.finish("first", "failed", 10_060);
+            }
+            let mut side = facts(vec![user("side question")]);
+            side.generation_parent_id = Some("node".into());
+            side.has_new_user = true;
+            let assigned = attribution
+                .admit(&start("side"), &mut side.prepare("side"), 11_750, 11_750)
+                .await;
+            assert_eq!(assigned.grouping_reason, expected);
+            if expected == "new_user" {
+                assert_ne!(assigned.interaction_id, "interaction");
+                assert_eq!(
+                    assigned.parent_interaction_id.as_deref(),
+                    Some("interaction")
+                );
+            } else {
+                assert_eq!(assigned.interaction_id, "interaction");
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn new_user_after_delivery_window_creates_interrupted_child() {
         for (delay, delivered) in [(2_001_i64, Some(10_000_i64)), (1, None), (-1, Some(10_000))] {
             let mut evidence = MemoryEvidence::default();

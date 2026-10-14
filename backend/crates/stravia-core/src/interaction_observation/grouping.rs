@@ -69,6 +69,7 @@ struct RetryCandidate {
     client_output_committed: bool,
     active: bool,
     has_new_user: bool,
+    generation_parent_id: Option<String>,
 }
 
 #[derive(Default)]
@@ -82,6 +83,18 @@ impl GroupingIndex {
             interactions.iter().map(String::as_str).collect();
         self.runs
             .retain(|_, run| !removed.contains(run.interaction_id.as_str()));
+    }
+
+    /// 快速续接只描述父响应的第一个后继；该 node 已被其他 Run 续接时，
+    /// 后到的带 User 请求是并行分支。失败且未向客户端输出的尝试不算续接，
+    /// 否则同一请求的重试会被误判成分支。窗口仅 2 秒，内存证据足够，无需持久化查询。
+    fn node_has_continuation(&self, generation_parent_id: Option<&str>) -> bool {
+        generation_parent_id.is_some_and(|node| {
+            self.runs.values().any(|run| {
+                run.generation_parent_id.as_deref() == Some(node)
+                    && !(run.failed_at.is_some() && !run.client_output_committed)
+            })
+        })
     }
 
     pub fn assign(
@@ -110,12 +123,14 @@ impl GroupingIndex {
                 Some("exact_continuation")
             } else if input.has_matching_pending_tool_result {
                 Some("pending_tool_result")
-            } else if parent.delivery_completed_at.is_some_and(|delivered_at| {
-                input
-                    .ingress_received_at
-                    .checked_sub(delivered_at)
-                    .is_some_and(|elapsed| (0..=2000).contains(&elapsed))
-            }) {
+            } else if !self.node_has_continuation(input.generation_parent_id)
+                && parent.delivery_completed_at.is_some_and(|delivered_at| {
+                    input
+                        .ingress_received_at
+                        .checked_sub(delivered_at)
+                        .is_some_and(|elapsed| (0..=2000).contains(&elapsed))
+                })
+            {
                 Some("rapid_exact_continuation")
             } else {
                 None
@@ -204,6 +219,7 @@ impl GroupingIndex {
                 client_output_committed: false,
                 active: true,
                 has_new_user: input.has_new_user,
+                generation_parent_id: input.generation_parent_id.map(str::to_owned),
             },
         );
         GroupAssignment {
