@@ -179,6 +179,12 @@ async fn http_nonstream_client_uses_native_stream() {
 
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires task build:vendors:all"]
+async fn http_reasoning_ignores_unsupported_logprobs() {
+    http_case("logprobs").await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires task build:vendors:all"]
 async fn http_malformed_and_truncated_sse_fail() {
     http_case("malformed").await;
     http_case("truncated").await;
@@ -242,6 +248,23 @@ async fn http_case(case: &'static str) {
             assert!(body.get("stream").is_none());
         } else {
             assert_eq!(body["stream"], true);
+        }
+        if case == "logprobs"
+            && body["include"].as_array().is_some_and(|include| {
+                include.iter().any(|value| value == "message.output_text.logprobs")
+            })
+        {
+            let payload = serde_json::json!({"error":{
+                "type":"invalid_request_error",
+                "message":"logprobs are not supported with reasoning models."
+            }}).to_string();
+            socket.write_all(format!("HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}", payload.len()).as_bytes()).await.unwrap();
+            return;
+        }
+        if case == "logprobs" {
+            assert_eq!(body["include"], serde_json::json!(["reasoning.encrypted_content"]));
+            assert_eq!(body["reasoning"]["effort"], "high");
+            assert!(body.get("top_logprobs").is_none());
         }
         if matches!(
             case,
@@ -329,6 +352,14 @@ async fn http_case(case: &'static str) {
     );
     let mut inference = request();
     inference.stream.enabled = case != "nonstream";
+    if case == "logprobs" {
+        inference = stravia_protocol_codec::codec::open_responses::decoder::ResponsesDecoder
+            .decode_request(serde_json::json!({
+                "model":"logical-model", "input":"hello", "stream":true,
+                "reasoning":{"effort":"high"}, "top_logprobs":0
+            }))
+            .unwrap();
+    }
     let input = if case.starts_with("compact") {
         OperationInput::Compact {
             provider,
@@ -704,6 +735,39 @@ async fn execute_once(
     runtime
         .execute(plugin, "codex", operation, input, scope)
         .await
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires task build:vendors:all"]
+async fn websocket_ignores_chat_logprobs_without_disabling_reasoning() {
+    use stravia_protocol_codec::transform::ProtocolAdapter;
+    let (runtime, plugin) = load_codex().await;
+    let recorded = Arc::new(Recording::default());
+    let inference = stravia_protocol_codec::codec::openai::compatible::chat_completions::OpenAIChatCompletionsV1
+        .decode_request(serde_json::json!({
+            "model":"logical-model", "messages":[{"role":"user","content":"hello"}],
+            "reasoning_effort":"high", "logprobs":true, "top_logprobs":2
+        }))
+        .unwrap();
+    let result = execute_once(
+        &runtime,
+        &plugin,
+        codex_provider(),
+        inference,
+        codex_frames(0, "resp_without_logprobs"),
+        &recorded,
+    )
+    .await
+    .expect("Codex WebSocket inference");
+    let OperationOutput::Infer(response) = result else {
+        panic!("expected inference");
+    };
+    assert_eq!(response.output_text(), "你好，我是 ChatGPT。");
+    assert_eq!(response.usage.reasoning_tokens, Some(12));
+    let sent = recorded.sent.lock();
+    assert_eq!(sent[0]["include"], serde_json::json!(["reasoning.encrypted_content"]));
+    assert_eq!(sent[0]["reasoning"]["effort"], "high");
+    assert!(sent[0].get("top_logprobs").is_none());
 }
 
 /// Regression: reasoning signatures of realistic size must complete now that

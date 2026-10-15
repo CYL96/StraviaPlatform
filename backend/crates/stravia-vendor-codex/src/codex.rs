@@ -292,28 +292,6 @@ pub(super) enum BodyOperation {
     Image,
 }
 
-pub(super) fn inference_include(
-    request: &stravia_runtime_contract::protocol::ir::AiRequest,
-) -> Vec<Value> {
-    use stravia_runtime_contract::thinking::{TargetThinkingControl, ThinkingLevel};
-    let reasoning = &request.reasoning;
-    let enabled = reasoning.mode.as_deref() != Some("disabled")
-        && reasoning.level != Some(ThinkingLevel::Off)
-        && !matches!(reasoning.target_control, Some(TargetThinkingControl::Disabled))
-        && (matches!(reasoning.mode.as_deref(), Some("enabled" | "auto"))
-            || reasoning.level.is_some()
-            || reasoning.target_control.is_some()
-            || reasoning.budget_tokens.is_some());
-    let mut include = Vec::with_capacity(2);
-    if request.parameters.store == Some(false) && enabled {
-        include.push("reasoning.encrypted_content".into());
-    }
-    if request.parameters.logprobs.is_some() {
-        include.push("message.output_text.logprobs".into());
-    }
-    include
-}
-
 pub(super) fn encode_tools(
     request: &stravia_runtime_contract::protocol::ir::AiRequest,
     operation: BodyOperation,
@@ -1066,21 +1044,6 @@ mod tests {
         body["tool_choice"] = json!({"type":"code_interpreter"});
         prepare_body(&mut body).unwrap();
         assert!(body.get("tool_choice").is_none());
-    }
-
-    #[test]
-    fn inference_include_is_derived_from_reasoning_storage_and_logprob_intent() {
-        use stravia_runtime_contract::protocol::ir::AiRequest;
-        let mut request = AiRequest::new("gpt-5.4", Vec::new());
-        request.parameters.store = Some(false);
-        request.parameters.logprobs = Some(0);
-        assert_eq!(inference_include(&request), vec![json!("message.output_text.logprobs")]);
-        request.reasoning.mode = Some("enabled".into());
-        assert_eq!(inference_include(&request), vec![
-            json!("reasoning.encrypted_content"), json!("message.output_text.logprobs"),
-        ]);
-        request.reasoning.mode = Some("disabled".into());
-        assert_eq!(inference_include(&request), vec![json!("message.output_text.logprobs")]);
     }
 
     #[test]

@@ -243,6 +243,8 @@ Channel 的 `client_header_names` 声明其需要读取的额外客户端头名�
 
 Codex 的工具声明也受官方 [`ToolSpec`](https://github.com/openai/codex/blob/main/codex-rs/tools/src/tool_spec.rs) 与 [function／namespace／custom 类型](https://github.com/openai/codex/blob/main/codex-rs/tools/src/responses_api.rs)约束：按工具类型过滤外围控制，不把整个 tools 数组当作任意业务 JSON。保留 function／custom 的 defer_loading、namespace 中的两类合法声明、client tool_search 的 execution 与完整参数 schema，以及由统一 `NativeTool::WebSearch` 生成的 web_search 官方字段（域名过滤、用户位置与上下文大小）。工具 schema 与 grammar definition 的业务内容不裁剪；公共 API 的其他 hosted tools 不因同属 Responses 就获得 CLI 推理出站权限。CLI 推理 tool_choice 使用官方字符串形态，不透传公共 API 的对象选择；已有 Search／MediaImage 操作仅使用各自固定构造器及操作白名单，不能由客户端参数绕入。
 
+Codex 推理的 `include` 同样遵循[官方客户端构造器](https://github.com/openai/codex/blob/main/codex-rs/core/src/client.rs)的能力边界，只保留统一推理控制派生的 `reasoning.encrypted_content`，不请求公共 Responses 的 `message.output_text.logprobs`。客户端的 `logprobs`／`top_logprobs`（包括 `top_logprobs: 0`）在 Codex HTTP 与 WebSocket 出站时省略，不通过关闭推理或重试绕过上游不支持的能力。标准 API codec 的 logprobs 投影不变；已有安装须重新构建并导入 `openai-codex` Wasm 才能获得修复。
+
 函数工具只保留 `strict` 与 `defer_loading` 两个外围控制；`eager_input_streaming`、`allowed_callers`、`input_examples`、`citations` 与工具级 `cache_control` 不进入 canonical，官方工具确需的形态由所属插件按官方规则生成。改变工具声明或原生工具集合会改变有效请求身份，不能误复用旧 continuation。schema、grammar 与原生工具描述中的业务内容参与秘密保护，不因外围参数白名单而丢失。
 
 Claude Code 的函数工具白名单依据 [2.1.300 官方发布包](https://registry.npmjs.org/@anthropic-ai/claude-code-win32-x64/-/claude-code-win32-x64-2.1.300.tgz)中的实际构造器核对：名称、描述、schema、strict 与 defer_loading 来自统一 `ToolSpec`，缓存锚点由插件按官方规则生成；`eager_input_streaming` 并非官方必发字段，不再接受客户端控制。其 hosted 工具只允许由 `NativeTool::WebSearch` 生成的 `web_search_20250305` 及对应官方字段，不因公共 Messages API 支持其他工具就自动放行。升级 CLI 契约时应重新核对产出路径，不能通过客户端版本字符串覆盖来扩大白名单。
