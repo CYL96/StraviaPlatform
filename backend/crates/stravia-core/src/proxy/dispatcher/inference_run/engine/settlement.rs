@@ -294,9 +294,7 @@ mod tests {
     use crate::history_marker::{HistoryMarker, HistoryMarkerKind};
     use stravia_runtime_contract::protocol::ids::OPEN_RESPONSES_2026_04_24;
     use stravia_runtime_contract::protocol::ids::OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1;
-    use stravia_runtime_contract::protocol::ir::{
-        AiItem, AiRequest, OpenResponsesExt, ProtocolExt,
-    };
+    use stravia_runtime_contract::protocol::ir::{AiItem, AiRequest};
 
     async fn fixture() -> (
         tempfile::TempDir,
@@ -448,7 +446,6 @@ mod tests {
         )];
         let mut request = AiRequest::new("model", Vec::new());
         request.meta.source_protocol = Some(OPEN_RESPONSES_2026_04_24);
-        request.ext = Some(ProtocolExt::OpenResponses(OpenResponsesExt::default()));
         let mut write = gateway
             .generation_chains
             .begin(ledger.terminal.principal.clone(), request)
@@ -494,9 +491,9 @@ mod tests {
     ) {
         let mut request = AiRequest::new("model", Vec::new());
         request.meta.source_protocol = Some(OPEN_RESPONSES_2026_04_24);
-        // begin resolves explicit parents from OpenResponsesExt, not vendor metadata alone.
-        request.ext = Some(ProtocolExt::OpenResponses(OpenResponsesExt::default()));
-        crate::router::stamp_previous_response_id(&mut request, generation_id);
+        request.parameters.continuation = Some(
+            stravia_runtime_contract::protocol::ir::Continuation::PreviousResponse(generation_id.to_owned()),
+        );
         let continuation = gateway
             .generation_chains
             .begin(ledger.terminal.principal.clone(), request)

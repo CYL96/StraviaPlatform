@@ -361,7 +361,7 @@ mod tests {
     };
     use stravia_runtime_contract::protocol::ir::request::MediaRoutingMode;
     use stravia_runtime_contract::protocol::ir::{
-        AiErrorKind, AiItem, MessageContent, OpenResponsesExt, ProtocolExt, Role, Usage,
+        AiErrorKind, AiItem, MessageContent, Role, Usage,
     };
 
     fn target(provider: &str, priority: i32) -> TargetConfig {
@@ -860,10 +860,7 @@ mod tests {
     async fn stored_conversation_affinity_is_preferred_over_priority() {
         let fixture = fixture(memory(), no_continuation());
         let mut request = request();
-        request.ext = Some(ProtocolExt::OpenResponses(OpenResponsesExt {
-            prompt_cache_key: Some("chat-a".into()),
-            ..Default::default()
-        }));
+        request.parameters.cache.key = Some("chat-a".into());
         fixture.policy_state.record_success(
             &RouteAttemptContext {
                 cooldown: CooldownAttempts::default(),
@@ -931,10 +928,7 @@ mod tests {
 
         // A conversation identity suppresses the cache hint entirely.
         let mut identified = request();
-        identified.ext = Some(ProtocolExt::OpenResponses(OpenResponsesExt {
-            prompt_cache_key: Some("chat-b".into()),
-            ..Default::default()
-        }));
+        identified.parameters.cache.key = Some("chat-b".into());
         let mut identified_policy = fixture
             .selector
             .select(
@@ -963,10 +957,7 @@ mod tests {
         );
         let route = route(vec![target("primary", 10), target("continued", 0)]);
         let mut request = request();
-        request.ext = Some(ProtocolExt::OpenResponses(OpenResponsesExt {
-            prompt_cache_key: Some("chat-c".into()),
-            ..Default::default()
-        }));
+        request.parameters.cache.key = Some("chat-c".into());
         let mut policy = fixture
             .selector
             .select(
@@ -1011,7 +1002,8 @@ mod tests {
 
     fn responses_request(items: Vec<AiItem>) -> AiRequest {
         let mut request = AiRequest::new("route", items);
-        request.ext = Some(ProtocolExt::OpenResponses(OpenResponsesExt::default()));
+        request.meta.source_protocol =
+            Some(stravia_runtime_contract::protocol::ids::OPEN_RESPONSES_2026_04_24);
         request
     }
 
@@ -1024,6 +1016,7 @@ mod tests {
             actual_model: "model".into(),
             target_id: format!("{provider}:model"),
             authority: None,
+            issued: Vec::new(),
         })
     }
 

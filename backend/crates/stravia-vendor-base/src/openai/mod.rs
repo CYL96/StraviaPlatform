@@ -230,7 +230,7 @@ fn infer(
     } else {
         None
     };
-    let encoded = common::encode_inference_request(&protocol.to_string(), request)?;
+    let encoded = crate::parameters::encode(&provider, &protocol.to_string(), request)?;
     let mut body = encoded.body;
     if protocol == OPEN_RESPONSES_2026_04_24 {
         prepare_responses_body(&provider, &mut body)?;
@@ -261,8 +261,6 @@ fn infer(
     };
     let url = endpoint(&provider.base_url, &path);
     let mut headers = common::header_pairs(&encoded.headers)?;
-    append_client_headers(&provider, &mut headers);
-    crate::apply_session_affinity(&provider, &mut headers);
     set_header(&mut headers, "content-type", "application/json".into());
     if !headers
         .iter()
@@ -322,21 +320,7 @@ fn prepare_responses_body(
     let object = body
         .as_object_mut()
         .ok_or_else(|| invalid("OpenAI Responses request body must be an object"))?;
-    let include = object
-        .entry("include")
-        .or_insert_with(|| Value::Array(Vec::new()));
-    if include.is_null() {
-        *include = Value::Array(Vec::new());
-    }
-    let include = include
-        .as_array_mut()
-        .ok_or_else(|| invalid("OpenAI Responses include must be an array"))?;
-    if !include
-        .iter()
-        .any(|value| value.as_str() == Some("reasoning.encrypted_content"))
-    {
-        include.push(Value::String("reasoning.encrypted_content".into()));
-    }
+
     if object.get("store").and_then(Value::as_bool) == Some(false)
         && !object.contains_key("prompt_cache_key")
         && let Some(affinity) = provider
@@ -359,12 +343,6 @@ fn set_header(headers: &mut Vec<(String, String)>, name: &str, value: String) {
     headers.push((name.into(), value));
 }
 
-fn append_client_headers(provider: &ProviderSnapshot, headers: &mut Vec<(String, String)>) {
-    for (name, value) in &provider.client_headers {
-        set_header(headers, name, value.clone());
-    }
-}
-
 fn retain_compact_fields(fields: Option<&Value>, body: &mut Value) -> Result<(), PluginError> {
     let object = body
         .as_object_mut()
@@ -372,11 +350,18 @@ fn retain_compact_fields(fields: Option<&Value>, body: &mut Value) -> Result<(),
     let explicit = fields.and_then(Value::as_array);
     object.retain(|key, _| {
         matches!(key.as_str(), "model" | "input" | "instructions")
-            || explicit.is_some_and(|fields| {
+            || (matches!(
+                key.as_str(),
+                "previous_response_id"
+                    | "prompt_cache_key"
+                    | "prompt_cache_options"
+                    | "prompt_cache_retention"
+                    | "service_tier"
+            ) && explicit.is_none_or(|fields| {
                 fields
                     .iter()
                     .any(|field| field.as_str() == Some(key.as_str()))
-            })
+            }))
     });
     Ok(())
 }
@@ -389,9 +374,7 @@ fn infer_responses_websocket(
     preserve_upstream_errors: bool,
 ) -> Result<stravia_runtime_contract::protocol::ir::AiResponse, PluginError> {
     let mut headers = common::header_pairs(codec_headers)?;
-    // 不附加 session_affinity：socket 本身已把会话固定在同一上游节点，而宿主按
-    // 握手标头匹配可复用连接，逐链变化的标头会拆散同一客户端会话的复用。
-    append_client_headers(provider, &mut headers);
+
     headers.retain(|(name, _)| !name.eq_ignore_ascii_case("authorization"));
     if let Some(api_key) = credential(provider, "apiKey") {
         headers.push(("authorization".into(), format!("Bearer {api_key}")));
@@ -675,5 +658,67 @@ pub(super) fn unsupported(message: impl Into<String>) -> PluginError {
         kind: ErrorKind::Unsupported,
         message: message.into(),
         upstream_status: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn official_preparation_preserves_codec_derived_includes() {
+        let provider = ProviderSnapshot {
+            provider_id: "openai".into(),
+            channel: "default".into(),
+            base_url: "https://api.openai.com/v1".into(),
+            protocol: "openai-responses".into(),
+            options: Default::default(),
+            credentials: Default::default(),
+            model: Some("model".into()),
+            model_metadata: None,
+            client_headers: Vec::new(),
+            operation_metadata: Default::default(),
+        };
+        for include in [
+            None,
+            Some(serde_json::json!(["message.output_text.logprobs"])),
+            Some(serde_json::json!(["reasoning.encrypted_content"])),
+        ] {
+            let mut body = serde_json::json!({"model": "model", "input": []});
+            if let Some(include) = &include {
+                body["include"] = include.clone();
+            }
+            prepare_responses_body(&provider, &mut body).unwrap();
+            assert_eq!(body.get("include"), include.as_ref());
+        }
+    }
+
+    #[test]
+    fn compact_metadata_cannot_authorize_nonofficial_fields() {
+        let mut body = serde_json::json!({
+            "model": "model", "input": [], "instructions": "keep",
+            "previous_response_id": "response", "prompt_cache_key": "cache",
+            "service_tier": "default", "max_output_tokens": 10,
+            "unknown": {"business": true}
+        });
+        retain_compact_fields(
+            Some(&serde_json::json!([
+                "previous_response_id",
+                "prompt_cache_key",
+                "service_tier",
+                "max_output_tokens",
+                "unknown"
+            ])),
+            &mut body,
+        )
+        .unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "model": "model", "input": [], "instructions": "keep",
+                "previous_response_id": "response", "prompt_cache_key": "cache",
+                "service_tier": "default"
+            })
+        );
     }
 }

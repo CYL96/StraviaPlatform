@@ -1,5 +1,34 @@
 use super::*;
 
+#[test]
+fn unsupported_official_controls_are_dropped_and_cache_is_unified() {
+    let request = AnthropicDecoder.decode_request(request_with(serde_json::json!({
+        "speed": "fast",
+        "output_config": {"task_budget": {"type": "tokens", "total": 0, "remaining": 0, "private": true}},
+        "cache_control": {"type": "ephemeral", "ttl": "1h", "evict_on_complete": false, "private": true},
+        "thread": {"type": "continue", "previous_message_id": "msg", "private": true},
+        "diagnostics": {"previous_message_id": null, "private": true},
+        "safeguards": [{"type": "policy", "classifier_context": "context", "private": true}],
+        "context_hint": {"enabled": false, "target_tokens_saved": 0, "private": true},
+        "fallbacks": [{"model": "claude", "private": true}],
+        "thinking": {"type": "adaptive", "block_binding": {"prefix_mismatch_behavior": "error", "private": true}},
+        "unknown_body": true
+    }))).unwrap();
+    let (body, _) = crate::codec::anthropic::messages::encoder::AnthropicEncoder
+        .encode_request(request)
+        .unwrap();
+    assert_eq!(
+        body["cache_control"],
+        serde_json::json!({"type": "ephemeral", "ttl": "1h"})
+    );
+    for key in ["speed", "thread", "diagnostics", "safeguards", "context_hint", "fallbacks"] {
+        assert!(body.get(key).is_none(), "{key}");
+    }
+    assert!(body["output_config"].get("task_budget").is_none());
+    assert!(body["thinking"].get("block_binding").is_none());
+    assert!(body.get("unknown_body").is_none());
+}
+
 fn request_with(extra: Value) -> Value {
     let mut request = serde_json::json!({
         "model": "model",
@@ -42,8 +71,7 @@ fn adaptive_thinking_uses_output_effort() {
         })))
         .expect("adaptive thinking");
 
-    assert!(request.reasoning.enabled);
-    assert_eq!(request.reasoning.effort, Some(ReasoningEffort::Medium));
+    assert!(request.reasoning.is_enabled());
     assert_eq!(
         request.reasoning.level,
         Some(stravia_runtime_contract::thinking::ThinkingLevel::Medium)
@@ -58,8 +86,8 @@ fn output_effort_without_thinking_is_preserved() {
         })))
         .expect("output effort");
 
-    assert!(request.reasoning.enabled);
-    assert_eq!(request.reasoning.effort, Some(ReasoningEffort::High));
+    assert!(request.reasoning.is_enabled());
+    assert_eq!(request.reasoning.mode, None);
     assert_eq!(
         request.reasoning.level,
         Some(stravia_runtime_contract::thinking::ThinkingLevel::High)
@@ -67,14 +95,14 @@ fn output_effort_without_thinking_is_preserved() {
 }
 
 #[test]
-fn explicit_effort_overrides_enabled_budget_and_disabled_thinking() {
+fn explicit_effort_keeps_source_mode_and_enabled_budget() {
     for thinking in [
         serde_json::json!({"type": "enabled", "budget_tokens": 1024, "display": "omitted"}),
         serde_json::json!({"type": "disabled", "display": "omitted"}),
     ] {
         let request = AnthropicDecoder
             .decode_request(request_with(serde_json::json!({
-                "thinking": thinking,
+                "thinking": thinking.clone(),
                 "output_config": {"effort": "max"}
             })))
             .unwrap();
@@ -82,9 +110,16 @@ fn explicit_effort_overrides_enabled_budget_and_disabled_thinking() {
             request.reasoning.level,
             Some(stravia_runtime_contract::thinking::ThinkingLevel::Max)
         );
-        assert!(request.reasoning.enabled);
-        assert_eq!(request.reasoning.budget_tokens, None);
-        assert_eq!(request.reasoning.display.as_deref(), Some("omitted"));
+        assert_eq!(request.reasoning.mode.as_deref(), thinking["type"].as_str());
+        assert_eq!(
+            request.reasoning.is_enabled(),
+            thinking["type"] != "disabled"
+        );
+        assert_eq!(
+            request.reasoning.budget_tokens,
+            thinking["budget_tokens"].as_u64().map(|v| v as u32)
+        );
+        assert_eq!(request.reasoning.summary, Some(ReasoningSummary::None));
     }
 }
 
@@ -132,4 +167,193 @@ fn same_protocol_round_trip_keeps_tool_strict_and_tool_result_is_error() {
     assert_eq!(encoded["tools"][1]["strict"], false);
     assert!(encoded["tools"][2].get("strict").is_none());
     assert_eq!(encoded["messages"][2]["content"][0]["is_error"], false);
+}
+
+#[test]
+fn native_controls_decode_directly_into_canonical_parameters() {
+    let request = AnthropicDecoder
+        .decode_request(request_with(serde_json::json!({
+            "top_k": 0,
+            "context_management": null,
+            "container": {"id": "", "skills": []},
+            "inference_geo": "",
+            "metadata": {"user_id": "", "unknown": "not-forwarded"},
+            "service_tier": "auto",
+            "stop_sequences": [],
+            "system": "",
+            "tools": [],
+            "tool_choice": {"type": "auto", "disable_parallel_tool_use": false}
+        })))
+        .unwrap();
+    assert_eq!(request.parameters.top_k, Some(0));
+    assert!(request.parameters.compaction.is_none());
+    assert!(request.parameters.native_tools.is_empty());
+    assert!(request.parameters.end_user_id.is_none());
+    assert_eq!(request.parameters.service_tier, Some(ServiceTier::Auto));
+    assert_eq!(request.generation.stop, Some(vec![]));
+    assert_eq!(request.parallel_tool_calls, Some(true));
+    assert!(request.parameters.resets(ParameterReset::Instructions));
+    assert!(request.parameters.resets(ParameterReset::NativeTools));
+    assert!(request.parameters.resets(ParameterReset::EndUser));
+
+    assert!(request.meta.vendor.ingress.is_empty());
+    let (body, _) = crate::codec::anthropic::messages::encoder::AnthropicEncoder
+        .encode_request(request)
+        .unwrap();
+    assert!(body.get("context_management").is_none());
+    assert!(body.get("container").is_none());
+    assert!(body.get("inference_geo").is_none());
+    assert!(body.get("system").is_none());
+    assert!(body.get("tools").is_none());
+    assert!(body.get("metadata").is_none());
+}
+
+#[test]
+fn native_search_is_typed_and_function_vendor_controls_are_dropped() {
+    let request = AnthropicDecoder
+        .decode_request(request_with(serde_json::json!({
+            "tools": [
+                {"name": "read", "input_schema": {"type": "object"},
+                 "strict": false, "cache_control": {"type": "ephemeral", "ttl": "1h"}},
+                {"name": "web_search", "type": "web_search_20250305", "max_uses": 0,
+                 "allowed_domains": [], "cache_control": {"type": "ephemeral", "ttl": "1h"}}
+            ]
+        })))
+        .unwrap();
+    assert_eq!(request.tools.as_ref().unwrap().len(), 1);
+    assert_eq!(request.parameters.native_tools.len(), 1);
+    let NativeTool::WebSearch(search) = &request.parameters.native_tools[0] else {
+        panic!("expected unified web search");
+    };
+    assert_eq!(search.max_uses, Some(0));
+    assert!(
+        !request
+            .meta
+            .vendor
+            .ingress
+            .contains_key("__anthropic_raw_tools")
+    );
+    let (body, _) = crate::codec::anthropic::messages::encoder::AnthropicEncoder
+        .encode_request(request)
+        .unwrap();
+    assert!(body["tools"][0].get("cache_control").is_none());
+    assert_eq!(body["tools"][0]["strict"], false);
+    assert_eq!(body["tools"][1]["type"], "web_search_20250305");
+    assert_eq!(body["tools"][1]["max_uses"], 0);
+    assert!(body["tools"][1].get("cache_control").is_none());
+}
+
+#[test]
+fn unified_reasoning_cache_container_and_compaction_roundtrip() {
+    for (display, summary) in [
+        ("summarized", ReasoningSummary::Auto),
+        ("omitted", ReasoningSummary::None),
+    ] {
+        let request = AnthropicDecoder.decode_request(request_with(serde_json::json!({
+            "thinking": {"type": "adaptive", "display": display},
+            "cache_control": {"type": "ephemeral", "ttl": "5m"},
+            "tools": [{"type": "code_execution_20250825", "name": "code_execution"}],
+            "container": {"id": "container_1", "skills": [{"private": true}]},
+            "context_management": {"edits": [
+                {"type": "clear_tool_uses_20250919", "trigger": {"type": "input_tokens", "value": 100}},
+                {"type": "compact_20260112", "trigger": {"type": "input_tokens", "value": 120000}, "instructions": "private"}
+            ]},
+            "service_tier": "standard_only",
+            "metadata": {"user_id": "user_1", "private": "ignored"}
+        }))).unwrap();
+        assert_eq!(request.reasoning.summary, Some(summary));
+        assert_eq!(request.parameters.cache.retention, Some(CacheRetention::Default));
+        assert_eq!(request.parameters.compaction.as_ref().unwrap().threshold_tokens, Some(120000));
+        assert_eq!(request.parameters.service_tier, Some(ServiceTier::Default));
+        let NativeTool::CodeExecution(tool) = &request.parameters.native_tools[0] else {
+            panic!("expected code execution");
+        };
+        assert_eq!(tool.container.as_deref(), Some("container_1"));
+        let (body, _) = crate::codec::anthropic::messages::encoder::AnthropicEncoder.encode_request(request).unwrap();
+        assert_eq!(body["thinking"]["display"], display);
+        assert_eq!(body["container"], "container_1");
+        assert_eq!(body["tools"][0]["type"], "code_execution_20260120");
+        assert!(body["tools"][0].get("container").is_none());
+        assert_eq!(body["context_management"], serde_json::json!({"edits": [{
+            "type": "compact_20260112", "trigger": {"type": "input_tokens", "value": 120000}
+        }]}));
+        assert_eq!(body["metadata"], serde_json::json!({"user_id": "user_1"}));
+    }
+}
+
+#[test]
+fn explicit_nulls_only_reset_inheritance_and_are_not_emitted() {
+    let request = AnthropicDecoder.decode_request(request_with(serde_json::json!({
+        "system": null, "tools": null, "temperature": null, "top_p": null,
+        "max_tokens": null, "thinking": null, "cache_control": null,
+        "service_tier": null, "metadata": {"user_id": null}, "output_config": null
+    }))).unwrap();
+    for reset in [
+        ParameterReset::Instructions, ParameterReset::NativeTools, ParameterReset::Temperature,
+        ParameterReset::TopP, ParameterReset::MaxTokens, ParameterReset::Reasoning,
+        ParameterReset::CacheRetention, ParameterReset::ServiceTier,
+        ParameterReset::EndUser, ParameterReset::ResponseFormat,
+    ] {
+        assert!(request.parameters.resets(reset), "{reset:?}");
+    }
+    let (body, _) = crate::codec::anthropic::messages::encoder::AnthropicEncoder.encode_request(request).unwrap();
+    assert!(body.as_object().unwrap().values().all(|value| !value.is_null()));
+}
+
+#[test]
+fn unsupported_tools_and_vendor_function_controls_are_silently_dropped() {
+    let request = AnthropicDecoder.decode_request(request_with(serde_json::json!({
+        "tools": [
+            {"type": "computer_20250124", "name": "computer", "display_width_px": 1024},
+            {"type": "web_fetch_20250910", "name": "web_fetch"},
+            {"type": "bash_20250124", "name": "bash"},
+            {"name": "read", "input_schema": {"type": "object"},
+             "eager_input_streaming": {"unsupported": true}, "allowed_callers": 123,
+             "citations": "unsupported", "input_examples": false, "cache_control": false}
+        ],
+        "speed": {"unsupported": true},
+        "inference_geo": 123
+    }))).unwrap();
+    assert!(request.parameters.native_tools.is_empty());
+    let (body, _) = crate::codec::anthropic::messages::encoder::AnthropicEncoder.encode_request(request).unwrap();
+    assert_eq!(body["tools"], serde_json::json!([{
+        "name": "read", "input_schema": {"type": "object"}
+    }]));
+    assert!(body.get("speed").is_none());
+    assert!(body.get("inference_geo").is_none());
+}
+
+#[test]
+fn native_tool_choice_has_unified_ownership() {
+    let request = AnthropicDecoder.decode_request(request_with(serde_json::json!({
+        "tools": [{"type": "web_search_20250305", "name": "web_search"}],
+        "tool_choice": {"type": "tool", "name": "web_search"}
+    }))).unwrap();
+    assert!(matches!(request.tool_choice, Some(ToolChoice::Native(NativeToolKind::WebSearch))));
+    let (body, _) = crate::codec::anthropic::messages::encoder::AnthropicEncoder.encode_request(request).unwrap();
+    assert_eq!(body["tool_choice"], serde_json::json!({"type": "tool", "name": "web_search"}));
+}
+
+#[test]
+fn nested_null_controls_reset_without_emitting_nulls() {
+    let request = AnthropicDecoder.decode_request(request_with(serde_json::json!({
+        "thinking": {"type": "adaptive", "display": null},
+        "output_config": {"effort": null, "format": null},
+        "cache_control": {"type": "ephemeral", "ttl": null},
+        "tool_choice": {"type": "auto", "disable_parallel_tool_use": null}
+    }))).unwrap();
+    for reset in [
+        ParameterReset::ReasoningSummary, ParameterReset::ReasoningLevel,
+        ParameterReset::ResponseFormat, ParameterReset::CacheRetention,
+        ParameterReset::ParallelToolCalls,
+    ] {
+        assert!(request.parameters.resets(reset), "{reset:?}");
+    }
+    assert!(request.reasoning.summary.is_none());
+    assert!(request.parameters.cache.retention.is_none());
+    let (body, _) = crate::codec::anthropic::messages::encoder::AnthropicEncoder.encode_request(request).unwrap();
+    assert!(body["thinking"].get("display").is_none());
+    assert!(body.get("cache_control").is_none());
+    assert!(body["tool_choice"].get("disable_parallel_tool_use").is_none());
+    assert!(body["output_config"].get("format").is_none());
 }

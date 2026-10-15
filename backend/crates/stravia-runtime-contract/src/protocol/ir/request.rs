@@ -12,6 +12,7 @@ use crate::protocol::ids::ProtocolId;
 use crate::protocol::ir::cache::CacheControl;
 use crate::protocol::ir::envelope::RawEnvelope;
 use crate::protocol::ir::ext::ProtocolExt;
+use crate::protocol::ir::native_tools::NativeToolKind;
 use crate::protocol::ir::vendor_ext::VendorExtensions;
 use crate::thinking::{TargetThinkingControl, ThinkingLevel};
 
@@ -1142,16 +1143,13 @@ pub struct ToolSpec {
     /// Whether to enforce strict JSON Schema validation (OpenAI + Anthropic).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub strict: Option<bool>,
-    /// Per-tool cache breakpoint (Anthropic).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cache_control: Option<CacheControl>,
-    /// Vendor-specific extra fields not covered by the IR.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub meta: Option<Value>,
+    /// Whether tool search must load this definition before it can be called.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub defer_loading: Option<bool>,
 }
 
 /// `tool_choice` — how the model selects tools.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolChoice {
     /// Model decides whether to call a tool.
@@ -1162,8 +1160,105 @@ pub enum ToolChoice {
     Required,
     /// Force a specific tool by name.
     Named { name: String },
-    /// Pass-through raw value for protocol-specific options.
+    Allowed { names: Vec<String>, required: bool },
+    Native(NativeToolKind),
+}
+
+// 旧 Raw 只在读取时归一化，无法表达的供应商选择不能重新进入公共契约。
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ToolChoiceWire {
+    Auto,
+    None,
+    Required,
+    Named { name: String },
+    Allowed { names: Vec<String>, required: bool },
+    Native(NativeToolKind),
     Raw(Value),
+}
+
+impl ToolChoiceWire {
+    fn into_choice(self) -> Option<ToolChoice> {
+        Some(match self {
+            Self::Auto => ToolChoice::Auto,
+            Self::None => ToolChoice::None,
+            Self::Required => ToolChoice::Required,
+            Self::Named { name } => ToolChoice::Named { name },
+            Self::Allowed { names, required } => ToolChoice::Allowed { names, required },
+            Self::Native(kind) => ToolChoice::Native(kind),
+            Self::Raw(value) => return legacy_tool_choice(&value),
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for ToolChoice {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        ToolChoiceWire::deserialize(deserializer)?
+            .into_choice()
+            .ok_or_else(|| serde::de::Error::custom("unsupported legacy tool choice"))
+    }
+}
+
+fn legacy_tool_choice(value: &Value) -> Option<ToolChoice> {
+    let value = value.get("functionCallingConfig").unwrap_or(value);
+    let kind = value
+        .as_str()
+        .or_else(|| value.get("type").and_then(Value::as_str))
+        .or_else(|| value.get("mode").and_then(Value::as_str))?;
+    match kind {
+        "auto" | "AUTO" => {
+            if let Some(names) = value.get("allowedFunctionNames").and_then(Value::as_array) {
+                return Some(ToolChoice::Allowed {
+                    names: names.iter().filter_map(Value::as_str).map(str::to_owned).collect(),
+                    required: false,
+                });
+            }
+            Some(ToolChoice::Auto)
+        }
+        "none" | "NONE" => Some(ToolChoice::None),
+        "required" | "any" | "ANY" => {
+            if let Some(names) = value.get("allowedFunctionNames").and_then(Value::as_array) {
+                return Some(ToolChoice::Allowed {
+                    names: names.iter().filter_map(Value::as_str).map(str::to_owned).collect(),
+                    required: true,
+                });
+            }
+            Some(ToolChoice::Required)
+        }
+        "function" | "tool" | "custom" => value
+            .get("name")
+            .or_else(|| value.get("function").and_then(|function| function.get("name")))
+            .and_then(Value::as_str)
+            .map(|name| ToolChoice::Named { name: name.into() }),
+        "allowed_tools" => {
+            let tools = value.get("tools")?.as_array()?;
+            let names = tools.iter().filter_map(|tool| {
+                tool.get("name")
+                    .or_else(|| tool.get("function").and_then(|function| function.get("name")))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            }).collect();
+            Some(ToolChoice::Allowed {
+                names,
+                required: value.get("mode").and_then(Value::as_str) == Some("required"),
+            })
+        }
+        "web_search" | "web_search_preview" | "web_search_2025_08_26" => {
+            Some(ToolChoice::Native(NativeToolKind::WebSearch))
+        }
+        "code_execution" | "code_interpreter" => {
+            Some(ToolChoice::Native(NativeToolKind::CodeExecution))
+        }
+        "image_generation" => Some(ToolChoice::Native(NativeToolKind::ImageGeneration)),
+        "tool_search" => Some(ToolChoice::Native(NativeToolKind::ToolSearch)),
+        kind if kind.starts_with("web_search_") => {
+            Some(ToolChoice::Native(NativeToolKind::WebSearch))
+        }
+        kind if kind.starts_with("code_execution_") => {
+            Some(ToolChoice::Native(NativeToolKind::CodeExecution))
+        }
+        _ => None,
+    }
 }
 
 // ── Generation config ─────────────────────────────────────────────────────────
@@ -1192,7 +1287,7 @@ pub struct GenerationConfig {
 /// Effort level for reasoning / thinking models.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum ReasoningEffort {
+enum ReasoningEffort {
     None,
     Minimal,
     Low,
@@ -1205,20 +1300,6 @@ pub enum ReasoningEffort {
 }
 
 impl ReasoningEffort {
-    pub fn from_openai_str(value: &str) -> anyhow::Result<Self> {
-        let effort = match value {
-            "none" => Self::None,
-            "minimal" => Self::Minimal,
-            "low" => Self::Low,
-            "medium" => Self::Medium,
-            "high" => Self::High,
-            "xhigh" => Self::Xhigh,
-            "max" => Self::Max,
-            _ => anyhow::bail!("invalid OpenAI reasoning effort"),
-        };
-        Ok(effort)
-    }
-
     pub fn as_openai_str(&self) -> Option<&str> {
         match self {
             Self::None => Some("none"),
@@ -1239,18 +1320,17 @@ impl ReasoningEffort {
 /// - OpenAI `reasoning.effort` + `reasoning.summary`
 /// - Anthropic `thinking: { type: "enabled", budget_tokens, display }`
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(from = "ReasoningConfigWire")]
 pub struct ReasoningConfig {
-    /// Whether extended reasoning / thinking is requested.
-    pub enabled: bool,
+    /// 原生执行模式不是 effort 档位；adaptive 不应被还原为缺少预算的 enabled。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
     /// Token budget for thinking (Anthropic `budget_tokens`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub budget_tokens: Option<u32>,
-    /// Effort level (OpenAI `reasoning.effort`).
+    /// 跨协议只保留摘要意图，避免 display 与 summary 形成两个控制来源。
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub effort: Option<ReasoningEffort>,
-    /// Display mode for thinking content (Anthropic `display: "summarized" | "omitted"`).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub display: Option<String>,
+    pub summary: Option<ReasoningSummary>,
     /// Canonical client-requested Thinking Level. `None` means unspecified.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub level: Option<ThinkingLevel>,
@@ -1259,19 +1339,139 @@ pub struct ReasoningConfig {
     pub target_control: Option<TargetThinkingControl>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningSummary {
+    None,
+    Auto,
+    Concise,
+    Detailed,
+}
+
+impl ReasoningConfig {
+    /// Derive client-requested activation without including per-attempt target controls.
+    pub fn is_enabled(&self) -> bool {
+        match self.mode.as_deref() {
+            Some("disabled") => false,
+            Some("auto" | "enabled" | "adaptive") => true,
+            _ => self
+                .level
+                .map(|level| level != ThinkingLevel::Off)
+                .unwrap_or_else(|| self.budget_tokens.is_some_and(|budget| budget > 0)),
+        }
+    }
+}
+
+// 格式 1 的旧字段仅在读取 DTO 中出现，不重新成为平台状态。
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct ReasoningConfigWire {
+    mode: Option<String>,
+    enabled: bool,
+    budget_tokens: Option<u32>,
+    effort: Option<ReasoningEffort>,
+    summary: Option<ReasoningSummary>,
+    display: Option<String>,
+    level: NullableControl<ThinkingLevel>,
+    target_control: Option<TargetThinkingControl>,
+}
+
+impl From<ReasoningConfigWire> for ReasoningConfig {
+    fn from(wire: ReasoningConfigWire) -> Self {
+        // 兼容投影可同时携带 budget 与 effort，不能把副本重新解释成额外意图。
+        let level = match wire.level {
+            NullableControl::Value(level) => Some(level),
+            NullableControl::Null => None,
+            NullableControl::Missing if wire.budget_tokens.is_some() => None,
+            NullableControl::Missing => wire.effort.as_ref().and_then(|effort| match effort {
+                ReasoningEffort::Budget(value) => Some(ThinkingLevel::from_budget(*value)),
+                value => value
+                    .as_openai_str()
+                    .and_then(|value| ThinkingLevel::from_wire(value).ok()),
+            }),
+        };
+        let budget_tokens = wire.budget_tokens.or(match wire.effort {
+            Some(ReasoningEffort::Budget(value)) => Some(value),
+            _ => None,
+        });
+        let mode = wire.mode.or_else(|| {
+            (wire.enabled && level.is_none() && budget_tokens.is_none()).then(|| "enabled".into())
+        });
+        Self {
+            mode,
+            budget_tokens,
+            summary: wire.summary.or(match wire.display.as_deref() {
+                Some("summarized") => Some(ReasoningSummary::Auto),
+                Some("omitted") => Some(ReasoningSummary::None),
+                _ => None,
+            }),
+            level,
+            target_control: wire.target_control,
+        }
+    }
+}
+
 // ── Response format ───────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ResponseFormat {
     Text,
     JsonObject,
     JsonSchema {
         name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
         schema: Value,
         #[serde(skip_serializing_if = "Option::is_none")]
         strict: Option<bool>,
     },
+}
+
+// 历史插件曾把 schema 包在 json_schema 中；读取兼容不能改变写出的唯一形态。
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ResponseFormatWire {
+    Text,
+    JsonObject,
+    JsonSchema {
+        #[serde(flatten)]
+        shape: ResponseSchemaWire,
+    },
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ResponseSchemaWire {
+    Direct(ResponseSchemaFields),
+    Nested { json_schema: ResponseSchemaFields },
+}
+
+#[derive(Deserialize)]
+struct ResponseSchemaFields {
+    name: String,
+    description: Option<String>,
+    schema: Value,
+    strict: Option<bool>,
+}
+
+impl<'de> Deserialize<'de> for ResponseFormat {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(match ResponseFormatWire::deserialize(deserializer)? {
+            ResponseFormatWire::Text => Self::Text,
+            ResponseFormatWire::JsonObject => Self::JsonObject,
+            ResponseFormatWire::JsonSchema { shape } => {
+                let (ResponseSchemaWire::Direct(fields)
+                    | ResponseSchemaWire::Nested { json_schema: fields }) = shape;
+                Self::JsonSchema {
+                    name: fields.name,
+                    description: fields.description,
+                    schema: fields.schema,
+                    strict: fields.strict,
+                }
+            }
+        })
+    }
 }
 
 // ── Stream config ─────────────────────────────────────────────────────────────
@@ -1281,15 +1481,6 @@ pub struct StreamConfig {
     pub enabled: bool,
     /// Whether the provider should include token usage in the final stream chunk.
     pub include_usage: bool,
-}
-
-// ── Safety settings ───────────────────────────────────────────────────────────
-
-/// Google SafetySettings — important enough to have a first-class home in the IR.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SafetySettings {
-    pub category: String,
-    pub threshold: String,
 }
 
 // ── Request metadata ──────────────────────────────────────────────────────────
@@ -1355,9 +1546,8 @@ pub struct EmbeddingRequest {
 
 /// Unified ingress IR consumed by all codec encoders and the dispatcher.
 ///
-/// Fields are annotated with the FIELD_HOMING.md category that they belong to:
-/// `[IR]` = core, `[OAIChat]` = OpenAIChatExt, etc.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(from = "AiRequestWire")]
 pub struct AiRequest {
     // ── Core ──────────────────────────────────────────────────────────────────
     /// [IR] The model identifier as received from the client.
@@ -1366,6 +1556,7 @@ pub struct AiRequest {
     pub items: Vec<AiItem>,
     /// [IR] Request-level instructions. This remains separate from ordered
     /// message history so continuation can inherit it exactly.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
 
     // ── Generation ────────────────────────────────────────────────────────────
@@ -1384,10 +1575,8 @@ pub struct AiRequest {
     /// [IR] Tool selection mode.
     pub tool_choice: Option<ToolChoice>,
     /// [IR] Whether the provider should call tools in parallel.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub parallel_tool_calls: Option<bool>,
-    /// [IR] Disable parallel tool use (Anthropic `disable_parallel_tool_use`,
-    /// equivalent to `parallel_tool_calls = false` for OpenAI).
-    pub disable_parallel_tool_calls: Option<bool>,
 
     // ── Reasoning ─────────────────────────────────────────────────────────────
     /// [IR] Reasoning / extended-thinking configuration.
@@ -1395,19 +1584,154 @@ pub struct AiRequest {
 
     // ── Output format ─────────────────────────────────────────────────────────
     /// [IR] Response format constraint.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub response_format: Option<ResponseFormat>,
 
-    // ── Safety ────────────────────────────────────────────────────────────────
-    /// [IR] Google SafetySettings (ignored by other encoders).
-    pub safety_settings: Option<Vec<SafetySettings>>,
-
     // ── Protocol extensions ───────────────────────────────────────────────────
-    /// Protocol-domain Ext carrying fields specific to the source protocol.
-    /// Populated by the ingress decoder (PR-2); consumed by the egress encoder (PR-3).
-    pub ext: Option<ProtocolExt>,
+    /// 独立语义控制的唯一平台归属；扩展字段均有默认值以保持插件读取兼容。
+    #[serde(default)]
+    pub parameters: super::parameters::RequestParameters,
 
     // ── Metadata / vendor bag ─────────────────────────────────────────────────
     pub meta: RequestMetadata,
+}
+
+// 缺省与显式 null 只在读取边界区分，避免把续接重置状态扩散到公共字段。
+#[derive(Default)]
+enum NullableControl<T> {
+    #[default]
+    Missing,
+    Null,
+    Value(T),
+}
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for NullableControl<T> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(match Option::<T>::deserialize(deserializer)? {
+            Some(value) => Self::Value(value),
+            None => Self::Null,
+        })
+    }
+}
+
+impl<T> NullableControl<T> {
+    fn into_value(
+        self,
+        resets: &mut Vec<super::parameters::ParameterReset>,
+        reset: super::parameters::ParameterReset,
+    ) -> Option<T> {
+        match self {
+            Self::Value(value) => Some(value),
+            Self::Null => {
+                if !resets.contains(&reset) {
+                    resets.push(reset);
+                }
+                None
+            }
+            Self::Missing => None,
+        }
+    }
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct GenerationConfigWire {
+    temperature: NullableControl<f64>,
+    max_tokens: NullableControl<u32>,
+    top_p: NullableControl<f64>,
+    seed: Option<i64>,
+    stop: Option<Vec<String>>,
+    presence_penalty: NullableControl<f64>,
+    frequency_penalty: NullableControl<f64>,
+}
+
+impl GenerationConfigWire {
+    fn into_config(self, resets: &mut Vec<super::parameters::ParameterReset>) -> GenerationConfig {
+        use super::parameters::ParameterReset;
+        GenerationConfig {
+            temperature: self.temperature.into_value(resets, ParameterReset::Temperature),
+            max_tokens: self.max_tokens.into_value(resets, ParameterReset::MaxTokens),
+            top_p: self.top_p.into_value(resets, ParameterReset::TopP),
+            seed: self.seed,
+            stop: self.stop,
+            presence_penalty: self.presence_penalty.into_value(resets, ParameterReset::PresencePenalty),
+            frequency_penalty: self.frequency_penalty.into_value(resets, ParameterReset::FrequencyPenalty),
+        }
+    }
+}
+
+/// 仅用于读取已安装 format1 插件和历史快照；旧拼写不是运行时状态。
+#[derive(Deserialize)]
+struct AiRequestWire {
+    model: String,
+    items: Vec<AiItem>,
+    #[serde(default)]
+    instructions: NullableControl<String>,
+    #[serde(default)]
+    generation: Option<GenerationConfigWire>,
+    #[serde(default)]
+    embedding: Option<EmbeddingRequest>,
+    #[serde(default)]
+    stream: StreamConfig,
+    #[serde(default)]
+    tools: Option<Vec<ToolSpec>>,
+    #[serde(default)]
+    tool_choice: Option<ToolChoiceWire>,
+    #[serde(default)]
+    parallel_tool_calls: NullableControl<bool>,
+    #[serde(default)]
+    disable_parallel_tool_calls: Option<bool>,
+    #[serde(default)]
+    reasoning: NullableControl<ReasoningConfig>,
+    #[serde(default)]
+    response_format: NullableControl<ResponseFormat>,
+    #[serde(default)]
+    parameters: super::parameters::RequestParameters,
+    #[serde(default)]
+    ext: Option<ProtocolExt>,
+    #[serde(default)]
+    meta: RequestMetadata,
+}
+
+impl From<AiRequestWire> for AiRequest {
+    fn from(wire: AiRequestWire) -> Self {
+        use super::parameters::ParameterReset;
+        let mut parameters = wire.parameters;
+        let generation = wire.generation.unwrap_or_default().into_config(&mut parameters.resets);
+        let instructions = wire.instructions.into_value(&mut parameters.resets, ParameterReset::Instructions);
+        let parallel_is_missing = matches!(&wire.parallel_tool_calls, NullableControl::Missing);
+        let parallel_tool_calls = wire.parallel_tool_calls
+            .into_value(&mut parameters.resets, ParameterReset::ParallelToolCalls)
+            .or_else(|| {
+                if parallel_is_missing {
+                    wire.disable_parallel_tool_calls.map(|value| !value)
+                } else {
+                    None
+                }
+            });
+        let reasoning = wire.reasoning.into_value(&mut parameters.resets, ParameterReset::Reasoning).unwrap_or_default();
+        let response_format = wire.response_format.into_value(&mut parameters.resets, ParameterReset::ResponseFormat);
+        let mut request = Self {
+            model: wire.model,
+            items: wire.items,
+            instructions,
+            generation,
+            embedding: wire.embedding,
+            stream: wire.stream,
+            tools: wire.tools,
+            tool_choice: wire.tool_choice.and_then(ToolChoiceWire::into_choice),
+            parallel_tool_calls,
+            reasoning,
+            response_format,
+            parameters,
+            meta: wire.meta,
+        };
+        if let Some(extension) = wire.ext {
+            request.import_legacy_extension(extension);
+        }
+        request.normalize_parameters();
+        request
+    }
 }
 
 impl AiRequest {
@@ -1423,11 +1747,9 @@ impl AiRequest {
             tools: None,
             tool_choice: None,
             parallel_tool_calls: None,
-            disable_parallel_tool_calls: None,
             reasoning: ReasoningConfig::default(),
             response_format: None,
-            safety_settings: None,
-            ext: None,
+            parameters: Default::default(),
             meta: RequestMetadata::default(),
         }
     }
@@ -1443,13 +1765,9 @@ impl AiRequest {
         Ok(value)
     }
 
-    /// Return the modalities from `OpenAIChatExt` if present.
-    pub fn modalities(&self) -> Option<&Vec<String>> {
-        if let Some(ProtocolExt::OpenAiChat(ref e)) = self.ext {
-            e.modalities.as_ref()
-        } else {
-            None
-        }
+    /// 返回唯一平台输出模态；不从源协议的副本恢复。
+    pub fn modalities(&self) -> Option<&Vec<super::parameters::Modality>> {
+        self.parameters.modalities.as_ref()
     }
 }
 
@@ -1460,6 +1778,333 @@ mod tests {
         MediaSource, MessageContent,
     };
     use serde_json::{Value, json};
+
+    #[test]
+    fn legacy_request_snapshot_discards_removed_tool_and_safety_controls() {
+        let request: super::AiRequest = serde_json::from_value(json!({
+            "model": "model",
+            "items": [],
+            "tools": [{
+                "name": "lookup",
+                "description": "Find a record",
+                "parameters": {"type": "object", "properties": {"opaque": {"vendor": true}}},
+                "strict": false,
+                "defer_loading": true,
+                "eager_input_streaming": true,
+                "allowed_callers": ["code_execution"],
+                "input_examples": [{"opaque": 1}],
+                "citations_enabled": true,
+                "cache_control": {"type": "ephemeral"},
+                "meta": {"vendor": "discard"}
+            }],
+            "safety_settings": [{"category": "harm", "threshold": "block"}],
+            "disable_parallel_tool_calls": true,
+            "reasoning": {"enabled": true, "display": "summarized"},
+            "response_format": {"type": "json_schema", "name": "answer", "schema": {}}
+        })).unwrap();
+        let stored = serde_json::to_value(&request).unwrap();
+        assert_eq!(stored["tools"], json!([{
+            "name": "lookup",
+            "description": "Find a record",
+            "parameters": {"type": "object", "properties": {"opaque": {"vendor": true}}},
+            "strict": false,
+            "defer_loading": true
+        }]));
+        assert!(stored.get("safety_settings").is_none());
+        assert_eq!(stored["parallel_tool_calls"], false);
+        assert_eq!(stored["reasoning"], json!({"mode": "enabled", "summary": "auto"}));
+        assert_eq!(stored["response_format"], json!({
+            "type": "json_schema", "name": "answer", "schema": {}
+        }));
+        let restored: super::AiRequest = serde_json::from_value(stored.clone()).unwrap();
+        assert_eq!(serde_json::to_value(restored).unwrap(), stored);
+    }
+
+    #[test]
+    fn legacy_raw_tool_choices_import_without_preserving_vendor_json() {
+        for (raw, canonical) in [
+            (json!("required"), json!("required")),
+            (json!({"type": "function", "function": {"name": "lookup"}}),
+             json!({"named": {"name": "lookup"}})),
+            (json!({"type": "allowed_tools", "mode": "required",
+                    "tools": [{"type": "function", "name": "lookup"}, {"type": "custom", "name": "script"}]}),
+             json!({"allowed": {"names": ["lookup", "script"], "required": true}})),
+            (json!({"mode": "AUTO", "allowedFunctionNames": ["lookup"]}),
+             json!({"allowed": {"names": ["lookup"], "required": false}})),
+            (json!({"type": "web_search_preview_2025_03_11"}),
+             json!({"native": "web_search"})),
+            (json!({"type": "code_interpreter"}), json!({"native": "code_execution"})),
+            (json!({"type": "image_generation"}), json!({"native": "image_generation"})),
+            (json!({"type": "tool_search"}), json!({"native": "tool_search"})),
+            (json!({"type": "file_search", "private_control": true}), Value::Null),
+        ] {
+            let request: super::AiRequest = serde_json::from_value(json!({
+                "model": "model", "items": [], "tool_choice": {"raw": raw}
+            })).unwrap();
+            let stored = serde_json::to_value(&request).unwrap();
+            assert_eq!(stored["tool_choice"], canonical);
+            let restored: super::AiRequest = serde_json::from_value(stored).unwrap();
+            assert_eq!(serde_json::to_value(restored.tool_choice).unwrap(), canonical);
+        }
+    }
+
+    #[test]
+    fn reasoning_summary_replaces_display_and_prefers_canonical_value() {
+        for (wire, summary) in [
+            (json!({"display": "summarized"}), Some(super::ReasoningSummary::Auto)),
+            (json!({"display": "omitted"}), Some(super::ReasoningSummary::None)),
+            (json!({"display": "unknown"}), None),
+            (json!({"summary": "detailed", "display": "omitted"}), Some(super::ReasoningSummary::Detailed)),
+            (json!({"summary": "concise"}), Some(super::ReasoningSummary::Concise)),
+        ] {
+            let reasoning: super::ReasoningConfig = serde_json::from_value(wire).unwrap();
+            assert_eq!(reasoning.summary, summary);
+            let stored = serde_json::to_value(&reasoning).unwrap();
+            assert!(stored.get("display").is_none());
+            let restored: super::ReasoningConfig = serde_json::from_value(stored).unwrap();
+            assert_eq!(restored.summary, summary);
+        }
+    }
+
+    #[test]
+    fn canonical_reasoning_budget_and_level_override_legacy_effort_projection() {
+        for wire in [
+            json!({"budget_tokens":1024,"effort":{"budget":1024}}),
+            json!({"budget_tokens":1024,"level":null,"effort":{"budget":1024}}),
+            json!({"level":null,"effort":"high"}),
+        ] {
+            let reasoning: super::ReasoningConfig = serde_json::from_value(wire).unwrap();
+            assert!(reasoning.level.is_none());
+        }
+        let legacy: super::ReasoningConfig =
+            serde_json::from_value(json!({"effort":"high"})).unwrap();
+        assert_eq!(legacy.level, Some(crate::thinking::ThinkingLevel::High));
+    }
+
+    #[test]
+    fn response_format_description_round_trips_without_rewriting_business_schema() {
+        let value = json!({
+            "type": "json_schema",
+            "name": "answer",
+            "description": "Documented answer",
+            "schema": {
+                "type": "object",
+                "description": "Business schema description",
+                "properties": {"opaque": {"vendor_annotation": true}}
+            },
+            "strict": false
+        });
+        let format: super::ResponseFormat = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(format).unwrap(), value);
+        let nested = json!({
+            "type": "json_schema",
+            "json_schema": {
+                "name": "answer",
+                "description": "Documented answer",
+                "schema": value["schema"],
+                "strict": false
+            }
+        });
+        let legacy: super::ResponseFormat = serde_json::from_value(nested).unwrap();
+        assert_eq!(serde_json::to_value(legacy).unwrap(), value);
+    }
+
+    #[test]
+    fn explicit_null_request_controls_record_resets_without_roundtrip_growth() {
+        use crate::protocol::ir::parameters::ParameterReset;
+        let request: super::AiRequest = serde_json::from_value(json!({
+            "model": "model",
+            "items": [],
+            "instructions": null,
+            "reasoning": null,
+            "response_format": null,
+            "parallel_tool_calls": null,
+            "disable_parallel_tool_calls": false,
+            "generation": {
+                "temperature": null,
+                "top_p": null,
+                "max_tokens": null,
+                "presence_penalty": null,
+                "frequency_penalty": null
+            }
+        })).unwrap();
+        assert!(request.instructions.is_none());
+        assert!(request.parallel_tool_calls.is_none());
+        assert!(request.response_format.is_none());
+        for reset in [
+            ParameterReset::Instructions,
+            ParameterReset::Reasoning,
+            ParameterReset::ResponseFormat,
+            ParameterReset::ParallelToolCalls,
+            ParameterReset::Temperature,
+            ParameterReset::TopP,
+            ParameterReset::MaxTokens,
+            ParameterReset::PresencePenalty,
+            ParameterReset::FrequencyPenalty,
+        ] {
+            assert!(request.parameters.resets.contains(&reset), "{reset:?}");
+        }
+        let stored = serde_json::to_value(&request).unwrap();
+        for field in ["instructions", "response_format", "parallel_tool_calls"] {
+            assert!(stored.get(field).is_none(), "{field}");
+        }
+        let restored: super::AiRequest = serde_json::from_value(stored.clone()).unwrap();
+        assert_eq!(serde_json::to_value(restored).unwrap(), stored);
+        let missing: super::AiRequest = serde_json::from_value(json!({
+            "model": "model", "items": []
+        })).unwrap();
+        assert!(missing.parameters.resets.is_empty());
+    }
+
+    #[test]
+    fn legacy_bedrock_output_imports_single_canonical_response_format() {
+        let output = json!({
+            "textFormat": {
+                "type": "json_schema",
+                "structure": {"jsonSchema": {
+                    "schema": "{\"type\":\"object\",\"properties\":{\"opaque\":{\"unknown\":true}}}",
+                    "name": "answer",
+                    "description": "documented answer",
+                    "unknown": "ignored"
+                }}
+            }
+        });
+        for parameters in [
+            json!({"bedrock_output_config": output}),
+            json!({"extensions": {"bedrock": {"outputConfig": output}}}),
+        ] {
+            let request: super::AiRequest = serde_json::from_value(json!({
+                "model": "model", "items": [], "parameters": parameters
+            }))
+            .unwrap();
+            let Some(super::ResponseFormat::JsonSchema {
+                name,
+                description,
+                schema,
+                strict,
+            }) = &request.response_format
+            else {
+                panic!("legacy Bedrock format was not imported");
+            };
+            assert_eq!(name, "answer");
+            assert_eq!(schema["properties"]["opaque"]["unknown"], true);
+            assert_eq!(*strict, None);
+            assert_eq!(
+                description.as_deref(),
+                Some("documented answer")
+            );
+            let stored = serde_json::to_value(&request).unwrap();
+            assert!(stored["parameters"].get("bedrock_output_config").is_none());
+            assert!(stored["parameters"].get("extensions").is_none());
+        }
+    }
+
+    #[test]
+    fn legacy_native_controls_import_only_unified_fields() {
+        let request: super::AiRequest = serde_json::from_value(json!({
+            "model": "model", "items": [],
+            "tools": [{"name": "lookup", "parameters": {}, "strict": null}],
+            "parameters": {
+                "cohere_strict_tools": false,
+                "extensions": {
+                    "cohere": {"strict_tools": true, "priority": 0, "documents": [], "unknown": 1},
+                    "google": {"audioTimestamp": false, "speechConfig": null, "unknown": true},
+                    "open-responses": {
+                        "max_tool_calls": null,
+                        "text": {"format": {"strict": null}, "verbosity": null},
+                        "unknown": {"danger": true}
+                    },
+                    "unregistered": {"injected": true}
+                },
+                "future_optional_control": {"ignored": true}
+            }
+        }))
+        .unwrap();
+        assert_eq!(request.tools.as_ref().unwrap()[0].strict, Some(false));
+        let stored = serde_json::to_value(&request).unwrap();
+        for field in [
+            "extensions", "future_optional_control", "cohere_strict_tools",
+            "cohere_priority", "cohere_documents", "google_audio_timestamp",
+            "google_speech_config", "response_presence",
+        ] {
+            assert!(stored["parameters"].get(field).is_none(), "{field}");
+        }
+        let restored: super::AiRequest = serde_json::from_value(stored).unwrap();
+        assert_eq!(restored.tools.as_ref().unwrap()[0].strict, Some(false));
+    }
+
+    #[test]
+    fn ignored_legacy_controls_do_not_change_canonical_history_identity() {
+        let baseline = super::AiRequest::new("model", Vec::new());
+        let mut legacy = serde_json::to_value(&baseline).unwrap();
+        legacy["parameters"]["extensions"] = json!({"openai-chat": {"unknown": true}});
+        legacy["meta"]["vendor"] = json!({
+            "ingress": {"unknown": {"nested": true}},
+            "egress": {},
+            "passthrough_safe": {}
+        });
+        let ignored: super::AiRequest = serde_json::from_value(legacy).unwrap();
+        assert_eq!(
+            crate::protocol::ir::canonical::history_request_controls_hash(&baseline),
+            crate::protocol::ir::canonical::history_request_controls_hash(&ignored),
+        );
+    }
+
+    #[test]
+    fn legacy_reasoning_activation_is_only_a_missing_control_hint() {
+        for (wire, mode, enabled) in [
+            (json!({"enabled": true}), Some("enabled"), true),
+            (json!({"enabled": false}), None, false),
+            (json!({"enabled": true, "level": "off"}), None, false),
+            (json!({"enabled": true, "level": "high"}), None, true),
+            (json!({"enabled": true, "budget_tokens": 0}), None, false),
+            (
+                json!({"enabled": true, "mode": "disabled", "level": "max", "effort": "low"}),
+                Some("disabled"),
+                false,
+            ),
+        ] {
+            let reasoning: super::ReasoningConfig = serde_json::from_value(wire).unwrap();
+            assert_eq!(reasoning.mode.as_deref(), mode);
+            assert_eq!(reasoning.is_enabled(), enabled);
+            let canonical = serde_json::to_value(&reasoning).unwrap();
+            assert!(canonical.get("enabled").is_none());
+            assert!(canonical.get("effort").is_none());
+            let restored: super::ReasoningConfig = serde_json::from_value(canonical).unwrap();
+            assert_eq!(restored.mode, reasoning.mode);
+            assert_eq!(restored.level, reasoning.level);
+            assert_eq!(restored.is_enabled(), enabled);
+        }
+    }
+
+    #[test]
+    fn explicit_reasoning_mode_and_level_survive_legacy_effort_and_normalization() {
+        let mut request = super::AiRequest::new("model", Vec::new());
+        request.reasoning = serde_json::from_value(json!({
+            "mode": "disabled", "level": "max", "effort": "low", "enabled": true
+        }))
+        .unwrap();
+        request
+            .meta
+            .vendor
+            .ingress
+            .insert("reasoning_effort".into(), json!("medium"));
+        request.normalize_parameters();
+        assert_eq!(request.reasoning.mode.as_deref(), Some("disabled"));
+        assert_eq!(
+            request.reasoning.level,
+            Some(crate::thinking::ThinkingLevel::Max)
+        );
+        assert!(!request.reasoning.is_enabled());
+        request.reasoning.mode = Some("enabled".into());
+        request.reasoning.level = Some(crate::thinking::ThinkingLevel::Off);
+        request.normalize_parameters();
+        assert!(request.reasoning.is_enabled());
+        assert_eq!(
+            request.reasoning.level,
+            Some(crate::thinking::ThinkingLevel::Off)
+        );
+    }
 
     #[test]
     fn message_content_decoding_preserves_text_blocks_and_native_values() {

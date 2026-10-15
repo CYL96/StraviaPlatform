@@ -2,6 +2,8 @@
 
 > **范围与证据等级**：本文以 `anomalyco/opencode` 仓库 `dev` 分支在 **2026-09-29** 读取的 commit `7945de208964a49300d7f770d1a71d078db9a4c4`（提交时间 2026-09-28T22:59:34Z）为源码证据；以 `opencode.ai/docs/zen/`（读取于 2026-09-29）和 `opencode.ai/legal/terms-of-service`（生效日期 2026-08-15）为官方文档证据；以公开 GitHub issue 与第三方桥接项目源码/README 为行为佐证。标记为「实测/社区观测」的内容来自第三方项目的实测记录，不是官方承诺；标记 [无法确认] 的内容无法从一手来源证实。本文不包含任何真实 token。
 
+> **2026-10-15 更新**：历史章节保留原时点证据，不作为当前门控规范。当前官方入口、CLI 捕获、单变量结果及真实 Wasm 修复见 §3.4.3；“随机 hex session 足够”“只追最新 UA”“空 schema 足够”等历史推断均不能继续作为实现依据。
+
 ## 1. 先给结论
 
 1. **Zen 是 OpenCode 自营的 AI 网关**，按 token 计费（pay-as-you-go），同时维护一组**限时免费模型**。截至 2026-09-29 官方文档列出的免费模型为：`big-pickle`、`space-bunny-free`、`longcat-2.5-preview-free`、`mimo-v2.6-flash-free`、`mimo-v2.5-free`、`ling-3.0-flash-fin-free`、`nemotron-3-ultra-free`、`nemotron-3.5-lightning-free`、`muse-spark-1.3-contributor-free`、`jev-1.13-free`。官方明确说这些免费是 "for a limited time"，用于收集反馈/改进模型——本质是模型方或 OpenCode 补贴的推广期，部分免费模型的对话数据会被用于训练（Big Pickle、MiMo、Ling、Nemotron、Muse Spark Contributor 等，见 §6 隐私段）。
@@ -104,7 +106,7 @@ headers: {
 - **stream+tools 校验**（zen-proxy README，实测）：免费层只接受「真实 agent 形态」的请求——`stream: true` 且 body 带真实 tool 定义；裸 curl/健康探测得 `403 FreeTierError`。详见 §3.4.1。
 - **Cloudflare WAF**（issue #41320/#39374/#24284，实测）：`opencode.ai/zen/*` 前置 Cloudflare browser-signature 规则（error 1010），按 UA/TLS 指纹拦非 opencode 客户端；`codex-cli/*` UA 间歇性被 403，`Python-urllib` 直接 403，浏览器/curl UA 可通过。来源：[issue #41320](https://github.com/anomalyco/opencode/issues/41320)。
 
-#### 3.4.1 免费层「客户端契约」实测细节（tools 匹配策略）
+#### 3.4.1 历史第三方「客户端契约」观测（2026-09）
 
 目前对门控最完整的公开实测来自 OmniRoute（一个自托管多渠道路由器）的 `open-sse/executors/opencodeFreeTierContract.ts` 与配套的 `opencodeRequestShape.ts`、`opencodeToolObservation.ts`。其文件头注释声明是 **2026-09-17~21 对线上 endpoint 在 3 个免费模型、Chat Completions 与 Responses 两个 surface 上的实测**。结论（来源：[opencodeFreeTierContract.ts](https://github.com/diegosouzapw/OmniRoute/blob/release/v3.8.51/open-sse/executors/opencodeFreeTierContract.ts)、[opencodeRequestShape.ts](https://github.com/diegosouzapw/OmniRoute/blob/release/v3.8.51/open-sse/executors/opencodeRequestShape.ts)、[opencodeToolObservation.ts](https://github.com/diegosouzapw/OmniRoute/blob/release/v3.8.51/open-sse/executors/opencodeToolObservation.ts)，均为第三方实测，非官方承诺）：
 
@@ -149,7 +151,34 @@ headers: {
 
 结论：**契约门控当前在 `chat/completions` 面仍按 §3.4.1 生效，且满足后纯 HTTP 栈（非 Bun、非官方 TLS 指纹）可通过**——#49621 的「HTTP 层之下判别器」观测应限定于 `/responses` 面或 muse-spark 系模型；该面同契约仍 403，与 issue 一致。即可用性按 endpoint 分裂：`chat/completions` 系免费模型可桥接，`responses` 系（muse-spark 等）需要真实 opencode 会话或自带 key。
 
-tools 检查对象的细化（同日实测，模型 big-pickle）：单工具 `bash`（完整 schema）→ 403；两工具 `[bash, read]`（完整 schema）→ 200；**两个编造名 + 完整 schema → 403**；两个真名裸声明（无 description/parameters）→ **400 invalid_request_error**（即已通过 FreeTierError 门，被上游 schema 校验拒）。推断：门控检查的是**工具名集合**（须含 opencode 真实工具名、单一名字不够，疑似要求 ≥2 或特定组合），**不校验 schema 内容**——schema 合法性由上游 provider 校验兜底。伪造 tools 时名字必须用真名，struct 只需合法、不需要仿真 opencode 的 schema。
+tools 检查对象的细化（同日实测，模型 big-pickle）：单工具 `bash`（完整 schema）→ 403；两工具 `[bash, read]`（完整 schema）→ 200；**两个编造名 + 完整 schema → 403**；两个真名裸声明（无 description/parameters）→ **400 invalid_request_error**。这些对照只覆盖完整 schema 与缺失 schema，不能据此推出空 `properties` 足够或上游不检查 schema 内容；后续 §3.4.3 的受控结果已排除该推断。
+
+#### 3.4.3 本仓库回归修复（2026-10-15，官方 CLI 捕获与真实 Wasm）
+
+本机官方 OpenCode `1.18.25` 在隔离 HOME／XDG／APPDATA、配置与工作目录下，以 `--pure`、禁分享、工具权限 ask、无 stdin 和合成提示运行。loopback 接收器捕获一次真实构造的请求后返回受控错误，未执行工具、未访问用户项目或账号。实际 UA 为 `opencode/1.18.25 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14`，捕获工具包括 `bash/edit/glob/grep/read/skill/task/todowrite/webfetch/websearch/write`。
+
+源码固定在该发行 commit [`cb7d8b2`](https://github.com/anomalyco/opencode/tree/cb7d8b2f5e44876ef98b661dc10590c915af3a9f)：[请求头与模型请求](https://github.com/anomalyco/opencode/blob/cb7d8b2f5e44876ef98b661dc10590c915af3a9f/packages/opencode/src/session/llm/request.ts)、[工具注册](https://github.com/anomalyco/opencode/blob/cb7d8b2f5e44876ef98b661dc10590c915af3a9f/packages/opencode/src/tool/registry.ts)、[标识编码](https://github.com/anomalyco/opencode/blob/cb7d8b2f5e44876ef98b661dc10590c915af3a9f/packages/schema/src/identifier.ts)。session 使用降序时间前缀，message 使用升序前缀：`timestamp_ms * 4096 + counter` 从 1 计数，session 取反，取低 48 位按大端输出 12 hex，再加 14 位 base62 随机尾部；不能用宿主 affinity 或 UUID 的前 26 hex 冒充。
+
+之后的上游探测只使用合成提示、公开工具 schema 与字面量 `Bearer public`，不发送用户数据库、真实凭据或历史内容，不轮换出口，不重复重试同一失败条件。以下单变量对照使用当前 `/inference/v1/chat/completions`：
+
+| 条件 | 实际结果 |
+|---|---|
+| 官方捕获的 body／headers，由 Python urllib 重放 | 200，SSE 完成并准确返回探测标记 |
+| 在可接受请求中仅替换为 `1.19.0 / provider-utils 4.0.51` UA 组合 | 403 `FreeTierError` |
+| 仅将 UA 内 OpenCode 版本改成 `1.19.0`，SDK 仍为 `4.0.23` | 403 `FreeTierError` |
+| 仅将工具换成 `bash/read` 两项空 `properties` | 403 `FreeTierError` |
+| 只保留 `bash/read`，使用实际输入 schema | 200 |
+| 两个真名使用非空 `q:string` schema | 200 |
+| 空 schema 仅补 description 或 `required:[]`／`additionalProperties:false` | 403 `FreeTierError` |
+| 相同可接受工具 schema 仅改成两个自定义工具名 | 403 `FreeTierError` |
+| 仅把 session 换成 UUID 前 26 hex | 403 `FreeTierError` |
+| 仅把 request/message 换成 UUID 前 26 hex | 200 |
+| 不带工具，system 明确禁止工具 | 403 `FreeTierError` |
+| 原失败请求只更换 endpoint、移除禁令、补 `strict:false` 或补输出上限 | 均为 403 `FreeTierError` |
+
+实际构建的 Stravia Wasm 在修复 UA、原生 ID 和输入 schema 后，旧 `/zen/v1` 请求仍返回 403；改用[当前官方文档](https://opencode.ai/v2/docs/console/models/)的 `/inference/v1` 后，`big-pickle` 返回 HTTP 200，完整 SSE 经宿主汇总后准确输出 `STRAVIA_ZEN_PROBE_OK`。该请求保留“补出的 bash/read 不可调用”系统指令，说明本次不必删除禁令或新增工具执行器，也不必改成 CLI Agent 后端。
+
+私有门控无法从公开源码完整还原，上述成功也不能外推为全部模型、全部工具集或 Responses 面可用；Python 与 Wasm 的成功只排除了“本次 Chat 请求必须由官方二进制／TLS 才能通过”的解释。[维护者仍明确不支持其他 harness 使用免费层](https://github.com/anomalyco/opencode/issues/49621#issuecomment-5723383322)，社区方案（如已关闭的 [9router #4132](https://github.com/decolua/9router/pull/4132) 和 [OMP 同类故障](https://github.com/can1357/oh-my-pi/issues/12306)）只能作为历史线索，不能替代当前受控验证。
 
 ### 3.5 区域与其它限制
 
@@ -214,7 +243,18 @@ tools 检查对象的细化（同日实测，模型 big-pickle）：单工具 `b
 
 ### 7.4 本仓库实现
 
-专属插件 `stravia-vendor-opencode-free`（`provider_id = "opencode-free"`，dedicated，本地导入分发）实现免费层契约：命中免费模型（`-free` 后缀或 `big-pickle`）→ 强制 `stream: true`、注入 `bash`/`read` 占位工具（客户端已声明同名则保留客户端版本）、占位名写入 instructions 禁令、`tool_choice` 归一为 auto；指纹头（UA / `x-opencode-*`）对全部模型发送与真实客户端一致，无 apiKey 时 `Bearer public`；discovery 只暴露免费模型；`userAgent` 配置字段可覆盖 UA 版本。与 base 的 `opencode` Profile 并存不接管，`opencode-go` 付费面不受影响。组件级合同测试见 `tests/contract.rs`（`cargo test -p stravia-vendor-opencode-free --test contract -- --ignored`，需先 `task build:vendors:all`）。
+专属插件 `stravia-vendor-opencode-free`（`provider_id = "opencode-free"`，dedicated，本地导入分发）保持 HTTP Chat Completions 接入，默认 Base URL 为 `https://opencode.ai/inference/v1`。免费请求强制原生流式 wire 与 `tool_choice: auto`，即使客户端已提供完整工具集也执行归一。只补缺失的 `bash/read`，采用官方输入字段与边界，保留客户端同名工具和已有指令；禁令只针对补出的名字，不新增执行器，不伪造结果。消息 ID 使用原生编码；按宿主作用域 affinity 查找的 session 以至多 256 项私有缓存尽力复用，不把截断 hash 当作时间。缓存可能淘汰或受并发首次写覆盖影响，失去复用不改变完整消息或授权。
+
+不开放任意 `userAgent` 覆盖；未知控制仍由正向白名单透明丢弃，无 apiKey 时使用 `Bearer public`。与 base 的 `opencode` Profile 并存，不接管 Zen Go，不静默重写自定义 Base URL；手动固定旧 `/zen/v1` 的已有连接须在重新导入组件后更新地址。具体限制见[设计文档](../design/vendor-plugins.md#opencode-zen-free-准入限制)。
+
+先执行 `task build:vendors:all`，再分别运行：
+
+```bash
+# 离线真实组件合同，不调用上游
+cargo test --locked -p stravia-vendor-opencode-free --test contract -- --ignored --skip live_
+# 显式匿名上游调用；检查准确响应文本，不以非空文本代替成功
+cargo test --locked -p stravia-vendor-opencode-free --test contract live_free_model_infer_against_real_zen -- --ignored --exact --nocapture
+```
 
 ## 附：主要来源
 

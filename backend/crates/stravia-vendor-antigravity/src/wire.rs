@@ -40,23 +40,10 @@ pub(crate) fn infer(
         .take()
         .filter(|id| !id.trim().is_empty())
         .ok_or_else(|| invalid("Antigravity requires an upstream model"))?;
-    let (raw_thinking_level, raw_thinking_budget) = if request.reasoning.target_control.is_none() {
-        let raw = request
-            .meta
-            .vendor
-            .ingress
-            .get("__google_generation_config")
-            .and_then(|config| config.get("thinkingConfig"));
-        (
-            raw.and_then(|thinking| thinking.get("thinkingLevel"))
-                .cloned(),
-            raw.and_then(|thinking| thinking.get("thinkingBudget"))
-                .cloned(),
-        )
-    } else {
-        (None, None)
-    };
-    let has_raw_thinking_control = raw_thinking_level.is_some() || raw_thinking_budget.is_some();
+    let has_explicit_thinking_control = request.reasoning.target_control.is_none()
+        && (request.reasoning.mode.is_some()
+            || request.reasoning.level.is_some()
+            || request.reasoning.budget_tokens.is_some());
     let selector_budget = if let Some(table) = provider
         .model_metadata
         .as_ref()
@@ -71,7 +58,7 @@ pub(crate) fn infer(
         if effort {
             // CLI 同时选择真实 ID 与该档位的目录预算；不再生成第二个 level 控制。
             request.reasoning.target_control = None;
-            request.reasoning.effort = None;
+            request.reasoning.level = None;
             request.reasoning.budget_tokens = None;
         }
         selection.thinking_budget
@@ -96,13 +83,7 @@ pub(crate) fn infer(
     request.generation.presence_penalty = None;
     request.generation.frequency_penalty = None;
     request.parallel_tool_calls = None;
-    request.disable_parallel_tool_calls = None;
-    request.ext = request.ext.take().filter(|extension| {
-        matches!(
-            extension,
-            stravia_runtime_contract::protocol::ir::ext::ProtocolExt::Google(_)
-        )
-    });
+
     // CLI 使用 private master Schema，不能让公开 Gemini codec 的能力校验
     // 拒绝 strict 或移除已核对的 schema 约束；这些边界由下方显式构造。
     let tools = request.tools.take();
@@ -120,23 +101,23 @@ pub(crate) fn infer(
         .get_mut("generationConfig")
         .and_then(|config| config.get_mut("thinkingConfig"))
         .and_then(Value::as_object_mut)
+        && let Some(budget) = selector_budget.filter(|_| !has_explicit_thinking_control)
     {
-        for (field, value) in [
-            ("thinkingLevel", raw_thinking_level),
-            ("thinkingBudget", raw_thinking_budget),
-        ] {
-            if let Some(value) = value {
-                thinking.insert(field.into(), value);
-            }
-        }
-        if let Some(budget) = selector_budget.filter(|_| !has_raw_thinking_control) {
-            thinking.remove("thinkingLevel");
-            thinking.insert("thinkingBudget".into(), json!(budget));
-        }
+        thinking.remove("thinkingLevel");
+        thinking.insert("thinkingBudget".into(), json!(budget));
     }
     // 同协议 raw tools 保留原始 function response 与内置工具，再统一投影。
     if let Some(tools) = tools.filter(|tools| !tools.is_empty())
-        && !object.contains_key("tools")
+        && !object
+            .get("tools")
+            .and_then(Value::as_array)
+            .is_some_and(|tools| {
+                tools.iter().any(|tool| {
+                    tool.get("functionDeclarations")
+                        .and_then(Value::as_array)
+                        .is_some_and(|functions| !functions.is_empty())
+                })
+            })
     {
         let mut declarations = Vec::with_capacity(tools.len());
         for tool in tools {
@@ -150,23 +131,31 @@ pub(crate) fn infer(
         }
         let mut tool = serde_json::Map::new();
         tool.insert("functionDeclarations".into(), Value::Array(declarations));
-        object.insert("tools".into(), Value::Array(vec![Value::Object(tool)]));
+        object
+            .entry("tools")
+            .or_insert_with(|| Value::Array(Vec::new()))
+            .as_array_mut()
+            .ok_or_else(|| invalid("tools must be an array"))?
+            .push(Value::Object(tool));
     }
     if !object.contains_key("toolConfig") {
         let config = match tool_choice {
             Some(ToolChoice::Auto) => Some(("AUTO", None)),
             Some(ToolChoice::None) => Some(("NONE", None)),
             Some(ToolChoice::Required) => Some(("ANY", None)),
-            Some(ToolChoice::Named { name }) => Some(("ANY", Some(name))),
-            Some(ToolChoice::Raw(_)) | None => None,
+            Some(ToolChoice::Named { name }) => Some(("ANY", Some(vec![name]))),
+            Some(ToolChoice::Allowed { names, required }) => {
+                Some((if required { "ANY" } else { "AUTO" }, Some(names)))
+            }
+            Some(ToolChoice::Native(_)) | None => None,
         };
         if let Some((mode, name)) = config {
             let mut calling = serde_json::Map::new();
             calling.insert("mode".into(), Value::String(mode.into()));
-            if let Some(name) = name {
+            if let Some(names) = name {
                 calling.insert(
                     "allowedFunctionNames".into(),
-                    Value::Array(vec![Value::String(name)]),
+                    Value::Array(names.into_iter().map(Value::String).collect()),
                 );
             }
             let mut config = serde_json::Map::new();

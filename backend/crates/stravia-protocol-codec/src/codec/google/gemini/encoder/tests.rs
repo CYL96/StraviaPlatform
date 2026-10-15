@@ -575,6 +575,7 @@ fn encodes_json_schema_response_format_in_generation_config() {
     );
     request.response_format = Some(ResponseFormat::JsonSchema {
         name: "answer".into(),
+        description: None,
         strict: Some(true),
         schema: serde_json::json!({
             "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -595,10 +596,9 @@ fn encodes_json_schema_response_format_in_generation_config() {
         body["generationConfig"]["responseJsonSchema"]["properties"]["answer"]["type"],
         "string"
     );
-    assert!(
-        body["generationConfig"]["responseJsonSchema"]
-            .get("$schema")
-            .is_none()
+    assert_eq!(
+        body["generationConfig"]["responseJsonSchema"]["$schema"],
+        "https://json-schema.org/draft/2020-12/schema"
     );
 }
 
@@ -607,6 +607,7 @@ fn preserves_json_schema_constraints_and_local_definitions() {
     let mut request = AiRequest::new("gemini-2.5-flash", vec![]);
     request.response_format = Some(ResponseFormat::JsonSchema {
         name: "answer".into(),
+        description: None,
         strict: Some(true),
         schema: serde_json::json!({
             "type": "object", "additionalProperties": false,
@@ -630,20 +631,19 @@ fn preserves_json_schema_constraints_and_local_definitions() {
     let schema = &body["generationConfig"]["responseJsonSchema"];
     assert!(body["generationConfig"].get("responseSchema").is_none());
     assert_eq!(schema["additionalProperties"], false);
-    assert_eq!(schema["properties"]["answer"]["$ref"], "#/$defs/_entry");
-    assert_eq!(schema["$defs"]["_entry"]["type"], "string");
+    assert_eq!(
+        schema["properties"]["answer"]["$ref"],
+        "#/definitions/entry"
+    );
+    assert_eq!(schema["definitions"]["entry"]["type"], "string");
     assert_eq!(schema["$defs"]["entry"]["type"], "number");
     assert_eq!(
         schema["properties"]["additionalProperties"]["type"],
         "string"
     );
-    assert!(
-        schema["properties"]["additionalProperties"]
-            .get("pattern")
-            .is_none()
-    );
-    assert!(schema["$defs"]["_entry"].get("minLength").is_none());
-    assert!(schema.get("unknownConstraint").is_none());
+    assert_eq!(schema["properties"]["additionalProperties"]["pattern"], "x");
+    assert_eq!(schema["definitions"]["entry"]["minLength"], 3);
+    assert_eq!(schema["unknownConstraint"], true);
 }
 
 #[test]
@@ -655,6 +655,7 @@ fn preserves_recursive_refs_without_inlining() {
     });
     request.response_format = Some(ResponseFormat::JsonSchema {
         name: "node".into(),
+        description: None,
         strict: None,
         schema: schema.clone(),
     });
@@ -823,4 +824,72 @@ fn assistant_item_with_only_unmappable_protected_payload_is_skipped() {
     assert_eq!(contents.len(), 1);
     assert_eq!(contents[0]["role"], "user");
     assert!(!body.to_string().contains("redacted-payload"));
+}
+#[test]
+fn canonical_parameters_choice_schema_and_native_tools_are_projected() {
+    use stravia_runtime_contract::protocol::ir::{NativeTool, WebSearchTool, ImageGenerationTool, ToolSpec};
+    let canonical_schema = serde_json::json!({
+        "type": "object",
+        "properties": {"answer": {"enum": [null, false, 0, ""]}},
+        "additionalProperties": false
+    });
+    let mut request = AiRequest::new("gemini-2.5-flash", vec![]);
+    request.parameters.top_k = Some(0);
+    request.parameters.candidate_count = Some(0);
+    request.parameters.logprobs = Some(0);
+    request.parameters.modalities = Some(vec![Modality::Text, Modality::Audio]);
+    request.response_format = Some(ResponseFormat::JsonSchema {
+        name: "answer".into(),
+        description: None,
+        strict: None,
+        schema: canonical_schema.clone(),
+    });
+    request.tools = Some(vec![ToolSpec {
+        name: "lookup".into(),
+        description: Some(String::new()),
+        parameters: canonical_schema.clone(),
+        strict: None,
+        defer_loading: None,
+    }]);
+    request.tool_choice = Some(ToolChoice::None);
+    request.meta.vendor.ingress.insert("__google_raw_tools".into(), serde_json::json!([
+        {"functionDeclarations": [{"name": "stale", "parametersJsonSchema": {"type": "string"}}]}
+    ]));
+    request.parameters.native_tools = vec![
+        NativeTool::WebSearch(WebSearchTool {
+            blocked_domains: vec!["blocked.example".into()],
+            ..Default::default()
+        }),
+        NativeTool::ImageGeneration(ImageGenerationTool::default()),
+    ];
+    let (body, _) = GoogleEncoder
+        .encode_request(request)
+        .expect("canonical controls win");
+    assert_eq!(body["generationConfig"]["topK"], 0);
+    assert_eq!(body["generationConfig"]["candidateCount"], 0);
+    assert_eq!(body["generationConfig"]["responseLogprobs"], true);
+    assert_eq!(body["generationConfig"]["logprobs"], 0);
+    assert_eq!(
+        body["generationConfig"]["responseModalities"],
+        serde_json::json!(["TEXT", "AUDIO"])
+    );
+    assert_eq!(
+        body["generationConfig"]["responseJsonSchema"],
+        canonical_schema
+    );
+    assert!(body["generationConfig"].get("unknownOption").is_none());
+    assert!(body.get("cachedContent").is_none());
+    assert_eq!(
+        body["tools"],
+        serde_json::json!([
+            {"functionDeclarations": [{"name": "lookup", "description": "", "parametersJsonSchema": canonical_schema}]},
+            {"googleSearch": {"excludeDomains": ["blocked.example"]}}
+        ])
+    );
+    assert_eq!(
+        body["toolConfig"]["functionCallingConfig"],
+        serde_json::json!({
+            "mode": "NONE"
+        })
+    );
 }

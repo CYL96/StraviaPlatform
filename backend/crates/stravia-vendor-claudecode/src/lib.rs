@@ -215,11 +215,15 @@ fn infer(
 ) -> Result<stravia_runtime_contract::protocol::ir::AiResponse, PluginError> {
     request.model = required_model(provider)?.to_owned();
     let protocol = ANTHROPIC_MESSAGES_2023_06_01.to_string();
-    let display = request.reasoning.display.clone();
+    let display = request
+        .reasoning
+        .summary
+        .as_ref()
+        .map(thinking::summary_display);
     let mut encoded = common::encode_inference_request(&protocol, request)?;
     // 通用 Anthropic 编码器不输出 `thinking.display`（部分兼容上游不认该字段）；
-    // 本插件的上游是 Anthropic 本身，客户端选择的思考展示方式原样保留。
-    if let Some(display) = display.as_deref()
+    // 本插件的上游是 Anthropic 本身，将统一的摘要意图映射为官方展示控制。
+    if let Some(display) = display
         && let Some(thinking) = encoded
             .body
             .get_mut("thinking")
@@ -229,12 +233,14 @@ fn infer(
         thinking.insert("display".into(), Value::String(display.to_owned()));
     }
     let client_version = client_version(provider);
+    let parent_session_id = parent_session_id(provider);
     let identity = AccountIdentity {
         account_uuid: credential(provider, auth::ACCOUNT_UUID),
         device_id: credential(provider, auth::DEVICE_ID),
+        parent_session_id: parent_session_id.as_deref(),
     };
     let caps = capabilities::ModelCapabilities::from_snapshot(provider);
-    thinking::preserve_implicit_summary_intent(&mut encoded.body, &caps, display.as_deref());
+    thinking::preserve_implicit_summary_intent(&mut encoded.body, &caps, display);
     let shaped = request::shape(encoded.body, client_version, &identity, &caps, || {
         fallback_session_id(provider)
     })
@@ -264,7 +270,7 @@ fn infer(
     )
 }
 
-/// 客户端没有携带会话 ID 时，从宿主的传输亲和键派生稳定的 UUID 形态会话 ID，
+/// 仅从宿主 principal/target scoped 传输亲和键派生稳定的 UUID 形态会话 ID，
 /// 使同一会话的请求共享 `X-Claude-Code-Session-Id`；无亲和键时每次请求新建。
 fn fallback_session_id(provider: &ProviderSnapshot) -> String {
     let Some(affinity) = provider
@@ -276,6 +282,22 @@ fn fallback_session_id(provider: &ProviderSnapshot) -> String {
     else {
         return uuid::Uuid::new_v4().to_string();
     };
+    native_session_id(affinity)
+}
+
+/// A host-scoped parent label is lineage only, not proof that a parent session
+/// exists and not response-continuation authority.
+fn parent_session_id(provider: &ProviderSnapshot) -> Option<String> {
+    provider
+        .operation_metadata
+        .get("parent_transport_affinity")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|affinity| !affinity.is_empty())
+        .map(native_session_id)
+}
+
+fn native_session_id(affinity: &str) -> String {
     let digest = Sha256::digest(format!("{VENDOR_ID}:{affinity}").as_bytes());
     let bytes: [u8; 16] = digest[..16].try_into().expect("digest has 16 bytes");
     uuid::Builder::from_random_bytes(bytes)
@@ -427,5 +449,89 @@ mod tests {
     #[test]
     fn descriptor_passes_sdk_validation() {
         descriptor().validate().expect("valid descriptor");
+    }
+
+    #[test]
+    fn native_session_uses_only_host_scoped_affinity() {
+        let mut provider = ProviderSnapshot {
+            provider_id: VENDOR_ID.into(),
+            channel: CHANNEL.into(),
+            base_url: "https://api.anthropic.com".into(),
+            protocol: "anthropic-messages".into(),
+            options: Default::default(),
+            credentials: Default::default(),
+            model: Some("claude-sonnet-4-5".into()),
+            model_metadata: None,
+            client_headers: vec![(
+                "x-claude-code-session-id".into(),
+                "raw-client-session".into(),
+            )],
+            operation_metadata: Default::default(),
+        };
+        provider
+            .operation_metadata
+            .insert("transport_affinity".into(), "principal-target-a".into());
+        let session = fallback_session_id(&provider);
+        assert_eq!(fallback_session_id(&provider), session);
+        assert!(parent_session_id(&provider).is_none());
+        provider.operation_metadata.insert(
+            "parent_transport_affinity".into(),
+            "principal-target-parent".into(),
+        );
+        let parent = parent_session_id(&provider).unwrap();
+        let mut earlier_parent_provider = provider.clone();
+        earlier_parent_provider.operation_metadata.insert(
+            "transport_affinity".into(),
+            "principal-target-parent".into(),
+        );
+        assert_eq!(parent, fallback_session_id(&earlier_parent_provider));
+        assert_ne!(parent, session);
+        provider.client_headers[0].1 = "other-raw-client-session".into();
+        assert_eq!(fallback_session_id(&provider), session);
+        let shaped = request::shape(
+            serde_json::json!({
+                "model":"claude-sonnet-4-5", "max_tokens":1024,
+                "messages":[{"role":"user", "content":"hi"}],
+                "metadata":{"user_id":"{\"session_id\":\"spoofed\",\"account_uuid\":\"spoofed\",\"device_id\":\"spoofed\"}"}
+            }),
+            DEFAULT_CLIENT_VERSION,
+            &AccountIdentity {
+                account_uuid: Some("native-account"),
+                device_id: Some("native-device"),
+                parent_session_id: Some(&parent),
+            },
+            &capabilities::ModelCapabilities::default(),
+            || fallback_session_id(&provider),
+        ).unwrap();
+        let body: Value = serde_json::from_slice(&shaped.body).unwrap();
+        let identity: Value =
+            serde_json::from_str(body["metadata"]["user_id"].as_str().unwrap()).unwrap();
+        let headers = request::inference_headers(
+            "test-token",
+            DEFAULT_CLIENT_VERSION,
+            &shaped.session_id,
+            shaped.betas,
+        );
+        let header_session = headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("x-claude-code-session-id"))
+            .unwrap();
+        assert_eq!(
+            identity["session_id"].as_str(),
+            Some(header_session.1.as_str())
+        );
+        assert_eq!(identity["session_id"], session);
+        assert_eq!(identity["parent_session_id"], parent);
+        assert_eq!(identity["account_uuid"], "native-account");
+        assert_eq!(identity["device_id"], "native-device");
+        provider
+            .operation_metadata
+            .insert("transport_affinity".into(), "principal-target-b".into());
+        assert_ne!(fallback_session_id(&provider), session);
+        provider.operation_metadata.clear();
+        assert_ne!(
+            fallback_session_id(&provider),
+            fallback_session_id(&provider)
+        );
     }
 }

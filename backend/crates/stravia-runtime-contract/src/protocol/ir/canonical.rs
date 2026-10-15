@@ -30,9 +30,18 @@ pub fn native_compaction_item(item: &crate::protocol::ir::AiItem) -> Option<serd
 use sha2::{Digest, Sha256};
 
 use super::{
-    AiItem, AiRequest, ContentBlock, DocumentSource, MediaSource, MessageContent, ProtocolExt,
-    ToolSpec,
+    AiItem, AiRequest, ContentBlock, DocumentSource, MediaSource, MessageContent, ToolSpec,
 };
+
+mod retry;
+
+/// Hash the complete canonical request except its per-attempt correlation ID.
+///
+/// Object ordering is immaterial; all session identity and future request fields
+/// participate. This typed fingerprint is process-local, not a persisted wire format.
+pub fn retry_request_hash(request: &AiRequest) -> Result<[u8; 32], serde_json::Error> {
+    retry::request_hash(request)
+}
 
 struct HashWriter(Sha256);
 
@@ -632,187 +641,116 @@ fn append_history_serialized_hash(
 /// matching. The projection is intentionally positive: new request fields do
 /// not become cache identity until their Provider semantics are classified.
 pub fn cache_controls_hash(request: &AiRequest) -> [u8; 32] {
-    let mut controls = serde_json::json!({
-        "model": &request.model,
-        "instructions": &request.instructions,
-        "tools": null,
-        "tool_choice": &request.tool_choice,
-        "parallel_tool_calls": request.parallel_tool_calls,
-        "disable_parallel_tool_calls": request.disable_parallel_tool_calls,
-        "reasoning": &request.reasoning,
-        "response_format": &request.response_format,
-        "safety_settings": &request.safety_settings,
-        "protocol_controls": null,
-    });
-    controls["tools"] = request
-        .tools
-        .as_ref()
-        .map_or(serde_json::Value::Null, |tools| {
-            serde_json::Value::Array(tools.iter().map(history_tool_value).collect())
-        });
-    controls["protocol_controls"] = cache_protocol_controls_value(request.ext.as_ref());
-    json_hash(&controls)
+    request_controls_hash(request, true)
 }
 
 pub fn history_request_controls_hash(request: &AiRequest) -> [u8; 32] {
-    let mut controls = serde_json::json!({
-        "model": &request.model,
-        "instructions": &request.instructions,
-        "generation": {
-            "temperature": request.generation.temperature,
-            "top_p": request.generation.top_p,
-            "seed": request.generation.seed,
-            "stop": &request.generation.stop,
-            "presence_penalty": request.generation.presence_penalty,
-            "frequency_penalty": request.generation.frequency_penalty,
-        },
-        "embedding": &request.embedding,
-        "tools": null,
-        "tool_choice": &request.tool_choice,
-        "parallel_tool_calls": request.parallel_tool_calls,
-        "disable_parallel_tool_calls": request.disable_parallel_tool_calls,
-        "reasoning": &request.reasoning,
-        "response_format": &request.response_format,
-        "safety_settings": &request.safety_settings,
-        "protocol_controls": null,
-    });
-    controls["tools"] = request
-        .tools
-        .as_ref()
-        .filter(|tools| !tools.is_empty())
-        .map_or(serde_json::Value::Null, |tools| {
-            serde_json::Value::Array(tools.iter().map(history_tool_value).collect())
-        });
-    controls["protocol_controls"] = history_protocol_controls_value(request.ext.as_ref());
-    json_hash(&controls)
+    request_controls_hash(request, false)
 }
 
-fn history_tool_value(tool: &ToolSpec) -> serde_json::Value {
-    serde_json::json!({
-        "name": &tool.name,
-        "description": &tool.description,
-        "parameters": &tool.parameters,
-        "strict": tool.strict,
-        "meta": &tool.meta,
-    })
+fn request_controls_hash(request: &AiRequest, cache: bool) -> [u8; 32] {
+    let mut writer = HashWriter(Sha256::new());
+    serde_json::to_writer(&mut writer, &RequestControls { request, cache })
+        .expect("request controls must serialize as JSON");
+    writer.0.finalize().into()
 }
 
-fn history_protocol_controls_value(extension: Option<&ProtocolExt>) -> serde_json::Value {
-    normalize_empty_controls(match extension {
-        None => serde_json::Value::Null,
-        Some(ProtocolExt::OpenAiChat(extension)) => serde_json::json!({
-            "openai_chat": {
-                "audio": &extension.audio,
-                "logit_bias": &extension.logit_bias,
-                "logprobs": extension.logprobs,
-                "top_logprobs": extension.top_logprobs,
-                "modalities": &extension.modalities,
-                "n": extension.n,
-                "prediction": &extension.prediction,
-                "verbosity": &extension.verbosity,
-                "web_search_options": &extension.web_search_options,
-            }
-        }),
-        // Compaction policy governs the next request, not the identity of
-        // delivered history. Target Continuation still checks it separately.
-        Some(ProtocolExt::OpenResponses(extension)) => serde_json::json!({
-            "open_responses": {
-                "max_tool_calls": extension.max_tool_calls,
-                "top_logprobs": extension.top_logprobs,
-                "truncation": &extension.truncation,
-                "text": &extension.text,
-                "service_tier": &extension.service_tier,
-                "native_web_search": &extension.native_web_search,
-                "tool_choice_ext": &extension.tool_choice_ext,
-            }
-        }),
-        Some(ProtocolExt::Anthropic(extension)) => serde_json::json!({
-            "anthropic": {
-                "top_k": extension.top_k,
-                "container": &extension.container,
-                "inference_geo": &extension.inference_geo,
-                "output_config": &extension.output_config,
-                "service_tier": &extension.service_tier,
-                "server_tools": &extension.server_tools,
-            }
-        }),
-        Some(ProtocolExt::Google(extension)) => serde_json::json!({
-            "google": {
-                "top_k": extension.top_k,
-                "candidate_count": extension.candidate_count,
-                "response_logprobs": extension.response_logprobs,
-                "logprobs": extension.logprobs,
-                "response_mime_type": &extension.response_mime_type,
-                "response_json_schema": &extension.response_json_schema,
-                "tool_config": &extension.tool_config,
-                "response_modalities": &extension.response_modalities,
-                "thinking_config": &extension.thinking_config,
-            }
-        }),
-    })
+struct RequestControls<'a> {
+    request: &'a AiRequest,
+    cache: bool,
 }
 
-fn cache_protocol_controls_value(extension: Option<&ProtocolExt>) -> serde_json::Value {
-    normalize_empty_controls(match extension {
-        None => serde_json::Value::Null,
-        Some(ProtocolExt::OpenAiChat(extension)) => serde_json::json!({
-            "openai_chat": {
-                "prompt_cache_retention": &extension.prompt_cache_retention,
-                "prediction": &extension.prediction,
-                "web_search_options": &extension.web_search_options,
-            }
-        }),
-        Some(ProtocolExt::OpenResponses(extension)) => {
-            let mut controls = serde_json::json!({
-            "open_responses": {
-                "prompt_cache_key": &extension.prompt_cache_key,
-                "truncation": &extension.truncation,
-                "text": &extension.text,
-                "native_web_search": &extension.native_web_search,
-                "tool_choice_ext": &extension.tool_choice_ext,
-            }
-            });
-            if let Some(control) = extension.passthrough_body.get("context_management") {
-                controls["open_responses"]["context_management"] =
-                    serde_json::json!({"present": true, "value": control});
-            }
-            controls
+impl serde::Serialize for RequestControls<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let r = self.request;
+        let p = &r.parameters;
+        let mut map = serializer.serialize_map(None)?;
+        map.serialize_entry("model", &r.model)?;
+        map.serialize_entry("instructions", &r.instructions)?;
+        map.serialize_entry(
+            "tools",
+            &r.tools
+                .as_deref()
+                .filter(|tools| self.cache || !tools.is_empty())
+                .map(ControlTools),
+        )?;
+        map.serialize_entry("tool_choice", &r.tool_choice)?;
+        map.serialize_entry("parallel_tool_calls", &r.parallel_tool_calls)?;
+        map.serialize_entry("reasoning", &r.reasoning)?;
+        map.serialize_entry("response_format", &r.response_format)?;
+        macro_rules! optional {
+            ($name:literal, $value:expr) => {
+                if let Some(value) = $value {
+                    map.serialize_entry($name, value)?;
+                }
+            };
         }
-        Some(ProtocolExt::Anthropic(extension)) => serde_json::json!({
-            "anthropic": {
-                "container": &extension.container,
-                "inference_geo": &extension.inference_geo,
-                "output_config": &extension.output_config,
-                "service_tier": &extension.service_tier,
-                "server_tools": &extension.server_tools,
+        if !self.cache {
+            optional!("temperature", &r.generation.temperature);
+            optional!("top_p", &r.generation.top_p);
+            optional!("seed", &r.generation.seed);
+            optional!("stop", &r.generation.stop);
+            optional!("presence_penalty", &r.generation.presence_penalty);
+            optional!("frequency_penalty", &r.generation.frequency_penalty);
+            optional!("embedding", &r.embedding);
+            // Sampling and output scores affect history identity, not the
+            // prompt prefix eligible for reuse on the same Target.
+            optional!("top_k", &p.top_k);
+            optional!("min_p", &p.min_p);
+            optional!("repetition_penalty", &p.repetition_penalty);
+            optional!("candidate_count", &p.candidate_count);
+            if let Some(bias) = &p.logit_bias {
+                // HashMap 的顺序不是契约；只排序借用，不复制参数正文。
+                let sorted: std::collections::BTreeMap<_, _> = bias.iter().collect();
+                map.serialize_entry("logit_bias", &sorted)?;
             }
-        }),
-        Some(ProtocolExt::Google(extension)) => serde_json::json!({
-            "google": {
-                "cached_content": &extension.cached_content,
-                "thinking_config": &extension.thinking_config,
-                "tool_config": &extension.tool_config,
-                "response_mime_type": &extension.response_mime_type,
-                "response_json_schema": &extension.response_json_schema,
-            }
-        }),
-    })
-}
-
-fn normalize_empty_controls(value: serde_json::Value) -> serde_json::Value {
-    fn is_empty(value: &serde_json::Value) -> bool {
-        match value {
-            serde_json::Value::Null => true,
-            serde_json::Value::Array(values) => values.iter().all(is_empty),
-            serde_json::Value::Object(values) => values.values().all(is_empty),
-            _ => false,
+            optional!("logprobs", &p.logprobs);
         }
+        optional!("modalities", &p.modalities);
+        optional!("audio", &p.audio);
+        optional!("verbosity", &p.verbosity);
+        optional!("max_tool_calls", &p.max_tool_calls);
+        optional!("truncation", &p.truncation);
+        optional!("service_tier", &p.service_tier);
+        optional!("generate", &p.generate);
+        if !p.native_tools.is_empty() {
+            map.serialize_entry("native_tools", &p.native_tools)?;
+        }
+        optional!("compaction", &p.compaction);
+        if self.cache {
+            optional!("cache_key", &p.cache.key);
+            optional!("cache_retention", &p.cache.retention);
+        }
+        map.end()
     }
+}
 
-    if is_empty(&value) {
-        serde_json::Value::Null
-    } else {
-        value
+struct ControlTools<'a>(&'a [ToolSpec]);
+
+impl serde::Serialize for ControlTools<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        #[derive(serde::Serialize)]
+        struct Tool<'a> {
+            name: &'a str,
+            description: &'a Option<String>,
+            parameters: &'a serde_json::Value,
+            strict: Option<bool>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            defer_loading: Option<bool>,
+        }
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for tool in self.0 {
+            sequence.serialize_element(&Tool {
+                name: &tool.name,
+                description: &tool.description,
+                parameters: &tool.parameters,
+                strict: tool.strict,
+                defer_loading: tool.defer_loading,
+            })?;
+        }
+        sequence.end()
     }
 }
 
@@ -1040,6 +978,30 @@ mod tests {
         AiItem, AiItemAudience, AiItemProvenance, AiItemStatus, ContentBlock, MessageContent, Role,
         ToolCall,
     };
+
+    #[test]
+    fn legacy_activation_hint_is_not_an_independent_request_control() {
+        let mut canonical = AiRequest::new("model", Vec::new());
+        canonical.reasoning.level = Some(crate::thinking::ThinkingLevel::High);
+        let mut legacy = canonical.clone();
+        legacy.reasoning = serde_json::from_value(serde_json::json!({
+            "level": "high", "enabled": true, "effort": "low"
+        }))
+        .unwrap();
+        assert_eq!(
+            cache_controls_hash(&canonical),
+            cache_controls_hash(&legacy)
+        );
+        assert_eq!(
+            history_request_controls_hash(&canonical),
+            history_request_controls_hash(&legacy)
+        );
+        legacy.reasoning.mode = Some("disabled".into());
+        assert_ne!(
+            cache_controls_hash(&canonical),
+            cache_controls_hash(&legacy)
+        );
+    }
 
     fn assert_borrowed_history_matches_owned(items: &[AiItem]) {
         let mut expected = hash_bytes(b"stravia-generation-chain-history-v1");
@@ -1408,65 +1370,6 @@ mod tests {
     }
 
     #[test]
-    fn controls_projection_preserves_optional_tools_and_protocol_values() {
-        let tool = ToolSpec {
-            name: "lookup".into(),
-            description: Some("description\n🙂".into()),
-            parameters: serde_json::json!({"type": "object", "properties": {"z": {"type": "string"}}}),
-            strict: Some(true),
-            cache_control: None,
-            meta: Some(serde_json::json!({"native": [null, {"z": 2, "a": 1}]})),
-        };
-        for tools in [None, Some(Vec::new()), Some(vec![tool])] {
-            let mut request = AiRequest::new("model", Vec::new());
-            request.tools = tools;
-            request.ext = Some(ProtocolExt::Google(super::super::GoogleExt {
-                cached_content: Some("cachedContents/example".into()),
-                response_json_schema: Some(serde_json::json!({"type": "object", "z": [1, null]})),
-                ..Default::default()
-            }));
-            let expected_cache = serde_json::json!({
-                "model": &request.model,
-                "instructions": &request.instructions,
-                "tools": request.tools.as_ref().map(|tools| tools.iter().map(history_tool_value).collect::<Vec<_>>()),
-                "tool_choice": &request.tool_choice,
-                "parallel_tool_calls": request.parallel_tool_calls,
-                "disable_parallel_tool_calls": request.disable_parallel_tool_calls,
-                "reasoning": &request.reasoning,
-                "response_format": &request.response_format,
-                "safety_settings": &request.safety_settings,
-                "protocol_controls": cache_protocol_controls_value(request.ext.as_ref()),
-            });
-            let expected_history = serde_json::json!({
-                "model": &request.model,
-                "instructions": &request.instructions,
-                "generation": {
-                    "temperature": request.generation.temperature,
-                    "top_p": request.generation.top_p,
-                    "seed": request.generation.seed,
-                    "stop": &request.generation.stop,
-                    "presence_penalty": request.generation.presence_penalty,
-                    "frequency_penalty": request.generation.frequency_penalty,
-                },
-                "embedding": &request.embedding,
-                "tools": request.tools.as_ref().filter(|tools| !tools.is_empty()).map(|tools| tools.iter().map(history_tool_value).collect::<Vec<_>>()),
-                "tool_choice": &request.tool_choice,
-                "parallel_tool_calls": request.parallel_tool_calls,
-                "disable_parallel_tool_calls": request.disable_parallel_tool_calls,
-                "reasoning": &request.reasoning,
-                "response_format": &request.response_format,
-                "safety_settings": &request.safety_settings,
-                "protocol_controls": history_protocol_controls_value(request.ext.as_ref()),
-            });
-            assert_eq!(cache_controls_hash(&request), json_hash(&expected_cache));
-            assert_eq!(
-                history_request_controls_hash(&request),
-                json_hash(&expected_history)
-            );
-        }
-    }
-
-    #[test]
     fn media_identity_changes_item_hash() {
         let left = item(ContentBlock::Image {
             source: MediaSource::Url("https://example.test/a.png".into()),
@@ -1502,17 +1405,39 @@ mod tests {
     }
 
     #[test]
-    fn google_cached_content_is_cache_policy_not_history_identity() {
-        let request_with = |cached_content: Option<&str>| {
+    fn canonical_sampling_controls_change_history_but_not_cache_identity() {
+        let baseline = AiRequest::new("model", Vec::new());
+        let mutations: [fn(&mut crate::protocol::ir::RequestParameters); 6] = [
+            |p| p.top_k = Some(8),
+            |p| p.min_p = Some(0.1),
+            |p| p.repetition_penalty = Some(1.2),
+            |p| p.candidate_count = Some(2),
+            |p| p.logit_bias = Some([("token".into(), 0.5)].into_iter().collect()),
+            |p| p.logprobs = Some(3),
+        ];
+        for mutate in mutations {
+            let mut changed = baseline.clone();
+            mutate(&mut changed.parameters);
+            assert_eq!(
+                cache_controls_hash(&baseline),
+                cache_controls_hash(&changed)
+            );
+            assert_ne!(
+                history_request_controls_hash(&baseline),
+                history_request_controls_hash(&changed)
+            );
+        }
+    }
+
+    #[test]
+    fn cache_key_is_cache_policy_not_history_identity() {
+        let request_with = |key: Option<&str>| {
             let mut request = AiRequest::new("model", Vec::new());
-            request.ext = Some(ProtocolExt::Google(super::super::GoogleExt {
-                cached_content: cached_content.map(str::to_owned),
-                ..Default::default()
-            }));
+            request.parameters.cache.key = key.map(str::to_owned);
             request
         };
         let without_cache = request_with(None);
-        let with_cache = request_with(Some("cachedContents/example"));
+        let with_cache = request_with(Some("cache-bucket"));
 
         assert_eq!(
             history_request_controls_hash(&without_cache),
@@ -1522,6 +1447,78 @@ mod tests {
             cache_controls_hash(&without_cache),
             cache_controls_hash(&with_cache)
         );
+    }
+
+    #[test]
+    fn unified_native_and_output_controls_change_canonical_identity() {
+        use crate::protocol::ir::{
+            AudioOutput, CodeExecutionTool, CompactionControl, Modality, NativeTool, ServiceTier,
+            Truncation, Verbosity,
+        };
+
+        let baseline = AiRequest::new("model", Vec::new());
+        let mutations: [fn(&mut crate::protocol::ir::RequestParameters); 9] = [
+            |p| p.modalities = Some(vec![Modality::Audio]),
+            |p| p.audio = Some(AudioOutput {
+                voice: Some("voice".into()),
+                format: Some("pcm".into()),
+            }),
+            |p| p.verbosity = Some(Verbosity::High),
+            |p| p.max_tool_calls = Some(2),
+            |p| p.truncation = Some(Truncation::Auto),
+            |p| p.service_tier = Some(ServiceTier::Priority),
+            |p| p.generate = Some(false),
+            |p| p.native_tools = vec![NativeTool::CodeExecution(CodeExecutionTool {
+                container: Some("container".into()),
+            })],
+            |p| p.compaction = Some(CompactionControl {
+                threshold_tokens: Some(1_000),
+            }),
+        ];
+        for mutate in mutations {
+            let mut changed = baseline.clone();
+            mutate(&mut changed.parameters);
+            assert_ne!(cache_controls_hash(&baseline), cache_controls_hash(&changed));
+            assert_ne!(
+                history_request_controls_hash(&baseline),
+                history_request_controls_hash(&changed)
+            );
+        }
+    }
+
+    #[test]
+    fn unified_reasoning_summary_and_schema_description_change_identity() {
+        use crate::protocol::ir::{ReasoningConfig, ReasoningSummary, ResponseFormat};
+
+        let mut baseline = AiRequest::new("model", Vec::new());
+        baseline.reasoning = ReasoningConfig {
+            mode: Some("enabled".into()),
+            budget_tokens: None,
+            summary: Some(ReasoningSummary::Auto),
+            level: None,
+            target_control: None,
+        };
+        baseline.response_format = Some(ResponseFormat::JsonSchema {
+            name: "answer".into(),
+            description: Some("Original description".into()),
+            schema: serde_json::json!({"type": "object"}),
+            strict: Some(true),
+        });
+        let mut changed_summary = baseline.clone();
+        changed_summary.reasoning.summary = Some(ReasoningSummary::None);
+        let mut changed_description = baseline.clone();
+        if let Some(ResponseFormat::JsonSchema { description, .. }) =
+            &mut changed_description.response_format
+        {
+            *description = Some("Different description".into());
+        }
+        for changed in [&changed_summary, &changed_description] {
+            assert_ne!(cache_controls_hash(&baseline), cache_controls_hash(changed));
+            assert_ne!(
+                history_request_controls_hash(&baseline),
+                history_request_controls_hash(changed)
+            );
+        }
     }
 
     #[test]

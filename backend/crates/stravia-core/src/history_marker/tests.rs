@@ -1233,6 +1233,7 @@ async fn resolver_replaces_reasoning_previews_and_restores_redacted_blocks() {
         actual_model: "actual-model".into(),
         target_id: "original-target".into(),
         authority: Some("provider:deployment".into()),
+        issued: Vec::new(),
     };
     let encrypted = store
         .create_thinking(
@@ -1301,7 +1302,12 @@ async fn resolver_replaces_reasoning_previews_and_restores_redacted_blocks() {
 
     assert_eq!(summary.restored_thinking_segments, 2);
     assert_eq!(request.items.len(), 2);
-    assert_eq!(ThinkingSource::from_item(&request.items[0]), Some(source));
+    let mut expected_source_item = request.items[0].clone();
+    source.stamp_item(&mut expected_source_item);
+    assert_eq!(
+        ThinkingSource::from_item(&request.items[0]),
+        ThinkingSource::from_item(&expected_source_item)
+    );
     assert_eq!(ThinkingSource::from_item(&request.items[1]), None);
     let mut response = stravia_runtime_contract::protocol::ir::AiResponse::new("response", "model");
     response.items = request.items.clone();
@@ -1669,6 +1675,7 @@ fn thinking_source_round_trips_unknown_guest_protocol_identity() {
         actual_model: "model".into(),
         target_id: "target".into(),
         authority: Some("opaque-deployment".into()),
+        issued: Vec::new(),
     };
 
     let encoded = serde_json::to_value(&source).expect("serialize Thinking source");

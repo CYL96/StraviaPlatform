@@ -120,16 +120,7 @@ fn scrub_request(request: &mut AiRequest) -> Result<(), ArtifactError> {
     scrub_serialized(&mut request.tool_choice)?;
     scrub_serialized(&mut request.reasoning)?;
     scrub_serialized(&mut request.response_format)?;
-    scrub_serialized(&mut request.safety_settings)?;
-    if let Some(extension) = &mut request.ext {
-        use stravia_runtime_contract::protocol::ir::ProtocolExt;
-        match extension {
-            ProtocolExt::OpenAiChat(extension) => scrub_serialized(extension)?,
-            ProtocolExt::OpenResponses(extension) => scrub_serialized(extension)?,
-            ProtocolExt::Anthropic(extension) => scrub_serialized(extension)?,
-            ProtocolExt::Google(extension) => scrub_serialized(extension)?,
-        }
-    }
+    scrub_serialized(&mut request.parameters)?;
     scrub_serialized(&mut request.meta.vendor)?;
     if let Some(raw) = &mut request.meta.raw {
         if let Some(body) = &mut raw.body {
@@ -260,8 +251,7 @@ fn request_contains_upload_grant(request: &AiRequest) -> Result<bool, ArtifactEr
         || contains_upload_grant(&request.tool_choice)?
         || contains_upload_grant(&request.reasoning)?
         || contains_upload_grant(&request.response_format)?
-        || contains_upload_grant(&request.safety_settings)?
-        || contains_upload_grant(&request.ext)?
+        || contains_upload_grant(&request.parameters)?
         || contains_upload_grant(&request.meta.vendor)?
     {
         return Ok(true);

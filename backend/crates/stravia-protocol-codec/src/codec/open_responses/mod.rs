@@ -66,14 +66,9 @@ pub(super) fn is_hosted_image_generation_item(item_type: &str) -> bool {
 pub fn hosted_image_generation_requested(
     request: &stravia_runtime_contract::protocol::ir::AiRequest,
 ) -> bool {
-    matches!(
-        request.ext.as_ref(),
-        Some(stravia_runtime_contract::protocol::ir::ProtocolExt::OpenResponses(extension))
-            if extension.passthrough_tools.iter().any(|tool| {
-                tool.get("type").and_then(serde_json::Value::as_str)
-                    == Some("image_generation")
-            })
-    )
+    request.parameters.native_tools.iter().any(|tool| {
+        matches!(tool, stravia_runtime_contract::protocol::ir::NativeTool::ImageGeneration(_))
+    })
 }
 
 pub(super) fn validate_hosted_image_generation_item(

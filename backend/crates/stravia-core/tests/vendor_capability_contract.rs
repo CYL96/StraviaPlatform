@@ -182,6 +182,7 @@ struct UpstreamState {
 
 enum UpstreamReply {
     Json(StatusCode, Value),
+    ResponsesStream(Value),
     Barrier {
         entered: oneshot::Sender<()>,
         release: oneshot::Receiver<()>,
@@ -223,6 +224,16 @@ impl LocalUpstream {
             .entry(path.into())
             .or_default()
             .push_back(UpstreamReply::Json(status, body));
+    }
+
+    async fn push_responses_stream(&self, body: Value) {
+        self.state
+            .replies
+            .lock()
+            .await
+            .entry("/responses".into())
+            .or_default()
+            .push_back(UpstreamReply::ResponsesStream(body));
     }
 
     async fn push_barrier(
@@ -308,6 +319,7 @@ async fn upstream_handler(
 ) -> Response {
     let path = uri.path().to_owned();
     let body = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    let streaming = body.get("stream").and_then(Value::as_bool) == Some(true);
     let state_before = headers
         .get("x-state-before")
         .and_then(|value| value.to_str().ok())
@@ -326,6 +338,78 @@ async fn upstream_handler(
         .and_then(VecDeque::pop_front);
     match reply {
         Some(UpstreamReply::Json(status, body)) => (status, Json(body)).into_response(),
+        Some(UpstreamReply::ResponsesStream(body)) => {
+            if !streaming {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"detail":"stream must be set to true"})),
+                )
+                    .into_response();
+            }
+            let mut created = body.clone();
+            created["status"] = "in_progress".into();
+            created["output"] = json!([]);
+            created["usage"] = Value::Null;
+            let mut frames = vec![json!({
+                "type":"response.created","sequence_number":0,"response":created
+            })];
+            let mut emit = |mut event: Value| {
+                event["sequence_number"] = frames.len().into();
+                frames.push(event);
+            };
+            for (output_index, item) in body["output"].as_array().unwrap().iter().enumerate() {
+                let mut added = item.clone();
+                added["status"] = "in_progress".into();
+                if item["type"] == "message" {
+                    added["content"] = json!([]);
+                }
+                emit(
+                    json!({"type":"response.output_item.added","output_index":output_index,"item":added}),
+                );
+                if item["type"] == "message" {
+                    for (content_index, part) in
+                        item["content"].as_array().unwrap().iter().enumerate()
+                    {
+                        let mut added = part.clone();
+                        added["text"] = "".into();
+                        emit(
+                            json!({"type":"response.content_part.added","output_index":output_index,
+                            "content_index":content_index,"item_id":item["id"],"part":added}),
+                        );
+                        emit(
+                            json!({"type":"response.output_text.delta","output_index":output_index,
+                            "content_index":content_index,"item_id":item["id"],"delta":part["text"]}),
+                        );
+                        emit(
+                            json!({"type":"response.output_text.done","output_index":output_index,
+                            "content_index":content_index,"item_id":item["id"],"text":part["text"]}),
+                        );
+                        emit(
+                            json!({"type":"response.content_part.done","output_index":output_index,
+                            "content_index":content_index,"item_id":item["id"],"part":part}),
+                        );
+                    }
+                }
+                emit(
+                    json!({"type":"response.output_item.done","output_index":output_index,"item":item}),
+                );
+            }
+            emit(json!({"type":"response.completed","response":body}));
+            let stream = frames
+                .into_iter()
+                .map(|event| {
+                    format!(
+                        "event: {}\ndata: {event}\n\n",
+                        event["type"].as_str().unwrap()
+                    )
+                })
+                .collect::<String>();
+            (
+                [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                stream,
+            )
+                .into_response()
+        }
         Some(UpstreamReply::Barrier {
             entered,
             release,
@@ -2916,9 +3000,7 @@ async fn manually_installed_codex_component_reuses_one_connection_for_search_and
         .await?;
 
     upstream
-        .push_json(
-            "/responses",
-            StatusCode::OK,
+        .push_responses_stream(
             stravia_protocol_codec::codec::open_responses::formatter::response_resource_snapshot(
                 "resp_infer_fixture", "gpt-5.4", "completed",
                 vec![json!({
@@ -2935,24 +3017,47 @@ async fn manually_installed_codex_component_reuses_one_connection_for_search_and
             ),
         )
         .await;
-    assert_eq!(codex.client_header_names.len(), 5);
-    let declared_headers: Vec<_> = codex
-        .client_header_names
-        .iter()
-        .enumerate()
-        .map(|(index, name)| (name.to_ascii_uppercase(), format!("client-context-{index}")))
-        .collect();
+    let turn_context = json!({
+        "installation_id":"spoofed-installation",
+        "session_id":"spoofed-session",
+        "thread_id":"spoofed-thread",
+        "window_id":"spoofed-window",
+        "turn_id":"spoofed-turn",
+        "custom_hint":"native-consumer-context"
+    })
+    .to_string();
+    let declared_headers = [
+        ("X-CODEX-BETA-FEATURES", "native-beta"),
+        ("X-CODEX-INSTALLATION-ID", "client-installation"),
+        ("X-CODEX-TURN-METADATA", turn_context.as_str()),
+        ("X-CODEX-TURN-STATE", "native-turn-state"),
+        ("X-CODEX-WINDOW-ID", "raw-window"),
+    ];
     let mut infer_request = reqwest::Client::new()
         .post(harness.endpoint.trim_end_matches("/mcp").to_owned() + "/v1/responses")
         .bearer_auth(&harness.token)
         .header("cookie", "client-session=never-upstream")
         .header("idempotency-key", "public-client-request")
+        .header("x-session-id", "shared-client-session")
+        .header("session_id", "lower-priority-client-session")
+        .header("x-client-request-id", "independent-request-correlation")
         .header("x-undeclared-plugin-context", "never-upstream");
     for (name, value) in &declared_headers {
-        infer_request = infer_request.header(name.as_str(), value.as_str());
+        infer_request = infer_request.header(*name, *value);
     }
     let inferred = infer_request
-        .json(&json!({"model":route.model_id,"input":"Codex inference through Wasm"}))
+        .json(&json!({
+            "model":route.model_id,
+            "input":"Codex inference through Wasm",
+            "temperature":0.2,
+            "top_p":0.9,
+            "max_output_tokens":256,
+            "parallel_tool_calls":false,
+            "metadata":{"verification":"canonical-final"},
+            "prompt_cache_key":"canonical-final-smoke",
+            "prompt_cache_retention":"24h",
+            "store":false
+        }))
         .send()
         .await?;
     let infer_status = inferred.status();
@@ -2971,30 +3076,70 @@ async fn manually_installed_codex_component_reuses_one_connection_for_search_and
     );
 
     upstream
-        .push_json(
-            "/responses",
-            StatusCode::OK,
-            json!({
-                "id":"resp_search_fixture",
-                "status":"completed",
-                "output":[{
-                    "type":"message",
-                    "role":"assistant",
-                    "content":[{
-                        "type":"output_text",
-                        "text":"Verified",
-                        "annotations":[{
-                            "type":"url_citation",
-                            "start_index":0,
-                            "end_index":8,
-                            "url":SOURCE_URL,
-                            "title":"Verified source"
-                        }]
-                    }]
-                }, {"type":"web_search_call","id":"search_fixture","status":"completed"}],
-                "usage":{"input_tokens":3,"output_tokens":5,"total_tokens":8}
-            }),
+        .push_responses_stream(
+            stravia_protocol_codec::codec::open_responses::formatter::response_resource_snapshot(
+                "resp_child_fixture", "gpt-5.4", "completed",
+                vec![json!({
+                    "id":"msg_child_fixture","type":"message","role":"assistant","status":"completed",
+                    "content":[{"type":"output_text","text":"Follow-up retained full history","annotations":[]}]
+                })],
+                Value::Null,
+                Value::Null,
+                json!({
+                    "input_tokens":8,"input_tokens_details":{"cached_tokens":0},
+                    "output_tokens":4,"output_tokens_details":{"reasoning_tokens":0},
+                    "total_tokens":12
+                }),
+            ),
         )
+        .await;
+    let child = reqwest::Client::new()
+        .post(harness.endpoint.trim_end_matches("/mcp").to_owned() + "/v1/responses")
+        .bearer_auth(&harness.token)
+        .header("x-session-id", "shared-client-session")
+        .header("x-client-request-id", "child-request-correlation")
+        .json(&json!({
+            "model":route.model_id,
+            "previous_response_id":infer_body["id"],
+            "input":"Continue the prior Codex exchange",
+            "store":false
+        }))
+        .send()
+        .await?;
+    let child_status = child.status();
+    let child_body: Value = child.json().await?;
+    assert!(child_status.is_success(), "{child_body}");
+    assert!(child_body["output"].as_array().is_some_and(|items| {
+        items.iter().any(|item| {
+            item["content"].as_array().is_some_and(|content| {
+                content
+                    .iter()
+                    .any(|part| part["text"] == "Follow-up retained full history")
+            })
+        })
+    }));
+
+    upstream
+        .push_responses_stream(json!({
+            "id":"resp_search_fixture",
+            "status":"completed",
+            "output":[{
+                "type":"message",
+                "role":"assistant",
+                "content":[{
+                    "type":"output_text",
+                    "text":"Verified",
+                    "annotations":[{
+                        "type":"url_citation",
+                        "start_index":0,
+                        "end_index":8,
+                        "url":SOURCE_URL,
+                        "title":"Verified source"
+                    }]
+                }]
+            }, {"type":"web_search_call","id":"search_fixture","status":"completed"}],
+            "usage":{"input_tokens":3,"output_tokens":5,"total_tokens":8}
+        }))
         .await;
     let searched = completed_search(
         terminal_search(
@@ -3010,22 +3155,18 @@ async fn manually_installed_codex_component_reuses_one_connection_for_search_and
     assert_eq!(searched.report.sources[0].url, SOURCE_URL);
 
     upstream
-        .push_json(
-            "/responses",
-            StatusCode::OK,
-            json!({
-                "id":"resp_image_fixture",
+        .push_responses_stream(json!({
+            "id":"resp_image_fixture",
+            "status":"completed",
+            "output":[{
+                "type":"image_generation_call",
+                "id":"image_fixture",
                 "status":"completed",
-                "output":[{
-                    "type":"image_generation_call",
-                    "id":"image_fixture",
-                    "status":"completed",
-                    "result":PNG_BASE64,
-                    "output_format":"png"
-                }],
-                "usage":{"input_tokens":4,"output_tokens":6,"total_tokens":10}
-            }),
-        )
+                "result":PNG_BASE64,
+                "output_format":"png"
+            }],
+            "usage":{"input_tokens":4,"output_tokens":6,"total_tokens":10}
+        }))
         .await;
     let client = harness.connect().await;
     let generated = call_generate(
@@ -3043,22 +3184,18 @@ async fn manually_installed_codex_component_reuses_one_connection_for_search_and
         .to_owned();
 
     upstream
-        .push_json(
-            "/responses",
-            StatusCode::OK,
-            json!({
-                "id":"resp_edit_fixture",
+        .push_responses_stream(json!({
+            "id":"resp_edit_fixture",
+            "status":"completed",
+            "output":[{
+                "type":"image_generation_call",
+                "id":"image_edit_fixture",
                 "status":"completed",
-                "output":[{
-                    "type":"image_generation_call",
-                    "id":"image_edit_fixture",
-                    "status":"completed",
-                    "result":PNG_BASE64,
-                    "output_format":"png"
-                }],
-                "usage":{"input_tokens":7,"output_tokens":6,"total_tokens":13}
-            }),
-        )
+                "result":PNG_BASE64,
+                "output_format":"png"
+            }],
+            "usage":{"input_tokens":7,"output_tokens":6,"total_tokens":13}
+        }))
         .await;
     let edited = call_generate(
         &client,
@@ -3074,26 +3211,139 @@ async fn manually_installed_codex_component_reuses_one_connection_for_search_and
         "image/png"
     );
 
+    let (_, other_token) = harness.create_key("Isolated Codex consumer").await?;
+    upstream
+        .push_responses_stream(
+            stravia_protocol_codec::codec::open_responses::formatter::response_resource_snapshot(
+                "resp_isolated_fixture", "gpt-5.4", "completed",
+                vec![json!({
+                    "id":"msg_isolated_fixture","type":"message","role":"assistant","status":"completed",
+                    "content":[{"type":"output_text","text":"Isolated consumer completed","annotations":[]}]
+                })],
+                Value::Null,
+                Value::Null,
+                json!({
+                    "input_tokens":2,"input_tokens_details":{"cached_tokens":0},
+                    "output_tokens":3,"output_tokens_details":{"reasoning_tokens":0},
+                    "total_tokens":5
+                }),
+            ),
+        )
+        .await;
+    let isolated = reqwest::Client::new()
+        .post(harness.endpoint.trim_end_matches("/mcp").to_owned() + "/v1/responses")
+        .bearer_auth(&other_token)
+        .header("x-session-id", "shared-client-session")
+        .header("session_id", "lower-priority-client-session")
+        .header("x-client-request-id", "other-request-correlation")
+        .json(&json!({"model":route.model_id,"input":"Isolated Codex consumer"}))
+        .send()
+        .await?;
+    let isolated_status = isolated.status();
+    let isolated_body: Value = isolated.json().await?;
+    assert!(isolated_status.is_success(), "{isolated_body}");
+    assert!(isolated_body["output"].as_array().is_some_and(|items| {
+        items.iter().any(|item| {
+            item["content"].as_array().is_some_and(|content| {
+                content
+                    .iter()
+                    .any(|part| part["text"] == "Isolated consumer completed")
+            })
+        })
+    }));
+
     let requests = upstream.requests().await;
-    assert_eq!(requests.len(), 4);
+    assert_eq!(requests.len(), 6);
     assert!(requests.iter().all(|request| request.path == "/responses"));
-    for (name, value) in &declared_headers {
+    for request in &requests {
+        for (header, key) in [
+            ("session-id", "session_id"),
+            ("thread-id", "thread_id"),
+            ("x-codex-window-id", "x-codex-window-id"),
+            ("x-codex-turn-metadata", "x-codex-turn-metadata"),
+        ] {
+            let identity = request.headers[header].to_str()?;
+            assert_eq!(request.body["client_metadata"][key], identity);
+            assert!(
+                ![
+                    "shared-client-session",
+                    "lower-priority-client-session",
+                    "spoofed-session",
+                    "spoofed-thread",
+                    "raw-window",
+                    "spoofed-window"
+                ]
+                .contains(&identity)
+            );
+        }
+        let turn: Value = serde_json::from_str(request.headers["x-codex-turn-metadata"].to_str()?)?;
         assert_eq!(
-            requests[0]
-                .headers
-                .get(name.to_ascii_lowercase().as_str())
-                .and_then(|value| value.to_str().ok()),
-            Some(value.as_str()),
-            "declared client header {name}",
+            turn["session_id"],
+            request.body["client_metadata"]["session_id"]
+        );
+        assert_eq!(
+            turn["thread_id"],
+            request.body["client_metadata"]["thread_id"]
+        );
+        assert_eq!(
+            turn["window_id"],
+            request.body["client_metadata"]["x-codex-window-id"]
+        );
+        assert_eq!(turn["turn_id"], request.body["client_metadata"]["turn_id"]);
+        assert_ne!(turn["turn_id"], "spoofed-turn");
+        assert_ne!(
+            request.headers["x-client-request-id"],
+            request.headers["thread-id"]
+        );
+        assert!(!request.headers.contains_key("session_id"));
+        assert!(!request.headers.contains_key("x-session-id"));
+        assert!(!request.headers.contains_key("idempotency-key"));
+    }
+    let infer_turn: Value =
+        serde_json::from_str(requests[0].headers["x-codex-turn-metadata"].to_str()?)?;
+    let installation_id = requests[0].headers["x-codex-installation-id"].to_str()?;
+    uuid::Uuid::parse_str(installation_id)?;
+    assert_ne!(installation_id, "client-installation");
+    assert_eq!(infer_turn["installation_id"], installation_id);
+    assert_eq!(
+        requests[0].body["client_metadata"]["x-codex-installation-id"],
+        requests[0].headers["x-codex-installation-id"].to_str()?
+    );
+    assert!(infer_turn.get("custom_hint").is_none());
+    for request in &requests {
+        assert_eq!(
+            request.headers["x-codex-installation-id"].to_str()?,
+            installation_id
+        );
+        assert!(!request.headers.contains_key("x-codex-beta-features"));
+        assert_ne!(
+            request.headers.get("x-codex-turn-state").and_then(|value| value.to_str().ok()),
+            Some("native-turn-state")
         );
     }
     assert_eq!(
-        requests[0]
-            .headers
-            .get("idempotency-key")
-            .and_then(|value| value.to_str().ok()),
-        Some("public-client-request"),
+        requests[0].headers["x-client-request-id"],
+        "independent-request-correlation"
     );
+    assert_eq!(
+        requests[5].headers["x-client-request-id"],
+        "other-request-correlation"
+    );
+    for header in ["session-id", "thread-id", "x-codex-window-id"] {
+        assert_ne!(requests[0].headers[header], requests[5].headers[header]);
+    }
+    for (index, request) in requests.iter().enumerate() {
+        for earlier in &requests[..index] {
+            assert_ne!(
+                request.headers["x-client-request-id"],
+                earlier.headers["x-client-request-id"]
+            );
+            assert_ne!(
+                request.body["client_metadata"]["turn_id"],
+                earlier.body["client_metadata"]["turn_id"]
+            );
+        }
+    }
     assert_eq!(
         requests[0]
             .headers
@@ -3108,25 +3358,58 @@ async fn manually_installed_codex_component_reuses_one_connection_for_search_and
             .contains_key("x-undeclared-plugin-context")
     );
     assert_eq!(requests[0].body["model"], "gpt-5.4");
-    assert_eq!(requests[1].body["model"], "gpt-5.4");
+    for unsupported in [
+        "metadata",
+        "prompt_cache_retention",
+        "temperature",
+        "top_p",
+        "max_output_tokens",
+    ] {
+        assert!(
+            requests[0].body.get(unsupported).is_none(),
+            "unsupported native control: {unsupported}"
+        );
+    }
+    assert_eq!(requests[0].body["parallel_tool_calls"], false);
+    assert_eq!(
+        requests[0].body["prompt_cache_key"],
+        "canonical-final-smoke"
+    );
+    assert!(requests[1].body.get("previous_response_id").is_none());
+    let child_history = requests[1].body["input"].as_array().expect("full history");
+    for text in [
+        "Codex inference through Wasm",
+        "Codex inference completed",
+        "Continue the prior Codex exchange",
+    ] {
+        assert!(
+            child_history.iter().any(|item| {
+                item["content"]
+                    .as_array()
+                    .is_some_and(|content| content.iter().any(|part| part["text"] == text))
+            }),
+            "missing HTTP continuation history: {text}"
+        );
+    }
+    assert_eq!(requests[2].body["model"], "gpt-5.4");
     assert!(
-        requests[1].body["tools"]
+        requests[2].body["tools"]
             .as_array()
             .is_some_and(|tools| { tools.iter().any(|tool| tool["type"] == "web_search") })
     );
-    assert_eq!(requests[2].body["model"], "gpt-5.4");
-    assert!(requests[2].body["tools"].as_array().is_some_and(|tools| {
-        tools
-            .iter()
-            .any(|tool| tool["type"] == "image_generation" && tool["action"] == "generate")
-    }));
     assert_eq!(requests[3].body["model"], "gpt-5.4");
     assert!(requests[3].body["tools"].as_array().is_some_and(|tools| {
         tools
             .iter()
+            .any(|tool| tool["type"] == "image_generation" && tool["action"] == "generate")
+    }));
+    assert_eq!(requests[4].body["model"], "gpt-5.4");
+    assert!(requests[4].body["tools"].as_array().is_some_and(|tools| {
+        tools
+            .iter()
             .any(|tool| tool["type"] == "image_generation" && tool["action"] == "edit")
     }));
-    let edit_images: Vec<_> = requests[3].body["input"]
+    let edit_images: Vec<_> = requests[4].body["input"]
         .as_array()
         .into_iter()
         .flatten()

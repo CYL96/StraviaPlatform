@@ -13,7 +13,6 @@ use crate::db::models::{RouteSelectionStrategy, TargetConfig};
 use crate::runtime_cache::RuntimeCache;
 use stravia_runtime_contract::protocol::ir::AiErrorKind;
 use stravia_runtime_contract::protocol::ir::AiRequest;
-use stravia_runtime_contract::protocol::ir::ProtocolExt;
 
 #[derive(Debug, Clone)]
 pub struct SelectedTarget {
@@ -1132,11 +1131,10 @@ pub fn conversation_identity(request: &AiRequest) -> Option<ConversationIdentity
     super::continuation::parent_id_from_request(request)
         .map(ConversationIdentity::GenerationParent)
         .or_else(|| {
-            let Some(ProtocolExt::OpenResponses(extension)) = request.ext.as_ref() else {
-                return None;
-            };
-            extension
-                .prompt_cache_key
+            request
+                .parameters
+                .cache
+                .key
                 .as_ref()
                 .map(|value| ConversationIdentity::PromptCacheKey(value.clone()))
         })
@@ -1348,16 +1346,8 @@ mod tests {
     #[test]
     fn generation_parent_identity_uses_the_canonical_cross_protocol_marker() {
         let mut request = AiRequest::new("route", Vec::new());
-        request.meta.vendor.ingress.insert(
-            "previous_response_id".into(),
-            serde_json::Value::String("parent-a".into()),
-        );
-        request.ext = Some(ProtocolExt::OpenResponses(
-            stravia_runtime_contract::protocol::ir::OpenResponsesExt {
-                prompt_cache_key: Some("cache-key".into()),
-                ..Default::default()
-            },
-        ));
+        super::super::continuation::stamp_previous_response_id(&mut request, "parent-a");
+        request.parameters.cache.key = Some("cache-key".into());
 
         assert_eq!(
             conversation_identity(&request),

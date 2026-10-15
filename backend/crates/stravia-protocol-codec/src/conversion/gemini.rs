@@ -246,8 +246,7 @@ fn gemini_tool_json_schema_retains_argument_constraints_and_local_references() {
             }
         }),
         strict: None,
-        cache_control: None,
-        meta: None,
+        defer_loading: None,
     }]);
     let mut req = AiRequest::new("gemini-2.5-flash", messages);
     req.stream = StreamConfig {

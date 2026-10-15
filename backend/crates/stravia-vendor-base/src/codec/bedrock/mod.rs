@@ -28,13 +28,71 @@ use stravia_runtime_contract::protocol::ir::ContentBlock;
 use stravia_runtime_contract::protocol::ir::DocumentSource;
 use stravia_runtime_contract::protocol::ir::MediaSource;
 use stravia_runtime_contract::protocol::ir::MessageContent;
+use stravia_runtime_contract::protocol::ir::ParameterReset;
+use stravia_runtime_contract::protocol::ir::ResponseFormat;
 use stravia_runtime_contract::protocol::ir::Role;
+use stravia_runtime_contract::protocol::ir::ServiceTier;
 use stravia_runtime_contract::protocol::ir::ToolCall;
 use stravia_runtime_contract::protocol::ir::ToolChoice;
 use stravia_runtime_contract::protocol::ir::ToolSpec;
 use stravia_runtime_contract::protocol::ir::Usage;
 
 pub struct BedrockConverseV1;
+
+fn decode_output_config(request: &mut AiRequest, value: &Value) -> anyhow::Result<()> {
+    let Some(format) = value.get("textFormat") else {
+        return Ok(());
+    };
+    if format.get("type").and_then(Value::as_str) != Some("json_schema") {
+        return Ok(());
+    }
+    let definition = format
+        .pointer("/structure/jsonSchema")
+        .context("Bedrock JSON schema output is missing its definition")?;
+    let schema = definition
+        .get("schema")
+        .and_then(Value::as_str)
+        .context("Bedrock JSON schema output is missing its schema string")?;
+    request.response_format = Some(ResponseFormat::JsonSchema {
+        name: definition
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("response")
+            .into(),
+        description: definition
+            .get("description")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        schema: serde_json::from_str(schema).context("Bedrock output schema is not valid JSON")?,
+        strict: None,
+    });
+    Ok(())
+}
+
+fn encode_output_config(request: &AiRequest) -> anyhow::Result<Option<Value>> {
+    let Some(format) = &request.response_format else {
+        return Ok(None);
+    };
+    let (name, description, schema) = match format {
+        ResponseFormat::Text | ResponseFormat::JsonObject => return Ok(None),
+        ResponseFormat::JsonSchema {
+            name,
+            description,
+            schema,
+            ..
+        } => (name, description, schema),
+    };
+    let mut definition = Map::from_iter([
+        ("schema".into(), serde_json::to_string(schema)?.into()),
+        ("name".into(), name.clone().into()),
+    ]);
+    if let Some(description) = description {
+        definition.insert("description".into(), description.clone().into());
+    }
+    Ok(Some(json!({"textFormat": {
+        "type": "json_schema", "structure": {"jsonSchema": definition}
+    }})))
+}
 
 const CAPS: EndpointCapabilities = EndpointCapabilities {
     streaming: true,
@@ -44,7 +102,7 @@ const CAPS: EndpointCapabilities = EndpointCapabilities {
     override_model_in_body: false,
     ingress_routes: &[],
     multimodal: true,
-    structured_output: false,
+    structured_output: true,
     function_calling: true,
     parallel_tool_calls: false,
     extended_reasoning: true,
@@ -73,7 +131,72 @@ impl ProtocolAdapter for BedrockConverseV1 {
                 .unwrap_or_default(),
             decode_messages(&body)?,
         );
-        request.instructions = body.get("system").map(decode_system).transpose()?;
+        if let Some(system) = body.get("system").filter(|value| !value.is_null()) {
+            request.items.insert(
+                0,
+                AiItem {
+                    role: Role::System,
+                    content: MessageContent::Blocks(decode_cached_blocks(system)?),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    meta: None,
+                },
+            );
+        }
+        request.parameters.metadata = body
+            .get("requestMetadata")
+            .and_then(Value::as_object)
+            .map(|metadata| {
+                metadata
+                    .iter()
+                    .filter_map(|(key, value)| {
+                        value.as_str().map(|value| (key.clone(), value.to_owned()))
+                    })
+                    .collect()
+            });
+        request.parameters.service_tier =
+            match body.pointer("/serviceTier/type").and_then(Value::as_str) {
+                Some("default") => Some(ServiceTier::Default),
+                Some("flex") => Some(ServiceTier::Flex),
+                Some("priority") => Some(ServiceTier::Priority),
+                _ => None,
+            };
+        if let Some(value) = body.get("outputConfig") {
+            decode_output_config(&mut request, value)?;
+        }
+        if let Some(native) = body.get("additionalModelRequestFields") {
+            request.parameters.top_k = native
+                .get("top_k")
+                .and_then(Value::as_u64)
+                .and_then(|value| u32::try_from(value).ok());
+            if let Some(effort) = native
+                .pointer("/output_config/effort")
+                .and_then(Value::as_str)
+            {
+                request.reasoning.level =
+                    Some(stravia_runtime_contract::thinking::ThinkingLevel::from_wire(effort)?);
+            }
+            if let Some(thinking) = native.get("thinking").filter(|value| !value.is_null()) {
+                let kind = thinking
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .context("Bedrock thinking is missing type")?;
+                request.reasoning.target_control = Some(match kind {
+                    "disabled" => {
+                        stravia_runtime_contract::thinking::TargetThinkingControl::Disabled
+                    }
+                    "enabled" | "adaptive" => {
+                        stravia_runtime_contract::thinking::TargetThinkingControl::Enabled
+                    }
+                    _ => bail!("unsupported Bedrock thinking type"),
+                });
+                request.reasoning.mode = Some(kind.into());
+                request.reasoning.budget_tokens = thinking
+                    .get("budget_tokens")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| u32::try_from(value).ok());
+            }
+        }
         if let Some(config) = body.get("inferenceConfig") {
             request.generation.temperature = config.get("temperature").and_then(Value::as_f64);
             request.generation.top_p = config.get("topP").and_then(Value::as_f64);
@@ -84,16 +207,61 @@ impl ProtocolAdapter for BedrockConverseV1 {
             request.generation.stop = config.get("stopSequences").and_then(string_array);
         }
         if let Some(tool_config) = body.get("toolConfig") {
-            request.tools = tool_config.get("tools").map(decode_tools).transpose()?;
+            request.tools = tool_config
+                .get("tools")
+                .filter(|value| !value.is_null())
+                .map(decode_tools)
+                .transpose()?;
             request.tool_choice = tool_config
                 .get("toolChoice")
+                .filter(|value| !value.is_null())
                 .map(decode_tool_choice)
                 .transpose()?;
+        }
+        for (pointer, reset) in [
+            ("/outputConfig", ParameterReset::ResponseFormat),
+            ("/serviceTier", ParameterReset::ServiceTier),
+            ("/inferenceConfig/temperature", ParameterReset::Temperature),
+            ("/inferenceConfig/topP", ParameterReset::TopP),
+            ("/inferenceConfig/maxTokens", ParameterReset::MaxTokens),
+            (
+                "/additionalModelRequestFields/thinking",
+                ParameterReset::Reasoning,
+            ),
+        ] {
+            if body.pointer(pointer).is_some_and(Value::is_null) {
+                request.parameters.reset(reset);
+            }
         }
         Ok(request)
     }
 
-    fn encode_request(&self, request: AiRequest) -> anyhow::Result<(Value, HeaderMap)> {
+    fn encode_request(&self, mut request: AiRequest) -> anyhow::Result<(Value, HeaderMap)> {
+        request.normalize_parameters();
+        let claude = request.model.contains("anthropic.claude");
+        let thinking = claude
+            && match request.reasoning.target_control {
+                Some(
+                    stravia_runtime_contract::thinking::TargetThinkingControl::Disabled
+                    | stravia_runtime_contract::thinking::TargetThinkingControl::Hidden,
+                ) => false,
+                Some(
+                    stravia_runtime_contract::thinking::TargetThinkingControl::Enabled
+                    | stravia_runtime_contract::thinking::TargetThinkingControl::Budget { .. }
+                    | stravia_runtime_contract::thinking::TargetThinkingControl::Effort { .. },
+                ) => true,
+                None => request.reasoning.is_enabled(),
+            };
+        let budget = match request.reasoning.target_control {
+            Some(stravia_runtime_contract::thinking::TargetThinkingControl::Budget { value }) => {
+                Some(value)
+            }
+            _ => request.reasoning.budget_tokens,
+        };
+        if thinking {
+            request.generation.temperature = None;
+            request.generation.top_p = None;
+        }
         let mut body =
             Map::from_iter([("messages".into(), Value::Array(encode_messages(&request)?))]);
         let mut system = Vec::new();
@@ -110,10 +278,14 @@ impl ProtocolAdapter for BedrockConverseV1 {
                     }
                     MessageContent::Blocks(blocks) => {
                         for block in blocks {
-                            if let ContentBlock::Text { text, .. } = block
+                            if let ContentBlock::Text {
+                                text,
+                                cache_control,
+                            } = block
                                 && !text.trim().is_empty()
                             {
                                 system.push(json!({"text": text}));
+                                append_cache_point(&mut system, cache_control.as_ref());
                             }
                         }
                     }
@@ -130,6 +302,80 @@ impl ProtocolAdapter for BedrockConverseV1 {
         }
         if let Some(tool_config) = encode_tool_config(&request)? {
             body.insert("toolConfig".into(), tool_config);
+        }
+        if let Some(value) = &request.parameters.metadata {
+            body.insert("requestMetadata".into(), json!(value));
+        }
+        if let Some(value) = request
+            .parameters
+            .service_tier
+            .as_ref()
+            .and_then(|tier| match tier {
+                ServiceTier::Default => Some("default"),
+                ServiceTier::Flex => Some("flex"),
+                ServiceTier::Priority => Some("priority"),
+                ServiceTier::Auto => None,
+            })
+        {
+            body.insert("serviceTier".into(), json!({"type": value}));
+        }
+        if let Some(value) = encode_output_config(&request)? {
+            body.insert("outputConfig".into(), value);
+        }
+        if claude {
+            let mut native = Map::new();
+            if let Some(top_k) = request.parameters.top_k.filter(|_| !thinking) {
+                native.insert("top_k".into(), top_k.into());
+            }
+            if thinking {
+                let config = if matches!(
+                    request.reasoning.mode.as_deref(),
+                    Some("auto" | "adaptive")
+                ) || matches!(
+                    request.reasoning.target_control,
+                    Some(stravia_runtime_contract::thinking::TargetThinkingControl::Effort { .. })
+                ) {
+                    json!({"type": "adaptive"})
+                } else if let Some(budget) = budget {
+                    if let Some(cap) = request.generation.max_tokens {
+                        anyhow::ensure!(
+                            budget < cap,
+                            "Bedrock Claude thinking budget must be below the output token limit"
+                        );
+                    }
+                    json!({"type": "enabled", "budget_tokens": budget})
+                } else {
+                    bail!(
+                        "Bedrock Claude enabled thinking requires a token budget or adaptive mode"
+                    );
+                };
+                native.insert("thinking".into(), config);
+                let effort = match request.reasoning.target_control.as_ref() {
+                    Some(stravia_runtime_contract::thinking::TargetThinkingControl::Effort {
+                        value,
+                    }) => Some(value.as_str()),
+                    _ => request.reasoning.level.map(|level| {
+                        if level == stravia_runtime_contract::thinking::ThinkingLevel::Off {
+                            "none"
+                        } else {
+                            level.as_str()
+                        }
+                    }),
+                };
+                if let Some(effort @ ("low" | "medium" | "high" | "max")) = effort {
+                    native.insert("output_config".into(), json!({"effort": effort}));
+                }
+            } else if matches!(
+                request.reasoning.target_control,
+                Some(stravia_runtime_contract::thinking::TargetThinkingControl::Disabled)
+            ) || (request.reasoning.target_control.is_none()
+                && request.reasoning.mode.as_deref() == Some("disabled"))
+            {
+                native.insert("thinking".into(), json!({"type": "disabled"}));
+            }
+            if !native.is_empty() {
+                body.insert("additionalModelRequestFields".into(), Value::Object(native));
+            }
         }
         Ok((Value::Object(body), HeaderMap::new()))
     }
@@ -507,7 +753,13 @@ fn encode_user_content(content: &MessageContent) -> anyhow::Result<Vec<Value>> {
             let mut parts = Vec::new();
             for block in blocks {
                 match block {
-                    ContentBlock::Text { text, .. } => parts.push(json!({"text": text})),
+                    ContentBlock::Text {
+                        text,
+                        cache_control,
+                    } => {
+                        parts.push(json!({"text": text}));
+                        append_cache_point(&mut parts, cache_control.as_ref());
+                    }
                     ContentBlock::Image {
                         source: MediaSource::Base64 { media_type, data },
                         ..
@@ -658,7 +910,13 @@ fn encode_assistant_content(item: &AiItem) -> anyhow::Result<Vec<Value>> {
             let mut parts = Vec::new();
             for block in blocks {
                 match block {
-                    ContentBlock::Text { text, .. } => parts.push(json!({"text": text})),
+                    ContentBlock::Text {
+                        text,
+                        cache_control,
+                    } => {
+                        parts.push(json!({"text": text}));
+                        append_cache_point(&mut parts, cache_control.as_ref());
+                    }
                     ContentBlock::Thinking {
                         thinking,
                         signature,
@@ -709,9 +967,16 @@ fn encode_assistant_content(item: &AiItem) -> anyhow::Result<Vec<Value>> {
                     }
                     ContentBlock::RedactedThinking { .. } => {}
                     ContentBlock::ToolUse {
-                        id, name, input, ..
-                    } if input.is_object() => parts
-                        .push(json!({"toolUse": {"toolUseId": id, "name": name, "input": input}})),
+                        id,
+                        name,
+                        input,
+                        cache_control,
+                    } if input.is_object() => {
+                        parts.push(
+                            json!({"toolUse": {"toolUseId": id, "name": name, "input": input}}),
+                        );
+                        append_cache_point(&mut parts, cache_control.as_ref());
+                    }
                     _ => {}
                 }
             }
@@ -871,16 +1136,19 @@ fn encode_tool_config(request: &AiRequest) -> anyhow::Result<Option<Value>> {
     let Some(tools) = request.tools.as_deref().filter(|tools| !tools.is_empty()) else {
         return Ok(None);
     };
-    let mut tool_config = Map::from_iter([(
-        "tools".into(),
-        Value::Array(tools.iter().map(encode_tool).collect()),
-    )]);
+    let mut definitions = Vec::with_capacity(tools.len());
+    for tool in tools {
+        definitions.push(encode_tool(tool));
+    }
+    let mut tool_config = Map::from_iter([("tools".into(), Value::Array(definitions))]);
     if let Some(choice) = &request.tool_choice {
         let choice = match choice {
             ToolChoice::Auto => json!({"auto": {}}),
             ToolChoice::Required => json!({"any": {}}),
             ToolChoice::Named { name } => json!({"tool": {"name": name}}),
-            ToolChoice::None | ToolChoice::Raw(_) => return Ok(Some(Value::Object(tool_config))),
+            ToolChoice::None | ToolChoice::Allowed { .. } | ToolChoice::Native(_) => {
+                return Ok(Some(Value::Object(tool_config)));
+            }
         };
         tool_config.insert("toolChoice".into(), choice);
     }
@@ -906,13 +1174,11 @@ fn decode_messages(body: &Value) -> anyhow::Result<Vec<AiItem>> {
                 "assistant" => Role::Assistant,
                 other => bail!("unsupported Bedrock message role `{other}`"),
             };
-            let blocks = message
-                .get("content")
-                .and_then(Value::as_array)
-                .context("Bedrock message is missing content")?
-                .iter()
-                .map(decode_content_block)
-                .collect::<anyhow::Result<Vec<_>>>()?;
+            let blocks = decode_cached_blocks(
+                message
+                    .get("content")
+                    .context("Bedrock message is missing content")?,
+            )?;
             Ok(AiItem {
                 role,
                 content: MessageContent::Blocks(blocks),
@@ -924,14 +1190,53 @@ fn decode_messages(body: &Value) -> anyhow::Result<Vec<AiItem>> {
         .collect()
 }
 
-fn decode_system(value: &Value) -> anyhow::Result<String> {
-    Ok(value
+fn append_cache_point(
+    parts: &mut Vec<Value>,
+    cache: Option<&stravia_runtime_contract::protocol::ir::CacheControl>,
+) {
+    if let Some(cache) = cache {
+        let ttl = match cache.ttl {
+            stravia_runtime_contract::protocol::ir::CacheTtl::Ephemeral5m => "5m",
+            stravia_runtime_contract::protocol::ir::CacheTtl::Ephemeral1h => "1h",
+        };
+        parts.push(json!({"cachePoint": {"type": "default", "ttl": ttl}}));
+    }
+}
+
+fn decode_cached_blocks(value: &Value) -> anyhow::Result<Vec<ContentBlock>> {
+    let mut blocks = Vec::new();
+    for part in value
         .as_array()
-        .context("Bedrock system must be an array")?
-        .iter()
-        .map(|part| required_string(part, "text"))
-        .collect::<anyhow::Result<Vec<_>>>()?
-        .join("\n"))
+        .context("Bedrock content must be an array")?
+    {
+        if let Some(point) = part.get("cachePoint") {
+            let cache = decode_cache_point(point)?;
+            match blocks.last_mut() {
+                Some(
+                    ContentBlock::Text { cache_control, .. }
+                    | ContentBlock::ToolUse { cache_control, .. },
+                ) => *cache_control = Some(cache),
+                _ => bail!("Bedrock cache point must follow a supported cacheable block"),
+            }
+        } else {
+            blocks.push(decode_content_block(part)?);
+        }
+    }
+    Ok(blocks)
+}
+
+fn decode_cache_point(
+    point: &Value,
+) -> anyhow::Result<stravia_runtime_contract::protocol::ir::CacheControl> {
+    anyhow::ensure!(
+        point.get("type").and_then(Value::as_str) == Some("default"),
+        "unsupported Bedrock cache point type"
+    );
+    Ok(match point.get("ttl").and_then(Value::as_str) {
+        None | Some("5m") => stravia_runtime_contract::protocol::ir::CacheControl::ephemeral(),
+        Some("1h") => stravia_runtime_contract::protocol::ir::CacheControl::ephemeral_1h(),
+        Some(_) => bail!("unsupported Bedrock cache point TTL"),
+    })
 }
 
 fn decode_content_block(block: &Value) -> anyhow::Result<ContentBlock> {
@@ -988,15 +1293,13 @@ fn decode_content_block(block: &Value) -> anyhow::Result<ContentBlock> {
 }
 
 fn decode_tools(value: &Value) -> anyhow::Result<Vec<ToolSpec>> {
-    value
-        .as_array()
-        .context("Bedrock tools must be an array")?
-        .iter()
-        .map(|tool| {
+    let mut tools: Vec<ToolSpec> = Vec::new();
+    for tool in value.as_array().context("Bedrock tools must be an array")? {
+        if tool.get("cachePoint").is_none() {
             let spec = tool
                 .get("toolSpec")
                 .context("Bedrock tool is missing toolSpec")?;
-            Ok(ToolSpec {
+            tools.push(ToolSpec {
                 name: required_string(spec, "name")?,
                 description: spec
                     .get("description")
@@ -1007,11 +1310,11 @@ fn decode_tools(value: &Value) -> anyhow::Result<Vec<ToolSpec>> {
                     .cloned()
                     .unwrap_or_else(|| json!({})),
                 strict: None,
-                cache_control: None,
-                meta: None,
-            })
-        })
-        .collect()
+                defer_loading: None,
+            });
+        }
+    }
+    Ok(tools)
 }
 
 fn decode_tool_choice(value: &Value) -> anyhow::Result<ToolChoice> {

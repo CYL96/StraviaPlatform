@@ -2431,7 +2431,7 @@ async fn projection_session_fixture(
 mod tests {
     use super::*;
     use crate::history_marker::HistoryMarkerKind;
-    use crate::history_marker::{ReasoningRejections, ThinkingProvenance, ThinkingSource};
+    use crate::history_marker::{ThinkingProvenance, ThinkingSource};
     use stravia_runtime_contract::protocol::ids::{
         ANTHROPIC_MESSAGES_2023_06_01, GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA,
         OPEN_RESPONSES_2026_04_24,
@@ -2448,6 +2448,7 @@ mod tests {
             target_id: "actual-provider".into(),
             authority: Some(format!("authority-{protocol}-{model}")),
             protocol: Some(protocol),
+            issued: Vec::new(),
         }
     }
 
@@ -2730,7 +2731,8 @@ mod tests {
             let mut session =
                 ClientProjectionSession::new(Arc::clone(&store), principal.clone(), ingress);
             protected_leg(&mut session, source.clone());
-            let original = AiItem::thinking("provider thought", Some("provider-opaque".into()));
+            let mut original = AiItem::thinking("provider thought", Some("provider-opaque".into()));
+            source.stamp_item(&mut original);
             let mut response = AiResponse::new("response", model);
             response.items = vec![original.clone()];
             let batch = session
@@ -2776,7 +2778,7 @@ mod tests {
             );
             assert_eq!(
                 ThinkingSource::from_item(restored_thinking[0]),
-                Some(source.clone())
+                ThinkingSource::from_item(&original)
             );
             for target in [
                 OPEN_RESPONSES_2026_04_24,
@@ -2786,10 +2788,22 @@ mod tests {
             ] {
                 let target_source = replay_source(target, model);
                 let mut replay = restored.clone();
-                stravia_protocol_codec::transform::prepare_thinking_replay(&mut replay, |item| {
-                    target_source.provenance(item, &ReasoningRejections::default())
-                        != ThinkingProvenance::Foreign
-                });
+                assert!(!stravia_protocol_codec::transform::prepare_thinking_replay(
+                    &mut replay,
+                    |item, block| {
+                        let provenance = target_source.provenance(item, block);
+                        if target == issuer {
+                            assert_eq!(provenance, ThinkingProvenance::Own);
+                        } else {
+                            assert_eq!(
+                                provenance,
+                                ThinkingProvenance::Foreign(source.authority.clone().unwrap())
+                            );
+                        }
+                        // 首发不因来源协议不同而剥离，是否承载由出口 codec 决定。
+                        true
+                    }
+                ));
                 let thoughts = replay
                     .items
                     .iter()
@@ -2797,26 +2811,30 @@ mod tests {
                     .collect::<Vec<_>>();
                 assert_eq!(
                     thoughts,
-                    vec![(
-                        "provider thought",
-                        (target == issuer).then_some("provider-opaque")
-                    )]
+                    vec![("provider thought", Some("provider-opaque"))]
                 );
             }
             if issuer == GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA {
                 let other_model = replay_source(issuer, "different-gemini");
                 let mut replay = restored;
-                stravia_protocol_codec::transform::prepare_thinking_replay(&mut replay, |item| {
-                    other_model.provenance(item, &ReasoningRejections::default())
-                        != ThinkingProvenance::Foreign
-                });
+                assert!(!stravia_protocol_codec::transform::prepare_thinking_replay(
+                    &mut replay,
+                    |item, block| {
+                        assert_eq!(
+                            other_model.provenance(item, block),
+                            ThinkingProvenance::Foreign(source.authority.clone().unwrap())
+                        );
+                        // 模型改变只影响来源判定，不再触发首发剥离。
+                        true
+                    }
+                ));
                 assert_eq!(
                     replay
                         .items
                         .iter()
                         .filter_map(AiItem::thinking_ref)
                         .collect::<Vec<_>>(),
-                    vec![("provider thought", None)]
+                    vec![("provider thought", Some("provider-opaque"))]
                 );
             }
         }
@@ -2952,7 +2970,9 @@ mod tests {
             .iter()
             .filter(|item| item.thinking_ref().is_some())
         {
-            assert_eq!(ThinkingSource::from_item(item), Some(source.clone()));
+            let mut stamped = item.clone();
+            source.stamp_item(&mut stamped);
+            assert_eq!(ThinkingSource::from_item(item), ThinkingSource::from_item(&stamped));
         }
         assert!(replay.items.iter().any(|item| {
             item.function_call_ref()
@@ -3133,7 +3153,9 @@ mod tests {
                 serde_json::to_value(&thoughts[0].content).unwrap(),
                 serde_json::to_value(&original.content).unwrap()
             );
-            assert_eq!(ThinkingSource::from_item(thoughts[0]), Some(source));
+            let mut stamped = original.clone();
+            source.stamp_item(&mut stamped);
+            assert_eq!(ThinkingSource::from_item(thoughts[0]), ThinkingSource::from_item(&stamped));
         }
     }
 
@@ -3227,7 +3249,9 @@ mod tests {
                 serde_json::to_value(&thoughts[0].content).unwrap(),
                 serde_json::to_value(&original.content).unwrap()
             );
-            assert_eq!(ThinkingSource::from_item(thoughts[0]), Some(source));
+            let mut stamped = original.clone();
+            source.stamp_item(&mut stamped);
+            assert_eq!(ThinkingSource::from_item(thoughts[0]), ThinkingSource::from_item(&stamped));
             let mut response = AiResponse::new("response", "responses-model");
             response.items = vec![original];
             let batch = session
@@ -3354,7 +3378,9 @@ mod tests {
             serde_json::to_value(&thought[0].content).unwrap(),
             serde_json::to_value(&original.content).unwrap()
         );
-        assert_eq!(ThinkingSource::from_item(thought[0]), Some(source));
+        let mut stamped = original.clone();
+        source.stamp_item(&mut stamped);
+        assert_eq!(ThinkingSource::from_item(thought[0]), ThinkingSource::from_item(&stamped));
     }
 
     #[tokio::test]

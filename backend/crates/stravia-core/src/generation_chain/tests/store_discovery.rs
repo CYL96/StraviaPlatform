@@ -1,6 +1,152 @@
 use super::*;
 use stravia_runtime_contract::artifact::{ArtifactStore, bytes_stream};
 
+#[test]
+fn native_generation_controls_inherit_without_inheriting_resets() {
+    use stravia_runtime_contract::protocol::ir::{
+        AudioOutput, CacheRetention, CompactionControl, Modality, NativeTool,
+        RequestParameters, ServiceTier, Truncation, Verbosity, WebSearchTool,
+    };
+    let mut parent = RequestParameters::default();
+    parent.top_k = Some(20);
+    parent.min_p = Some(0.1);
+    parent.repetition_penalty = Some(1.1);
+    parent.candidate_count = Some(2);
+    parent.logit_bias = Some(std::collections::HashMap::from([("1".into(), 0.5)]));
+    parent.logprobs = Some(0);
+    parent.modalities = Some(vec![Modality::Text, Modality::Audio]);
+    parent.audio = Some(AudioOutput {
+        voice: Some("alloy".into()),
+        format: Some("wav".into()),
+    });
+    parent.verbosity = Some(Verbosity::High);
+    parent.max_tool_calls = Some(3);
+    parent.background = Some(false);
+    parent.truncation = Some(Truncation::Auto);
+    parent.compaction = Some(CompactionControl {
+        threshold_tokens: Some(2000),
+    });
+    parent.metadata = Some(std::collections::BTreeMap::from([("key".into(), "value".into())]));
+    parent.end_user_id = Some("user".into());
+    parent.service_tier = Some(ServiceTier::Default);
+    parent.cache.key = Some("cache".into());
+    parent.cache.retention = Some(CacheRetention::Extended);
+    parent.native_tools = vec![NativeTool::WebSearch(WebSearchTool {
+        max_uses: Some(3),
+        allowed_domains: Vec::new(),
+        blocked_domains: Vec::new(),
+        user_location: None,
+        context_size: None,
+    })];
+    parent.reset(ParameterReset::Temperature);
+    let mut current = RequestParameters::default();
+    inherit_parameters(&mut current, &parent);
+    parent.resets.clear();
+    assert_eq!(
+        serde_json::to_value(current).unwrap(),
+        serde_json::to_value(parent).unwrap()
+    );
+}
+
+#[test]
+fn continuation_resets_block_defaults_without_inheriting_per_turn_controls() {
+    use stravia_runtime_contract::protocol::ir::{
+        CacheRetention, Continuation, NativeTool, CodeExecutionTool, ServiceTier,
+        Truncation, Verbosity,
+    };
+    let mut parent = responses_request(Vec::new());
+    parent.instructions = Some("parent instructions".into());
+    parent.generation.temperature = Some(0.5);
+    parent.generation.top_p = Some(0.8);
+    parent.generation.presence_penalty = Some(0.2);
+    parent.generation.frequency_penalty = Some(0.3);
+    parent.generation.max_tokens = Some(100);
+    parent.parallel_tool_calls = Some(true);
+    parent.parameters.background = Some(true);
+    parent.parameters.max_tool_calls = Some(5);
+    parent.parameters.cache.key = Some("parent cache".into());
+    parent.parameters.cache.retention = Some(CacheRetention::Extended);
+    parent.parameters.logprobs = Some(3);
+    parent.parameters.truncation = Some(Truncation::Auto);
+    parent.parameters.service_tier = Some(ServiceTier::Priority);
+    parent.parameters.verbosity = Some(Verbosity::High);
+    parent.parameters.end_user_id = Some("parent user".into());
+    parent.parameters.native_tools = vec![NativeTool::CodeExecution(CodeExecutionTool {
+        container: Some("container".into()),
+    })];
+    parent.parameters.store = Some(true);
+    parent.parameters.generate = Some(false);
+    parent.parameters.continuation = Some(Continuation::PreviousResponse("parent".into()));
+    parent.parameters.session.id = Some("parent session".into());
+    let config = EffectiveRequestConfig::from_request(&parent);
+    let mut current = responses_request(Vec::new());
+    for reset in [
+        ParameterReset::Instructions, ParameterReset::Temperature, ParameterReset::TopP,
+        ParameterReset::PresencePenalty, ParameterReset::FrequencyPenalty, ParameterReset::MaxTokens,
+        ParameterReset::ParallelToolCalls, ParameterReset::Background, ParameterReset::MaxToolCalls,
+        ParameterReset::CacheKey, ParameterReset::CacheRetention, ParameterReset::Logprobs,
+        ParameterReset::Truncation, ParameterReset::ServiceTier, ParameterReset::Verbosity,
+        ParameterReset::EndUser, ParameterReset::NativeTools,
+    ] {
+        current.parameters.reset(reset);
+    }
+    let expected = serde_json::to_value(&current).unwrap();
+    config.apply_missing_to(&mut current);
+    assert_eq!(serde_json::to_value(&current).unwrap(), expected);
+
+    let mut current = responses_request(Vec::new());
+    current.generation.temperature = Some(0.1);
+    current.parameters.logprobs = Some(0);
+    current.parameters.cache.key = Some("current cache".into());
+    current.parameters.continuation = Some(Continuation::Conversation("conversation".into()));
+    current.parameters.session.id = Some("current session".into());
+    config.apply_missing_to(&mut current);
+    assert_eq!(current.generation.temperature, Some(0.1));
+    assert_eq!(current.parameters.logprobs, Some(0));
+    assert_eq!(current.parameters.cache.key.as_deref(), Some("current cache"));
+    assert_eq!(
+        current.parameters.continuation.as_ref().and_then(|value| value.conversation_id()),
+        Some("conversation")
+    );
+    assert_eq!(current.parameters.session.id.as_deref(), Some("current session"));
+    assert!(current.parameters.store.is_none());
+    assert!(current.parameters.generate.is_none());
+    assert_eq!(current.instructions.as_deref(), Some("parent instructions"));
+}
+
+#[test]
+fn nullable_nested_controls_block_inherited_values() {
+    use stravia_runtime_contract::protocol::ir::{ResponseFormat, ReasoningSummary};
+    let mut parent = responses_request(Vec::new());
+    parent.reasoning.level = Some(stravia_runtime_contract::thinking::ThinkingLevel::High);
+    parent.reasoning.summary = Some(ReasoningSummary::Auto);
+    parent.response_format = Some(ResponseFormat::JsonSchema {
+        name: "result".into(),
+        description: None,
+        schema: serde_json::json!({"type": "object"}),
+        strict: Some(true),
+    });
+    let config = EffectiveRequestConfig::from_request(&parent);
+    let mut current = responses_request(Vec::new());
+    current.parameters.reset(ParameterReset::ReasoningLevel);
+    current.parameters.reset(ParameterReset::ReasoningSummary);
+    current.parameters.reset(ParameterReset::ResponseFormatStrict);
+    config.apply_missing_to(&mut current);
+    assert!(current.reasoning.level.is_none());
+    assert!(current.reasoning.summary.is_none());
+    assert!(matches!(
+        current.response_format,
+        Some(ResponseFormat::JsonSchema { strict: None, .. })
+    ));
+    let mut current = responses_request(Vec::new());
+    current.parameters.reset(ParameterReset::Reasoning);
+    current.parameters.reset(ParameterReset::ResponseFormat);
+    config.apply_missing_to(&mut current);
+    assert!(current.reasoning.level.is_none());
+    assert!(current.reasoning.summary.is_none());
+    assert!(current.response_format.is_none());
+}
+
 struct ControlledDiscoveryTurnChainStore {
     inner: crate::turn_chain::SqlTurnChainStore,
     blocked: parking_lot::Mutex<std::collections::HashSet<String>>,
@@ -772,7 +918,7 @@ async fn discovery_workspace_does_not_retain_expired_or_invalid_ancestor_evidenc
             Some(vec![AiItem::output_text("old answer")]),
             "old answer",
         ),
-        Duration::from_millis(500),
+        Duration::from_secs(60),
     )
     .await;
     let mut workspace = DiscoveryWorkspace::new(&owner, true);
@@ -785,22 +931,42 @@ async fn discovery_workspace_does_not_retain_expired_or_invalid_ancestor_evidenc
         .await
         .unwrap();
     assert_eq!(initial.client_items.len(), 2);
-    tokio::time::sleep(
-        initial
-            .expires_at
-            .saturating_duration_since(std::time::Instant::now())
-            + Duration::from_millis(25),
+    let (_, proof_expires_at) = workspace
+        .chain(
+            &owner,
+            &TurnNodeId::new("expired-workspace-root"),
+            std::time::Instant::now(),
+        )
+        .expect("fresh workspace proof");
+    assert!(
+        workspace
+            .chain(
+                &owner,
+                &TurnNodeId::new("expired-workspace-root"),
+                proof_expires_at,
+            )
+            .is_none()
+    );
+    commit_observation_node(
+        durable.as_ref(),
+        &owner,
+        "expired-durable-root",
+        None,
+        observation_payload(vec![user_message("expired")], None, None, "expired answer"),
+        Duration::ZERO,
     )
     .await;
-    assert!(
+    assert_eq!(
         store
             .materialize_discovery_generation(
                 &owner,
-                &TurnNodeId::new("expired-workspace-root"),
+                &TurnNodeId::new("expired-durable-root"),
                 &mut workspace
             )
             .await
-            .is_err()
+            .err()
+            .as_deref(),
+        Some("turn unavailable"),
     );
     commit_observation_node(
         durable.as_ref(),
@@ -941,6 +1107,63 @@ async fn shared_discovery_replay_preserves_mutations_reasoning_and_media_boundar
                 .any(|item| replace && item.content.to_text() == "root")
         );
     }
+}
+
+#[test]
+fn historical_v6_request_controls_are_imported_before_continuation_inheritance() {
+    let root = responses_request(vec![user_message("historical question")]);
+    let mut config = serde_json::to_value(EffectiveRequestConfig::from_request(&root)).unwrap();
+    config.as_object_mut().unwrap().remove("parameters");
+    config["ext"] = serde_json::json!({
+        "include": ["reasoning.encrypted_content"],
+        "prompt_cache_key": "historical-cache",
+        "top_logprobs": 0,
+        "background": false,
+        "text": {"verbosity": "high", "format": {"type": "json_object"}},
+        "service_tier": "default",
+    });
+    let mut payload = observation_payload(
+        vec![user_message("historical question")],
+        None,
+        None,
+        "answer",
+    );
+    payload["effective_request"] = config;
+    let materialized = materialize_generation_nodes(
+        vec![stravia_runtime_contract::turn_chain::TurnNode {
+            id: TurnNodeId::new("historical-v6"),
+            kind: TurnNodeKind::Response,
+            parent_id: None,
+            payload_version: 6,
+            payload,
+        }],
+        std::time::Instant::now() + Duration::from_secs(60),
+    )
+    .unwrap();
+    let mut continuation = responses_request(vec![user_message("continue")]);
+    materialized
+        .effective_request
+        .as_ref()
+        .unwrap()
+        .apply_missing_to(&mut continuation);
+    assert_eq!(
+        continuation.parameters.cache.key.as_deref(),
+        Some("historical-cache")
+    );
+    assert_eq!(continuation.parameters.logprobs, Some(0));
+    assert_eq!(continuation.parameters.background, Some(false));
+    assert_eq!(
+        continuation.parameters.verbosity,
+        Some(stravia_runtime_contract::protocol::ir::Verbosity::High)
+    );
+    assert!(matches!(
+        continuation.response_format,
+        Some(stravia_runtime_contract::protocol::ir::ResponseFormat::JsonObject)
+    ));
+    assert_eq!(
+        continuation.parameters.service_tier,
+        Some(stravia_runtime_contract::protocol::ir::ServiceTier::Default)
+    );
 }
 
 type PendingPersist = tokio::task::JoinHandle<Result<(), PersistError>>;
@@ -2117,10 +2340,7 @@ async fn materialization_cache_does_not_outlive_the_generation_ttl() {
         .expect("set controlled durable deadline");
     assert_eq!(live_rows.rows_affected(), 1);
     let mut cached = responses_request(vec![user_message("follow up")]);
-    let Some(ProtocolExt::OpenResponses(extension)) = cached.ext.as_mut() else {
-        unreachable!();
-    };
-    extension.previous_response_id = Some("resp_expiring".into());
+    crate::router::stamp_previous_response_id(&mut cached, "resp_expiring");
     store
         .materialize_parent(&owner, &mut cached)
         .await
@@ -2189,10 +2409,7 @@ async fn materialization_cache_does_not_outlive_the_generation_ttl() {
             <= std::time::Instant::now()
     );
     let mut expired = responses_request(vec![user_message("follow up")]);
-    let Some(ProtocolExt::OpenResponses(extension)) = expired.ext.as_mut() else {
-        unreachable!();
-    };
-    extension.previous_response_id = Some("resp_expiring".into());
+    crate::router::stamp_previous_response_id(&mut expired, "resp_expiring");
     assert_eq!(
         store
             .materialize_parent(&owner, &mut expired)
@@ -2480,10 +2697,7 @@ async fn previous_response_materializes_history_and_supports_branching() {
 
     for follow_up in ["branch-a", "branch-b"] {
         let mut request = responses_request(vec![user_message(follow_up)]);
-        let Some(ProtocolExt::OpenResponses(extension)) = request.ext.as_mut() else {
-            unreachable!();
-        };
-        extension.previous_response_id = Some("resp_root".into());
+        crate::router::stamp_previous_response_id(&mut request, "resp_root");
         let active = store
             .materialize_parent(&owner, &mut request)
             .await
@@ -2524,10 +2738,7 @@ async fn replacement_mutation_replays_the_effective_history_without_a_hook() {
         .expect("save rewritten response");
 
     let mut next = responses_request(vec![user_message("follow up")]);
-    let Some(ProtocolExt::OpenResponses(extension)) = next.ext.as_mut() else {
-        unreachable!();
-    };
-    extension.previous_response_id = Some("resp_rewritten".into());
+    crate::router::stamp_previous_response_id(&mut next, "resp_rewritten");
     store
         .materialize_parent(&owner, &mut next)
         .await
@@ -2588,10 +2799,7 @@ async fn previous_response_materializes_the_ordered_item_graph_without_collapsin
         .expect("save response");
 
     let mut request = responses_request(vec![user_message("follow-up")]);
-    let Some(ProtocolExt::OpenResponses(extension)) = request.ext.as_mut() else {
-        unreachable!();
-    };
-    extension.previous_response_id = Some("resp_root".into());
+    crate::router::stamp_previous_response_id(&mut request, "resp_root");
 
     store
         .materialize_parent(&owner, &mut request)
@@ -2691,10 +2899,7 @@ async fn matching_prefix_prefers_ephemeral_upstream_continuation_when_transport_
     let owner = principal("owner");
     let question = user_message("question");
     let mut initial = responses_request(vec![question.clone()]);
-    let Some(ProtocolExt::OpenResponses(extension)) = initial.ext.as_mut() else {
-        unreachable!();
-    };
-    extension.store = Some(false);
+    initial.parameters.store = Some(false);
     let mut root = chain
         .begin(owner.clone(), initial)
         .await
@@ -2713,10 +2918,7 @@ async fn matching_prefix_prefers_ephemeral_upstream_continuation_when_transport_
         AiItem::output_text("answer"),
         user_message("follow-up"),
     ]);
-    let Some(ProtocolExt::OpenResponses(extension)) = resumed_request.ext.as_mut() else {
-        unreachable!();
-    };
-    extension.store = Some(false);
+    resumed_request.parameters.store = Some(false);
     let resumed = chain
         .begin(owner.clone(), resumed_request)
         .await
@@ -2817,10 +3019,7 @@ async fn stable_session_does_not_link_semantically_changed_history() {
     };
     let mut initial = responses_request(vec![original_user]);
     initial.instructions = Some("first controls".into());
-    initial.meta.vendor.ingress.insert(
-        GENERATION_SESSION_ID_META.into(),
-        serde_json::Value::String("session-1".into()),
-    );
+    initial.parameters.session.id = Some("session-1".into());
     let mut root = chain
         .begin(owner.clone(), initial)
         .await
@@ -2839,10 +3038,7 @@ async fn stable_session_does_not_link_semantically_changed_history() {
         user_message("second"),
     ]);
     resumed_request.instructions = Some("changed controls".into());
-    resumed_request.meta.vendor.ingress.insert(
-        GENERATION_SESSION_ID_META.into(),
-        serde_json::Value::String("session-1".into()),
-    );
+    resumed_request.parameters.session.id = Some("session-1".into());
     let resumed = chain
         .begin(owner, resumed_request)
         .await
@@ -2868,10 +3064,7 @@ async fn controls_prefix_wins_when_same_session_candidate_does_not_match() {
     // session-layer index returns this candidate, then items_equal rejects it.
     let mut session_request = responses_request(vec![user_message("session alpha")]);
     session_request.instructions = Some("shared controls".into());
-    session_request.meta.vendor.ingress.insert(
-        GENERATION_SESSION_ID_META.into(),
-        serde_json::Value::String("session-1".into()),
-    );
+    session_request.parameters.session.id = Some("session-1".into());
     let mut session_root = chain
         .begin(owner.clone(), session_request)
         .await
@@ -2905,10 +3098,7 @@ async fn controls_prefix_wins_when_same_session_candidate_does_not_match() {
         user_message("next"),
     ]);
     resumed_request.instructions = Some("shared controls".into());
-    resumed_request.meta.vendor.ingress.insert(
-        GENERATION_SESSION_ID_META.into(),
-        serde_json::Value::String("session-1".into()),
-    );
+    resumed_request.parameters.session.id = Some("session-1".into());
     let resumed = chain
         .begin(owner, resumed_request)
         .await
@@ -2965,10 +3155,7 @@ async fn previous_response_resolves_principal_scoped_item_references() {
             })),
         ),
     }]);
-    let Some(ProtocolExt::OpenResponses(extension)) = request.ext.as_mut() else {
-        unreachable!();
-    };
-    extension.previous_response_id = Some("resp_items".into());
+    crate::router::stamp_previous_response_id(&mut request, "resp_items");
 
     store
         .materialize_parent(&owner, &mut request)
@@ -2988,10 +3175,7 @@ async fn previous_response_resolves_principal_scoped_item_references() {
     );
 
     let mut unauthorized = request.clone();
-    let Some(ProtocolExt::OpenResponses(extension)) = unauthorized.ext.as_mut() else {
-        unreachable!();
-    };
-    extension.previous_response_id = Some("resp_items".into());
+    crate::router::stamp_previous_response_id(&mut unauthorized, "resp_items");
     unauthorized.items = vec![AiItem {
         role: Role::User,
         content: MessageContent::Text(String::new().into()),
@@ -3098,10 +3282,7 @@ async fn previous_response_resolves_references_to_persisted_input_items() {
             })),
         ),
     }]);
-    let Some(ProtocolExt::OpenResponses(extension)) = request.ext.as_mut() else {
-        unreachable!();
-    };
-    extension.previous_response_id = Some("resp_input".into());
+    crate::router::stamp_previous_response_id(&mut request, "resp_input");
 
     store
         .materialize_parent(&owner, &mut request)
@@ -3139,10 +3320,7 @@ async fn previous_response_inherits_instructions_unless_replaced() {
     ] {
         let mut request = responses_request(vec![user_message("continue")]);
         request.instructions = replacement.map(str::to_owned);
-        let Some(ProtocolExt::OpenResponses(extension)) = request.ext.as_mut() else {
-            unreachable!();
-        };
-        extension.previous_response_id = Some("resp_instructions".into());
+        crate::router::stamp_previous_response_id(&mut request, "resp_instructions");
         store
             .materialize_parent(&owner, &mut request)
             .await
@@ -3150,11 +3328,8 @@ async fn previous_response_inherits_instructions_unless_replaced() {
         assert_eq!(request.instructions.as_deref(), Some(expected));
     }
     let mut explicit_null = responses_request(vec![user_message("continue")]);
-    let Some(ProtocolExt::OpenResponses(extension)) = explicit_null.ext.as_mut() else {
-        unreachable!();
-    };
-    extension.previous_response_id = Some("resp_instructions".into());
-    extension.instructions_present = true;
+    crate::router::stamp_previous_response_id(&mut explicit_null, "resp_instructions");
+    explicit_null.parameters.reset(ParameterReset::Instructions);
     store
         .materialize_parent(&owner, &mut explicit_null)
         .await
@@ -3170,11 +3345,19 @@ async fn previous_response_inherits_request_configuration_and_keeps_overrides() 
     root.model = "root-model".into();
     root.generation.temperature = Some(0.25);
     root.generation.max_tokens = Some(200);
-    let Some(ProtocolExt::OpenResponses(root_extension)) = root.ext.as_mut() else {
-        unreachable!();
-    };
-    root_extension.include = Some(vec!["reasoning.encrypted_content".into()]);
-    root_extension.store = Some(false);
+    root.parameters.store = Some(false);
+    root.parameters.min_p = Some(0.12);
+    root.parameters.logprobs = Some(3);
+    root.parameters.metadata = Some(std::collections::BTreeMap::from([("trace".into(), "parent".into())]));
+    root.parameters.cache.key = Some("prompt-bucket".into());
+    root.parameters.verbosity = Some(stravia_runtime_contract::protocol::ir::Verbosity::High);
+    root.response_format = Some(stravia_runtime_contract::protocol::ir::ResponseFormat::Text);
+    root.parameters.native_tools.push(
+        stravia_runtime_contract::protocol::ir::NativeTool::CodeExecution(
+            stravia_runtime_contract::protocol::ir::CodeExecutionTool { container: None },
+        ),
+    );
+    root.parameters.session.id = Some("parent-session".into());
     store
         .save(GenerationChainCommit {
             principal: owner.clone(),
@@ -3192,10 +3375,11 @@ async fn previous_response_inherits_request_configuration_and_keeps_overrides() 
     let mut continuation = responses_request(vec![user_message("continue")]);
     continuation.model.clear();
     continuation.generation.max_tokens = Some(50);
-    let Some(ProtocolExt::OpenResponses(extension)) = continuation.ext.as_mut() else {
-        unreachable!();
-    };
-    extension.previous_response_id = Some("resp_config".into());
+    continuation.parameters.min_p = Some(0.0);
+    continuation.parameters.logprobs = Some(0);
+    continuation.parameters.metadata = Some(std::collections::BTreeMap::new());
+    continuation.parameters.reset(ParameterReset::NativeTools);
+    crate::router::stamp_previous_response_id(&mut continuation, "resp_config");
     store
         .materialize_parent(&owner, &mut continuation)
         .await
@@ -3204,14 +3388,38 @@ async fn previous_response_inherits_request_configuration_and_keeps_overrides() 
     assert_eq!(continuation.model, "root-model");
     assert_eq!(continuation.generation.temperature, Some(0.25));
     assert_eq!(continuation.generation.max_tokens, Some(50));
-    let Some(ProtocolExt::OpenResponses(extension)) = continuation.ext else {
-        unreachable!();
-    };
+    assert_eq!(continuation.parameters.store, None);
+    assert_eq!(continuation.parameters.min_p, Some(0.0));
+    assert_eq!(continuation.parameters.logprobs, Some(0));
     assert_eq!(
-        extension.include,
-        Some(vec!["reasoning.encrypted_content".into()])
+        continuation.parameters.metadata,
+        Some(std::collections::BTreeMap::new())
     );
-    assert_eq!(extension.store, None);
+    assert_eq!(
+        continuation.parameters.cache.key.as_deref(),
+        Some("prompt-bucket")
+    );
+    assert!(continuation.parameters.continuation.is_none());
+    assert!(continuation.parameters.session.id.is_none());
+    assert!(continuation.parameters.native_tools.is_empty());
+    assert!(continuation.parameters.resets(ParameterReset::NativeTools));
+
+    let mut reset = responses_request(vec![user_message("explicit source nulls")]);
+    crate::router::stamp_previous_response_id(&mut reset, "resp_config");
+    reset.parameters.resets = vec![
+        ParameterReset::Temperature,
+        ParameterReset::CacheKey,
+        ParameterReset::ResponseFormat,
+        ParameterReset::Verbosity,
+    ];
+    store
+        .materialize_parent(&owner, &mut reset)
+        .await
+        .expect("materialize reset controls");
+    assert!(reset.generation.temperature.is_none());
+    assert!(reset.parameters.cache.key.is_none());
+    assert!(reset.parameters.verbosity.is_none());
+    assert!(reset.response_format.is_none());
 }
 
 #[tokio::test]
@@ -3231,10 +3439,7 @@ async fn response_ids_are_isolated_by_principal() {
         .await
         .expect("save response");
     let mut request = responses_request(vec![user_message("steal")]);
-    let Some(ProtocolExt::OpenResponses(extension)) = request.ext.as_mut() else {
-        unreachable!();
-    };
-    extension.previous_response_id = Some("resp_private".into());
+    crate::router::stamp_previous_response_id(&mut request, "resp_private");
 
     assert_eq!(
         store
@@ -3276,10 +3481,7 @@ async fn response_history_survives_adapter_reconstruction() {
         crate::runtime_cache::RuntimeCache::tinyufo(16 * 1024 * 1024),
     );
     let mut continuation = responses_request(vec![user_message("follow-up")]);
-    let Some(ProtocolExt::OpenResponses(extension)) = continuation.ext.as_mut() else {
-        unreachable!();
-    };
-    extension.previous_response_id = Some("resp_persisted".into());
+    crate::router::stamp_previous_response_id(&mut continuation, "resp_persisted");
     reconstructed
         .materialize_parent(&owner, &mut continuation)
         .await
@@ -3343,10 +3545,7 @@ async fn persisted_tool_text_semantics_keep_plain_secrets_and_media_distinct() {
         crate::runtime_cache::RuntimeCache::tinyufo(16 * 1024 * 1024),
     );
     let mut request = responses_request(Vec::new());
-    let Some(ProtocolExt::OpenResponses(ext)) = request.ext.as_mut() else {
-        unreachable!()
-    };
-    ext.previous_response_id = Some("resp_tool_semantics".into());
+    crate::router::stamp_previous_response_id(&mut request, "resp_tool_semantics");
     reconstructed
         .materialize_parent(&owner, &mut request)
         .await
@@ -3422,10 +3621,7 @@ async fn response_history_survives_gateway_restart_with_sqlite() {
         .await
         .expect("restarted Gateway");
     let mut continuation = responses_request(vec![user_message("follow-up")]);
-    let Some(ProtocolExt::OpenResponses(extension)) = continuation.ext.as_mut() else {
-        unreachable!();
-    };
-    extension.previous_response_id = Some(response_id);
+    crate::router::stamp_previous_response_id(&mut continuation, &response_id);
     let write = gateway
         .generation_chains
         .begin(owner, continuation)
@@ -3459,10 +3655,7 @@ async fn compatible_parent_uses_upstream_id_and_only_new_messages() {
         .expect("save response");
 
     let mut next = responses_request(vec![user_message("m2")]);
-    let Some(ProtocolExt::OpenResponses(extension)) = next.ext.as_mut() else {
-        unreachable!();
-    };
-    extension.previous_response_id = Some("resp_gateway_1".into());
+    crate::router::stamp_previous_response_id(&mut next, "resp_gateway_1");
     let active = store
         .materialize_parent(&owner, &mut next)
         .await
@@ -3509,11 +3702,8 @@ async fn compatible_parent_uses_upstream_id_and_only_new_messages() {
         &full_items
     ));
     assert_eq!(next.items.len(), 1);
-    let Some(ProtocolExt::OpenResponses(extension)) = next.ext.as_ref() else {
-        unreachable!();
-    };
     assert_eq!(
-        extension.previous_response_id.as_deref(),
+        next.parameters.continuation.as_ref().and_then(|value| value.previous_response_id()),
         Some("upstream-1")
     );
 }
@@ -3523,10 +3713,7 @@ async fn automatic_prefix_selects_exact_completed_context_and_leaves_new_items()
     let store = generation_store().await;
     let owner = principal("owner");
     let mut root = responses_request(vec![user_message("m1")]);
-    let Some(ProtocolExt::OpenResponses(extension)) = root.ext.as_mut() else {
-        unreachable!();
-    };
-    extension.store = Some(false);
+    root.parameters.store = Some(false);
     let state = GenerationChainState::from_request(&root, "target-a", OPEN_RESPONSES_2026_04_24);
     let mut response = AiResponse::new("upstream-1", "model");
     response.push_output_text("r1");
@@ -3568,10 +3755,7 @@ async fn automatic_prefix_selects_exact_completed_context_and_leaves_new_items()
             user_message("m2"),
         ]
     ));
-    let Some(ProtocolExt::OpenResponses(extension)) = &next.ext else {
-        unreachable!();
-    };
-    assert_eq!(extension.store, None);
+    assert_eq!(next.parameters.store, None);
 }
 
 #[tokio::test]
@@ -3772,13 +3956,21 @@ fn target_continuation_namespace_includes_every_hard_request_control() {
         description: None,
         parameters: serde_json::json!({"type": "object"}),
         strict: None,
-        cache_control: None,
-        meta: None,
+        defer_loading: None,
     }]);
+    let tool_state =
+        GenerationChainState::from_request(&tools, "target-a", OPEN_RESPONSES_2026_04_24);
+    let mut changed_tools = tools.clone();
+    changed_tools.tools.as_mut().unwrap()[0].defer_loading = Some(true);
+    let changed_state = GenerationChainState::from_request(
+        &changed_tools,
+        "target-a",
+        OPEN_RESPONSES_2026_04_24,
+    );
+    assert!(!changed_state.compatible_continuation(&tool_state));
     variants.push(tools);
     let mut reasoning = original.clone();
-    reasoning.reasoning.effort =
-        Some(stravia_runtime_contract::protocol::ir::ReasoningEffort::High);
+    reasoning.reasoning.level = Some(stravia_runtime_contract::thinking::ThinkingLevel::High);
     variants.push(reasoning);
     let mut response_format = original;
     response_format.response_format =
@@ -3908,10 +4100,7 @@ fn native_upstream_reuse_requires_persisted_open_responses_target() {
         (ANTHROPIC_MESSAGES_2023_06_01, Some(true)),
     ] {
         let mut request = responses_request(vec![user_message("new")]);
-        let Some(ProtocolExt::OpenResponses(extension)) = request.ext.as_mut() else {
-            panic!("Open Responses extension");
-        };
-        extension.store = store_value;
+        request.parameters.store = store_value;
         let state = GenerationChainState::from_request(&request, "provider", egress);
         let active = ActiveGenerationChain {
             parent_upstream_response_id: Some("upstream".into()),

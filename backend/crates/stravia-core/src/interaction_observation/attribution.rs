@@ -42,7 +42,8 @@ struct DiscoverInput<'a> {
 pub(crate) struct AdmissionFacts {
     /// The received canonical client request; never restored or effective
     /// history. Tail evidence reads `client_request.items`; the retry
-    /// fingerprint covers the whole request per the documented contract.
+    /// fingerprint covers the whole semantic request, excluding only its
+    /// per-attempt correlation ID, per the documented contract.
     pub client_request: Arc<AiRequest>,
     pub has_new_user: bool,
     pub has_matching_pending_tool_result: bool,
@@ -451,6 +452,7 @@ impl<E: AttributionEvidence> RunAttribution<E> {
         );
         // Placement remains governed by ADR-0053. The stricter input-origin
         // decision only controls observation metadata and preview publication.
+        let has_new_user = has_new_user && !assignment.inferred_retry;
         self.grouping.set_has_new_user(&start.id, has_new_user);
         Attribution {
             has_new_user,
@@ -807,17 +809,15 @@ impl<E: AttributionEvidence> RunAttribution<E> {
     }
 }
 
-/// Fingerprint over the canonical serialization of the received request — the
-/// documented "same request" identity for failed-root retry merge. A request
+/// Fingerprint over the complete received request except per-attempt request
+/// correlation. Session isolation and every payload/control field remain
+/// significant, including history beyond the diagnostic tail window. A request
 /// that cannot serialize falls back to a unique value so it never merges.
 /// Process-local only; never persisted or serialized.
 fn request_fingerprint(request: &AiRequest, run_id: &str) -> (String, bool) {
-    match serde_json::to_value(request).and_then(|mut canonical| {
-        canonical.sort_all_objects();
-        super::tail::hash_json(&canonical, usize::MAX)
-    }) {
-        Ok(Some((hash, _))) => (canonical::hash_hex(&hash), false),
-        Ok(None) | Err(_) => (format!("unavailable:{run_id}"), true),
+    match canonical::retry_request_hash(request) {
+        Ok(hash) => (canonical::hash_hex(&hash), false),
+        Err(_) => (format!("unavailable:{run_id}"), true),
     }
 }
 
@@ -1306,7 +1306,7 @@ mod tests {
         use crate::generation_chain::{GenerationChain, GenerationSource};
         use std::{sync::Arc, time::Duration};
         use stravia_runtime_contract::protocol::ids::OPEN_RESPONSES_2026_04_24;
-        use stravia_runtime_contract::protocol::ir::{AiResponse, OpenResponsesExt, ProtocolExt};
+        use stravia_runtime_contract::protocol::ir::AiResponse;
 
         let backend = Arc::new(crate::turn_chain::test_store().await);
         let chain = GenerationChain::from_turn_chain(
@@ -1318,7 +1318,7 @@ mod tests {
         let principal = Principal::new("owner");
         let request = |items| {
             let mut request = AiRequest::new("model", items);
-            request.ext = Some(ProtocolExt::OpenResponses(OpenResponsesExt::default()));
+            request.meta.source_protocol = Some(OPEN_RESPONSES_2026_04_24);
             request
         };
         let source = GenerationSource::Hook {
@@ -2354,28 +2354,198 @@ mod tests {
 
     #[tokio::test]
     async fn identical_failed_input_retries_within_window() {
-        let items = vec![user("same request")];
-        let mut attribution = RunAttribution::new(MemoryEvidence::default());
-        let first = attribution
-            .admit(
-                &start("first"),
-                &mut facts(items.clone()).prepare("first"),
-                1_000,
-                1_000,
-            )
-            .await;
-        attribution.finish("first", "failed", 2_000);
-        let retry = attribution
-            .admit(
-                &start("retry"),
-                &mut facts(items).prepare("retry"),
-                3_000,
-                3_000,
-            )
-            .await;
-        assert_eq!(retry.interaction_id, first.interaction_id);
-        assert_eq!(retry.grouping_reason, "inferred_retry");
-        assert!(retry.inferred_retry);
+        for text in ["same request".to_owned(), "x".repeat(600_000)] {
+            let mut request = facts(vec![user(&text)]);
+            request.has_new_user = true;
+            let mut attribution = RunAttribution::new(MemoryEvidence::default());
+            let first = attribution
+                .admit(
+                    &start("first"),
+                    &mut request.clone().prepare("first"),
+                    1_000,
+                    1_000,
+                )
+                .await;
+            assert!(first.has_new_user);
+            attribution.finish("first", "failed", 2_000);
+            let retry = attribution
+                .admit(&start("retry"), &mut request.prepare("retry"), 3_000, 3_000)
+                .await;
+            assert_eq!(retry.interaction_id, first.interaction_id);
+            assert_eq!(retry.grouping_reason, "inferred_retry");
+            assert!(retry.inferred_retry);
+            assert!(!retry.has_new_user);
+            assert!(!attribution.has_new_user("retry"));
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_input_with_new_correlation_id_is_one_interaction() {
+        for (text, session, first_id) in [
+            ("same request".to_owned(), None, None),
+            (
+                "same request".to_owned(),
+                None,
+                Some("first-failed-attempt"),
+            ),
+            ("same request".to_owned(), Some("same-session"), None),
+            (
+                "same request".to_owned(),
+                Some("same-session"),
+                Some("first-failed-attempt"),
+            ),
+            (
+                "x".repeat(600_000),
+                Some("same-session"),
+                Some("first-failed-attempt"),
+            ),
+        ] {
+            let mut first_facts = facts(vec![user(&text)]);
+            first_facts.has_new_user = true;
+            let first_request = Arc::make_mut(&mut first_facts.client_request);
+            first_request.parameters.session.id = session.map(str::to_owned);
+            first_request.parameters.session.request_id = first_id.map(str::to_owned);
+            let mut retry_facts = first_facts.clone();
+            Arc::make_mut(&mut retry_facts.client_request)
+                .parameters
+                .session
+                .request_id = Some("second-exact-client-retry".into());
+
+            let mut attribution = RunAttribution::new(MemoryEvidence::default());
+            let first = attribution
+                .admit(
+                    &start("first"),
+                    &mut first_facts.prepare("first"),
+                    1_000,
+                    1_000,
+                )
+                .await;
+            attribution.finish("first", "failed", 2_000);
+            let retry = attribution
+                .admit(
+                    &start("retry"),
+                    &mut retry_facts.prepare("retry"),
+                    3_000,
+                    3_000,
+                )
+                .await;
+
+            assert!(first.has_new_user);
+            assert_eq!(retry.interaction_id, first.interaction_id);
+            assert_eq!(retry.parent_run_id.as_deref(), Some("first"));
+            assert_eq!(retry.grouping_reason, "inferred_retry");
+            assert!(retry.inferred_retry);
+            assert!(!retry.has_new_user);
+            assert!(!attribution.has_new_user("retry"));
+        }
+    }
+
+    #[tokio::test]
+    async fn changed_correlation_id_does_not_weaken_retry_admission_guards() {
+        for guard in ["principal", "expired", "committed", "active"] {
+            let mut first_facts = facts(vec![user("same request")]);
+            first_facts.has_new_user = true;
+            Arc::make_mut(&mut first_facts.client_request)
+                .parameters
+                .session
+                .request_id = Some("first".into());
+            let mut retry_facts = first_facts.clone();
+            Arc::make_mut(&mut retry_facts.client_request)
+                .parameters
+                .session
+                .request_id = Some("retry".into());
+            let mut attribution = RunAttribution::new(MemoryEvidence::default());
+            let first = attribution
+                .admit(
+                    &start("first"),
+                    &mut first_facts.prepare("first"),
+                    1_000,
+                    1_000,
+                )
+                .await;
+            if guard == "committed" {
+                attribution.output_committed("first");
+            }
+            if guard != "active" {
+                attribution.finish("first", "failed", 2_000);
+            }
+            let mut retry_start = start("retry");
+            if guard == "principal" {
+                retry_start.principal = "other-owner".into();
+            }
+            let now = if guard == "expired" { 122_000 } else { 3_000 };
+            let retry = attribution
+                .admit(&retry_start, &mut retry_facts.prepare("retry"), now, now)
+                .await;
+            assert_ne!(retry.interaction_id, first.interaction_id, "{guard}");
+            assert!(!retry.inferred_retry, "{guard}");
+            assert!(retry.has_new_user, "{guard}");
+        }
+    }
+
+    #[tokio::test]
+    async fn correlation_id_exclusion_preserves_full_payload_and_session_identity() {
+        for difference in [
+            "model",
+            "sampling",
+            "cache",
+            "session",
+            "turn",
+            "parent",
+            "metadata",
+            "older_history",
+            "new_user",
+        ] {
+            // The diagnostic tail cannot contain this history. Identity must
+            // still include the oldest input, not only the captured window.
+            let mut first_facts = facts(vec![user("old history"), user(&"x".repeat(600_000))]);
+            first_facts.has_new_user = true;
+            let request = Arc::make_mut(&mut first_facts.client_request);
+            request.parameters.session.id = Some("session".into());
+            request.parameters.session.request_id = Some("first".into());
+            let mut next_facts = first_facts.clone();
+            let next = Arc::make_mut(&mut next_facts.client_request);
+            next.parameters.session.request_id = Some("retry".into());
+            match difference {
+                "model" => next.model = "other-model".into(),
+                "sampling" => next.parameters.top_k = Some(7),
+                "cache" => next.parameters.cache.key = Some("other-cache".into()),
+                "session" => next.parameters.session.id = Some("other-session".into()),
+                "turn" => next.parameters.session.turn_id = Some("other-turn".into()),
+                "parent" => next.parameters.session.parent_id = Some("other-parent".into()),
+                "metadata" => {
+                    next.parameters.metadata = Some(std::collections::BTreeMap::from([
+                        ("request_id".into(), "payload".into()),
+                    ]));
+                }
+                "older_history" => next.items[0] = user("different old history"),
+                "new_user" => next.items.push(user("genuinely new input")),
+                _ => unreachable!(),
+            }
+
+            let mut attribution = RunAttribution::new(MemoryEvidence::default());
+            let first = attribution
+                .admit(
+                    &start("first"),
+                    &mut first_facts.prepare("first"),
+                    1_000,
+                    1_000,
+                )
+                .await;
+            attribution.finish("first", "failed", 2_000);
+            let next = attribution
+                .admit(
+                    &start("next"),
+                    &mut next_facts.prepare("next"),
+                    3_000,
+                    3_000,
+                )
+                .await;
+            assert_ne!(next.interaction_id, first.interaction_id, "{difference}");
+            assert!(!next.inferred_retry, "{difference}");
+            assert!(next.has_new_user, "{difference}");
+            assert!(attribution.has_new_user("next"), "{difference}");
+        }
     }
 
     #[tokio::test]

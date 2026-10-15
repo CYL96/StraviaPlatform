@@ -422,7 +422,7 @@ async fn inbound_responses_websocket_preserves_native_compaction_and_replays_cur
         };
         assert_eq!(second.body["input"], current_window,
             "replay must retain the whole supplied window without restoring removed history");
-        assert_eq!(second.body["context_management"], json!([]));
+        assert!(second.body.get("context_management").is_none());
         second.respond.send(completed("native-replayed", json!([{
             "type":"message","id":"accepted","role":"assistant","status":"completed",
             "content":[{"type":"output_text","text":"native replay accepted","annotations":[]}]

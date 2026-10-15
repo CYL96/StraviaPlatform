@@ -130,8 +130,8 @@ interface types {
         /// The exact socket tip requested for local continuation is unavailable.
         /// No new handshake or model request has been sent.
         continuation-unavailable,
-        /// Upstream explicitly rejected protected reasoning replay. The host may
-        /// retry once without protected payloads only before any model output.
+        /// 上游明确拒绝受保护推理回放。宿主仅在尚未提交模型输出时，
+        /// 剥离非本上游来源的载荷并重放一次；保留本上游载荷，不再分级恢复。
         protected-reasoning-rejected,
         /// Upstream failed. Typed facts, not this variant alone, drive model
         /// retry/failover policy.

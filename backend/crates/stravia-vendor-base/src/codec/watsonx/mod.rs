@@ -44,18 +44,50 @@ impl ProtocolAdapter for WatsonxTextChatV1 {
         if let Some(model) = object.remove("model_id") {
             object.insert("model".into(), model);
         }
+        if !object.contains_key("tool_choice")
+            && let Some(choice) = object.remove("tool_choice_option")
+        {
+            object.insert("tool_choice".into(), choice);
+        }
         let mut request = OpenAIChatCompletionsV1.decode_request(body)?;
+        request.normalize_parameters();
         request.meta.source_protocol = Some(WATSONX_TEXT_CHAT_V1);
         Ok(request)
     }
 
-    fn encode_request(&self, request: AiRequest) -> anyhow::Result<(Value, HeaderMap)> {
+    fn encode_request(&self, mut request: AiRequest) -> anyhow::Result<(Value, HeaderMap)> {
+        request.normalize_parameters();
         let (mut body, headers) = OpenAIChatCompletionsV1.encode_request(request)?;
         let object = body
             .as_object_mut()
             .ok_or_else(|| anyhow::anyhow!("OpenAI encoder returned a non-object"))?;
         if let Some(model) = object.remove("model") {
             object.insert("model_id".into(), model);
+        }
+        // IBM's text/chat contract is not the complete OpenAI request contract.
+        // https://ibm.github.io/watsonx-ai-node-sdk/interfaces/1_4_x.WatsonXAI.TextChatParams.html
+        object.retain(|name, _| {
+            matches!(
+                name.as_str(),
+                "model_id"
+                    | "messages"
+                    | "temperature"
+                    | "top_p"
+                    | "max_tokens"
+                    | "frequency_penalty"
+                    | "presence_penalty"
+                    | "n"
+                    | "logprobs"
+                    | "top_logprobs"
+                    | "response_format"
+                    | "tools"
+                    | "tool_choice"
+            )
+        });
+        if object.get("tool_choice").is_some_and(Value::is_string)
+            && let Some(choice) = object.remove("tool_choice")
+        {
+            object.insert("tool_choice_option".into(), choice);
         }
         Ok((body, headers))
     }

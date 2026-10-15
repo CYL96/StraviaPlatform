@@ -135,7 +135,7 @@ fn infer(
     }
     // Only the confirmed Anthropic API adapter adds this display default.
     // Messages-compatible vendors retain their natural return behavior.
-    if request.reasoning.display.is_none()
+    if request.reasoning.summary.is_none()
         && request.reasoning.level != Some(stravia_runtime_contract::thinking::ThinkingLevel::Off)
         && matches!(
             request.reasoning.target_control,
@@ -146,15 +146,19 @@ fn infer(
             )
         )
     {
-        request.reasoning.display = Some("summarized".into());
+        request.reasoning.summary =
+            Some(stravia_runtime_contract::protocol::ir::ReasoningSummary::Auto);
     }
-    let display = match request.reasoning.display.as_deref() {
-        Some("omitted" | "none" | "disabled" | "hidden") => Some("omitted"),
-        Some("summarized" | "auto" | "concise" | "detailed") => Some("summarized"),
-        _ => None,
+    let display = match request.reasoning.summary {
+        Some(stravia_runtime_contract::protocol::ir::ReasoningSummary::None) => Some("omitted"),
+        Some(_) => Some("summarized"),
+        None => None,
     };
-    let encoded =
-        common::encode_inference_request(&ANTHROPIC_MESSAGES_2023_06_01.to_string(), request)?;
+    let encoded = crate::parameters::encode(
+        &provider,
+        &ANTHROPIC_MESSAGES_2023_06_01.to_string(),
+        request,
+    )?;
     let mut body = encoded.body;
     if let Some(thinking) = body.get_mut("thinking").and_then(Value::as_object_mut)
         && thinking.get("type").and_then(Value::as_str) != Some("disabled")
@@ -165,7 +169,7 @@ fn infer(
     let codec_headers = encoded.headers;
     let egress_path = encoded.path;
     let mut headers = common::header_pairs(&codec_headers)?;
-    crate::apply_session_affinity(&provider, &mut headers);
+
     set_header(&mut headers, "content-type", "application/json".into());
     set_header(
         &mut headers,

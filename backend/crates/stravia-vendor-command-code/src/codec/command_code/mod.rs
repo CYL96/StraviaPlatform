@@ -20,10 +20,9 @@ use stravia_runtime_contract::protocol::ir::AiStreamDelta;
 use stravia_runtime_contract::protocol::ir::ContentBlock;
 use stravia_runtime_contract::protocol::ir::MediaSource;
 use stravia_runtime_contract::protocol::ir::MessageContent;
-use stravia_runtime_contract::protocol::ir::ReasoningEffort;
+
 use stravia_runtime_contract::protocol::ir::Role;
 use stravia_runtime_contract::protocol::ir::ToolCall;
-use stravia_runtime_contract::protocol::ir::ToolChoice;
 use stravia_runtime_contract::protocol::ir::ToolSpec;
 use stravia_runtime_contract::protocol::ir::usage::Usage;
 
@@ -105,24 +104,20 @@ impl CommandCodeGenerateV1 {
                 params.insert("reasoning_effort".into(), Value::String(value));
             }
             None => {
-                if let Some(effort) = request
-                    .reasoning
-                    .effort
-                    .as_ref()
-                    .and_then(ReasoningEffort::as_openai_str)
-                {
+                if let Some(effort) = request.reasoning.level.map(|level| {
+                    if level == stravia_runtime_contract::thinking::ThinkingLevel::Off {
+                        "none"
+                    } else {
+                        level.as_str()
+                    }
+                }) {
                     params.insert("reasoning_effort".into(), Value::String(effort.into()));
                 }
             }
             _ => {}
         }
-        if let Some(choice) = request.tool_choice {
-            params.insert("tool_choice".into(), encode_tool_choice(choice));
-        }
-        if let Some(parallel) = request.parallel_tool_calls {
-            params.insert("parallel_tool_calls".into(), Value::Bool(parallel));
-        }
-
+        // command-code 1.82.1's shipped createModelClient emits no native
+        // tool_choice or parallel_tool_calls controls.
         let mut body = json!({
             "config": {
                 "workingDir": DEFAULT_WORKING_DIR,
@@ -144,6 +139,7 @@ impl CommandCodeGenerateV1 {
         body.as_object_mut()
             .expect("envelope is an object")
             .insert("params".into(), Value::Object(params));
+
         Ok(body)
     }
 }
@@ -367,19 +363,6 @@ fn encode_tool(tool: ToolSpec) -> Value {
             },
         ),
     ])
-}
-
-fn encode_tool_choice(choice: ToolChoice) -> Value {
-    match choice {
-        ToolChoice::Auto => json!({"type": "auto"}),
-        ToolChoice::None => json!({"type": "none"}),
-        ToolChoice::Required => json!({"type": "any"}),
-        ToolChoice::Named { name } => object([
-            ("type", Value::String("tool".into())),
-            ("name", Value::String(name)),
-        ]),
-        ToolChoice::Raw(value) => value,
-    }
 }
 
 fn owned_tool_call_value(call: ToolCall) -> Value {

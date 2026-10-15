@@ -202,11 +202,6 @@ async fn http_continuation_not_retained_by_zdr_replays_full_request_once() {
     request.stream.enabled = true;
     request.meta.source_protocol =
         Some(stravia_runtime_contract::protocol::ids::OPEN_RESPONSES_2026_04_24);
-    request.ext = Some(
-        stravia_runtime_contract::protocol::ir::ProtocolExt::OpenResponses(
-            stravia_runtime_contract::protocol::ir::OpenResponsesExt::default(),
-        ),
-    );
 
     let turn = executor
         .execute(TurnInput::new(Principal::new(key.id), request))

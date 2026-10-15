@@ -53,14 +53,39 @@ pub fn endpoint(protocol: &str) -> Result<ProtocolEndpoint, PluginError> {
 
 pub fn encode_inference_request(
     protocol: &str,
-    request: AiRequest,
+    mut request: AiRequest,
 ) -> Result<EncodedRequest, PluginError> {
     let egress = endpoint(protocol)?;
     let ingress = ProtocolTransform::inferred_ingress(&request).unwrap_or(egress);
-    ProtocolTransform::global()
+    // 已授权目标 profile 的临时投影，不把供应商开关放回入口参数。
+    let controls = [
+        "thinking",
+        "enable_thinking",
+        "chat_template_args",
+        "chat_template_kwargs",
+    ]
+    .map(|key| {
+        (egress.protocol == Protocol::OpenAICompatible)
+            .then(|| {
+                request
+                    .meta
+                    .vendor
+                    .egress
+                    .remove(key)
+                    .map(|value| (key, value))
+            })
+            .flatten()
+    });
+    let mut encoded = ProtocolTransform::global()
         .bind(ingress, egress)
         .and_then(|pair| pair.encode_request(request))
-        .map_err(map_request_transform_error)
+        .map_err(map_request_transform_error)?;
+    if let Some(body) = encoded.body.as_object_mut() {
+        for (key, value) in controls.into_iter().flatten() {
+            body.insert(key.into(), value);
+        }
+    }
+    Ok(encoded)
 }
 
 pub fn header_pairs(headers: &http::HeaderMap) -> Result<Vec<(String, String)>, PluginError> {

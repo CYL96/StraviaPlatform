@@ -179,7 +179,7 @@ fn apply_compatible_control(
         && profile.needs_effort_companion()
     {
         let (key, value) = encode_toggle(profile, true);
-        request.meta.vendor.ingress.insert(key.to_owned(), value);
+        request.meta.vendor.egress.insert(key.to_owned(), value);
         return true;
     }
 
@@ -198,7 +198,7 @@ fn apply_compatible_toggle(vendor_id: &str, model: &str, request: &mut AiRequest
     let (key, value) = encode_toggle(profile, enabled);
 
     // Route-resolved control is authoritative over raw client extensions.
-    request.meta.vendor.ingress.insert(key.to_owned(), value);
+    request.meta.vendor.egress.insert(key.to_owned(), value);
     request.reasoning.target_control = None;
     true
 }

@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::protocol::ir::{
-    AiItem, AiRequest, CacheControl, ContentBlock, MessageContent, ProtocolExt, Role, ToolCall,
+    AiItem, AiRequest, CacheControl, ContentBlock, MessageContent, Role, ToolCall,
     ToolResultContentKind,
 };
 
@@ -44,24 +44,15 @@ pub enum ContextCompleteness {
 impl ContextCompleteness {
     pub fn from_request(request: &AiRequest) -> Self {
         let mut opaque_refs = Vec::new();
-        match request.ext.as_ref() {
-            Some(ProtocolExt::Google(extension)) => {
-                if let Some(value) = &extension.cached_content {
-                    opaque_refs.push(OpaqueContextRef {
-                        namespace: "google.cached_content".into(),
-                        value: value.clone(),
-                    });
-                }
+        for tool in &request.parameters.native_tools {
+            if let crate::protocol::ir::NativeTool::CodeExecution(tool) = tool
+                && let Some(container) = &tool.container
+            {
+                opaque_refs.push(OpaqueContextRef {
+                    namespace: "code_execution.container".into(),
+                    value: container.clone(),
+                });
             }
-            Some(ProtocolExt::Anthropic(extension)) => {
-                if let Some(container) = &extension.container {
-                    opaque_refs.push(OpaqueContextRef {
-                        namespace: "anthropic.container".into(),
-                        value: container.to_string(),
-                    });
-                }
-            }
-            _ => {}
         }
         if opaque_refs.is_empty() {
             Self::Full

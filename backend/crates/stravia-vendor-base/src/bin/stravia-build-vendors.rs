@@ -16,6 +16,8 @@ const COMPONENTS: &[(&str, &str)] = &[
     ("opencode-free", "stravia-vendor-opencode-free"),
     ("claude-code", "stravia-vendor-claudecode"),
     ("antigravity", "stravia-vendor-antigravity"),
+    ("muse-code", "stravia-vendor-muse-code"),
+    ("kilo", "stravia-vendor-kilo"),
 ];
 
 #[derive(Serialize)]

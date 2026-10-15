@@ -103,8 +103,7 @@ def wire_route(env: dict[str, Any], url: str, protocol: str, model: str) -> str:
 def test_raw_encoder_carriers_are_protected_without_losing_fidelity(
     admin_env: dict[str, Any], protocol: str,
 ) -> None:
-    # Only the late contextual occurrence identifies this synthetic value. Earlier
-    # raw copies must be replaced in the same request, not just on the next turn.
+    # 后出现的凭据上下文也必须保护同一请求里更早出现的裸值，不能等到下一轮。
     contextual = "Q8n4Vk7sT2p9X5a3Lc6D0h1R"
     opaque_data = contextual
     early = f"Earlier bare value: {contextual}"
@@ -167,7 +166,8 @@ def test_raw_encoder_carriers_are_protected_without_losing_fidelity(
                     }}]},
                     {"role": "user", "parts": [{"text": echo}]},
                 ],
-                "tools": [{"googleSearch": {}, "functionDeclarations": [
+                # 搜索声明会进入平台能力 Gate；此处只验证业务载体，不依赖搜索配置。
+                "tools": [{"functionDeclarations": [
                     {"name": SECRET, "description": f"Tool {SECRET}", "parameters": schema},
                 ]}],
                 "generationConfig": {"responseMimeType": "application/json", "responseSchema": schema},
@@ -195,6 +195,16 @@ def test_raw_encoder_carriers_are_protected_without_losing_fidelity(
             }
         set_enabled(admin_env, True)
         try:
+            if protocol == "google-gemini":
+                status, response = http_request(
+                    "POST", f"{admin_env['proxy']}{path}",
+                    payload={**payload, "tools": [{"googleSearch": {}}] + payload["tools"]},
+                    headers={"authorization": f"Bearer {key}"},
+                    timeout=15.0,
+                )
+                assert status == 403, response
+                assert response["error"]["code"] == "web_search_unavailable"
+                assert received == []
             status, response = http_request(
                 "POST", f"{admin_env['proxy']}{path}", payload=payload,
                 headers={"authorization": f"Bearer {key}", "anthropic-version": "2023-06-01"},
@@ -242,7 +252,8 @@ def test_raw_encoder_carriers_are_protected_without_losing_fidelity(
                     }},
                 ]
                 tool = actual["tools"][0]
-                assert tool["cache_control"] == cache
+                # 工具控制不再建模；内容块缓存边界仍由上面的断言保护。
+                assert "cache_control" not in tool
                 assert tool["input_schema"] == expected_schema
             elif protocol == "google-gemini":
                 parts = actual["systemInstruction"]["parts"]
@@ -251,10 +262,10 @@ def test_raw_encoder_carriers_are_protected_without_losing_fidelity(
                                     "thought": True, "thoughtSignature": SECRET}
                 assert parts[2]["executableCode"] == {"language": "PYTHON", "code": f"token = '{secret_ref}'"}
                 assert parts[3]["codeExecutionResult"] == {"outcome": "OUTCOME_OK", "output": secret_ref}
-                assert actual["tools"][0]["googleSearch"] == {}
+                assert all("googleSearch" not in declaration for declaration in actual["tools"])
                 tool = actual["tools"][0]["functionDeclarations"][0]
-                assert tool["parameters"] == expected_schema
-                assert actual["generationConfig"]["responseSchema"] == expected_schema
+                assert tool["parametersJsonSchema"] == expected_schema
+                assert actual["generationConfig"]["responseJsonSchema"] == expected_schema
                 call = actual["contents"][0]["parts"][0]["functionCall"]
                 assert call["args"] == {"value": secret_ref}
                 result = actual["contents"][1]["parts"][0]["functionResponse"]
@@ -267,10 +278,11 @@ def test_raw_encoder_carriers_are_protected_without_losing_fidelity(
             else:
                 result = next(message for message in actual["messages"] if message["role"] == "tool")
                 assert result["content"] == json.dumps([{"type": "image", "value": secret_ref}])
-                assert actual["prediction"] == {"type": "content", "content": f"Predict {secret_ref}"}
+                assert "prediction" not in actual
                 tool = actual["response_format"]["json_schema"]
                 assert tool["schema"] == expected_schema
-                assert actual["user"] == SECRET
+                assert actual["safety_identifier"] == SECRET
+                assert "user" not in actual
                 assert tool["description"] == f"Format {secret_ref}"
             assert tool["name"] == SECRET
             assert "__stravia_tool_result_content_kind" not in json.dumps(actual)

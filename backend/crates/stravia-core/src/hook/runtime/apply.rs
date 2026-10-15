@@ -440,6 +440,7 @@ pub(super) fn apply_request_patch(
             *request = *next;
             request.meta = protected_metadata;
             request.meta.media_routing = media_routing;
+            request.normalize_parameters();
             let completeness = ContextCompleteness::from_request(request);
             current.update_from_request(request, completeness);
         }
@@ -451,6 +452,7 @@ pub(super) fn apply_request_patch(
         }
         RequestPatch::SetSystem(system) => {
             request.instructions = system.clone();
+            request.parameters.reset(stravia_runtime_contract::protocol::ir::ParameterReset::Instructions);
             current.system = system;
         }
         RequestPatch::SetGeneration(generation) => request.generation = generation,
@@ -462,8 +464,8 @@ pub(super) fn apply_request_patch(
             };
             embedding.input = input;
         }
-        RequestPatch::SetProtocolExtension(extension) => {
-            request.ext = extension.map(|extension| *extension);
+        RequestPatch::SetParameters(parameters) => {
+            request.parameters = *parameters;
             current.completeness = ContextCompleteness::from_request(request);
         }
         RequestPatch::ReplaceContextSpans(rewrites) => {

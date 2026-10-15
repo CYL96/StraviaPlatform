@@ -17,9 +17,8 @@ use stravia_runtime_contract::protocol::ir::AiResponse;
 use stravia_runtime_contract::protocol::ir::ContentBlock;
 use stravia_runtime_contract::protocol::ir::MediaSource;
 use stravia_runtime_contract::protocol::ir::MessageContent;
-use stravia_runtime_contract::protocol::ir::OpenResponsesExt;
-use stravia_runtime_contract::protocol::ir::ProtocolExt;
 use stravia_runtime_contract::protocol::ir::Role;
+use stravia_runtime_contract::protocol::ir::ParameterReset;
 use stravia_runtime_contract::protocol::ir::request::VERIFIED_HISTORY_REPLAY_META;
 use stravia_runtime_contract::turn_chain::ReusablePrefixMetadata;
 use stravia_runtime_contract::turn_chain::ReusablePrefixQuery;
@@ -47,8 +46,8 @@ use store::*;
 
 pub(crate) use project::{
     apply_provider_effective_response, generation_node_is_completed,
-    generation_session_fingerprint, has_gemini_tool_calls, project_client_history,
-    set_generation_session_id,
+    generation_session_fingerprint, generation_session_id_fingerprint, has_gemini_tool_calls,
+    project_client_history, set_generation_session_id,
 };
 pub(crate) use store::{
     GenerationDiscoveryWorkspace, hydrate_response_artifact_references,
@@ -57,7 +56,6 @@ pub(crate) use store::{
 
 // Persisted payloads must match this version exactly; older encodings are rejected.
 const RESPONSE_PAYLOAD_VERSION: u32 = 6;
-const GENERATION_SESSION_ID_META: &str = "__stravia_generation_session_id";
 
 #[cfg(test)]
 const DEFAULT_GENERATION_CHAIN_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
@@ -441,7 +439,8 @@ impl GenerationChain {
         principal: Principal,
         request: impl Into<Arc<AiRequest>>,
     ) -> Result<GenerationChainWrite, BeginError> {
-        let request = request.into();
+        let mut request = request.into();
+        Arc::make_mut(&mut request).normalize_parameters();
         self.pending_commits
             .wait_for_relevant(&principal, &request)
             .await;
@@ -470,11 +469,12 @@ impl GenerationChain {
             normalize_gemini_client_tool_ids(&mut Arc::make_mut(&mut request_delta).items);
         }
         let native = self.resolve_compaction(&principal, &request).await?;
-        let has_explicit_parent = matches!(
-            request.ext.as_ref(),
-            Some(ProtocolExt::OpenResponses(extension))
-                if extension.previous_response_id.is_some()
-        );
+        let has_explicit_parent = request
+            .parameters
+            .continuation
+            .as_ref()
+            .and_then(|continuation| continuation.previous_response_id())
+            .is_some();
 
         // Explicit continuation resolves only against its authorized parent lineage.
         if !has_explicit_parent && request_has_item_references(&request) {
@@ -528,13 +528,31 @@ impl GenerationChain {
                 active.compaction_input_range = Some(native_range);
                 active
             } else {
+                // 原生窗口允许本轮更改控制；完整交付前缀仍能证明后代身份，
+                // 但只能继承祖先关系，不能恢复旧控制或已替换的执行窗口。
+                let leading_controls = request.items.len()
+                    - canonical_client_history_request(&request).items.len();
+                let source_prefix = self
+                    .store
+                    .compaction_source_from_items(&principal, &request, workspace)
+                    .await?
+                    .filter(|(count, _)| leading_controls + *count >= native_range.end);
+                let parent_id = source_prefix
+                    .as_ref()
+                    .map(|(_, id)| id.as_str())
+                    .or(native.source_generation_id.as_deref());
                 if explicit
                     .as_deref()
-                    .is_some_and(|id| Some(id) != native.source_generation_id.as_deref())
+                    .is_some_and(|id| Some(id) != parent_id)
                 {
                     return Err(BeginError::CompactionConflict);
                 }
-                let mut parent = match native.source_generation_id.as_deref() {
+                if let (Some((_, id)), Some(source)) =
+                    (&source_prefix, native.source_generation_id.as_deref())
+                {
+                    self.require_ancestor(&principal, id, source).await?;
+                }
+                let mut parent = match parent_id {
                     Some(id) => self
                         .store
                         .source_parent(&principal, id, workspace)
@@ -549,7 +567,13 @@ impl GenerationChain {
                         .items,
                 );
                 parent.compaction_input_range = Some(native_range.clone());
-                Arc::make_mut(&mut request_delta).items.drain(native_range);
+                if let Some((count, _)) = source_prefix {
+                    Arc::make_mut(&mut request_delta)
+                        .items
+                        .drain(..leading_controls + count);
+                } else {
+                    Arc::make_mut(&mut request_delta).items.drain(native_range);
+                }
                 crate::router::clear_previous_response_id(Arc::make_mut(&mut request));
                 parent
             }
@@ -615,7 +639,8 @@ impl GenerationChain {
         principal: Principal,
         request: impl Into<Arc<AiRequest>>,
     ) -> Result<GenerationChainWrite, BeginError> {
-        let request = request.into();
+        let mut request = request.into();
+        Arc::make_mut(&mut request).normalize_parameters();
         self.pending_commits
             .wait_for_relevant(&principal, &request)
             .await;
@@ -870,6 +895,8 @@ enum EffectiveHistoryMutation<'a> {
 
 #[derive(Clone, Serialize, Deserialize)]
 struct ClientHistoryState {
+    #[serde(default)]
+    projection_version: u32,
     controls_fingerprint: String,
     context_fingerprint: String,
     context_messages: usize,
@@ -879,11 +906,13 @@ struct ClientHistoryState {
 
 /// Namespace generation stamped on stored reusable prefixes. Bumping the
 /// version makes every older index stale at startup rebuild.
-const GENERATION_PREFIX_NAMESPACE: &str = "stravia-generation-history-v3:";
+const GENERATION_PREFIX_NAMESPACE: &str = "stravia-generation-history-v5:";
 
 impl ClientHistoryState {
     fn from_request(request: &AiRequest, items: &[AiItem]) -> Self {
         Self {
+            projection_version:
+                stravia_runtime_contract::turn_chain::REUSABLE_PREFIX_PROJECTION_VERSION,
             controls_fingerprint: stravia_runtime_contract::protocol::ir::canonical::hash_hex(
                 &stravia_runtime_contract::protocol::ir::canonical::history_request_controls_hash(
                     request,
@@ -909,6 +938,7 @@ impl ClientHistoryState {
     }
 }
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(try_from = "EffectiveRequestConfigWire")]
 struct EffectiveRequestConfig {
     model: String,
     instructions: Option<String>,
@@ -916,11 +946,62 @@ struct EffectiveRequestConfig {
     tools: Option<Vec<stravia_runtime_contract::protocol::ir::ToolSpec>>,
     tool_choice: Option<stravia_runtime_contract::protocol::ir::ToolChoice>,
     parallel_tool_calls: Option<bool>,
+    reasoning: stravia_runtime_contract::protocol::ir::ReasoningConfig,
+    response_format: Option<stravia_runtime_contract::protocol::ir::ResponseFormat>,
+    #[serde(default)]
+    parameters: stravia_runtime_contract::protocol::ir::RequestParameters,
+}
+
+/// Read-only v6 persistence adapter. New snapshots serialize only canonical
+/// controls; historical extension fields are imported once without any history.
+#[derive(Deserialize)]
+struct EffectiveRequestConfigWire {
+    model: String,
+    instructions: Option<String>,
+    generation: stravia_runtime_contract::protocol::ir::GenerationConfig,
+    tools: Option<Vec<stravia_runtime_contract::protocol::ir::ToolSpec>>,
+    tool_choice: Option<stravia_runtime_contract::protocol::ir::ToolChoice>,
+    parallel_tool_calls: Option<bool>,
+    #[serde(default)]
     disable_parallel_tool_calls: Option<bool>,
     reasoning: stravia_runtime_contract::protocol::ir::ReasoningConfig,
     response_format: Option<stravia_runtime_contract::protocol::ir::ResponseFormat>,
-    safety_settings: Option<Vec<stravia_runtime_contract::protocol::ir::SafetySettings>>,
-    ext: Option<OpenResponsesExt>,
+    #[serde(default)]
+    parameters: stravia_runtime_contract::protocol::ir::RequestParameters,
+    #[serde(default)]
+    ext: Option<serde_json::Value>,
+}
+
+impl TryFrom<EffectiveRequestConfigWire> for EffectiveRequestConfig {
+    type Error = serde_json::Error;
+
+    fn try_from(wire: EffectiveRequestConfigWire) -> Result<Self, Self::Error> {
+        let mut request = AiRequest::new(wire.model, Vec::new());
+        request.instructions = wire.instructions;
+        request.generation = wire.generation;
+        request.tools = wire.tools;
+        request.tool_choice = wire.tool_choice;
+        request.parallel_tool_calls = wire
+            .parallel_tool_calls
+            .or(wire.disable_parallel_tool_calls.map(|disabled| !disabled));
+        request.reasoning = wire.reasoning;
+        request.response_format = wire.response_format;
+        request.parameters = wire.parameters;
+        if let Some(extension) = wire.ext {
+            request.import_legacy_responses_extension(extension);
+        }
+        Ok(Self {
+            model: request.model,
+            instructions: request.instructions,
+            generation: request.generation,
+            tools: request.tools,
+            tool_choice: request.tool_choice,
+            parallel_tool_calls: request.parallel_tool_calls,
+            reasoning: request.reasoning,
+            response_format: request.response_format,
+            parameters: request.parameters,
+        })
+    }
 }
 
 impl EffectiveRequestConfig {
@@ -932,14 +1013,9 @@ impl EffectiveRequestConfig {
             tools: request.tools.clone(),
             tool_choice: request.tool_choice.clone(),
             parallel_tool_calls: request.parallel_tool_calls,
-            disable_parallel_tool_calls: request.disable_parallel_tool_calls,
             reasoning: request.reasoning.clone(),
             response_format: request.response_format.clone(),
-            safety_settings: request.safety_settings.clone(),
-            ext: match request.ext.as_ref() {
-                Some(ProtocolExt::OpenResponses(extension)) => Some(extension.clone()),
-                _ => None,
-            },
+            parameters: request.parameters.clone(),
         }
     }
 
@@ -947,49 +1023,54 @@ impl EffectiveRequestConfig {
         if request.model.is_empty() {
             request.model.clone_from(&self.model);
         }
-        let instructions_present = matches!(
-            request.ext.as_ref(),
-            Some(ProtocolExt::OpenResponses(extension)) if extension.instructions_present
-        );
-        if request.instructions.is_none() && !instructions_present {
+        if request.instructions.is_none() && !request.parameters.resets(ParameterReset::Instructions) {
             request.instructions.clone_from(&self.instructions);
         }
-        inherit_option(
-            &mut request.generation.temperature,
-            &self.generation.temperature,
-        );
-        inherit_option(
-            &mut request.generation.max_tokens,
-            &self.generation.max_tokens,
-        );
-        inherit_option(&mut request.generation.top_p, &self.generation.top_p);
+        macro_rules! inherit_generation {
+            ($($field:ident => $reset:ident),* $(,)?) => {
+                $(if !request.parameters.resets(ParameterReset::$reset) {
+                    inherit_option(&mut request.generation.$field, &self.generation.$field);
+                })*
+            };
+        }
+        inherit_generation!(temperature => Temperature, max_tokens => MaxTokens,
+            top_p => TopP, presence_penalty => PresencePenalty,
+            frequency_penalty => FrequencyPenalty);
         inherit_option(&mut request.generation.seed, &self.generation.seed);
         inherit_option(&mut request.generation.stop, &self.generation.stop);
-        inherit_option(
-            &mut request.generation.presence_penalty,
-            &self.generation.presence_penalty,
-        );
-        inherit_option(
-            &mut request.generation.frequency_penalty,
-            &self.generation.frequency_penalty,
-        );
         inherit_option(&mut request.tools, &self.tools);
         inherit_option(&mut request.tool_choice, &self.tool_choice);
-        inherit_option(&mut request.parallel_tool_calls, &self.parallel_tool_calls);
-        inherit_option(
-            &mut request.disable_parallel_tool_calls,
-            &self.disable_parallel_tool_calls,
-        );
-        if !request.reasoning.enabled
-            && request.reasoning.budget_tokens.is_none()
-            && request.reasoning.effort.is_none()
-            && request.reasoning.display.is_none()
+        if !request.parameters.resets(ParameterReset::ParallelToolCalls) {
+            inherit_option(&mut request.parallel_tool_calls, &self.parallel_tool_calls);
+        }
+        if request.reasoning.budget_tokens.is_none()
+            && request.reasoning.level.is_none()
+            && request.reasoning.mode.is_none()
+            && request.reasoning.summary.is_none()
+            && request.reasoning.target_control.is_none()
+            && !request.parameters.resets(ParameterReset::Reasoning)
         {
             request.reasoning = self.reasoning.clone();
+            if request.parameters.resets(ParameterReset::ReasoningLevel) {
+                request.reasoning.level = None;
+                request.reasoning.target_control = None;
+            }
+            if request.parameters.resets(ParameterReset::ReasoningSummary) {
+                request.reasoning.summary = None;
+            }
         }
-        inherit_option(&mut request.response_format, &self.response_format);
-        inherit_option(&mut request.safety_settings, &self.safety_settings);
-        inherit_open_responses_ext(&mut request.ext, &self.ext);
+        if !request.parameters.resets(ParameterReset::ResponseFormat) {
+            inherit_option(&mut request.response_format, &self.response_format);
+            if request.parameters.resets(ParameterReset::ResponseFormatStrict)
+                && let Some(stravia_runtime_contract::protocol::ir::ResponseFormat::JsonSchema {
+                    strict,
+                    ..
+                }) = &mut request.response_format
+            {
+                *strict = None;
+            }
+        }
+        inherit_parameters(&mut request.parameters, &self.parameters);
     }
 }
 
@@ -998,26 +1079,53 @@ fn inherit_option<T: Clone>(current: &mut Option<T>, parent: &Option<T>) {
         current.clone_from(parent);
     }
 }
-fn inherit_open_responses_ext(
-    current: &mut Option<ProtocolExt>,
-    parent: &Option<OpenResponsesExt>,
+fn inherit_parameters(
+    current: &mut stravia_runtime_contract::protocol::ir::RequestParameters,
+    parent: &stravia_runtime_contract::protocol::ir::RequestParameters,
 ) {
-    let (Some(ProtocolExt::OpenResponses(current)), Some(parent)) = (current, parent) else {
-        return;
-    };
-    inherit_option(&mut current.background, &parent.background);
-    inherit_option(&mut current.include, &parent.include);
-    inherit_option(&mut current.stream_options, &parent.stream_options);
-    inherit_option(&mut current.max_tool_calls, &parent.max_tool_calls);
-    inherit_option(&mut current.safety_identifier, &parent.safety_identifier);
-    inherit_option(&mut current.prompt_cache_key, &parent.prompt_cache_key);
-    inherit_option(&mut current.top_logprobs, &parent.top_logprobs);
-    inherit_option(&mut current.truncation, &parent.truncation);
-    inherit_option(&mut current.metadata, &parent.metadata);
-    inherit_option(&mut current.text, &parent.text);
-    inherit_option(&mut current.service_tier, &parent.service_tier);
-    inherit_option(&mut current.native_web_search, &parent.native_web_search);
-    inherit_option(&mut current.tool_choice_ext, &parent.tool_choice_ext);
+    macro_rules! inherit {
+        ($($field:ident),* $(,)?) => {
+            $(inherit_option(&mut current.$field, &parent.$field);)*
+        };
+    }
+    inherit!(
+        top_k,
+        min_p,
+        repetition_penalty,
+        candidate_count,
+        logit_bias,
+        modalities,
+        audio,
+        metadata,
+        compaction
+    );
+    macro_rules! inherit_resettable {
+        ($($field:ident => $reset:ident),* $(,)?) => {
+            $(if !current.resets(ParameterReset::$reset) {
+                inherit_option(&mut current.$field, &parent.$field);
+            })*
+        };
+    }
+    inherit_resettable!(
+        logprobs => Logprobs,
+        verbosity => Verbosity,
+        max_tool_calls => MaxToolCalls,
+        background => Background,
+        truncation => Truncation,
+        end_user_id => EndUser,
+        service_tier => ServiceTier,
+    );
+    if !current.resets(ParameterReset::CacheKey) {
+        inherit_option(&mut current.cache.key, &parent.cache.key);
+    }
+    if !current.resets(ParameterReset::CacheRetention) {
+        inherit_option(&mut current.cache.retention, &parent.cache.retention);
+    }
+    // 留存、预热与续接身份只属于本轮请求，不能作为父请求的生成默认值继承。
+    if !current.resets(ParameterReset::NativeTools) && current.native_tools.is_empty() {
+        current.native_tools.clone_from(&parent.native_tools);
+    }
+    // 重置只阻止本轮继承，不能成为后续请求的默认值。
 }
 
 #[derive(Clone, Serialize, Deserialize)]

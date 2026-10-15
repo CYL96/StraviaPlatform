@@ -1,9 +1,295 @@
 use super::*;
 
+#[test]
+fn unified_controls_project_and_unsupported_vendor_controls_are_dropped() {
+    let request = ResponsesDecoder.decode_request(serde_json::json!({
+        "model": "gpt", "input": "hello", "generate": false,
+        "access_programs": {"cyber": "standard", "private": true},
+        "reasoning": {"context": "current_turn", "private": true},
+        "stream_options": {"reasoning_summary_delivery": "delta", "private": true},
+        "prompt_cache_options": {"mode": "explicit", "ttl": "30m", "prewarm": false, "private": true},
+        "context_management": [{"type": "compaction", "compact_threshold": 10000, "private": true}],
+        "metadata": {"private": {"business": true}},
+        "unknown_body": {"private": true}
+    })).unwrap();
+    assert!(crate::codec::compaction::native_compaction_requested(
+        &request
+    ));
+    let (body, _) = ResponsesEncoder.encode_request(request).unwrap();
+    assert_eq!(body["generate"], false);
+    for field in ["access_programs", "stream_options", "prompt_cache_options"] {
+        assert!(body.get(field).is_none(), "{field} leaked");
+    }
+    assert!(body["reasoning"].get("context").is_none());
+    assert_eq!(
+        body["context_management"],
+        serde_json::json!([{"type": "compaction", "compact_threshold": 10000}])
+    );
+    assert_eq!(
+        body["metadata"],
+        serde_json::json!({})
+    );
+    assert!(body.get("unknown_body").is_none());
+}
+
+#[test]
+fn compaction_requires_an_official_control_or_explicit_trigger() {
+    for control in [
+        Value::Null,
+        serde_json::json!([]),
+        serde_json::json!([{"type": "future", "private": true}]),
+    ] {
+        let request = ResponsesDecoder
+            .decode_request(serde_json::json!({
+                "model": "gpt", "input": "hello", "context_management": control
+            }))
+            .unwrap();
+        assert!(!crate::codec::compaction::native_compaction_requested(
+            &request
+        ));
+    }
+    let request = ResponsesDecoder
+        .decode_request(serde_json::json!({
+            "model": "gpt", "input": [{"type": "compaction_trigger"}], "context_management": null
+        }))
+        .unwrap();
+    assert!(crate::codec::compaction::native_compaction_requested(
+        &request
+    ));
+}
+
 use crate::codec::anthropic::messages::decoder::AnthropicDecoder;
 use crate::codec::open_responses::decoder::ResponsesDecoder;
 use crate::codec::openai::compatible::decoder::OpenAIDecoder;
 use stravia_runtime_contract::protocol::ir::AiItem;
+
+#[test]
+fn responses_include_is_derived_only_from_unified_intent() {
+    for (store, effort, logprobs, expected) in [
+        (false, "high", Some(0), serde_json::json!(["reasoning.encrypted_content", "message.output_text.logprobs"])),
+        (true, "high", Some(2), serde_json::json!(["message.output_text.logprobs"])),
+        (false, "none", None, Value::Null),
+    ] {
+        let request = ResponsesDecoder.decode_request(serde_json::json!({
+            "model": "gpt", "input": "hello", "store": store,
+            "reasoning": {"effort": effort}, "top_logprobs": logprobs,
+            "include": ["file_search_call.results", "reasoning.encrypted_content"],
+        })).unwrap();
+        let (body, _) = ResponsesEncoder.encode_request(request).unwrap();
+        assert_eq!(body["include"], expected);
+        if expected.is_null() { assert!(body.get("include").is_none()); }
+    }
+    let request = ResponsesDecoder.decode_request(serde_json::json!({
+        "model": "gpt", "input": "hello", "store": false,
+        "include": ["reasoning.encrypted_content"],
+    })).unwrap();
+    let (body, _) = ResponsesEncoder.encode_request(request).unwrap();
+    assert!(body.get("include").is_none());
+}
+
+#[test]
+fn native_tools_and_choices_use_current_official_types() {
+    use stravia_runtime_contract::protocol::ir::{NativeToolKind, ToolChoice};
+    for (wire_type, kind, official_type) in [
+        ("web_search_preview", NativeToolKind::WebSearch, "web_search"),
+        ("code_interpreter", NativeToolKind::CodeExecution, "code_interpreter"),
+        ("image_generation", NativeToolKind::ImageGeneration, "image_generation"),
+        ("tool_search", NativeToolKind::ToolSearch, "tool_search"),
+    ] {
+        let request = ResponsesDecoder.decode_request(serde_json::json!({
+            "model": "gpt", "input": "hello",
+            "tools": [{"type": wire_type}, {"type": "file_search"}, {"type": "mcp"}],
+            "tool_choice": {"type": wire_type},
+        })).unwrap();
+        assert!(matches!(request.tool_choice, Some(ToolChoice::Native(actual)) if actual == kind));
+        assert_eq!(request.parameters.native_tools.len(), 1);
+        let profile = response_profile_from_request(&request);
+        let (body, _) = ResponsesEncoder.encode_request(request).unwrap();
+        for output in [&profile, &body] {
+            assert_eq!(output["tools"].as_array().unwrap().len(), 1);
+            assert_eq!(output["tools"][0]["type"], official_type);
+            assert_eq!(output["tool_choice"]["type"], official_type);
+        }
+    }
+}
+
+#[test]
+fn custom_and_allowed_choices_remain_typed_without_tool_definition_passthrough() {
+    let request = ResponsesDecoder.decode_request(serde_json::json!({
+        "model": "gpt", "input": "hello",
+        "tools": [{"type": "custom", "name": "patch", "format": {
+            "type": "grammar", "syntax": "lark", "definition": "start: \"ok\""
+        }, "private": true}],
+        "tool_choice": {"type": "allowed_tools", "mode": "required",
+            "tools": [{"type": "custom", "name": "patch"}]},
+    })).unwrap();
+    let (body, _) = ResponsesEncoder.encode_request(request).unwrap();
+    assert_eq!(body["tools"][0]["type"], "custom");
+    assert_eq!(body["tools"][0]["format"]["definition"], "start: \"ok\"");
+    assert!(body["tools"][0].get("private").is_none());
+    assert_eq!(body["tool_choice"], serde_json::json!({
+        "type": "allowed_tools", "mode": "required", "tools": [{"type": "custom", "name": "patch"}]
+    }));
+}
+
+#[test]
+fn effective_profile_round_trip_retains_unified_response_controls() {
+    use stravia_runtime_contract::protocol::ir::{CompactionControl, ReasoningSummary, ServiceTier};
+    let request = ResponsesDecoder.decode_request(serde_json::json!({
+        "model": "gpt", "input": "hello", "store": false,
+        "user": "legacy-user", "safety_identifier": "safe-user",
+        "metadata": {"tenant": "acme", "discard": 42},
+        "reasoning": {"effort": "high", "summary": "concise"},
+        "service_tier": "priority",
+        "context_management": [{"type": "compaction", "compact_threshold": 12000}],
+    })).unwrap();
+    assert_eq!(request.parameters.end_user_id.as_deref(), Some("safe-user"));
+    assert_eq!(request.parameters.compaction, Some(CompactionControl { threshold_tokens: Some(12000) }));
+    let profile = effective_response_profile_from_request(&request);
+    let decoded = super::super::decoder::decode_effective_response_profile("gpt", profile.as_object().unwrap()).unwrap();
+    assert_eq!(decoded.reasoning.summary, Some(ReasoningSummary::Concise));
+    assert_eq!(decoded.parameters.service_tier, Some(ServiceTier::Priority));
+    assert_eq!(decoded.parameters.compaction, request.parameters.compaction);
+    let (body, _) = ResponsesEncoder.encode_request(decoded).unwrap();
+    assert_eq!(body["safety_identifier"], "safe-user");
+    assert!(body.get("user").is_none());
+    assert_eq!(body["metadata"], serde_json::json!({"tenant": "acme"}));
+    assert_eq!(body["context_management"], serde_json::json!([{"type": "compaction", "compact_threshold": 12000}]));
+}
+
+#[test]
+fn canonical_controls_win_in_encoder_and_borrowed_profile() {
+    use stravia_runtime_contract::protocol::ir::{CacheRetention, Continuation, ServiceTier, Verbosity, NativeTool, WebSearchTool};
+    let mut request = ResponsesDecoder
+        .decode_request(serde_json::json!({
+            "model": "gpt", "input": "hello"
+        }))
+        .unwrap();
+    request.parameters.store = Some(false);
+    request.parameters.background = Some(false);
+    request.parameters.max_tool_calls = Some(0);
+    request.parameters.logprobs = Some(0);
+    request.parameters.metadata = Some(Default::default());
+    request.parameters.verbosity = Some(Verbosity::Low);
+    request.parameters.cache.key = Some(String::new());
+    request.parameters.cache.retention = Some(CacheRetention::Extended);
+    request.parameters.continuation = Some(Continuation::Conversation("conv_canonical".into()));
+    request.parameters.service_tier = Some(ServiceTier::Priority);
+    request.parameters.native_tools.push(NativeTool::WebSearch(WebSearchTool::default()));
+    let schema =
+        serde_json::json!({"type": "object", "properties": {"optional": {"type": "string"}}});
+    request.response_format = Some(ResponseFormat::JsonSchema {
+        name: "canonical".into(),
+        description: Some(String::new()),
+        schema: schema.clone(),
+        strict: Some(false),
+    });
+    let profile = response_profile_from_request(&request);
+    let (body, _) = ResponsesEncoder.encode_request(request).unwrap();
+    for output in [&profile, &body] {
+        assert_eq!(output["store"], false);
+        assert_eq!(output["background"], false);
+        assert_eq!(output["max_tool_calls"], 0);
+        assert_eq!(output["top_logprobs"], 0);
+        assert_eq!(output["metadata"], serde_json::json!({}));
+        assert_eq!(output["prompt_cache_key"], "");
+        assert_eq!(output["prompt_cache_retention"], "24h");
+        assert!(output.get("prompt_cache_options").is_none());
+        assert_eq!(output["conversation"], "conv_canonical");
+        assert_eq!(output["service_tier"], "priority");
+        assert_eq!(output["text"]["verbosity"], "low");
+        assert_eq!(output["text"]["format"]["description"], "");
+        assert_eq!(output["text"]["format"]["schema"], schema);
+        assert_eq!(output["text"]["format"]["strict"], false);
+        assert_eq!(output["tools"][0]["type"], "web_search");
+    }
+    assert_eq!(body["include"], serde_json::json!(["message.output_text.logprobs"]));
+    assert!(body.get("stream_options").is_none());
+    assert!(profile.get("include").is_none());
+    assert!(profile.get("stream_options").is_none());
+}
+
+#[test]
+fn cross_projection_uses_typed_controls_without_foreign_options() {
+    let request = OpenAIDecoder
+        .decode_request(serde_json::json!({
+            "model": "gpt", "messages": [{"role": "user", "content": "hello"}],
+            "store": false, "logprobs": true, "top_logprobs": 0, "verbosity": "low",
+            "prompt_cache_key": "", "stream_options": {"include_obfuscation": false},
+            "service_tier": "priority", "parallel_tool_calls": false,
+            "reasoning_effort": "high", "web_search_options": {}
+        }))
+        .unwrap();
+    let (body, _) = ResponsesEncoder.encode_request(request).unwrap();
+    assert_eq!(body["store"], false);
+    assert_eq!(body["parallel_tool_calls"], false);
+    assert_eq!(body["top_logprobs"], 0);
+    assert_eq!(body["text"]["verbosity"], "low");
+    assert_eq!(body["prompt_cache_key"], "");
+    assert_eq!(body["reasoning"]["effort"], "high");
+    assert!(body.get("stream_options").is_none());
+    assert!(body.get("context_management").is_none());
+    assert_eq!(body["service_tier"], "priority");
+    assert_eq!(body["tools"][0]["type"], "web_search");
+    for field in [
+        "unknown",
+        "temperature",
+        "web_search_options",
+        "client_metadata",
+    ] {
+        assert!(body.get(field).is_none(), "{field} leaked");
+    }
+}
+
+#[test]
+fn explicit_null_resets_never_leave_as_null_controls() {
+    let mut request = ResponsesDecoder.decode_request(serde_json::json!({
+        "model": "gpt", "input": "hello", "store": null, "top_logprobs": null,
+        "background": null, "stream_options": null, "safety_identifier": null,
+        "text": {"verbosity": null, "format": {
+            "type": "json_schema", "name": "response", "schema": {"type": "object"}, "strict": null
+        }},
+        "reasoning": {"effort": null, "summary": null}
+    })).unwrap();
+    let (body, _) = ResponsesEncoder.encode_request(request.clone()).unwrap();
+    for field in [
+        "top_logprobs",
+        "background",
+        "stream_options",
+        "safety_identifier",
+    ] {
+        assert!(body.get(field).is_none(), "{field}");
+    }
+    assert_eq!(body["store"], true);
+    assert!(body["text"]["format"].get("strict").is_none());
+    assert!(body["text"].get("verbosity").is_none());
+    assert!(body.get("reasoning").is_none());
+    request.parameters.store = Some(false);
+    request.parameters.logprobs = Some(0);
+    request.parameters.verbosity = Some(stravia_runtime_contract::protocol::ir::Verbosity::Low);
+    request.reasoning.level = Some(stravia_runtime_contract::thinking::ThinkingLevel::Low);
+    let profile = response_profile_from_request(&request);
+    assert_eq!(profile["store"], false);
+    assert_eq!(profile["top_logprobs"], 0);
+    assert_eq!(profile["text"]["verbosity"], "low");
+    assert_eq!(profile["reasoning"]["effort"], "low");
+}
+
+#[test]
+fn canonical_presence_and_reasoning_mode_project_without_native_maps() {
+    let mut request = AiRequest::new("gpt", vec![AiItem::output_text("hello")]);
+    request.parameters.reset(stravia_runtime_contract::protocol::ir::ParameterReset::Instructions);
+    request.parameters.reset(stravia_runtime_contract::protocol::ir::ParameterReset::NativeTools);
+    request.reasoning.mode = Some("disabled".into());
+    let profile = effective_response_profile_from_request(&request);
+    let (body, _) = ResponsesEncoder.encode_request(request).unwrap();
+    for output in [&profile, &body] {
+        assert!(output.get("instructions").is_none());
+        assert_eq!(output["reasoning"], serde_json::json!({"effort": "none"}));
+    }
+    assert_eq!(profile["tools"], serde_json::json!([]));
+    assert!(body.get("tools").is_none());
+}
 
 #[test]
 fn consumed_text_requests_preserve_shared_snapshots_and_wire_roles() {
@@ -47,12 +333,11 @@ fn consumed_text_requests_preserve_shared_snapshots_and_wire_roles() {
 #[test]
 fn responses_summary_respects_explicit_intent_and_disabled_target() {
     use stravia_runtime_contract::thinking::{TargetThinkingControl, ThinkingLevel};
-    for (display, level, control, expected) in [
-        (Some("none"), None, None, None),
-        (Some("omitted"), None, None, None),
-        (Some("hidden"), None, None, None),
-        (Some("concise"), None, None, Some("concise")),
-        (Some("detailed"), None, None, Some("detailed")),
+    use stravia_runtime_contract::protocol::ir::ReasoningSummary;
+    for (summary, level, control, expected) in [
+        (Some(ReasoningSummary::None), None, None, None),
+        (Some(ReasoningSummary::Concise), None, None, Some("concise")),
+        (Some(ReasoningSummary::Detailed), None, None, Some("detailed")),
         (
             None,
             Some(ThinkingLevel::Off),
@@ -66,7 +351,7 @@ fn responses_summary_respects_explicit_intent_and_disabled_target() {
         let mut request = ResponsesDecoder
             .decode_request(serde_json::json!({"model": "gpt", "input": "hello"}))
             .unwrap();
-        request.reasoning.display = display.map(str::to_owned);
+        request.reasoning.summary = summary;
         request.reasoning.level = level;
         request.reasoning.target_control = control;
         let (body, _) = ResponsesEncoder.encode_request(request).unwrap();
@@ -325,21 +610,14 @@ fn forwards_provider_persistence_only_when_explicitly_requested() {
             meta: None,
         }],
     );
-    request.ext = Some(
-        stravia_runtime_contract::protocol::ir::ProtocolExt::OpenResponses(
-            stravia_runtime_contract::protocol::ir::OpenResponsesExt {
-                store: Some(true),
-                ..Default::default()
-            },
-        ),
-    );
+    request.parameters.store = Some(true);
 
     let (body, _) = ResponsesEncoder.encode_request(request).unwrap();
     assert_eq!(body["store"], true);
 }
 
 #[test]
-fn keeps_dated_metadata_and_safety_identifier_out_of_provider_requests() {
+fn forwards_canonical_metadata_and_safety_identifier() {
     let mut request = AiRequest::new(
         "logical-model",
         vec![AiItem {
@@ -350,20 +628,13 @@ fn keeps_dated_metadata_and_safety_identifier_out_of_provider_requests() {
             meta: None,
         }],
     );
-    request.ext = Some(
-        stravia_runtime_contract::protocol::ir::ProtocolExt::OpenResponses(
-            stravia_runtime_contract::protocol::ir::OpenResponsesExt {
-                metadata: Some(serde_json::json!({"tenant": "acme"})),
-                safety_identifier: Some("safe-user-1".into()),
-                ..Default::default()
-            },
-        ),
-    );
+    request.parameters.metadata = Some([("tenant".into(), "acme".into())].into());
+    request.parameters.end_user_id = Some("safe-user-1".into());
 
     let (body, _) = ResponsesEncoder.encode_request(request).unwrap();
 
-    assert!(body.get("metadata").is_none());
-    assert!(body.get("safety_identifier").is_none());
+    assert_eq!(body["metadata"], serde_json::json!({"tenant": "acme"}));
+    assert_eq!(body["safety_identifier"], "safe-user-1");
 }
 
 #[test]
@@ -432,14 +703,7 @@ fn encodes_responses_supported_media_without_text_coercion() {
 #[test]
 fn continuation_without_new_input_omits_input() {
     let mut request = AiRequest::new("logical-model", Vec::new());
-    request.ext = Some(
-        stravia_runtime_contract::protocol::ir::ProtocolExt::OpenResponses(
-            stravia_runtime_contract::protocol::ir::OpenResponsesExt {
-                previous_response_id: Some("resp_parent".into()),
-                ..Default::default()
-            },
-        ),
-    );
+    request.parameters.continuation = Some(stravia_runtime_contract::protocol::ir::Continuation::PreviousResponse("resp_parent".into()));
 
     let (body, _) = ResponsesEncoder
         .encode_request(request)
@@ -489,6 +753,7 @@ fn encodes_canonical_json_schema_for_dated_targets() {
     let mut request = AiRequest::new("gpt", vec![input]);
     request.response_format = Some(ResponseFormat::JsonSchema {
         name: "answer".into(),
+        description: None,
         schema: serde_json::json!({
             "type": "object",
             "properties": {"answer": {"type": "string"}},

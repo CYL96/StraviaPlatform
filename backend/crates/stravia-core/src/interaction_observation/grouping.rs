@@ -97,6 +97,28 @@ impl GroupingIndex {
         })
     }
 
+    fn retry_candidate(&self, input: &AssignInput<'_>, now: i64) -> Option<&RetryCandidate> {
+        if self.runs.values().any(|candidate| {
+            candidate.principal == input.principal
+                && candidate.fingerprint == input.canonical_fingerprint
+                && candidate.active
+        }) {
+            return None;
+        }
+        self.runs
+            .values()
+            .filter(|candidate| {
+                candidate.principal == input.principal
+                    && candidate.fingerprint == input.canonical_fingerprint
+                    && !candidate.active
+                    && !candidate.client_output_committed
+                    && candidate.failed_at.is_some_and(|failed_at| {
+                        now >= failed_at && now.saturating_sub(failed_at) < RETRY_WINDOW_MS
+                    })
+            })
+            .max_by_key(|candidate| candidate.failed_at)
+    }
+
     pub fn assign(
         &mut self,
         input: AssignInput<'_>,
@@ -104,6 +126,7 @@ impl GroupingIndex {
         parent: Option<&ObservedParent>,
         diagnostic: Option<&DiagnosticSource>,
     ) -> GroupAssignment {
+        let retry_candidate = self.retry_candidate(&input, now);
         let mut grouping_reason = "new_root";
         let mut parent_interaction_id = None;
         let mut diagnostic_source_run_id = None;
@@ -174,40 +197,19 @@ impl GroupingIndex {
                     false,
                 )
             }
+        } else if let Some(candidate) = retry_candidate {
+            grouping_reason = "inferred_retry";
+            (
+                candidate.interaction_id.clone(),
+                Some(candidate.run_id.clone()),
+                true,
+            )
         } else {
-            let candidate = self
-                .runs
-                .values()
-                .filter(|candidate| {
-                    candidate.principal == input.principal
-                        && candidate.fingerprint == input.canonical_fingerprint
-                        && !candidate.active
-                        && !candidate.client_output_committed
-                        && candidate.failed_at.is_some_and(|failed_at| {
-                            now >= failed_at && now.saturating_sub(failed_at) < RETRY_WINDOW_MS
-                        })
-                })
-                .max_by_key(|candidate| candidate.failed_at);
-            let identical_active = self.runs.values().any(|candidate| {
-                candidate.principal == input.principal
-                    && candidate.fingerprint == input.canonical_fingerprint
-                    && candidate.active
-            });
-            if !identical_active {
-                if let Some(candidate) = candidate {
-                    grouping_reason = "inferred_retry";
-                    (
-                        candidate.interaction_id.clone(),
-                        Some(candidate.run_id.clone()),
-                        true,
-                    )
-                } else {
-                    (stravia_runtime_contract::identifier::new_id(), None, false)
-                }
-            } else {
-                (stravia_runtime_contract::identifier::new_id(), None, false)
-            }
+            (stravia_runtime_contract::identifier::new_id(), None, false)
         };
+        // 工具续接等归属证据优先，但不应把同一交互内的完整请求重试再当作新输入。
+        let inferred_retry = inferred_retry
+            || retry_candidate.is_some_and(|candidate| candidate.interaction_id == interaction_id);
         self.runs.insert(
             input.run_id.to_owned(),
             RetryCandidate {
@@ -426,6 +428,35 @@ mod tests {
         let duplicate = concurrent.assign(input("duplicate", "p", "f"), 1, None, None);
         assert_ne!(duplicate.interaction_id, active.interaction_id);
     }
+    #[test]
+    fn failed_candidate_cannot_merge_while_an_exact_request_is_active() {
+        let mut index = GroupingIndex::default();
+        let failed = index.assign(input("failed", "p", "f"), 1_000, None, None);
+        let active = index.assign(input("active", "p", "f"), 1_001, None, None);
+        index.finish("failed", "failed", 2_000);
+        let duplicate = index.assign(input("duplicate", "p", "f"), 3_000, None, None);
+        assert_ne!(duplicate.interaction_id, failed.interaction_id);
+        assert_ne!(duplicate.interaction_id, active.interaction_id);
+        assert!(!duplicate.inferred_retry);
+    }
+
+    #[test]
+    fn failed_retry_requires_exact_principal_payload_and_time_window() {
+        for (principal, fingerprint, now) in [
+            ("other-principal", "exact", 3_000),
+            ("principal", "different-payload", 3_000),
+            ("principal", "exact", 1_999),
+            ("principal", "exact", 122_000),
+        ] {
+            let mut index = GroupingIndex::default();
+            let first = index.assign(input("first", "principal", "exact"), 1_000, None, None);
+            index.finish("first", "failed", 2_000);
+            let next = index.assign(input("next", principal, fingerprint), now, None, None);
+            assert_ne!(next.interaction_id, first.interaction_id);
+            assert!(!next.inferred_retry);
+        }
+    }
+
     #[test]
     fn explicit_parent_never_uses_failed_root_inference() {
         let mut index = GroupingIndex::default();

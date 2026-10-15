@@ -1039,8 +1039,7 @@ async fn protected_reasoning_replay_preserves_parallel_public_tool_calls() {
             "properties": {}
         }),
         strict: None,
-        cache_control: None,
-        meta: None,
+        defer_loading: None,
     }];
     let system = stravia_runtime_contract::protocol::ir::AiItem {
         role: stravia_runtime_contract::protocol::ir::Role::System,

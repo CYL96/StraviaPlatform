@@ -3,8 +3,7 @@ use std::sync::Arc;
 
 use stravia_runtime_contract::Principal;
 use stravia_runtime_contract::protocol::ids::ProtocolId;
-use stravia_runtime_contract::protocol::ir::AiRequest;
-use stravia_runtime_contract::protocol::ir::ProtocolExt;
+use stravia_runtime_contract::protocol::ir::{AiRequest, Continuation};
 
 pub(crate) use crate::generation_chain::GenerationParentTarget;
 
@@ -75,13 +74,7 @@ impl ContinuationLookup for ScriptedContinuation {
         match &self.previous_response_id {
             Some(previous_response_id) => {
                 let mut fallback = request.clone();
-                if parent_id_from_request(&fallback).is_some()
-                    || fallback
-                        .meta
-                        .vendor
-                        .ingress
-                        .contains_key("previous_response_id")
-                {
+                if parent_id_from_request(&fallback).is_some() {
                     clear_previous_response_id(Arc::make_mut(&mut fallback));
                 }
                 *full_fallback = Some(fallback);
@@ -89,13 +82,7 @@ impl ContinuationLookup for ScriptedContinuation {
                 Some(previous_response_id.clone())
             }
             None => {
-                if parent_id_from_request(request).is_some()
-                    || request
-                        .meta
-                        .vendor
-                        .ingress
-                        .contains_key("previous_response_id")
-                {
+                if parent_id_from_request(request).is_some() {
                     clear_previous_response_id(Arc::make_mut(request));
                 }
                 None
@@ -106,58 +93,48 @@ impl ContinuationLookup for ScriptedContinuation {
 
 pub(crate) fn parent_id_from_request(request: &AiRequest) -> Option<String> {
     request
-        .ext
+        .parameters
+        .continuation
         .as_ref()
-        .and_then(|extension| match extension {
-            ProtocolExt::OpenResponses(extension) => extension.previous_response_id.clone(),
-            _ => None,
-        })
-        .or_else(|| {
-            request
-                .meta
-                .vendor
-                .ingress
-                .get("previous_response_id")
-                .and_then(serde_json::Value::as_str)
-                .map(ToOwned::to_owned)
-        })
+        .and_then(Continuation::previous_response_id)
+        .map(str::to_owned)
 }
 
 pub(crate) fn stamp_previous_response_id(request: &mut AiRequest, parent_id: &str) {
-    if let Some(ProtocolExt::OpenResponses(extension)) = request.ext.as_mut() {
-        extension.previous_response_id = Some(parent_id.to_owned());
-    }
-    request.meta.vendor.ingress.insert(
-        "previous_response_id".into(),
-        serde_json::Value::String(parent_id.to_owned()),
-    );
+    request.parameters.continuation = Some(Continuation::PreviousResponse(parent_id.to_owned()));
 }
 
 pub(crate) fn clear_previous_response_id(request: &mut AiRequest) {
-    if let Some(ProtocolExt::OpenResponses(extension)) = request.ext.as_mut() {
-        extension.previous_response_id = None;
+    if matches!(
+        request.parameters.continuation,
+        Some(Continuation::PreviousResponse(_))
+    ) {
+        request.parameters.continuation = None;
     }
-    request.meta.vendor.ingress.remove("previous_response_id");
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stravia_runtime_contract::protocol::ir::OpenResponsesExt;
 
     #[test]
-    fn stamped_parent_survives_protocol_extension_replacement() {
+    fn previous_response_helpers_stamp_and_clear_only_response_continuations() {
         let mut request = AiRequest::new("model", Vec::new());
-        request.ext = Some(ProtocolExt::OpenResponses(OpenResponsesExt::default()));
-
-        stamp_previous_response_id(&mut request, "gateway-parent");
-        request.ext = Some(ProtocolExt::OpenResponses(OpenResponsesExt::default()));
-
-        assert_eq!(
-            parent_id_from_request(&request).as_deref(),
-            Some("gateway-parent")
-        );
+        stamp_previous_response_id(&mut request, "response");
+        assert_eq!(parent_id_from_request(&request).as_deref(), Some("response"));
         clear_previous_response_id(&mut request);
+        assert!(request.parameters.continuation.is_none());
+
+        request.parameters.continuation = Some(Continuation::Conversation("conversation".into()));
         assert!(parent_id_from_request(&request).is_none());
+        clear_previous_response_id(&mut request);
+        assert_eq!(
+            request
+                .parameters
+                .continuation
+                .as_ref()
+                .and_then(Continuation::conversation_id),
+            Some("conversation")
+        );
     }
 }

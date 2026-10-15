@@ -1,10 +1,7 @@
 //! OpenAI Embeddings API (`POST /v1/embeddings`).
 //!
 //! Requests and responses pass through typed canonical IR so HookRuntime can
-//! inspect and replace embedding inputs and vectors. Unknown wire fields remain
-//! isolated in the vendor extension bag according to the endpoint policy.
-
-use std::collections::HashMap;
+//! inspect and replace embedding inputs and vectors. Unsupported controls are dropped.
 
 use http::header::HeaderMap;
 use serde_json::Value;
@@ -24,10 +21,6 @@ use stravia_runtime_contract::protocol::ir::GenerationConfig;
 use stravia_runtime_contract::protocol::ir::StreamConfig;
 
 use crate::transform::{ProtocolAdapter, TransformError, WireStreamDecoder, WireStreamEncoder};
-
-/// OpenAI-spec field names for the embeddings endpoint.
-const KNOWN_EMBEDDINGS_FIELDS: &[&str] =
-    &["model", "input", "dimensions", "encoding_format", "user"];
 
 const CAPS: EndpointCapabilities = EndpointCapabilities {
     streaming: false,
@@ -124,46 +117,39 @@ impl EmbeddingsDecoder {
             })?;
         let dimensions = obj
             .get("dimensions")
+            .filter(|value| !value.is_null())
             .map(|value| serde_json::from_value::<u32>(value.clone()))
             .transpose()
             .map_err(|error| anyhow::anyhow!("invalid embeddings dimensions: {error}"))?;
         let encoding_format = obj
             .get("encoding_format")
+            .filter(|value| !value.is_null())
             .map(|value| serde_json::from_value::<String>(value.clone()))
             .transpose()
             .map_err(|error| anyhow::anyhow!("invalid embeddings encoding_format: {error}"))?;
         let user = obj
             .get("user")
+            .filter(|value| !value.is_null())
             .map(|value| serde_json::from_value::<String>(value.clone()))
             .transpose()
             .map_err(|error| anyhow::anyhow!("invalid embeddings user: {error}"))?;
-        let mut ingress: HashMap<String, Value> = HashMap::new();
-
-        // Collect unknown fields into __vendor_ingress.
-        let mut vendor_ingress = serde_json::Map::new();
-        for (k, v) in obj {
-            if !KNOWN_EMBEDDINGS_FIELDS.contains(&k.as_str()) {
-                vendor_ingress.insert(k.clone(), v.clone());
-            }
-        }
-        if !vendor_ingress.is_empty() {
-            ingress.insert("__vendor_ingress".into(), Value::Object(vendor_ingress));
-        }
-
         let mut ai_req = AiRequest::new(model, Vec::<AiItem>::new());
         ai_req.generation = GenerationConfig::default();
         ai_req.embedding = Some(EmbeddingRequest {
             input,
             dimensions,
             encoding_format,
-            user,
+            user: None,
         });
         ai_req.stream = StreamConfig {
             enabled: false,
             include_usage: false,
         };
         ai_req.meta.source_protocol = Some(OPENAI_COMPATIBLE_EMBEDDINGS_V1);
-        ai_req.meta.vendor.ingress = ingress;
+        ai_req.parameters.end_user_id = user;
+        if obj.get("user").is_some_and(Value::is_null) {
+            ai_req.parameters.reset(stravia_runtime_contract::protocol::ir::ParameterReset::EndUser);
+        }
 
         Ok(ai_req)
     }
@@ -202,7 +188,7 @@ impl EmbeddingsEncoder {
         if let Some(encoding_format) = embedding.encoding_format {
             obj.insert("encoding_format".into(), Value::String(encoding_format));
         }
-        if let Some(user) = embedding.user {
+        if let Some(user) = req.parameters.end_user_id {
             obj.insert("user".into(), Value::String(user));
         }
 

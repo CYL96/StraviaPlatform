@@ -1,7 +1,7 @@
 use super::*;
 use crate::protocol::ids::ProtocolId;
 use crate::protocol::ir::{
-    AiItem, AiRequest, AiResponse, EmbeddingInput, GenerationConfig, ProtocolExt, ToolCall,
+    AiItem, AiRequest, AiResponse, EmbeddingInput, GenerationConfig, RequestParameters, ToolCall,
     ToolChoice, ToolSpec,
 };
 use async_trait::async_trait;
@@ -157,7 +157,7 @@ pub enum RequestPatch {
     ReplaceTools(Option<Vec<ToolSpec>>),
     SetToolChoice(Option<ToolChoice>),
     SetEmbeddingInput(EmbeddingInput),
-    SetProtocolExtension(Option<Box<ProtocolExt>>),
+    SetParameters(Box<RequestParameters>),
     ReplaceContextSpans(Vec<ReplaceContextSpan>),
 }
 

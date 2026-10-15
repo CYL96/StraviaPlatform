@@ -12,12 +12,27 @@ fn request_round_trip_uses_typed_embedding_fields() {
     });
 
     let request = EmbeddingsDecoder.decode_request(input.clone()).unwrap();
+    assert_eq!(request.parameters.end_user_id.as_deref(), Some("local-user"));
     assert!(matches!(
         request.embedding.as_ref().map(|embedding| &embedding.input),
         Some(EmbeddingInput::Texts(values)) if values == &["first", "second"]
     ));
     let (encoded, _) = EmbeddingsEncoder.encode_request(request).unwrap();
     assert_eq!(encoded, input);
+}
+
+#[test]
+fn request_drops_unsupported_controls_and_resets_null_user() {
+    let request = EmbeddingsDecoder.decode_request(serde_json::json!({
+        "model": "embedding", "input": "hello", "user": null,
+        "dimensions": null, "encoding_format": null,
+        "safety_identifier": "unsupported", "private": {"secret": true}
+    })).unwrap();
+    assert!(request.parameters.end_user_id.is_none());
+    assert!(request.parameters.resets(stravia_runtime_contract::protocol::ir::ParameterReset::EndUser));
+    assert!(request.meta.vendor.ingress.is_empty());
+    let (body, _) = EmbeddingsEncoder.encode_request(request).unwrap();
+    assert_eq!(body, serde_json::json!({"model": "embedding", "input": "hello"}));
 }
 
 #[test]

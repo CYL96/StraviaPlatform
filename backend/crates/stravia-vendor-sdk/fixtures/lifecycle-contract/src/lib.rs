@@ -398,7 +398,7 @@ impl VendorGuest for LifecycleContractVendor {
                 upstream_status: Some(status),
             };
             host.emit_failed(PluginError {
-                kind: failure.kind.clone(),
+                kind: failure.kind,
                 message: failure.message.clone(),
                 upstream_status: failure.upstream_status,
             })?;

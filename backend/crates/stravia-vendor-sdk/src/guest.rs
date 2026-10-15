@@ -756,11 +756,11 @@ impl OperationInput {
         Ok(match operation {
             Operation::Infer => Self::Infer {
                 provider,
-                request: decode_body(&input.input)?,
+                request: decode_request(&input.input)?,
             },
             Operation::Compact => Self::Compact {
                 provider,
-                request: decode_body(&input.input)?,
+                request: decode_request(&input.input)?,
             },
             Operation::Search => {
                 let request: SearchRequest = decode_body(&input.input)?;
@@ -903,6 +903,12 @@ fn decode_body<T: DeserializeOwned>(payload: &types::CanonicalPayload) -> Result
     Ok(decode_payload(payload)?.body)
 }
 
+fn decode_request(payload: &types::CanonicalPayload) -> Result<AiRequest, PluginError> {
+    let mut request: AiRequest = decode_body(payload)?;
+    request.normalize_parameters();
+    Ok(request)
+}
+
 fn encode_canonical<T: Serialize>(value: &T) -> Result<types::CanonicalPayload, PluginError> {
     Ok(types::CanonicalPayload {
         format: CANONICAL_FORMAT_VERSION,
@@ -944,7 +950,10 @@ pub fn encode_protocol_selection(
     provider: &ProviderSnapshot,
     request: &AiRequest,
 ) -> Result<(types::ProviderSnapshot, types::CanonicalPayload), PluginError> {
-    Ok((provider.encode_for_host()?, encode_canonical(request)?))
+    Ok((
+        provider.encode_for_host()?,
+        crate::encode_request_payload(request, &provider.protocol),
+    ))
 }
 
 fn admit_provider<G: VendorGuest>(
@@ -1022,7 +1031,7 @@ pub fn dispatch_select_protocol<G: VendorGuest>(
         ));
     }
     admit_provider::<G>(operation, &provider)?;
-    let request = decode_body(&request)?;
+    let request = decode_request(&request)?;
     G::select_protocol(operation, &channel, &provider, &request)
 }
 
@@ -1211,5 +1220,28 @@ mod profile_admission_tests {
         let error = admit_provider::<MultiProfileGuest>(Operation::Infer, &snapshot("gamma"))
             .expect_err("unknown profile must be rejected");
         assert!(matches!(error.kind, ErrorKind::Unsupported));
+    }
+
+    #[test]
+    fn infer_and_compact_decode_normalize_compatibility_aliases() {
+        for operation in [Operation::Infer, Operation::Compact] {
+            let mut request = AiRequest::new("model", Vec::new());
+            request.parameters.candidate_count = Some(0);
+            request.parameters.logprobs = Some(0);
+            let input = types::OperationInput {
+                provider: snapshot("alpha").encode_for_host().unwrap(),
+                input: crate::encode_request_payload(&request, "openai-chat"),
+            };
+            let decoded = OperationInput::decode(operation, "default", input).unwrap();
+            let request = match decoded {
+                OperationInput::Infer { request, .. } | OperationInput::Compact { request, .. } => {
+                    request
+                }
+                _ => panic!("unexpected operation"),
+            };
+            assert_eq!(request.parameters.candidate_count, Some(0));
+            assert_eq!(request.parameters.logprobs, Some(0));
+            assert!(!request.meta.vendor.ingress.contains_key("n"));
+        }
     }
 }

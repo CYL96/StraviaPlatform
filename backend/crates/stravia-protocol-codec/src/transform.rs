@@ -9,7 +9,6 @@ use stravia_runtime_contract::protocol::ids::ProtocolEndpoint;
 use stravia_runtime_contract::protocol::ir::AiRequest;
 use stravia_runtime_contract::protocol::ir::AiResponse;
 use stravia_runtime_contract::protocol::ir::AiStreamDelta;
-use stravia_runtime_contract::protocol::ir::ProtocolExt;
 
 mod replay;
 pub use replay::prepare_thinking_replay;
@@ -205,24 +204,7 @@ impl ProtocolTransform {
     }
 
     pub fn inferred_ingress(request: &AiRequest) -> Option<ProtocolEndpoint> {
-        if let Some(protocol) = request.meta.source_protocol {
-            return Some(protocol);
-        }
-        match request.ext.as_ref() {
-            Some(ProtocolExt::OpenResponses(_)) => {
-                Some(stravia_runtime_contract::protocol::ids::OPEN_RESPONSES_2026_04_24)
-            }
-            Some(ProtocolExt::Anthropic(_)) => {
-                Some(stravia_runtime_contract::protocol::ids::ANTHROPIC_MESSAGES_2023_06_01)
-            }
-            Some(ProtocolExt::Google(_)) => {
-                Some(stravia_runtime_contract::protocol::ids::GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA)
-            }
-            Some(ProtocolExt::OpenAiChat(_)) => {
-                Some(stravia_runtime_contract::protocol::ids::OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1)
-            }
-            None => None,
-        }
+        request.meta.source_protocol
     }
 }
 
@@ -715,6 +697,8 @@ fn stream_closed(endpoint: ProtocolEndpoint, direction: TransformDirection) -> T
 
 fn prune_request(pair: ProtocolPair, request: &mut AiRequest, capabilities: &EndpointCapabilities) {
     use stravia_runtime_contract::protocol::ir::{ResponseFormat, ToolChoice};
+    // Normalize before dropping foreign protocol fidelity state.
+    request.normalize_parameters();
     if request
         .reasoning
         .target_control
@@ -732,7 +716,6 @@ fn prune_request(pair: ProtocolPair, request: &mut AiRequest, capabilities: &End
     }
     if !capabilities.parallel_tool_calls {
         request.parallel_tool_calls = None;
-        request.disable_parallel_tool_calls = None;
     }
     if !capabilities.structured_output {
         request.response_format = None;
@@ -754,38 +737,41 @@ fn prune_request(pair: ProtocolPair, request: &mut AiRequest, capabilities: &End
     {
         request.response_format = None;
     }
-    if pair.egress.protocol != Protocol::GoogleGemini {
-        request.safety_settings = None;
-    }
     if request
         .tool_choice
         .as_ref()
         .is_some_and(|choice| match pair.egress.protocol {
-            Protocol::AnthropicMessages => false,
-            Protocol::BedrockConverse => matches!(choice, ToolChoice::None | ToolChoice::Raw(_)),
-            Protocol::CohereChat => matches!(choice, ToolChoice::Raw(_)),
-            Protocol::GoogleGemini => matches!(choice, ToolChoice::Raw(_)),
+            Protocol::AnthropicMessages | Protocol::OpenAICompatible => {
+                matches!(choice, ToolChoice::Allowed { .. } | ToolChoice::Native(_))
+            }
+            Protocol::BedrockConverse => matches!(
+                choice,
+                ToolChoice::None | ToolChoice::Allowed { .. } | ToolChoice::Native(_)
+            ),
+            Protocol::CohereChat => {
+                matches!(choice, ToolChoice::Allowed { .. } | ToolChoice::Native(_))
+            }
+            Protocol::GoogleGemini => matches!(choice, ToolChoice::Native(_)),
             _ => false,
         })
     {
         request.tool_choice = None;
     }
     if pair.ingress != pair.egress {
-        // The host may install verified target-native state after decoding the client.
-        let target_extension = matches!(
-            (request.ext.as_ref(), pair.egress.protocol),
-            (Some(ProtocolExt::OpenResponses(_)), Protocol::OpenResponses)
-                | (Some(ProtocolExt::Anthropic(_)), Protocol::AnthropicMessages)
-                | (Some(ProtocolExt::Google(_)), Protocol::GoogleGemini)
-                | (Some(ProtocolExt::OpenAiChat(_)), Protocol::OpenAICompatible)
-        );
-        if !target_extension {
-            if matches!(&request.ext, Some(ProtocolExt::OpenResponses(extension)) if !extension.passthrough_tools.is_empty())
-                && request.tools.as_ref().is_none_or(|tools| tools.is_empty())
-            {
-                request.tool_choice = None;
-            }
-            request.ext = None;
+        if !request.parameters.native_tools.is_empty()
+            && !request.parameters.native_tools.iter().any(|tool| {
+                use stravia_runtime_contract::protocol::ir::NativeTool;
+                match pair.egress.protocol {
+                    Protocol::OpenResponses => true,
+                    Protocol::AnthropicMessages | Protocol::GoogleGemini => {
+                        matches!(tool, NativeTool::WebSearch(_) | NativeTool::CodeExecution(_))
+                    }
+                    _ => false,
+                }
+            })
+            && request.tools.as_ref().is_none_or(|tools| tools.is_empty())
+        {
+            request.tool_choice = None;
         }
         request.meta.vendor.passthrough_safe.clear();
         request.items.retain(|item| {

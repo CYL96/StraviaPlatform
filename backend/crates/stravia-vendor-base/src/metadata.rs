@@ -544,10 +544,6 @@ fn custom_standard() -> (
                 value: "reasoning".into(),
                 label: crate::messages::reasoning_field_reasoning(),
             },
-            stravia_vendor_sdk::EnumOption {
-                value: "custom".into(),
-                label: crate::messages::reasoning_field_custom(),
-            },
         ],
     };
     reasoning_field.default_json = Some(Value::String("protocol_default".into()));
@@ -557,23 +553,7 @@ fn custom_standard() -> (
         field: stravia_vendor_sdk::FieldCondition::PROTOCOL_CONTEXT.into(),
         equals: Value::String("openai-compatible".into()),
     });
-    let mut custom_reasoning_field = string_field(
-        "custom_reasoning_field",
-        crate::messages::custom_reasoning_field(),
-        false,
-        true,
-    );
-    custom_reasoning_field.description =
-        Some(crate::messages::custom_reasoning_field_description());
-    custom_reasoning_field.group = Some("advanced".into());
-    custom_reasoning_field.max_length = Some(128);
-    custom_reasoning_field.visible_when = Some(stravia_vendor_sdk::FieldCondition {
-        field: "reasoning_field".into(),
-        equals: Value::String("custom".into()),
-    });
-    descriptor
-        .2
-        .extend([reasoning_field, custom_reasoning_field]);
+    descriptor.2.push(reasoning_field);
     descriptor.2.push(ConfigField {
         key: "ensure_reasoning_field".into(),
         label: crate::messages::ensure_reasoning_field(),

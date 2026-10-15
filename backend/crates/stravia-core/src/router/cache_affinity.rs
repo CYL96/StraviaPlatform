@@ -191,11 +191,9 @@ fn namespace(principal: &Principal, route_id: &str, request: &AiRequest) -> Cach
 mod tests {
     use super::*;
     use stravia_runtime_contract::protocol::ir::AiItem;
-    use stravia_runtime_contract::protocol::ir::AnthropicExt;
+
     use stravia_runtime_contract::protocol::ir::ContentBlock;
     use stravia_runtime_contract::protocol::ir::MessageContent;
-    use stravia_runtime_contract::protocol::ir::OpenResponsesExt;
-    use stravia_runtime_contract::protocol::ir::ProtocolExt;
     use stravia_runtime_contract::protocol::ir::Role;
     use stravia_runtime_contract::protocol::ir::ToolCall;
     use stravia_runtime_contract::protocol::ir::Usage;
@@ -394,16 +392,6 @@ mod tests {
             None
         );
 
-        let mut default_protocol_extension = request.clone();
-        default_protocol_extension.ext =
-            Some(ProtocolExt::OpenResponses(OpenResponsesExt::default()));
-        assert_eq!(
-            index
-                .preferred_target(&owner, "route", &default_protocol_extension)
-                .await,
-            Some("provider:eligible".into())
-        );
-
         let mut different_generation_controls = request.clone();
         different_generation_controls.generation.temperature = Some(0.2);
         assert_eq!(
@@ -413,23 +401,17 @@ mod tests {
             Some("provider:eligible".into())
         );
 
-        let mut different_generation_extension = request.clone();
-        different_generation_extension.ext = Some(ProtocolExt::Anthropic(AnthropicExt {
-            top_k: Some(8),
-            ..Default::default()
-        }));
+        let mut different_sampling_controls = request.clone();
+        different_sampling_controls.parameters.top_k = Some(8);
         assert_eq!(
             index
-                .preferred_target(&owner, "route", &different_generation_extension)
+                .preferred_target(&owner, "route", &different_sampling_controls)
                 .await,
             Some("provider:eligible".into())
         );
 
         let mut different_cache_controls = request.clone();
-        different_cache_controls.ext = Some(ProtocolExt::OpenResponses(OpenResponsesExt {
-            prompt_cache_key: Some("other-cache-key".into()),
-            ..Default::default()
-        }));
+        different_cache_controls.parameters.cache.key = Some("other-cache-key".into());
         assert_eq!(
             index
                 .preferred_target(&owner, "route", &different_cache_controls)

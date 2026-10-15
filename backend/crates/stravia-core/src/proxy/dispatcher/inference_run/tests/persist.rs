@@ -19,9 +19,7 @@ async fn delivered_root_hook_response_is_continuable_without_a_target() {
         .await
         .expect("Principal");
     let mut request = AiRequest::new("__lifecycle_short_circuit__", Vec::new());
-    request.ext = Some(
-        stravia_runtime_contract::protocol::ir::ProtocolExt::OpenResponses(Default::default()),
-    );
+    request.meta.source_protocol = Some(OPEN_RESPONSES_2026_04_24);
     let response = execute_request_with_headers(
         gateway.clone(),
         headers.clone(),
@@ -37,13 +35,9 @@ async fn delivered_root_hook_response_is_continuable_without_a_target() {
     let root: serde_json::Value = serde_json::from_slice(&body).expect("root response");
     let root_id = root["id"].as_str().expect("root identity").to_owned();
     let mut continuation = AiRequest::new("__lifecycle_short_circuit__", Vec::new());
-    continuation.ext = Some(
-        stravia_runtime_contract::protocol::ir::ProtocolExt::OpenResponses(
-            stravia_runtime_contract::protocol::ir::OpenResponsesExt {
-                previous_response_id: Some(root_id.clone()),
-                ..Default::default()
-            },
-        ),
+    continuation.meta.source_protocol = Some(OPEN_RESPONSES_2026_04_24);
+    continuation.parameters.continuation = Some(
+        stravia_runtime_contract::protocol::ir::Continuation::PreviousResponse(root_id.clone()),
     );
     assert_eq!(
         gateway
@@ -260,13 +254,9 @@ async fn delivered_terminal_publishes_response_chain() {
 
     let mut continuation = AiRequest::new("delivered-terminal", Vec::new());
     continuation.stream.enabled = true;
-    continuation.ext = Some(
-        stravia_runtime_contract::protocol::ir::ProtocolExt::OpenResponses(
-            stravia_runtime_contract::protocol::ir::OpenResponsesExt {
-                previous_response_id: Some(response_id.clone()),
-                ..Default::default()
-            },
-        ),
+    continuation.meta.source_protocol = Some(OPEN_RESPONSES_2026_04_24);
+    continuation.parameters.continuation = Some(
+        stravia_runtime_contract::protocol::ir::Continuation::PreviousResponse(response_id.clone()),
     );
     let headers = authorized_headers(&gateway).await;
     let continuation_response = execute(RunInput {
@@ -335,9 +325,7 @@ async fn terminal_commit_window_keeps_generation_and_interaction_parentage_align
     };
     let mut first = AiRequest::new("commit-window-parent", vec![question.clone()]);
     first.stream.enabled = true;
-    first.ext = Some(
-        stravia_runtime_contract::protocol::ir::ProtocolExt::OpenResponses(Default::default()),
-    );
+    first.meta.source_protocol = Some(OPEN_RESPONSES_2026_04_24);
 
     barrier.block_next_commit();
     let first_response = execute_request_with_headers(
@@ -389,9 +377,7 @@ async fn terminal_commit_window_keeps_generation_and_interaction_parentage_align
         ],
     );
     second.stream.enabled = true;
-    second.ext = Some(
-        stravia_runtime_contract::protocol::ir::ProtocolExt::OpenResponses(Default::default()),
-    );
+    second.meta.source_protocol = Some(OPEN_RESPONSES_2026_04_24);
     let continuation = tokio::spawn({
         let gateway = gateway.clone();
         let headers = headers.clone();
@@ -518,9 +504,7 @@ async fn delivered_tool_resumes_before_source_generation_commit(websocket: bool)
     };
     let mut first = AiRequest::new("tool-commit-window", vec![user("original long question")]);
     first.stream.enabled = true;
-    first.ext = Some(
-        stravia_runtime_contract::protocol::ir::ProtocolExt::OpenResponses(Default::default()),
-    );
+    first.meta.source_protocol = Some(OPEN_RESPONSES_2026_04_24);
     barrier.block_next_commit();
     let mut source_socket = None;
     let mut websocket_server = None;
@@ -624,9 +608,7 @@ async fn delivered_tool_resumes_before_source_generation_commit(websocket: bool)
         ],
     );
     second.stream.enabled = true;
-    second.ext = Some(
-        stravia_runtime_contract::protocol::ir::ProtocolExt::OpenResponses(Default::default()),
-    );
+    second.meta.source_protocol = Some(OPEN_RESPONSES_2026_04_24);
     let continuation = tokio::time::timeout(
         std::time::Duration::from_secs(2),
         execute_request_with_headers(
@@ -782,9 +764,7 @@ async fn unavailable_observation_writer_never_holds_generation_progress() {
     };
     let mut first = AiRequest::new("observation-unavailable", vec![question.clone()]);
     first.stream.enabled = true;
-    first.ext = Some(
-        stravia_runtime_contract::protocol::ir::ProtocolExt::OpenResponses(Default::default()),
-    );
+    first.meta.source_protocol = Some(OPEN_RESPONSES_2026_04_24);
     let first = execute_request_with_headers(
         gateway.clone(),
         headers.clone(),
@@ -815,9 +795,7 @@ async fn unavailable_observation_writer_never_holds_generation_progress() {
         ],
     );
     second.stream.enabled = true;
-    second.ext = Some(
-        stravia_runtime_contract::protocol::ir::ProtocolExt::OpenResponses(Default::default()),
-    );
+    second.meta.source_protocol = Some(OPEN_RESPONSES_2026_04_24);
     let second = execute_request_with_headers(
         gateway.clone(),
         headers,
@@ -863,14 +841,8 @@ async fn store_false_keeps_the_gateway_generation_chain_available() {
             meta: None,
         }],
     );
-    first.ext = Some(
-        stravia_runtime_contract::protocol::ir::ProtocolExt::OpenResponses(
-            stravia_runtime_contract::protocol::ir::OpenResponsesExt {
-                store: Some(false),
-                ..Default::default()
-            },
-        ),
-    );
+    first.meta.source_protocol = Some(OPEN_RESPONSES_2026_04_24);
+    first.parameters.store = Some(false);
     let first_response = execute_request_with_headers(
         gateway.clone(),
         headers.clone(),
@@ -901,15 +873,11 @@ async fn store_false_keeps_the_gateway_generation_chain_available() {
             meta: None,
         }],
     );
-    continuation.ext = Some(
-        stravia_runtime_contract::protocol::ir::ProtocolExt::OpenResponses(
-            stravia_runtime_contract::protocol::ir::OpenResponsesExt {
-                previous_response_id: Some(response_id),
-                store: Some(false),
-                ..Default::default()
-            },
-        ),
+    continuation.meta.source_protocol = Some(OPEN_RESPONSES_2026_04_24);
+    continuation.parameters.continuation = Some(
+        stravia_runtime_contract::protocol::ir::Continuation::PreviousResponse(response_id),
     );
+    continuation.parameters.store = Some(false);
     let continuation_response = execute_request_with_headers(
         gateway.clone(),
         headers,

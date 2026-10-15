@@ -39,7 +39,7 @@ use self::settlement::{
     PendingGenerationChainWrite, Settlement, prepare_client_completion, report_projected_delivery,
     settle,
 };
-use self::util::{client_session_id, forwarded_client_headers};
+use self::util::forwarded_client_headers;
 use super::{Phase, PhaseTracker, RunInput};
 use std::sync::Arc;
 
@@ -347,9 +347,10 @@ pub(super) async fn orchestrate(
         .expect("Inference Run ingress observer");
     ingress_observer.set_model(&request.model);
     let mut request = request;
-    if let Some(session_id) = client_session_id(&headers, &request) {
-        crate::generation_chain::set_generation_session_id(&mut request, session_id);
-    }
+    request.normalize_parameters();
+    crate::model_turn::normalize_request_headers(&mut request, |name| {
+        headers.get(name).and_then(|value| value.to_str().ok())
+    });
     let ingress_capabilities = stravia_protocol_codec::registry::ProtocolRegistry::global()
         .capabilities(&ingress)
         .expect("registered ingress protocol");
@@ -358,29 +359,14 @@ pub(super) async fn orchestrate(
     } else {
         stravia_runtime_contract::hook::RequestKind::Generation
     };
-    if let Some(stravia_runtime_contract::protocol::ir::ProtocolExt::OpenResponses(extension)) =
-        request.ext.as_ref()
-        && extension.background == Some(true)
-    {
-        let response = parameter_error_response(
-            StatusCode::BAD_REQUEST,
-            "unsupported_feature",
-            "background",
-            "Responses background mode is not supported.",
-        );
-        return reject_before_admission(
-            &mut Some(ingress_observer),
-            "protocol",
-            "unsupported_feature",
-            response,
-        );
+    if request.parameters.background == Some(true) {
+        // This ingress executes synchronously; omit unsupported background
+        // delivery rather than rejecting otherwise representable inference.
+        request.parameters.background = None;
     }
-    let previous_response_id = match request.ext.as_ref() {
-        Some(stravia_runtime_contract::protocol::ir::ProtocolExt::OpenResponses(extension)) => {
-            extension.previous_response_id.clone()
-        }
-        _ => None,
-    };
+    let previous_response_id = request.parameters.continuation.as_ref()
+        .and_then(stravia_runtime_contract::protocol::ir::Continuation::previous_response_id)
+        .map(str::to_owned);
     let credential = ClientCredential::from_inference_headers(&headers);
     let authenticated_principal = match Security::new(gw.storage.auth())
         .authenticated_principal(&credential)

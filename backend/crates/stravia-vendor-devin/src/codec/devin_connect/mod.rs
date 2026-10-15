@@ -62,18 +62,13 @@ impl ThinkingReplay {
 
 const CUSTOM_TOOL_META: &str = "__devin_custom_tool";
 
-use stravia_runtime_contract::protocol::ir::{AiRequest, ProtocolExt};
+use stravia_runtime_contract::protocol::ir::AiRequest;
 use stravia_runtime_contract::thinking::TargetThinkingControl;
 
 /// 私有协议能力只在插件中投影；正文编码器逐项省略不支持的内容。
 pub(crate) fn prepare_request(request: &mut AiRequest) {
     request.embedding = None;
     // 私有 wire 没有这些控制；正文与受保护思考由本插件的编码器投影。
-    request.tool_choice = None;
-    request.parallel_tool_calls = None;
-    request.disable_parallel_tool_calls = None;
-    request.generation.seed = None;
-    request.generation.stop = None;
     request.generation.presence_penalty = None;
     request.generation.frequency_penalty = None;
     request.response_format = None;
@@ -86,40 +81,6 @@ pub(crate) fn prepare_request(request: &mut AiRequest) {
     {
         request.reasoning.target_control = None;
     }
-    match request.ext.as_mut() {
-        Some(ProtocolExt::OpenAiChat(extension)) => {
-            extension.n = None;
-            extension.logit_bias = None;
-            extension.logprobs = None;
-            extension.top_logprobs = None;
-            extension.prediction = None;
-            extension.prompt_cache_retention = None;
-            extension.verbosity = None;
-        }
-        Some(ProtocolExt::OpenResponses(extension)) => {
-            extension.background = None;
-            extension.max_tool_calls = None;
-            extension.top_logprobs = None;
-            extension.truncation = None;
-            extension.text = None;
-            extension.tool_choice_ext = None;
-            extension.passthrough_body.remove("context_management");
-        }
-        Some(ProtocolExt::Anthropic(extension)) => {
-            extension.top_k = None;
-            extension.output_config = None;
-            extension.service_tier = None;
-        }
-        Some(ProtocolExt::Google(extension)) => {
-            extension.top_k = None;
-            extension.candidate_count = None;
-            extension.response_logprobs = None;
-            extension.logprobs = None;
-            extension.response_mime_type = None;
-            extension.response_json_schema = None;
-            extension.tool_config = None;
-            extension.thinking_config = None;
-        }
-        None => {}
-    }
+    // The encoder allowlists native fields from canonical parameters; foreign
+    // controls remain source history, never an arbitrary protobuf passthrough.
 }

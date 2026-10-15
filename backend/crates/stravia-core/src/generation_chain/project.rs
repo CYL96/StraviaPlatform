@@ -73,7 +73,7 @@ impl ClientHistoryState {
         &self,
     ) -> stravia_runtime_contract::turn_chain::ReusablePrefixProjection {
         stravia_runtime_contract::turn_chain::ReusablePrefixProjection {
-            version: stravia_runtime_contract::turn_chain::REUSABLE_PREFIX_PROJECTION_VERSION,
+            version: self.projection_version,
             controls_fingerprint: self.controls_fingerprint.clone(),
             // from_request and replay compute this from actual retained client
             // items, never effective history or a provider/redaction proof.
@@ -456,28 +456,19 @@ fn apply_provider_effective_request(
     apply_decoded_provider_effective_request(request, effective);
 }
 
-fn apply_decoded_provider_effective_request(request: &mut AiRequest, effective: AiRequest) {
+fn apply_decoded_provider_effective_request(request: &mut AiRequest, mut effective: AiRequest) {
+    effective.normalize_parameters();
     request.generation = effective.generation;
     request.tools = effective.tools;
     request.tool_choice = effective.tool_choice;
     request.parallel_tool_calls = effective.parallel_tool_calls;
     request.reasoning = effective.reasoning;
-    let Some(stravia_runtime_contract::protocol::ir::ProtocolExt::OpenResponses(source)) =
-        effective.ext
-    else {
-        return;
-    };
-    let Some(stravia_runtime_contract::protocol::ir::ProtocolExt::OpenResponses(target)) =
-        request.ext.as_mut()
-    else {
-        return;
-    };
-    target.max_tool_calls = source.max_tool_calls;
-    target.top_logprobs = source.top_logprobs;
-    target.truncation = source.truncation;
-    target.text = source.text;
-    target.service_tier = source.service_tier;
-    target.tool_choice_ext = source.tool_choice_ext;
+    request.parameters.max_tool_calls = effective.parameters.max_tool_calls;
+    request.parameters.logprobs = effective.parameters.logprobs;
+    request.parameters.truncation = effective.parameters.truncation;
+    request.parameters.verbosity = effective.parameters.verbosity;
+    request.parameters.service_tier = effective.parameters.service_tier;
+    request.response_format = effective.response_format;
 }
 
 pub(super) fn attach_persisted_profile(
@@ -710,24 +701,20 @@ pub(super) fn history_context_fingerprint(messages: &[AiItem]) -> String {
 }
 
 pub(crate) fn generation_session_fingerprint(request: &AiRequest) -> Option<String> {
-    let session_id = request
-        .meta
-        .vendor
-        .ingress
-        .get(GENERATION_SESSION_ID_META)?
-        .as_str()?;
+    let session_id = request.parameters.session.id.as_deref()?;
+    Some(generation_session_id_fingerprint(session_id))
+}
+
+pub(crate) fn generation_session_id_fingerprint(session_id: &str) -> String {
     let mut bytes = b"stravia-generation-session-v1\0".to_vec();
     bytes.extend_from_slice(session_id.as_bytes());
-    Some(stravia_runtime_contract::protocol::ir::canonical::hash_hex(
+    stravia_runtime_contract::protocol::ir::canonical::hash_hex(
         &stravia_runtime_contract::protocol::ir::canonical::hash_bytes(&bytes),
-    ))
+    )
 }
 
 pub(crate) fn set_generation_session_id(request: &mut AiRequest, session_id: impl Into<String>) {
-    request.meta.vendor.ingress.insert(
-        GENERATION_SESSION_ID_META.into(),
-        serde_json::Value::String(session_id.into()),
-    );
+    request.parameters.session.id = Some(session_id.into());
 }
 
 pub(super) fn append_history_context_fingerprint(previous: &str, message: &AiItem) -> String {

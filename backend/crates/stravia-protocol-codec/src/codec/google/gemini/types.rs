@@ -12,14 +12,13 @@ pub struct GoogleRequest {
     pub generation_config: Option<GoogleGenerationConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<GoogleToolEntry>>,
-    #[serde(rename = "toolConfig", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "toolConfig",
+        default,
+        deserialize_with = "present_json",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub tool_config: Option<Value>,
-    /// Safety settings per harm category.
-    #[serde(rename = "safetySettings", skip_serializing_if = "Option::is_none")]
-    pub safety_settings: Option<Vec<SafetySetting>>,
-    /// Name of a previously created cached content object.
-    #[serde(rename = "cachedContent", skip_serializing_if = "Option::is_none")]
-    pub cached_content: Option<String>,
 }
 
 // ── Content / parts ───────────────────────────────────────────────────────────
@@ -146,9 +145,21 @@ pub struct GoogleGenerationConfig {
     pub stop_sequences: Option<Vec<String>>,
     #[serde(rename = "responseMimeType", skip_serializing_if = "Option::is_none")]
     pub response_mime_type: Option<String>,
-    #[serde(rename = "responseSchema", skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "responseModalities", skip_serializing_if = "Option::is_none")]
+    pub response_modalities: Option<Vec<String>>,
+    #[serde(
+        rename = "responseSchema",
+        default,
+        deserialize_with = "present_json",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub response_schema: Option<Value>,
-    #[serde(rename = "responseJsonSchema", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "responseJsonSchema",
+        default,
+        deserialize_with = "present_json",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub response_json_schema: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seed: Option<i64>,
@@ -163,12 +174,19 @@ pub struct GoogleGenerationConfig {
     /// Gemini 2.5 thinking budget: `{ "thinkingBudget": N }`.
     #[serde(rename = "thinkingConfig", skip_serializing_if = "Option::is_none")]
     pub thinking_config: Option<Value>,
-    #[serde(rename = "audioTimestamp", skip_serializing_if = "Option::is_none")]
-    pub audio_timestamp: Option<bool>,
-    #[serde(rename = "mediaResolution", skip_serializing_if = "Option::is_none")]
-    pub media_resolution: Option<String>,
-    #[serde(rename = "routingConfig", skip_serializing_if = "Option::is_none")]
-    pub routing_config: Option<Value>,
+    #[serde(
+        rename = "speechConfig",
+        default,
+        deserialize_with = "present_json",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub speech_config: Option<Value>,
+}
+
+fn present_json<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Value>, D::Error> {
+    Value::deserialize(deserializer).map(Some)
 }
 
 // Normalize the two official schema dialects without resolving references. In
@@ -316,12 +334,24 @@ pub struct GoogleToolEntry {
         skip_serializing_if = "Option::is_none"
     )]
     pub function_declarations: Option<Vec<GoogleFunctionDecl>>,
-    #[serde(rename = "googleSearch", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "googleSearch",
+        default,
+        deserialize_with = "present_json",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub google_search: Option<Value>,
-    #[serde(rename = "codeExecution", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "codeExecution",
+        default,
+        deserialize_with = "present_json",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub code_execution: Option<Value>,
     #[serde(
         rename = "googleSearchRetrieval",
+        default,
+        deserialize_with = "present_json",
         skip_serializing_if = "Option::is_none"
     )]
     pub google_search_retrieval: Option<Value>,
@@ -332,19 +362,18 @@ pub struct GoogleFunctionDecl {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "present_json",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub parameters: Option<Value>,
     #[serde(
         rename = "parametersJsonSchema",
+        default,
+        deserialize_with = "present_json",
         skip_serializing_if = "Option::is_none"
     )]
     pub parameters_json_schema: Option<Value>,
 }
 
-// ── Safety ────────────────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct SafetySetting {
-    pub category: String,
-    pub threshold: String,
-}

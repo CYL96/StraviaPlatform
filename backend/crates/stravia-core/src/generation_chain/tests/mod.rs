@@ -6,7 +6,6 @@ use stravia_runtime_contract::protocol::ids::OPENAI_COMPATIBLE_CHAT_COMPLETIONS_
 use stravia_runtime_contract::protocol::ir::AiItemAudience;
 use stravia_runtime_contract::protocol::ir::AiItemProvenance;
 use stravia_runtime_contract::protocol::ir::AiItemStatus;
-use stravia_runtime_contract::protocol::ir::OpenResponsesExt;
 use stravia_runtime_contract::protocol::ir::Role;
 use stravia_runtime_contract::protocol::ir::ToolCall;
 
@@ -21,6 +20,7 @@ fn generation_source() -> GenerationSource {
         actual_model: "model".into(),
         target_id: "provider:model".into(),
         authority: Some("provider:model".into()),
+        issued: Vec::new(),
     })
 }
 
@@ -53,7 +53,7 @@ fn user_message(text: &str) -> AiItem {
 
 fn responses_request(messages: Vec<AiItem>) -> AiRequest {
     let mut request = AiRequest::new("model", messages);
-    request.ext = Some(ProtocolExt::OpenResponses(OpenResponsesExt::default()));
+    request.meta.source_protocol = Some(OPEN_RESPONSES_2026_04_24);
     request
 }
 

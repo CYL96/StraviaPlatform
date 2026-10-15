@@ -95,7 +95,7 @@ fn standalone_compact_window_replays_native_identity_without_generation_coercion
     assert_eq!(replay["input"][1], native);
     assert_eq!(replay["input"][2]["call_id"], "call_1");
     assert_eq!(replay["input"][3]["output"], "done");
-    assert_eq!(replay["context_management"], serde_json::json!([]));
+    assert!(replay.get("context_management").is_none());
 }
 
 #[test]
@@ -116,13 +116,7 @@ fn codex_native_trigger_is_a_control_not_thinking_or_unknown() {
         replay["input"],
         serde_json::json!([{"type": "compaction_trigger"}])
     );
-    assert!(
-        replay
-            .as_object()
-            .unwrap()
-            .contains_key("context_management")
-    );
-    assert!(replay["context_management"].is_null());
+    assert!(replay.get("context_management").is_none());
     assert!(
         super::super::decoder::ResponsesDecoder
             .decode_request(serde_json::json!({

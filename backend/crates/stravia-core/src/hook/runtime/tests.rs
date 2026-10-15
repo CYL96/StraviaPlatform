@@ -175,7 +175,7 @@ impl HookSession for CompleteContextSession {
     async fn handle(&mut self, event: HookEvent<'_>) -> Result<ActionBatch, String> {
         if matches!(event, HookEvent::Request { .. }) {
             Ok(ActionBatch::one(HookAction::PatchRequest(Box::new(
-                RequestPatch::SetProtocolExtension(None),
+                RequestPatch::SetParameters(Default::default()),
             ))))
         } else {
             Ok(ActionBatch::default())
@@ -261,7 +261,7 @@ impl HookSession for InvalidCompletionSession {
     async fn handle(&mut self, _event: HookEvent<'_>) -> Result<ActionBatch, String> {
         Ok(ActionBatch {
             actions: vec![
-                HookAction::PatchRequest(Box::new(RequestPatch::SetProtocolExtension(None))),
+                HookAction::PatchRequest(Box::new(RequestPatch::SetParameters(Default::default()))),
                 HookAction::PatchResponse(ResponsePatch::SetContent("invalid".into())),
             ],
         })
@@ -321,8 +321,7 @@ async fn no_hooks_preserve_route_errors_and_client_tool_ownership() {
         description: None,
         parameters: serde_json::json!({"type": "object"}),
         strict: None,
-        cache_control: None,
-        meta: None,
+        defer_loading: None,
     }]);
     let mut run = runtime
         .begin(
@@ -861,8 +860,7 @@ async fn exposed_platform_tool_is_classified_without_claiming_client_tool() {
         description: None,
         parameters: serde_json::json!({"type": "object"}),
         strict: None,
-        cache_control: None,
-        meta: None,
+        defer_loading: None,
     }]);
     let mut run = runtime
         .begin(

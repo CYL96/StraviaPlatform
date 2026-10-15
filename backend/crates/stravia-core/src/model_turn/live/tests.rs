@@ -3,7 +3,7 @@ use super::{
     UpstreamLocalWork, VendorDriverHandle, strip_rejected_protected_reasoning, thinking_authority,
 };
 use crate::history_marker::{
-    ReasoningRejections, ThinkingProvenance, ThinkingSource, protected_payload_digests,
+    ReasoningRejections, ThinkingProvenance, ThinkingSource, RejectedReasoning,
 };
 use crate::router::{RoutePolicyState, TargetRuntimeState};
 use std::sync::{Arc, atomic::AtomicU8};
@@ -15,6 +15,37 @@ use stravia_runtime_contract::protocol::ids::{
 use stravia_runtime_contract::protocol::ir::{AiItem, AiRequest};
 
 #[test]
+fn parent_session_transport_affinity_matches_real_parent_and_is_scoped() {
+    let principal = stravia_runtime_contract::Principal::new("owner");
+    let other = stravia_runtime_contract::Principal::new("other");
+    let target = "provider:model";
+    let mut parent = AiRequest::new("model", Vec::new());
+    parent.parameters.session.id = Some("real-parent-session".into());
+    let fingerprint = crate::generation_chain::generation_session_fingerprint(&parent).unwrap();
+    let actual_parent_affinity =
+        super::namespace_fingerprint(&(principal.continuation_key(), target, fingerprint.as_str()));
+    let mut child = AiRequest::new("model", Vec::new());
+    child.parameters.session.id = Some("child-session".into());
+    child.parameters.session.parent_id = parent.parameters.session.id.clone();
+    let label = child.parameters.session.parent_id.as_deref().unwrap();
+    let child_parent_affinity = super::scoped_session_transport_affinity(&principal, target, label);
+    assert_eq!(child_parent_affinity, actual_parent_affinity);
+    assert_ne!(child_parent_affinity, label);
+    assert_ne!(
+        child_parent_affinity,
+        super::scoped_session_transport_affinity(&other, target, label),
+    );
+    assert_ne!(
+        child_parent_affinity,
+        super::scoped_session_transport_affinity(&principal, "other:model", label),
+    );
+    assert_ne!(
+        child_parent_affinity,
+        super::scoped_session_transport_affinity(&principal, target, "different-parent"),
+    );
+}
+
+#[test]
 fn thinking_provenance_trusts_signing_scope_not_target_wiring() {
     let target = ThinkingSource {
         namespace: "target-namespace".into(),
@@ -22,6 +53,7 @@ fn thinking_provenance_trusts_signing_scope_not_target_wiring() {
         actual_model: "target-model".into(),
         target_id: "target-id".into(),
         authority: Some("deployment-a".into()),
+        issued: Vec::new(),
     };
     let native = AiItem::thinking("reasoning", Some("signature".into()));
     let stamped = |source: ThinkingSource| {
@@ -58,7 +90,7 @@ fn thinking_provenance_trusts_signing_scope_not_target_wiring() {
             "malformed record",
             &target,
             malformed,
-            ThinkingProvenance::Foreign,
+            ThinkingProvenance::Unknown,
         ),
         (
             // 路由 Target、代理或选项不同，只要签发作用域相同仍可证明。
@@ -70,13 +102,13 @@ fn thinking_provenance_trusts_signing_scope_not_target_wiring() {
                 target_id: "other-target".into(),
                 ..target.clone()
             }),
-            ThinkingProvenance::Verified,
+            ThinkingProvenance::Own,
         ),
         (
             "same protocol, other deployment or credential",
             &target,
             stamped(other_scope.clone()),
-            ThinkingProvenance::Unknown,
+            ThinkingProvenance::Foreign("deployment-b".into()),
         ),
         (
             "same protocol family under an alias",
@@ -85,7 +117,7 @@ fn thinking_provenance_trusts_signing_scope_not_target_wiring() {
                 protocol: Some("anthropic-messages".into()),
                 ..other_scope.clone()
             }),
-            ThinkingProvenance::Unknown,
+            ThinkingProvenance::Foreign("deployment-b".into()),
         ),
         (
             "other protocol",
@@ -94,7 +126,7 @@ fn thinking_provenance_trusts_signing_scope_not_target_wiring() {
                 protocol: Some(OPEN_RESPONSES_2026_04_24.into()),
                 ..other_scope.clone()
             }),
-            ThinkingProvenance::Foreign,
+            ThinkingProvenance::Foreign("deployment-b".into()),
         ),
         (
             "plugin protocol against a known protocol",
@@ -103,7 +135,7 @@ fn thinking_provenance_trusts_signing_scope_not_target_wiring() {
                 protocol: Some("acme/custom-wire".into()),
                 ..other_scope.clone()
             }),
-            ThinkingProvenance::Foreign,
+            ThinkingProvenance::Foreign("deployment-b".into()),
         ),
         (
             "same plugin protocol identity",
@@ -112,7 +144,7 @@ fn thinking_provenance_trusts_signing_scope_not_target_wiring() {
                 authority: Some("deployment-b".into()),
                 ..plugin.clone()
             }),
-            ThinkingProvenance::Unknown,
+            ThinkingProvenance::Foreign("deployment-b".into()),
         ),
         (
             "record without protocol",
@@ -121,7 +153,7 @@ fn thinking_provenance_trusts_signing_scope_not_target_wiring() {
                 protocol: None,
                 ..other_scope.clone()
             }),
-            ThinkingProvenance::Unknown,
+            ThinkingProvenance::Foreign("deployment-b".into()),
         ),
         (
             "model change on a protocol without model binding",
@@ -130,7 +162,7 @@ fn thinking_provenance_trusts_signing_scope_not_target_wiring() {
                 actual_model: "other-model".into(),
                 ..other_scope.clone()
             }),
-            ThinkingProvenance::Unknown,
+            ThinkingProvenance::Foreign("deployment-b".into()),
         ),
         (
             "Gemini model change",
@@ -140,7 +172,7 @@ fn thinking_provenance_trusts_signing_scope_not_target_wiring() {
                 authority: Some("deployment-b".into()),
                 ..gemini.clone()
             }),
-            ThinkingProvenance::Foreign,
+            ThinkingProvenance::Foreign("deployment-b".into()),
         ),
         (
             "Gemini same model, other deployment",
@@ -149,7 +181,7 @@ fn thinking_provenance_trusts_signing_scope_not_target_wiring() {
                 authority: Some("deployment-b".into()),
                 ..gemini.clone()
             }),
-            ThinkingProvenance::Unknown,
+            ThinkingProvenance::Foreign("deployment-b".into()),
         ),
         (
             "legacy record with the same namespace",
@@ -158,7 +190,7 @@ fn thinking_provenance_trusts_signing_scope_not_target_wiring() {
                 authority: None,
                 ..target.clone()
             }),
-            ThinkingProvenance::Verified,
+            ThinkingProvenance::Own,
         ),
         (
             "legacy record with another namespace",
@@ -179,48 +211,36 @@ fn thinking_provenance_trusts_signing_scope_not_target_wiring() {
                 authority: None,
                 ..target.clone()
             }),
-            ThinkingProvenance::Foreign,
+            ThinkingProvenance::Unknown,
         ),
     ];
-    let rejections = ReasoningRejections::default();
     for (case, current, item, expected) in &cases {
-        assert_eq!(current.provenance(item, &rejections), *expected, "{case}");
+        let stravia_runtime_contract::protocol::ir::MessageContent::Blocks(blocks) = &item.content else { panic!("blocks"); };
+        assert_eq!(current.provenance(item, &blocks[0]), *expected, "{case}");
     }
 
-    // 被当前签发作用域拒绝过的载荷一律剥离，包括本可证明同源的载荷；
-    // 其它签发作用域不受影响。
+    let rejections = ReasoningRejections::default();
     rejections.record(
         "deployment-a",
-        protected_payload_digests(std::slice::from_ref(&native)),
+        [RejectedReasoning::Origin("deployment-b".into())],
     );
-    let verified = stamped(target.clone());
-    assert_eq!(
-        target.provenance(&verified, &rejections),
-        ThinkingProvenance::Foreign
-    );
-    assert_eq!(
-        target.provenance(&native, &rejections),
-        ThinkingProvenance::Foreign
-    );
-    assert_eq!(
-        other_scope.provenance(&native, &rejections),
-        ThinkingProvenance::Unknown
-    );
-    let unrelated = AiItem::thinking("reasoning", Some("other-signature".into()));
-    assert_eq!(
-        target.provenance(&unrelated, &rejections),
-        ThinkingProvenance::Unknown
-    );
+    let mut unrelated = AiItem::thinking("reasoning", Some("new-signature".into()));
+    other_scope.stamp_item(&mut unrelated);
+    let stravia_runtime_contract::protocol::ir::MessageContent::Blocks(blocks) = &unrelated.content else { panic!("blocks"); };
+    assert!(rejections.rejected("deployment-a", target.provenance(&unrelated, &blocks[0]), &blocks[0]));
+    assert!(!rejections.rejected("deployment-c", target.provenance(&unrelated, &blocks[0]), &blocks[0]));
+    assert!(!rejections.rejected("deployment-a", ThinkingProvenance::Own, &blocks[0]));
 }
 
 #[test]
-fn rejected_protected_reasoning_strips_unverified_before_verified() {
+fn rejected_protected_reasoning_strips_only_foreign_and_unknown_once() {
     let source = ThinkingSource {
         namespace: "target-namespace".into(),
         protocol: Some(ANTHROPIC_MESSAGES_2023_06_01.into()),
         actual_model: "target-model".into(),
         target_id: "target-id".into(),
         authority: Some("deployment-a".into()),
+        issued: Vec::new(),
     };
     let mut verified = AiItem::thinking("own reasoning", Some("own-signature".into()));
     verified.role = stravia_runtime_contract::protocol::ir::Role::Assistant;
@@ -235,39 +255,100 @@ fn rejected_protected_reasoning_strips_unverified_before_verified() {
             .map(str::to_owned)
             .collect::<Vec<_>>()
     };
-    let rejections = ReasoningRejections::default();
     let mut request = AiRequest::new("model", vec![verified.clone(), unknown]);
     let mut stage = 0;
 
     assert!(strip_rejected_protected_reasoning(
         &mut request,
         &mut stage,
-        &source,
-        &rejections
+        &source
     ));
     assert_eq!(stage, 1);
     assert_eq!(signatures(&request), vec!["own-signature"]);
 
-    assert!(strip_rejected_protected_reasoning(
+    assert!(!strip_rejected_protected_reasoning(
         &mut request,
         &mut stage,
-        &source,
-        &rejections
+        &source
     ));
-    assert_eq!(stage, 2);
-    assert!(signatures(&request).is_empty());
+    assert_eq!(stage, 1);
+    assert_eq!(signatures(&request), vec!["own-signature"]);
 
-    // 只有已证实载荷时直接进入全剥离，不浪费一次重试。
+    // 只有本上游载荷时不剥离，也不启动恢复。
     let mut request = AiRequest::new("model", vec![verified]);
     let mut stage = 0;
-    assert!(strip_rejected_protected_reasoning(
+    assert!(!strip_rejected_protected_reasoning(
         &mut request,
         &mut stage,
-        &source,
-        &rejections
+        &source
     ));
-    assert_eq!(stage, 2);
-    assert!(signatures(&request).is_empty());
+    assert_eq!(stage, 0);
+    assert_eq!(signatures(&request), vec!["own-signature"]);
+}
+
+#[test]
+fn protected_reasoning_payload_inventory_and_dispatch_metadata_follow_actual_request() {
+    use stravia_runtime_contract::protocol::ir::{ContentBlock, MessageContent, Role};
+    let source = ThinkingSource {
+        namespace: "current".into(),
+        protocol: Some(ANTHROPIC_MESSAGES_2023_06_01.into()),
+        actual_model: "model".into(),
+        target_id: "target".into(),
+        authority: Some("current-authority".into()),
+        issued: Vec::new(),
+    };
+    let foreign = ThinkingSource {
+        protocol: Some(OPEN_RESPONSES_2026_04_24.into()),
+        authority: Some("foreign-authority".into()),
+        ..source.clone()
+    };
+    let mut item = AiItem::thinking("own", Some("own-signature".into()));
+    item.role = Role::Assistant;
+    source.stamp_item(&mut item);
+    let MessageContent::Blocks(blocks) = &mut item.content else { panic!("blocks"); };
+    blocks.push(ContentBlock::Thinking { thinking: "inserted".into(), signature: Some("inserted-signature".into()) });
+    let mut external = AiItem::thinking("external", Some("external-signature".into()));
+    external.role = Role::Assistant;
+    foreign.stamp_item(&mut external);
+    let MessageContent::Blocks(blocks) = &item.content else { panic!("blocks"); };
+    assert_eq!(source.provenance(&item, &blocks[0]), ThinkingProvenance::Own);
+    assert_eq!(source.provenance(&item, &blocks[1]), ThinkingProvenance::Unknown);
+    let mut legacy = item.clone();
+    let mut legacy_source = ThinkingSource::from_item(&legacy).unwrap();
+    legacy_source.issued.clear();
+    legacy.meta.as_mut().unwrap().insert_graph_extension(
+        "__stravia_thinking_source",
+        serde_json::to_value(legacy_source).unwrap(),
+    ).unwrap();
+    assert_eq!(source.provenance(&legacy, &blocks[1]), ThinkingProvenance::Own);
+    let mut request = AiRequest::new("model", vec![item, external]);
+    let rejections = ReasoningRejections::default();
+    assert!(!stravia_protocol_codec::transform::prepare_thinking_replay(&mut request, |item, block| {
+        !rejections.rejected("current-authority", source.provenance(item, block), block)
+    }));
+    let mut metadata = Default::default();
+    super::update_protected_reasoning_metadata(&mut metadata, &request, &source);
+    assert_eq!(metadata.get("protected_reasoning_untrusted"), Some(&serde_json::Value::Bool(true)));
+    let rejected = super::rejected_protected_reasoning(&request, &source);
+    let mut stage = 0;
+    assert!(strip_rejected_protected_reasoning(&mut request, &mut stage, &source));
+    super::update_protected_reasoning_metadata(&mut metadata, &request, &source);
+    assert!(!metadata.contains_key("protected_reasoning_untrusted"));
+    let MessageContent::Blocks(blocks) = &request.items[0].content else { panic!("blocks"); };
+    assert!(matches!(&blocks[0], ContentBlock::Thinking { signature: Some(signature), .. } if signature == "own-signature"));
+    rejections.record("current-authority", rejected);
+    // 同一来源新载荷命中上游对；未知来源仍只按原载荷记忆。
+    let mut new_external = AiItem::thinking("new", Some("new-external-signature".into()));
+    new_external.role = Role::Assistant;
+    foreign.stamp_item(&mut new_external);
+    let mut next = AiRequest::new("model", vec![new_external]);
+    assert!(stravia_protocol_codec::transform::prepare_thinking_replay(&mut next, |item, block| {
+        !rejections.rejected("current-authority", source.provenance(item, block), block)
+    }));
+    let inserted = ContentBlock::RedactedThinking { data: "inserted-signature".into() };
+    assert!(rejections.rejected("current-authority", ThinkingProvenance::Unknown, &inserted));
+    let unrelated = ContentBlock::RedactedThinking { data: "other-signature".into() };
+    assert!(!rejections.rejected("current-authority", ThinkingProvenance::Unknown, &unrelated));
 }
 
 #[test]

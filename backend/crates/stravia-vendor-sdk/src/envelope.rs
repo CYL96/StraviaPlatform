@@ -13,6 +13,8 @@ use crate::bindings::stravia::vendor::types::{self, CanonicalPayload, PluginErro
 /// host refuses plugins built against a version it does not support.
 pub const CANONICAL_FORMAT_VERSION: u32 = 1;
 
+pub use crate::request_compat::encode_request_payload;
+
 /// A typed canonical body plus its format tag. `T` is a
 /// `stravia-runtime-contract` type (e.g. `AiRequest`, `AiStreamDelta`,
 /// `AiResponse`) or an SDK operation payload.

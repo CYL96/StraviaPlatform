@@ -711,16 +711,9 @@ fn response_profile_uses_effective_request_and_provider_confirmed_values() {
         stravia_runtime_contract::protocol::ir::AiRequest::new("logical-model", Vec::new());
     request.instructions = Some("Be concise.".into());
     request.generation.temperature = Some(0.2);
-    request.ext = Some(
-        stravia_runtime_contract::protocol::ir::ProtocolExt::OpenResponses(
-            stravia_runtime_contract::protocol::ir::OpenResponsesExt {
-                store: Some(false),
-                metadata: Some(serde_json::json!({"tenant": "acme"})),
-                safety_identifier: Some("safe-user".into()),
-                ..Default::default()
-            },
-        ),
-    );
+    request.parameters.store = Some(false);
+    request.parameters.metadata = Some([("tenant".into(), "acme".into())].into());
+    request.parameters.end_user_id = Some("safe-user".into());
     let mut formatter = ResponsesStreamFormatter::new();
     formatter.set_response_profile_from_request(&request, Some("resp_parent"));
     let events = formatter.format_deltas(&[

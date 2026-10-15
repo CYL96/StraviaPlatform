@@ -148,7 +148,6 @@ pub enum AuthCompletionValue {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RuntimeBinding {
     pub base_url_override: Option<String>,
-    pub extra_headers: HashMap<String, String>,
     pub model_aliases: HashMap<String, String>,
     pub models_source_override: Option<String>,
     pub disable_default_auth: bool,

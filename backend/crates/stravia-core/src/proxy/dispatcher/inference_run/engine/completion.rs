@@ -1002,14 +1002,9 @@ mod tests {
     #[test]
     fn ephemeral_response_reuse_requires_confirmed_reusable_websocket() {
         let mut request = AiRequest::new("model", Vec::new());
-        request.ext = Some(
-            stravia_runtime_contract::protocol::ir::ProtocolExt::OpenResponses(
-                stravia_runtime_contract::protocol::ir::OpenResponsesExt {
-                    store: Some(false),
-                    ..Default::default()
-                },
-            ),
-        );
+        request.meta.source_protocol =
+            Some(stravia_runtime_contract::protocol::ids::OPEN_RESPONSES_2026_04_24);
+        request.parameters.store = Some(false);
         let unavailable = std::sync::atomic::AtomicBool::new(false);
         let available = std::sync::atomic::AtomicBool::new(true);
 

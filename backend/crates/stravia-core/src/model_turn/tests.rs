@@ -61,6 +61,10 @@ fn credential_observer(
 }
 
 async fn drain_test_http_request(socket: &mut tokio::net::TcpStream) {
+    read_captured_http_request(socket).await;
+}
+
+async fn read_captured_http_request(socket: &mut tokio::net::TcpStream) -> Vec<u8> {
     let mut bytes = Vec::new();
     let mut chunk = [0_u8; 4096];
     loop {
@@ -81,7 +85,7 @@ async fn drain_test_http_request(socket: &mut tokio::net::TcpStream) {
             })
             .unwrap_or(0);
         if bytes.len() >= header_end + 4 + content_length {
-            return;
+            return bytes;
         }
     }
 }
@@ -405,6 +409,13 @@ async fn serve_zdr_then_responses_stream() -> (String, Arc<Mutex<Vec<serde_json:
 }
 
 async fn serve_openai_capture_text(text: &'static str) -> (String, Arc<Mutex<Vec<u8>>>) {
+    serve_capture_text(text, "openai-compatible").await
+}
+
+async fn serve_capture_text(
+    text: &'static str,
+    protocol: &'static str,
+) -> (String, Arc<Mutex<Vec<u8>>>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind capturing provider");
@@ -416,27 +427,43 @@ async fn serve_openai_capture_text(text: &'static str) -> (String, Arc<Mutex<Vec
             .accept()
             .await
             .expect("accept capturing provider request");
-        let mut request = vec![0_u8; 16 * 1024];
-        let bytes_read = socket.read(&mut request).await.expect("read request");
-        request.truncate(bytes_read);
+        let request = read_captured_http_request(&mut socket).await;
         *observed.lock() = request;
-        let body = serde_json::json!({
-            "id": "chatcmpl-capture",
-            "object": "chat.completion",
-            "created": 1,
-            "model": "upstream-model",
-            "choices": [{
-                "index": 0,
-                "message": {"role": "assistant", "content": text},
-                "finish_reason": "stop"
-            }],
-            "usage": {
-                "prompt_tokens": 1,
-                "completion_tokens": 1,
-                "total_tokens": 2,
-                "prompt_tokens_details": {"cached_tokens": 0}
-            }
-        })
+        let body = if protocol == "open-responses" {
+            stravia_protocol_codec::codec::open_responses::formatter::response_resource_snapshot(
+                "resp-capture",
+                "upstream-model",
+                "completed",
+                vec![serde_json::json!({
+                    "id": "msg-capture",
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": text, "annotations": []}]
+                })],
+                serde_json::json!({"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}),
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+            )
+        } else {
+            serde_json::json!({
+                "id": "chatcmpl-capture",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "upstream-model",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": text},
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                    "total_tokens": 2,
+                    "prompt_tokens_details": {"cached_tokens": 0}
+                }
+            })
+        }
         .to_string();
         let response = format!(
             "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
@@ -480,7 +507,29 @@ async fn gateway_with_captured_thinking(
     Arc<Mutex<Vec<u8>>>,
     crate::db::models::ApiKeyWithBindings,
 ) {
-    let (base_url, captured) = serve_openai_capture_text(text).await;
+    gateway_with_captured_protocol(
+        model_name,
+        bind_key,
+        text,
+        default_thinking_level,
+        "openai-compatible",
+    )
+    .await
+}
+
+async fn gateway_with_captured_protocol(
+    model_name: &str,
+    bind_key: bool,
+    text: &'static str,
+    default_thinking_level: Option<ThinkingLevel>,
+    protocol: &'static str,
+) -> (
+    tempfile::TempDir,
+    crate::Gateway,
+    Arc<Mutex<Vec<u8>>>,
+    crate::db::models::ApiKeyWithBindings,
+) {
+    let (base_url, captured) = serve_capture_text(text, protocol).await;
     let data_dir = tempfile::tempdir().expect("temporary data directory");
     let gateway = Gateway::new(GatewayConfig {
         data_dir: data_dir.path().to_path_buf(),
@@ -495,7 +544,7 @@ async fn gateway_with_captured_thinking(
             source: ProviderSourceInput::Custom {
                 vendor: "custom".into(),
                 channel: "default".into(),
-                protocol: Some("openai-compatible".into()),
+                protocol: Some(protocol.into()),
                 base_url,
                 models_source: None,
                 static_models: None,
@@ -778,6 +827,205 @@ async fn first_token_timeout_records_one_precise_attempt_terminal_without_usage(
     assert!(terminal.get("usage").is_none_or(serde_json::Value::is_null));
     upstream.abort();
     let _ = upstream.await;
+}
+
+async fn read_http_request_body(socket: &mut tokio::net::TcpStream) -> String {
+    let mut request = Vec::new();
+    let mut chunk = [0_u8; 4096];
+    loop {
+        let read = socket.read(&mut chunk).await.unwrap();
+        assert_ne!(read, 0, "connection closed before the request completed");
+        request.extend_from_slice(&chunk[..read]);
+        let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") else {
+            continue;
+        };
+        let head = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+        let length = head
+            .lines()
+            .find_map(|line| line.strip_prefix("content-length:"))
+            .map_or(0, |value| value.trim().parse::<usize>().unwrap());
+        if request.len() >= end + 4 + length {
+            return String::from_utf8_lossy(&request[end + 4..end + 4 + length]).into_owned();
+        }
+    }
+}
+
+/// 首个连接等待 `rejection_delay` 后以 Anthropic 签名错误拒绝；之后每个连接等待
+/// `replay_delay` 后产出首 token，`None` 表示只给响应头、永不产出。
+/// 用一个外来签名执行一次 Model Turn，返回结果与上游依次收到的请求体。
+async fn run_anthropic_reasoning_rejection(
+    rejection_delay: Duration,
+    replay_delay: Option<Duration>,
+    first_token_timeout_ms: i64,
+    target_retry_budget: i32,
+) -> (Result<(), String>, Vec<String>) {
+    use stravia_runtime_contract::protocol::ir::{AiItem, MessageContent, Role};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let (bodies_tx, mut bodies_rx) = tokio::sync::mpsc::unbounded_channel();
+    let upstream = tokio::spawn(async move {
+        let held = Arc::new(Mutex::new(Vec::new()));
+        let mut rejected = false;
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let first = !std::mem::replace(&mut rejected, true);
+            let bodies_tx = bodies_tx.clone();
+            let held = held.clone();
+            tokio::spawn(async move {
+                bodies_tx
+                    .send(read_http_request_body(&mut socket).await)
+                    .unwrap();
+                if first {
+                    tokio::time::sleep(rejection_delay).await;
+                    let body = br#"{"type":"error","error":{"type":"invalid_request_error","message":"messages.1.content.0: Invalid `signature` in `thinking` block"}}"#;
+                    let head = format!(
+                        "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    socket.write_all(head.as_bytes()).await.unwrap();
+                    socket.write_all(body).await.unwrap();
+                    return;
+                }
+                socket
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n")
+                    .await
+                    .unwrap();
+                if let Some(delay) = replay_delay {
+                    tokio::time::sleep(delay).await;
+                    let events = concat!(
+                        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"upstream-model\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n",
+                        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+                        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n",
+                    );
+                    socket.write_all(events.as_bytes()).await.unwrap();
+                }
+                held.lock().push(socket);
+            });
+        }
+    });
+    let directory = tempfile::tempdir().unwrap();
+    let gateway = Gateway::new(GatewayConfig {
+        data_dir: directory.path().to_path_buf(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let admin = gateway.admin();
+    let provider = admin
+        .create_provider(CreateProvider {
+            name: Some("Rejection fixture".into()),
+            source: ProviderSourceInput::Custom {
+                vendor: "custom".into(),
+                channel: "default".into(),
+                protocol: Some("anthropic-messages".into()),
+                base_url,
+                models_source: None,
+                static_models: None,
+            },
+            credential: ProviderCredentialInput::ApiKey {
+                value: "test-key".into(),
+            },
+            vendor_options: Default::default(),
+            use_proxy: false,
+        })
+        .await
+        .unwrap();
+    add_test_provider_model(&gateway, &provider.id).await;
+    let model = admin
+        .create_model(CreateRoute {
+            model_id: "rejection-model".into(),
+            display_name: None,
+            balance: None,
+            targets: vec![CreateTarget {
+                enabled: true,
+                provider_id: provider.id,
+                model: "upstream-model".into(),
+                priority: None,
+                first_token_timeout_ms: Some(first_token_timeout_ms),
+                target_retry_budget: Some(target_retry_budget),
+                target_cooldown_ms: None,
+                thinking_level_map: Vec::new(),
+            }],
+            default_thinking_level: None,
+        })
+        .await
+        .unwrap();
+    let key = admin
+        .create_api_key(crate::db::models::CreateApiKey {
+            key: None,
+            name: "Rejection fixture".into(),
+            rpm_limit: None,
+            expires_at: None,
+            mcp_access_enabled: true,
+            transparent_injection_enabled: false,
+            inject_web_search: false,
+            inject_media_generation: false,
+            model_ids: vec![model.id.into()],
+            inject_media_understanding: false,
+        })
+        .await
+        .unwrap();
+    let user = |text: &str| AiItem {
+        role: Role::User,
+        content: MessageContent::Text(std::sync::Arc::new(text.into())),
+        tool_calls: None,
+        tool_call_id: None,
+        meta: None,
+    };
+    let mut request = AiRequest::new(
+        "rejection-model",
+        vec![
+            user("first"),
+            AiItem::thinking("client reasoning", Some("client-signature".into())),
+            AiItem::output_text("prior answer"),
+            user("second"),
+        ],
+    );
+    request.stream.enabled = true;
+    let result = gateway
+        .model_turn
+        .execute(TurnInput::new(Principal::new(key.id), request))
+        .await
+        .map(drop)
+        .map_err(|error| error.code);
+    let mut bodies = Vec::new();
+    while let Ok(body) = bodies_rx.try_recv() {
+        bodies.push(body);
+    }
+    upstream.abort();
+    let _ = upstream.await;
+    (result, bodies)
+}
+
+#[tokio::test]
+async fn protected_reasoning_rejection_is_remembered_when_replay_hits_first_token_timeout() {
+    let (result, bodies) = run_anthropic_reasoning_rejection(Duration::ZERO, None, 1000, 1).await;
+    assert_eq!(result, Err("first_token_timeout".into()));
+    assert_eq!(
+        bodies.len(),
+        3,
+        "rejected send, stripped replay, Target retry"
+    );
+    assert!(bodies[0].contains("client-signature"));
+    // 重放虽被首 token 超时取消，拒绝仍须记住；Target 重试不得再次首发外来载荷。
+    assert!(!bodies[1].contains("client-signature"));
+    assert!(!bodies[2].contains("client-signature"));
+}
+
+#[tokio::test]
+async fn protected_reasoning_replay_gets_its_own_first_token_window() {
+    // 被拒耗时与重放首 token 耗时合计超过超时，但各自都在窗口内。
+    let (result, bodies) = run_anthropic_reasoning_rejection(
+        Duration::from_millis(1500),
+        Some(Duration::from_millis(1000)),
+        2000,
+        0,
+    )
+    .await;
+    assert_eq!(result, Ok(()));
+    assert_eq!(bodies.len(), 2, "rejected send and stripped replay only");
+    assert!(bodies[0].contains("client-signature"));
+    assert!(!bodies[1].contains("client-signature"));
 }
 
 #[tokio::test]
@@ -2242,8 +2490,7 @@ async fn execute_tools_without_model_capability_declarations() {
         description: None,
         parameters: serde_json::json!({"type": "object"}),
         strict: None,
-        cache_control: None,
-        meta: None,
+        defer_loading: None,
     }]);
 
     let turn = gateway
@@ -2268,28 +2515,52 @@ async fn execute_tools_without_model_capability_declarations() {
 #[tokio::test]
 async fn execute_omits_previous_response_id_when_lookup_misses() {
     let (_data_dir, gateway, captured, key) =
-        gateway_with_captured_model("lookup-miss-model", true).await;
+        gateway_with_captured_protocol("lookup-miss-model", true, "ok", None, "open-responses")
+            .await;
     let executor = LiveModelTurnExecutor::new(
         gateway.clone(),
         crate::router::continuation::ScriptedContinuation::miss(),
     );
-    let mut request = AiRequest::new("lookup-miss-model", Vec::new());
+    let mut request = AiRequest::new(
+        "lookup-miss-model",
+        vec![
+            stravia_runtime_contract::protocol::ir::AiItem::output_text("prior answer"),
+            stravia_runtime_contract::protocol::ir::AiItem {
+                role: stravia_runtime_contract::protocol::ir::Role::User,
+                content: stravia_runtime_contract::protocol::ir::MessageContent::Text(
+                    "follow-up".to_owned().into(),
+                ),
+                tool_calls: None,
+                tool_call_id: None,
+                meta: None,
+            },
+        ],
+    );
     crate::router::stamp_previous_response_id(&mut request, "stravia-parent");
 
     let turn = executor
         .execute(TurnInput::new(Principal::new(key.id), request))
         .await
         .expect("missed continuation still executes");
-    let _ = turn.output.collect::<Vec<_>>().await;
-    let (_, body) = captured_http(&captured.lock());
+    let events = turn.output.collect::<Vec<_>>().await;
+    assert!(matches!(
+        events.last(),
+        Some(Ok(CanonicalEvent::Completed(response))) if response.id == "resp-capture"
+    ));
+    let (head, body) = captured_http(&captured.lock());
 
+    assert!(head.starts_with("POST /v1/responses "));
     assert!(body.get("previous_response_id").is_none());
+    assert_eq!(body["input"].as_array().map(Vec::len), Some(2));
+    assert_eq!(body["input"][0]["content"][0]["text"], "prior answer");
+    assert_eq!(body["input"][1]["content"][0]["text"], "follow-up");
 }
 
 #[tokio::test]
 async fn execute_sends_previous_response_id_when_lookup_hits() {
     let (_data_dir, gateway, captured, key) =
-        gateway_with_captured_model("lookup-hit-model", true).await;
+        gateway_with_captured_protocol("lookup-hit-model", true, "ok", None, "open-responses")
+            .await;
     let executor = LiveModelTurnExecutor::new(
         gateway.clone(),
         crate::router::continuation::ScriptedContinuation::hit("upstream-resp-1"),
@@ -2301,9 +2572,14 @@ async fn execute_sends_previous_response_id_when_lookup_hits() {
         .execute(TurnInput::new(Principal::new(key.id), request))
         .await
         .expect("hit continuation executes");
-    let _ = turn.output.collect::<Vec<_>>().await;
-    let (_, body) = captured_http(&captured.lock());
+    let events = turn.output.collect::<Vec<_>>().await;
+    assert!(matches!(
+        events.last(),
+        Some(Ok(CanonicalEvent::Completed(response))) if response.id == "resp-capture"
+    ));
+    let (head, body) = captured_http(&captured.lock());
 
+    assert!(head.starts_with("POST /v1/responses "));
     assert_eq!(
         body.get("previous_response_id")
             .and_then(|value| value.as_str()),
@@ -2312,7 +2588,32 @@ async fn execute_sends_previous_response_id_when_lookup_hits() {
 }
 
 #[tokio::test]
-async fn execute_forwards_extra_headers_without_overriding_authorization() {
+async fn execute_does_not_send_responses_continuation_to_chat_target() {
+    let (_data_dir, gateway, captured, key) =
+        gateway_with_captured_model("chat-continuation-model", true).await;
+    let executor = LiveModelTurnExecutor::new(
+        gateway,
+        crate::router::continuation::ScriptedContinuation::hit("upstream-resp-1"),
+    );
+    let mut request = AiRequest::new("chat-continuation-model", Vec::new());
+    crate::router::stamp_previous_response_id(&mut request, "stravia-parent");
+
+    let turn = executor
+        .execute(TurnInput::new(Principal::new(key.id), request))
+        .await
+        .expect("Chat target executes without Responses-only controls");
+    let events = turn.output.collect::<Vec<_>>().await;
+    assert!(matches!(
+        events.last(),
+        Some(Ok(CanonicalEvent::Completed(response))) if response.id == "chatcmpl-capture"
+    ));
+    let (head, body) = captured_http(&captured.lock());
+    assert!(head.starts_with("POST /v1/chat/completions "));
+    assert!(body.get("previous_response_id").is_none());
+}
+
+#[tokio::test]
+async fn execute_ignores_unlisted_extra_headers_without_overriding_authorization() {
     let (_data_dir, gateway, captured, key) =
         gateway_with_captured_model("header-model", true).await;
     let mut extra_headers = HeaderMap::new();
@@ -2337,7 +2638,7 @@ async fn execute_forwards_extra_headers_without_overriding_authorization() {
     let (head, _) = captured_http(&captured.lock());
     let head = head.to_ascii_lowercase();
 
-    assert!(head.contains("openai-beta: responses=v1"));
+    assert!(!head.contains("openai-beta: responses=v1"));
     assert!(head.contains("authorization: bearer test-provider-key"));
     assert!(!head.contains("attacker-key"));
 }
@@ -2492,9 +2793,7 @@ async fn route_default_thinking_level_yields_to_other_reasoning_directives() {
     )
     .await;
     let mut request = AiRequest::new("directive-thinking-model", Vec::new());
-    request.reasoning.enabled = true;
-    request.reasoning.effort =
-        Some(stravia_runtime_contract::protocol::ir::request::ReasoningEffort::High);
+    request.reasoning.mode = Some("enabled".into());
 
     let body = captured_reasoning_effort(
         &gateway,

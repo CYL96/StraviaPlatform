@@ -302,7 +302,19 @@ fn raise_max_tokens(object: &mut Map<String, Value>, budget: u64) {
     }
 }
 
-/// Preserve explicit display-only intent when reasoning is implicitly always on.
+/// The CLI accepts an omitted or summarized thinking transcript, not canonical
+/// summary verbosity names.
+pub(crate) fn summary_display(
+    summary: &stravia_runtime_contract::protocol::ir::ReasoningSummary,
+) -> &'static str {
+    use stravia_runtime_contract::protocol::ir::ReasoningSummary;
+    match summary {
+        ReasoningSummary::None => "omitted",
+        ReasoningSummary::Auto | ReasoningSummary::Concise | ReasoningSummary::Detailed => "summarized",
+    }
+}
+
+/// Preserve explicit summary-only intent when reasoning is implicitly always on.
 pub(crate) fn preserve_implicit_summary_intent(
     body: &mut Value,
     caps: &ModelCapabilities,
@@ -445,9 +457,9 @@ pub(crate) fn normalize(object: &mut Map<String, Value>, caps: &ModelCapabilitie
     }
 }
 
-/// `thinking.display` 只接受 `summarized` / `omitted`。Open Responses 入口把
+/// `thinking.display` 接受官方 `summarized` / `omitted` / `updates`。Open Responses 入口把
 /// `reasoning.summary`（`auto`/`concise`/`detailed`）原样带成 display，这些值都表示
-/// 要摘要；其余取值（含需要 beta 头的 `updates`）无法表示，丢弃后由型号默认值决定。
+/// 要摘要；其余取值丢弃后由型号默认值决定。`updates` 的 beta 由 request 模块添加。
 fn sanitize_display(object: &mut Map<String, Value>) {
     let Some(thinking) = object.get_mut("thinking").and_then(Value::as_object_mut) else {
         return;
@@ -456,6 +468,7 @@ fn sanitize_display(object: &mut Map<String, Value>) {
         None => return,
         Some("summarized" | "auto" | "concise" | "detailed") => Some("summarized"),
         Some("omitted" | "none" | "disabled" | "hidden") => Some("omitted"),
+        Some("updates") => Some("updates"),
         Some(_) => None,
     };
     match display {
@@ -475,6 +488,35 @@ fn cap_at_high(effort: &'static str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_summary_maps_to_official_display_and_preserves_implicit_intent() {
+        use stravia_runtime_contract::protocol::ir::ReasoningSummary;
+        for (summary, expected) in [
+            (ReasoningSummary::None, "omitted"),
+            (ReasoningSummary::Auto, "summarized"),
+            (ReasoningSummary::Concise, "summarized"),
+            (ReasoningSummary::Detailed, "summarized"),
+        ] {
+            let display = summary_display(&summary);
+            assert_eq!(display, expected);
+            let mut body = json!({"model":"claude-opus-5-5","max_tokens":1024});
+            preserve_implicit_summary_intent(
+                &mut body,
+                &ModelCapabilities::default(),
+                Some(display),
+            );
+            normalize(body.as_object_mut().unwrap(), &ModelCapabilities::default());
+            assert_eq!(body["thinking"], json!({"type":"adaptive","display":expected}));
+        }
+        let mut body = json!({"model":"claude-opus-5-5","thinking":{"type":"disabled"}});
+        preserve_implicit_summary_intent(
+            &mut body,
+            &ModelCapabilities::default(),
+            Some("omitted"),
+        );
+        assert_eq!(body["thinking"], json!({"type":"disabled"}));
+    }
 
     fn run(model: &str, extra: Value) -> Value {
         run_with(model, extra, &ModelCapabilities::default())
@@ -689,7 +731,7 @@ mod tests {
         // 无法表示的取值被丢弃，Opus 4.6 没有默认摘要，因此不带 display。
         assert_eq!(
             with("claude-opus-4-6", "updates"),
-            json!({"type": "adaptive"})
+            json!({"type": "adaptive", "display":"updates"})
         );
         // 型号未识别时同样清洗，display 属于协议层约束。
         assert_eq!(

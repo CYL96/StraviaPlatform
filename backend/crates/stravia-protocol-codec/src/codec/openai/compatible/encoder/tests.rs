@@ -1,6 +1,300 @@
 use super::*;
 
 #[test]
+fn chat_logprobs_merge_and_identifier_precedence_use_unified_intent() {
+    use super::super::decoder::OpenAIDecoder;
+    for (controls, expected) in [
+        (serde_json::json!({"logprobs": true}), Some(0)),
+        (serde_json::json!({"logprobs": true, "top_logprobs": 3}), Some(3)),
+        (serde_json::json!({"top_logprobs": 2}), Some(2)),
+        (serde_json::json!({"logprobs": false, "top_logprobs": 3}), None),
+    ] {
+        let mut input = serde_json::json!({
+            "model": "model", "messages": [{"role": "user", "content": "hello"}],
+            "user": "legacy-user", "safety_identifier": "preferred-user", "n": 2
+        });
+        input.as_object_mut().unwrap().extend(controls.as_object().unwrap().clone());
+        let request = OpenAIDecoder.decode_request(input).unwrap();
+        assert_eq!(request.parameters.logprobs, expected);
+        assert_eq!(request.parameters.end_user_id.as_deref(), Some("preferred-user"));
+        assert_eq!(request.parameters.candidate_count, Some(2));
+        let (body, _) = OpenAIEncoder.encode_request(request).unwrap();
+        assert_eq!(body["safety_identifier"], "preferred-user");
+        assert!(body.get("user").is_none());
+        assert_eq!(body["n"], 2);
+        if let Some(count) = expected {
+            assert_eq!(body["logprobs"], true);
+            assert_eq!(body["top_logprobs"], count);
+        } else {
+            assert!(body.get("logprobs").is_none());
+            assert!(body.get("top_logprobs").is_none());
+        }
+    }
+}
+
+#[test]
+fn chat_null_controls_reset_inheritance_without_emitting_nulls() {
+    use super::super::decoder::OpenAIDecoder;
+    use stravia_runtime_contract::protocol::ir::ParameterReset;
+    let request = OpenAIDecoder.decode_request(serde_json::json!({
+        "model": "model", "messages": [{"role": "user", "content": "hello"}],
+        "temperature": null, "top_p": null, "max_completion_tokens": null,
+        "presence_penalty": null, "frequency_penalty": null, "parallel_tool_calls": null,
+        "store": null, "prompt_cache_key": null, "prompt_cache_retention": null,
+        "verbosity": null, "service_tier": null, "reasoning_effort": null,
+        "response_format": null, "logprobs": null, "user": null,
+        "web_search_options": null
+    })).unwrap();
+    for reset in [
+        ParameterReset::Temperature, ParameterReset::TopP, ParameterReset::MaxTokens,
+        ParameterReset::PresencePenalty, ParameterReset::FrequencyPenalty,
+        ParameterReset::ParallelToolCalls, ParameterReset::Store, ParameterReset::CacheKey,
+        ParameterReset::CacheRetention, ParameterReset::Verbosity, ParameterReset::ServiceTier,
+        ParameterReset::ReasoningLevel, ParameterReset::ResponseFormat, ParameterReset::Logprobs,
+        ParameterReset::EndUser, ParameterReset::NativeTools,
+    ] {
+        assert!(request.parameters.resets(reset), "{reset:?}");
+    }
+    let (body, _) = OpenAIEncoder.encode_request(request).unwrap();
+    assert!(body.as_object().unwrap().values().all(|value| !value.is_null()));
+    assert!(body.get("resets").is_none());
+}
+
+#[test]
+fn chat_default_web_search_is_enabled_and_empty_tools_reset_inheritance() {
+    use super::super::decoder::OpenAIDecoder;
+    use stravia_runtime_contract::protocol::ir::{NativeTool, ParameterReset};
+    let request = OpenAIDecoder.decode_request(serde_json::json!({
+        "model": "model", "messages": [{"role": "user", "content": "hello"}],
+        "web_search_options": {}, "tools": []
+    })).unwrap();
+    assert!(request.parameters.resets(ParameterReset::NativeTools));
+    assert!(matches!(request.parameters.native_tools.as_slice(), [NativeTool::WebSearch(_)]));
+    let (body, _) = OpenAIEncoder.encode_request(request).unwrap();
+    assert_eq!(body["web_search_options"], serde_json::json!({}));
+}
+
+#[test]
+fn chat_only_projects_supported_tool_choices() {
+    use stravia_runtime_contract::protocol::ir::NativeToolKind;
+    for (choice, expected) in [
+        (ToolChoice::Auto, Some(serde_json::json!("auto"))),
+        (ToolChoice::None, Some(serde_json::json!("none"))),
+        (ToolChoice::Required, Some(serde_json::json!("required"))),
+        (ToolChoice::Named { name: "lookup".into() }, Some(serde_json::json!({
+            "type": "function", "function": {"name": "lookup"}
+        }))),
+        (ToolChoice::Allowed { names: vec!["lookup".into()], required: true }, None),
+        (ToolChoice::Native(NativeToolKind::WebSearch), None),
+    ] {
+        let mut request = AiRequest::new("model", vec![AiItem {
+            role: Role::User,
+            content: MessageContent::Text(std::sync::Arc::new("hello".into())),
+            tool_calls: None,
+            tool_call_id: None,
+            meta: None,
+        }]);
+        request.tool_choice = Some(choice);
+        let (body, _) = OpenAIEncoder.encode_request(request).unwrap();
+        assert_eq!(body.get("tool_choice"), expected.as_ref());
+    }
+}
+
+#[test]
+fn chat_drops_unsupported_official_controls_and_unknown_enum_values() {
+    use super::super::decoder::OpenAIDecoder;
+    let request = OpenAIDecoder.decode_request(serde_json::json!({
+        "model": "model", "messages": [{"role": "user", "content": "hello"}],
+        "prediction": {"type": "future", "private": true}, "service_tier": "scale",
+        "verbosity": "unsupported", "prompt_cache_retention": "forever",
+        "modalities": ["text", "private"], "tool_choice": {"type": "unsupported"},
+        "tools": [{"type": "file_search", "private": true}],
+        "audio": {"voice": "alloy", "format": null, "private": true},
+        "stream": true, "stream_options": {"include_obfuscation": true}
+    })).unwrap();
+    assert!(request.tool_choice.is_none());
+    let (body, _) = OpenAIEncoder.encode_request(request).unwrap();
+    for key in ["prediction", "service_tier", "verbosity", "prompt_cache_retention", "tool_choice"] {
+        assert!(body.get(key).is_none(), "{key}");
+    }
+    assert_eq!(body["modalities"], serde_json::json!(["text"]));
+    assert_eq!(body["tools"], serde_json::json!([]));
+    assert_eq!(body["audio"], serde_json::json!({"voice": "alloy"}));
+    assert_eq!(body["stream_options"], serde_json::json!({"include_usage": false}));
+}
+
+#[test]
+fn named_search_controls_strip_unknown_keys_without_changing_business_payloads() {
+    use crate::codec::openai::compatible::chat_completions::OpenAIChatCompletionsV1;
+    use crate::transform::ProtocolAdapter;
+    let schema = serde_json::json!({"type": "object", "properties": {"private": {"type": "boolean"}}, "business_constraint": true});
+    let request = OpenAIChatCompletionsV1.decode_request(serde_json::json!({
+        "model": "model", "messages": [{"role": "user", "content": "hello"}],
+        "web_search_options": {"search_context_size": "low", "private": true, "user_location": {"type": "approximate", "private": true, "approximate": {"city": "Tokyo", "private": true}}},
+        "metadata": {"private": {"business": true}, "label": "business"},
+        "tools": [{"type": "function", "function": {"name": "business", "parameters": schema}}],
+        "unknown_body": true
+    })).unwrap();
+    assert!(matches!(
+        request.parameters.native_tools.as_slice(),
+        [stravia_runtime_contract::protocol::ir::NativeTool::WebSearch(_)]
+    ));
+    let (body, _) = OpenAIEncoder.encode_request(request).unwrap();
+    assert_eq!(
+        body["web_search_options"],
+        serde_json::json!({"search_context_size": "low", "user_location": {"type": "approximate", "approximate": {"city": "Tokyo"}}})
+    );
+    assert_eq!(
+        body["metadata"],
+        serde_json::json!({"label": "business"})
+    );
+    assert_eq!(body["tools"][0]["function"]["parameters"], schema);
+    assert!(body.get("unknown_body").is_none());
+}
+
+#[test]
+fn chat_parameters_roundtrip_preserves_explicit_values_without_legacy_copies() {
+    use crate::codec::openai::compatible::chat_completions::OpenAIChatCompletionsV1;
+    use crate::transform::ProtocolAdapter;
+
+    let request = OpenAIChatCompletionsV1.decode_request(serde_json::json!({
+        "model": "model", "messages": [{"role": "user", "content": "hello"}],
+        "stream": true, "stream_options": {"include_usage": false, "include_obfuscation": false},
+        "n": 0, "logprobs": false, "top_logprobs": 0, "modalities": [], "tools": [],
+        "logit_bias": {}, "store": false, "metadata": {},
+        "prompt_cache_key": "", "prompt_cache_retention": "24h",
+        "audio": {"voice": "alloy", "format": "wav"},
+        "prediction": {"type": "content", "content": ""},
+        "verbosity": "low", "safety_identifier": "", "user": "",
+        "seed": 0, "frequency_penalty": 0, "presence_penalty": 0,
+        "reasoning_effort": "none", "unknown_future_option": {"private": true}
+    })).expect("decode canonical controls");
+    assert!(request.meta.vendor.ingress.is_empty());
+    assert_eq!(request.parameters.candidate_count, Some(0));
+    assert_eq!(request.parameters.logprobs, None);
+    assert!(request.parameters.resets(stravia_runtime_contract::protocol::ir::ParameterReset::Logprobs));
+    assert_eq!(
+        request.parameters.modalities.as_deref(),
+        Some([].as_slice())
+    );
+    let (body, _) = OpenAIEncoder
+        .encode_request(request)
+        .expect("encode canonical controls");
+    for (name, expected) in [
+        ("n", serde_json::json!(0)),
+        ("modalities", serde_json::json!([])),
+        ("logit_bias", serde_json::json!({})),
+        ("tools", serde_json::json!([])),
+        ("store", serde_json::json!(false)),
+        ("metadata", serde_json::json!({})),
+        ("prompt_cache_key", serde_json::json!("")),
+        ("prompt_cache_retention", serde_json::json!("24h")),
+        (
+            "audio",
+            serde_json::json!({"voice": "alloy", "format": "wav"}),
+        ),
+        ("reasoning_effort", serde_json::json!("none")),
+        (
+            "stream_options",
+            serde_json::json!({"include_usage": false}),
+        ),
+    ] {
+        assert_eq!(body[name], expected, "{name}");
+    }
+    assert!(body.get("unknown_future_option").is_none());
+    assert!(body.get("prediction").is_none());
+    assert!(body.get("logprobs").is_none());
+    assert!(body.get("top_logprobs").is_none());
+    assert!(body.get("user").is_none());
+    assert_eq!(body["safety_identifier"], "");
+}
+
+#[test]
+fn chat_projection_uses_canonical_controls_and_unified_service_tier() {
+    use stravia_runtime_contract::protocol::ir::ServiceTier;
+
+    let mut request = AiRequest::new(
+        "model",
+        vec![AiItem {
+            role: Role::User,
+            content: MessageContent::Text(std::sync::Arc::new("hello".into())),
+            tool_calls: None,
+            tool_call_id: None,
+            meta: None,
+        }],
+    );
+    request.parameters.candidate_count = Some(0);
+    request.parameters.modalities = Some(Vec::new());
+    request.parameters.service_tier = Some(ServiceTier::Auto);
+    request.parallel_tool_calls = Some(false);
+    let mut legacy = serde_json::to_value(&request).unwrap();
+    legacy["ext"] = serde_json::json!({
+        "OpenAiChat": {"n": 9, "modalities": ["audio"]}
+    });
+    let mut request: AiRequest = serde_json::from_value(legacy).unwrap();
+    request
+        .meta
+        .vendor
+        .ingress
+        .insert("parallel_tool_calls".into(), serde_json::json!(true));
+    request
+        .meta
+        .vendor
+        .ingress
+        .insert("unknown_future_option".into(), serde_json::json!("private"));
+
+    let (body, _) = OpenAIEncoder
+        .encode_request(request)
+        .expect("encode canonical priority");
+    assert_eq!(body["n"], 0);
+    assert_eq!(body["modalities"], serde_json::json!([]));
+    assert_eq!(body["parallel_tool_calls"], false);
+    assert_eq!(body["service_tier"], "auto");
+    assert!(body.get("unknown_future_option").is_none());
+    assert!(body.get("web_search_options").is_none());
+}
+
+#[test]
+fn malformed_chat_tool_is_a_protocol_error() {
+    use crate::codec::openai::compatible::chat_completions::OpenAIChatCompletionsV1;
+    use crate::transform::ProtocolAdapter;
+
+    assert!(
+        OpenAIChatCompletionsV1
+            .decode_request(serde_json::json!({
+                "model": "model", "messages": [{"role": "user", "content": "hello"}],
+                "tools": [{"type": "function", "function": {"parameters": {}}}]
+            }))
+            .is_err()
+    );
+}
+
+#[test]
+fn chat_tool_schema_null_branches_are_preserved_exactly() {
+    use crate::codec::openai::compatible::chat_completions::OpenAIChatCompletionsV1;
+    use crate::transform::ProtocolAdapter;
+
+    let schema = serde_json::json!({
+        "type": "object", "additionalProperties": false,
+        "properties": {"value": {"anyOf": [{"type": "string"}, {"type": "null"}]}},
+        "required": ["value"], "default": null
+    });
+    let request = OpenAIChatCompletionsV1
+        .decode_request(serde_json::json!({
+            "model": "model", "messages": [{"role": "user", "content": "hello"}],
+            "tools": [{"type": "function", "function": {
+                "name": "lookup", "parameters": schema, "strict": true
+            }}]
+        }))
+        .expect("decode nullable schema");
+    let (body, _) = OpenAIEncoder
+        .encode_request(request)
+        .expect("encode nullable schema");
+    assert_eq!(body["tools"][0]["function"]["parameters"], schema);
+    assert_eq!(body["tools"][0]["function"]["strict"], true);
+}
+
+#[test]
 fn json_schema_description_survives_without_overriding_canonical_controls() {
     use crate::transform::ProtocolTransform;
     use stravia_runtime_contract::protocol::ids::OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1;
@@ -26,6 +320,7 @@ fn json_schema_description_survives_without_overriding_canonical_controls() {
         serde_json::json!({"type": "object", "properties": {"answer": {"type": "string"}}});
     request.response_format = Some(ResponseFormat::JsonSchema {
         name: "changed".into(),
+        description: Some("Canonical description".into()),
         schema: schema.clone(),
         strict: Some(true),
     });
@@ -36,7 +331,7 @@ fn json_schema_description_survives_without_overriding_canonical_controls() {
     assert_eq!(
         body["response_format"]["json_schema"],
         serde_json::json!({
-            "name": "changed", "description": "Describe the answer", "schema": schema, "strict": true
+            "name": "changed", "description": "Canonical description", "schema": schema, "strict": true
         })
     );
 }
@@ -571,10 +866,7 @@ fn gateway_request_state_is_not_passed_through_upstream() {
         stravia_runtime_contract::protocol::ir::request::VERIFIED_HISTORY_REPLAY_META.into(),
         serde_json::Value::Bool(true),
     );
-    ingress.insert("client_extension".into(), serde_json::json!("kept"));
-
     let (body, _) = OpenAIEncoder.encode_request(request).expect("encode");
-    assert_eq!(body["client_extension"], "kept");
     assert!(!body.to_string().contains("__stravia_"), "{body}");
 }
 
@@ -753,19 +1045,21 @@ fn generic_toggle_without_provider_adapter_is_omitted() {
 }
 
 #[test]
-fn unknown_reasoning_effort_is_rejected() {
+fn unknown_reasoning_effort_is_silently_dropped() {
     use crate::codec::openai::compatible::decoder::OpenAIDecoder;
 
     for value in ["future_7", "not safe"] {
-        assert!(
-            OpenAIDecoder
-                .decode_request(serde_json::json!({
+        let request = OpenAIDecoder
+            .decode_request(serde_json::json!({
                 "model": "gpt",
                 "messages": [{"role": "user", "content": "hello"}],
                 "reasoning_effort": value
-                    }))
-                .is_err()
-        );
+            }))
+            .unwrap();
+        assert!(request.reasoning.level.is_none());
+        assert!(request.reasoning.target_control.is_none());
+        let (body, _) = OpenAIEncoder.encode_request(request).unwrap();
+        assert!(body.get("reasoning_effort").is_none());
     }
 }
 

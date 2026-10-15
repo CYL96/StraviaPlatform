@@ -5,51 +5,6 @@ use reqwest::header::{
     HeaderValue as ReqwestHeaderValue,
 };
 
-use stravia_runtime_contract::protocol::ir::AiRequest;
-use stravia_runtime_contract::protocol::ir::ProtocolExt;
-
-const SESSION_HEADER_PRIORITY: &[&str] = &[
-    "x-session-id",
-    "session-id",
-    "session_id",
-    "conversation_id",
-    "x-session-affinity",
-    "x-opencode-session",
-    "x-conversation-id",
-];
-
-/// Resolve an explicit client session without deriving identity from content.
-///
-/// Stravia's own `x-session-id` remains authoritative for compatibility.
-/// Native Codex/OpenCode session headers and Responses `prompt_cache_key`
-/// provide deterministic fallbacks. Generation-chain storage is already
-/// scoped by authenticated Principal, so equal raw IDs cannot collide across
-/// API keys.
-pub(super) fn client_session_id(
-    headers: &axum::http::HeaderMap,
-    request: &AiRequest,
-) -> Option<String> {
-    for name in SESSION_HEADER_PRIORITY {
-        if let Some(value) = headers
-            .get(*name)
-            .and_then(|value| value.to_str().ok())
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            return Some(value.to_owned());
-        }
-    }
-    let ProtocolExt::OpenResponses(extension) = request.ext.as_ref()? else {
-        return None;
-    };
-    extension
-        .prompt_cache_key
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-}
-
 /// Convert client-supplied request headers into the safe subset that may be
 /// forwarded upstream.
 ///
@@ -96,6 +51,10 @@ fn should_forward_client_header(name: &str) -> bool {
             | "refresh-token"
             | "cookie"
             | "set-cookie"
+            | "openai-organization"
+            | "openai-project"
+            | "x-organization-id"
+            | "x-claude-code-routing"
             // Hop-by-hop / transport-managed headers.
             | "connection"
             | "keep-alive"
@@ -128,7 +87,8 @@ fn should_forward_client_header(name: &str) -> bool {
             | "via"
             | "origin"
             | "referer"
-    ) || name.ends_with("-api-key")
+    ) || crate::model_turn::PARAMETER_HEADERS.contains(&name.as_str())
+        || name.ends_with("-api-key")
         || name.starts_with("sec-")
         || name.starts_with("proxy-")
         || name.starts_with("cf-");
@@ -144,37 +104,61 @@ mod tests {
 
     #[test]
     fn client_session_prefers_stravia_then_native_codex_headers() {
-        let request = AiRequest::new("gpt", Vec::new());
+        let mut request = stravia_runtime_contract::protocol::ir::AiRequest::new("gpt", Vec::new());
         let mut headers = HeaderMap::new();
         headers.insert("session-id", HeaderValue::from_static("codex-session"));
         headers.insert("x-session-id", HeaderValue::from_static("stravia-session"));
 
+        request
+            .parameters
+            .normalize_headers(|name| headers.get(name).and_then(|value| value.to_str().ok()));
         assert_eq!(
-            client_session_id(&headers, &request).as_deref(),
+            request.parameters.session.id.as_deref(),
             Some("stravia-session")
         );
 
         headers.remove("x-session-id");
+        let mut request = stravia_runtime_contract::protocol::ir::AiRequest::new("gpt", Vec::new());
+        request
+            .parameters
+            .normalize_headers(|name| headers.get(name).and_then(|value| value.to_str().ok()));
         assert_eq!(
-            client_session_id(&headers, &request).as_deref(),
+            request.parameters.session.id.as_deref(),
             Some("codex-session")
         );
     }
 
     #[test]
-    fn client_session_falls_back_to_responses_prompt_cache_key() {
-        let mut request = AiRequest::new("gpt", Vec::new());
-        request.ext = Some(ProtocolExt::OpenResponses(
-            stravia_runtime_contract::protocol::ir::OpenResponsesExt {
-                prompt_cache_key: Some("cache-session".into()),
-                ..Default::default()
-            },
-        ));
+    fn cache_key_does_not_become_session_identity() {
+        let mut request = stravia_runtime_contract::protocol::ir::AiRequest::new("gpt", Vec::new());
+        request.parameters.cache.key = Some("cache-session".into());
+        request.parameters.normalize_headers(|_| None);
+        assert!(request.parameters.session.id.is_none());
+    }
 
-        assert_eq!(
-            client_session_id(&HeaderMap::new(), &request).as_deref(),
-            Some("cache-session")
+    #[test]
+    fn normalized_session_headers_preserve_body_identity_and_are_not_forwarded() {
+        let mut request = stravia_runtime_contract::protocol::ir::AiRequest::new("gpt", Vec::new());
+        request.parameters.session.id = Some("body-session".into());
+        let mut headers = HeaderMap::new();
+        headers.insert("x-session-id", HeaderValue::from_static("platform-session"));
+        headers.insert("session-id", HeaderValue::from_static("native-session"));
+        headers.insert("authorization", HeaderValue::from_static("Bearer private"));
+        headers.insert("cookie", HeaderValue::from_static("session=private"));
+        headers.insert("openai-organization", HeaderValue::from_static("other-org"));
+        headers.insert(
+            "x-codex-turn-state",
+            HeaderValue::from_static("opaque-state"),
         );
+        crate::model_turn::normalize_request_headers(&mut request, |name| {
+            headers.get(name).and_then(|value| value.to_str().ok())
+        });
+        assert_eq!(
+            request.parameters.session.id.as_deref(),
+            Some("body-session")
+        );
+        assert!(!serde_json::to_string(&request.parameters).unwrap().contains("opaque-state"));
+        assert!(forwarded_client_headers(&headers).is_empty());
     }
 
     #[test]

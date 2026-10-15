@@ -2126,8 +2126,7 @@ mod tests {
                 }
             }),
             strict: None,
-            cache_control: None,
-            meta: None,
+            defer_loading: None,
         }]);
         for (id, request) in [
             ("short", request),

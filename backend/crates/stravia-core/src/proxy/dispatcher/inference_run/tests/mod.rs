@@ -2301,8 +2301,7 @@ async fn mixed_tool_continuation_replays_impl() {
             "properties": { "query": { "type": "string" } }
         }),
         strict: None,
-        cache_control: None,
-        meta: None,
+        defer_loading: None,
     }]);
 
     let first =

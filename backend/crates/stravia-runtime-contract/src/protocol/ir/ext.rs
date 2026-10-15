@@ -1,30 +1,18 @@
-//! Protocol-domain strong-typed extensions (`ProtocolExt`).
+//! 旧请求快照与 format-1 插件的私有 wire DTO。
 //!
-//! Each variant holds fields that are specific to one protocol family and
-//! influence codec behaviour but are **not** consumed by gateway infrastructure
-//! (router, quota, cache-key, dispatcher).  Fields in this module are only
-//! read by the matching protocol encoder or stream formatter.
-//!
-//! ## Design
-//!
-//! Using a concrete enum (rather than `Box<dyn Any>`) keeps downcasting
-//! ergonomic and avoids allocations for the common case where no extension is
-//! needed.
+//! 这些字段不属于当前运行时请求模型。入口读取旧快照时将其消费为唯一
+//! canonical 参数；SDK 出站时只向匹配协议的旧 wire 形状投影已支持的参数。
+//! 新参数必须添加到 `RequestParameters`，不能在此建立第二份运行时语义。
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 
-/// Protocol-specific request extension.
-///
-/// Populated by the ingress codec decoder; consumed by the egress encoder.
-/// When Stravia translates between protocols (e.g. Anthropic → OpenAI), the
-/// source `ProtocolExt` is discarded and the encoder relies solely on the
-/// core `AiRequest` fields.
+/// 旧 wire 协议族载体；只供历史导入与 SDK 格式桥接使用。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ProtocolExt {
     OpenAiChat(OpenAIChatExt),
-    OpenResponses(OpenResponsesExt),
+    OpenResponses(Box<OpenResponsesExt>),
     Anthropic(AnthropicExt),
     Google(GoogleExt),
 }
@@ -77,16 +65,11 @@ pub struct OpenResponsesExt {
     /// Whether `instructions` was present, including an explicit `null`.
     #[serde(skip)]
     pub instructions_present: bool,
-    /// Rolling Responses fields which are not part of the canonical IR.
-    ///
-    /// Same-protocol egress preserves them. Cross-protocol adapters may omit
-    /// them when they are advisory and have no equivalent wire field.
+    /// Read-only old snapshot carrier. Import consumes only named official
+    /// controls; unknown values never become runtime request parameters.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub passthrough_body: HashMap<String, Value>,
-    /// Hosted or future tool declarations which are not canonical functions.
-    ///
-    /// They are preserved for Responses egress and omitted for providers that
-    /// cannot execute hosted tools.
+    /// 旧原生工具载体；导入时仅保留能够映射到强类型工具的声明。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub passthrough_tools: Vec<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -115,10 +98,10 @@ pub struct OpenResponsesExt {
     pub text: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_tier: Option<String>,
-    /// Explicit hosted `web_search` declaration consumed by the Web Access hook.
+    /// 旧 Web Search 声明；导入时与其它原生搜索工具合并。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub native_web_search: Option<Value>,
-    /// Tool-choice forms which are not representable in the shared IR.
+    /// 旧工具选择载体；无法映射到统一选择的值在导入时丢弃。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice_ext: Option<Value>,
 }
@@ -143,8 +126,7 @@ pub struct AnthropicExt {
     /// Anthropic service tier (different enum space from OAI).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_tier: Option<String>,
-    /// Server-side tool specifications (bash, code_execution, web_search, etc.).
-    /// Encoded verbatim into the `tools` array alongside user-defined tools.
+    /// 旧服务器工具载体；不再允许将未知供应商工具原样透传到上游。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub server_tools: Option<Vec<Value>>,
 }
@@ -184,4 +166,26 @@ pub struct GoogleExt {
     /// Thinking / reasoning budget configuration (`thinkingBudget`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking_config: Option<Value>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn boxed_legacy_responses_preserves_snapshot_wire_shape() {
+        let wire = serde_json::json!({
+            "OpenResponses": {
+                "previous_response_id": "response-parent",
+                "top_logprobs": 2,
+                "passthrough_tools": [{"type": "web_search"}],
+            }
+        });
+        let extension: ProtocolExt = serde_json::from_value(wire.clone()).unwrap();
+        let ProtocolExt::OpenResponses(responses) = &extension else {
+            panic!("expected legacy Responses extension");
+        };
+        assert_eq!(responses.previous_response_id.as_deref(), Some("response-parent"));
+        assert_eq!(serde_json::to_value(extension).unwrap(), wire);
+    }
 }

@@ -12,7 +12,9 @@ use stravia_runtime_contract::hook::{
     HookSession, PlatformTool, PlatformToolError, PlatformToolOutput, RequestKind, ResponsePatch,
     SessionContext, ToolExecutionContext, ToolId, ToolProgress, ToolProgressSink,
 };
-use stravia_runtime_contract::protocol::ir::{ContentBlock, ProtocolExt, ToolChoice};
+use stravia_runtime_contract::protocol::ir::{
+    ContentBlock, NativeTool, NativeToolKind, ToolChoice, WebSearchTool,
+};
 
 use stravia_web_access_contract::read_path::{ReadTarget, format_search_path, parse_read_path};
 
@@ -300,13 +302,8 @@ impl HookSession for WebSearchHookSession {
         match event {
             HookEvent::Request { current, .. } if !self.resolved => {
                 self.resolved = true;
-                let native = match current.ext.as_ref() {
-                    Some(ProtocolExt::OpenResponses(extension)) => {
-                        extension.native_web_search.as_ref()
-                    }
-                    _ => None,
-                };
-                let filters = match native.map(DomainFilters::from_hosted_tool).transpose() {
+                let native = native_web_search_tool(current);
+                let filters = match native.map(DomainFilters::from_native_tool).transpose() {
                     Ok(filters) => filters,
                     Err(message) => return Ok(reject(400, "invalid_input", &message)),
                 };
@@ -334,7 +331,7 @@ impl HookSession for WebSearchHookSession {
                     self.native_filters = filters;
                     if matches!(
                         &current.tool_choice,
-                        Some(ToolChoice::Raw(value)) if is_native_web_search_choice(value)
+                        Some(ToolChoice::Native(NativeToolKind::WebSearch))
                     ) {
                         actions.push(HookAction::PatchRequest(Box::new(
                             stravia_runtime_contract::hook::RequestPatch::SetToolChoice(Some(
@@ -404,10 +401,20 @@ impl HookSession for WebSearchHookSession {
 pub fn native_web_search_requested(
     request: &stravia_runtime_contract::protocol::ir::AiRequest,
 ) -> bool {
-    matches!(
-        request.ext.as_ref(),
-        Some(ProtocolExt::OpenResponses(extension)) if extension.native_web_search.is_some()
-    )
+    native_web_search_tool(request).is_some()
+}
+
+fn native_web_search_tool(
+    request: &stravia_runtime_contract::protocol::ir::AiRequest,
+) -> Option<&WebSearchTool> {
+    request
+        .parameters
+        .native_tools
+        .iter()
+        .find_map(|tool| match tool {
+            NativeTool::WebSearch(tool) => Some(tool),
+            _ => None,
+        })
 }
 
 fn client_web_search_precedence(
@@ -422,23 +429,20 @@ fn client_web_search_precedence(
         return None;
     }
 
-    let Some(ProtocolExt::OpenResponses(extension)) = request.ext.as_ref() else {
-        return Some(ActionBatch::default());
-    };
-    if extension.native_web_search.is_none() {
+    if !native_web_search_requested(request) {
         return Some(ActionBatch::default());
     }
 
-    let mut extension = extension.clone();
-    extension.native_web_search = None;
+    let mut parameters = request.parameters.clone();
+    parameters
+        .native_tools
+        .retain(|tool| !matches!(tool, NativeTool::WebSearch(_)));
     let mut actions = vec![HookAction::PatchRequest(Box::new(
-        stravia_runtime_contract::hook::RequestPatch::SetProtocolExtension(Some(Box::new(
-            ProtocolExt::OpenResponses(extension),
-        ))),
+        stravia_runtime_contract::hook::RequestPatch::SetParameters(Box::new(parameters)),
     ))];
     if matches!(
         &request.tool_choice,
-        Some(ToolChoice::Raw(value)) if is_native_web_search_choice(value)
+        Some(ToolChoice::Native(NativeToolKind::WebSearch))
     ) {
         actions.push(HookAction::PatchRequest(Box::new(
             stravia_runtime_contract::hook::RequestPatch::SetToolChoice(Some(ToolChoice::Named {
@@ -467,57 +471,23 @@ fn rewritten_search_path(path: &str, filters: &DomainFilters) -> Option<String> 
 }
 
 impl DomainFilters {
-    fn from_hosted_tool(tool: &Value) -> Result<Self, String> {
-        if tool.get("blocked_domains").is_some()
-            || tool
-                .get("filters")
-                .and_then(|filters| filters.get("blocked_domains"))
-                .is_some()
-        {
+    fn from_native_tool(tool: &WebSearchTool) -> Result<Self, String> {
+        if !tool.blocked_domains.is_empty() {
             return Err("blocked_domains is not supported".into());
         }
-        let allowed_domains = normalized_hosted_domain_list(tool, "allowed_domains")?;
-        if allowed_domains.as_ref().is_some_and(Vec::is_empty) {
-            return Err("allowed_domains cannot be empty".into());
+        if tool.allowed_domains.is_empty() {
+            return Ok(Self::default());
         }
-        Ok(Self { allowed_domains })
-    }
-}
-
-fn normalized_hosted_domain_list(tool: &Value, key: &str) -> Result<Option<Vec<String>>, String> {
-    let value = tool
-        .get("filters")
-        .and_then(Value::as_object)
-        .and_then(|filters| filters.get(key))
-        .or_else(|| tool.get(key));
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    let values = value
-        .as_array()
-        .ok_or_else(|| format!("{key} must be an array of domain names"))?;
-    if values.len() > 20 {
-        return Err(format!("{key} cannot contain more than 20 entries"));
-    }
-    let domains = values
-        .iter()
-        .map(|value| {
-            value
-                .as_str()
-                .map(str::to_owned)
-                .ok_or_else(|| format!("{key} must contain only domain names"))
+        if tool.allowed_domains.len() > 20 {
+            return Err("allowed_domains cannot contain more than 20 entries".into());
+        }
+        let allowed_domains =
+            stravia_web_access_contract::normalize_domains(tool.allowed_domains.clone())
+                .map_err(|error| error.message)?;
+        Ok(Self {
+            allowed_domains: Some(allowed_domains),
         })
-        .collect::<Result<Vec<_>, _>>()?;
-    stravia_web_access_contract::normalize_domains(domains)
-        .map(Some)
-        .map_err(|error| error.message)
-}
-
-fn is_native_web_search_choice(value: &Value) -> bool {
-    value
-        .as_str()
-        .or_else(|| value.get("type").and_then(Value::as_str))
-        .is_some_and(|kind| matches!(kind, "web_search" | "web_search_2025_08_26"))
+    }
 }
 
 fn reject(status: u16, code: &str, message: &str) -> ActionBatch {
@@ -545,7 +515,7 @@ pub fn output_schema() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stravia_runtime_contract::protocol::ir::{AiItem, AiRequest, OpenResponsesExt, ToolSpec};
+    use stravia_runtime_contract::protocol::ir::{AiItem, AiRequest, ToolSpec};
 
     #[test]
     fn input_schema_is_strict_function_compatible() {
@@ -584,36 +554,66 @@ mod tests {
 
     #[test]
     fn native_blocked_domain_filters_are_rejected_as_unsupported() {
-        for tool in [
-            serde_json::json!({
-                "type": "web_search",
-                "filters": {"allowed_domains": ["example.com"], "blocked_domains": ["spam.org"]}
-            }),
-            serde_json::json!({"type": "web_search", "blocked_domains": ["spam.org"]}),
-            serde_json::json!({"type": "web_search", "filters": {"blocked_domains": []}}),
-            serde_json::json!({"type": "web_search", "blocked_domains": null}),
-            serde_json::json!({"type": "web_search", "filters": {"blocked_domains": "ignored?"}}),
-        ] {
-            assert!(DomainFilters::from_hosted_tool(&tool).is_err());
+        let tool = WebSearchTool {
+            blocked_domains: vec!["spam.org".into()],
+            ..Default::default()
+        };
+        assert!(DomainFilters::from_native_tool(&tool).is_err());
+    }
+
+    #[test]
+    fn native_empty_domain_filters_leave_model_search_path_unchanged() {
+        let filters = DomainFilters::from_native_tool(&WebSearchTool::default())
+            .expect("empty canonical filters");
+        assert!(rewritten_search_path("search://plain", &filters).is_none());
+    }
+
+    #[test]
+    fn native_search_is_detected_across_ingress_protocols() {
+        use stravia_runtime_contract::protocol::ir::{
+            native_tool_from_anthropic, native_tool_from_chat_web_search_options,
+            native_tool_from_gemini, native_tool_from_responses,
+        };
+
+        let tools = [
+            native_tool_from_responses(&serde_json::json!({"type": "web_search"})),
+            native_tool_from_responses(&serde_json::json!({"type": "web_search_preview"})),
+            native_tool_from_anthropic(&serde_json::json!({
+                "type": "web_search_20250305",
+                "name": "web_search"
+            })),
+            native_tool_from_gemini(&serde_json::json!({"googleSearch": {}})),
+            native_tool_from_gemini(&serde_json::json!({"googleSearchRetrieval": {}})),
+            native_tool_from_chat_web_search_options(&serde_json::json!({})),
+        ];
+        for tool in tools {
+            let mut request = AiRequest::new("model", Vec::<AiItem>::new());
+            assert!(!native_web_search_requested(&request));
+            request.parameters.native_tools.push(tool.expect("native search"));
+            assert!(native_web_search_requested(&request));
         }
     }
 
     #[test]
-    fn native_empty_allowed_domain_filters_are_rejected() {
-        for tool in [
-            serde_json::json!({"type": "web_search", "filters": {"allowed_domains": []}}),
-            serde_json::json!({"type": "web_search", "allowed_domains": []}),
+    fn native_allowed_domain_filters_keep_validation_limits() {
+        for domains in [
+            vec!["https://example.com/path".into()],
+            vec!["example.com".into(); 21],
         ] {
-            assert!(DomainFilters::from_hosted_tool(&tool).is_err());
+            let tool = WebSearchTool {
+                allowed_domains: domains,
+                ..Default::default()
+            };
+            assert!(DomainFilters::from_native_tool(&tool).is_err());
         }
     }
 
     #[test]
     fn native_allowed_domains_replace_the_model_search_path() {
-        let filters = DomainFilters::from_hosted_tool(&serde_json::json!({
-            "type": "web_search",
-            "filters": {"allowed_domains": ["Example.COM", "example.com"]}
-        }))
+        let filters = DomainFilters::from_native_tool(&WebSearchTool {
+            allowed_domains: vec!["Example.COM".into(), "example.com".into()],
+            ..Default::default()
+        })
         .expect("native allowed domains");
         let previous_path = "stravia://turns/abcdefghijklmnopqrstuvwxyzab";
         let rewritten = rewritten_search_path(
@@ -630,12 +630,10 @@ mod tests {
         assert_eq!(search.allowed_domains, Some(vec!["example.com".to_owned()]));
         assert_eq!(search.previous_path.as_deref(), Some(previous_path));
 
-        // Without a native override the model path is left untouched.
         assert_eq!(
             rewritten_search_path("search://plain", &DomainFilters::default()),
             None
         );
-        // Non-search paths are never rewritten.
         let override_filters = DomainFilters {
             allowed_domains: Some(vec!["example.com".to_owned()]),
         };
@@ -652,22 +650,22 @@ mod tests {
             description: None,
             parameters: serde_json::json!({"type": "object"}),
             strict: None,
-            cache_control: None,
-            meta: None,
+            defer_loading: None,
         }]);
         request
     }
 
     #[test]
-    fn client_function_wins_over_hosted_web_search_declaration() {
+    fn client_function_wins_over_native_web_search_declaration() {
         let mut request = client_web_search_request();
-        request.ext = Some(ProtocolExt::OpenResponses(OpenResponsesExt {
-            native_web_search: Some(serde_json::json!({"type": "web_search"})),
-            ..Default::default()
-        }));
-        request.tool_choice = Some(ToolChoice::Raw(serde_json::json!({
-            "type": "web_search"
-        })));
+        request
+            .parameters
+            .native_tools
+            .push(NativeTool::WebSearch(WebSearchTool::default()));
+        request.parameters.native_tools.push(NativeTool::CodeExecution(
+            stravia_runtime_contract::protocol::ir::CodeExecutionTool::default(),
+        ));
+        request.tool_choice = Some(ToolChoice::Native(NativeToolKind::WebSearch));
 
         let batch = client_web_search_precedence(&request).expect("client-owned collision");
 
@@ -683,11 +681,10 @@ mod tests {
             HookAction::PatchRequest(patch)
                 if matches!(
                     patch.as_ref(),
-                    stravia_runtime_contract::hook::RequestPatch::SetProtocolExtension(Some(extension))
+                    stravia_runtime_contract::hook::RequestPatch::SetParameters(parameters)
                         if matches!(
-                            extension.as_ref(),
-                            ProtocolExt::OpenResponses(extension)
-                                if extension.native_web_search.is_none()
+                            parameters.native_tools.as_slice(),
+                            [NativeTool::CodeExecution(_)]
                         )
                 )
         )));
