@@ -14,13 +14,14 @@ use stravia_runtime_contract::protocol::ir::AiItem;
 use stravia_runtime_contract::protocol::ir::AiRequest;
 use stravia_runtime_contract::protocol::ir::ContentBlock;
 use stravia_runtime_contract::protocol::ir::GenerationConfig;
-use stravia_runtime_contract::protocol::ir::GoogleExt;
+use stravia_runtime_contract::protocol::ir::{
+    AudioOutput, Modality, ParameterReset, ReasoningSummary, native_tool_from_gemini,
+};
 use stravia_runtime_contract::protocol::ir::MediaSource;
 use stravia_runtime_contract::protocol::ir::MessageContent;
-use stravia_runtime_contract::protocol::ir::ProtocolExt;
 use stravia_runtime_contract::protocol::ir::ReasoningConfig;
+use stravia_runtime_contract::protocol::ir::ResponseFormat;
 use stravia_runtime_contract::protocol::ir::Role;
-use stravia_runtime_contract::protocol::ir::SafetySettings;
 use stravia_runtime_contract::protocol::ir::StreamConfig;
 use stravia_runtime_contract::protocol::ir::ToolCall;
 use stravia_runtime_contract::protocol::ir::ToolChoice;
@@ -30,40 +31,73 @@ use super::types::*;
 
 pub struct GoogleDecoder;
 
-fn is_plain_auto_tool_config(value: &Value) -> bool {
-    let Some(config) = value.as_object() else {
-        return false;
-    };
-    let Some(function_calling) = config
-        .get("functionCallingConfig")
-        .and_then(Value::as_object)
-    else {
-        return false;
-    };
-
-    config.len() == 1
-        && function_calling.len() == 1
-        && function_calling.get("mode").and_then(Value::as_str) == Some("AUTO")
-}
-
 pub(super) fn decode_tool_choice(value: &Value) -> Option<ToolChoice> {
     let config = value.get("functionCallingConfig")?;
-    match config.get("mode")?.as_str()? {
+    let mode = config.get("mode")?.as_str()?;
+    if matches!(mode, "AUTO" | "ANY")
+        && let Some(names) = config.get("allowedFunctionNames").and_then(Value::as_array)
+    {
+        return Some(ToolChoice::Allowed {
+            names: names.iter().filter_map(Value::as_str).map(str::to_owned).collect(),
+            required: mode == "ANY",
+        });
+    }
+    match mode {
         "AUTO" => Some(ToolChoice::Auto),
         "NONE" => Some(ToolChoice::None),
-        "ANY" => match config.get("allowedFunctionNames").and_then(Value::as_array) {
-            Some(names) if names.len() == 1 => names[0]
-                .as_str()
-                .map(|name| ToolChoice::Named { name: name.into() }),
-            _ => Some(ToolChoice::Required),
-        },
+        "ANY" => Some(ToolChoice::Required),
         _ => None,
     }
 }
 
 impl GoogleDecoder {
     pub fn decode_with_model(&self, body: Value, model: &str, stream: bool) -> Result<AiRequest> {
-        let req: GoogleRequest = serde_json::from_value(body)?;
+        let mut resets = Vec::new();
+        for (key, reset) in [
+            ("systemInstruction", ParameterReset::Instructions),
+            ("tools", ParameterReset::NativeTools),
+        ] {
+            if body.get(key).is_some_and(|v| v.is_null() || v.as_array().is_some_and(Vec::is_empty)) {
+                resets.push(reset);
+            }
+        }
+        if body.pointer("/systemInstruction/parts").and_then(Value::as_array).is_some_and(Vec::is_empty) {
+            resets.push(ParameterReset::Instructions);
+        }
+        if let Some(config) = body.get("generationConfig") {
+            for (key, reset) in [
+                ("temperature", ParameterReset::Temperature),
+                ("topP", ParameterReset::TopP),
+                ("presencePenalty", ParameterReset::PresencePenalty),
+                ("frequencyPenalty", ParameterReset::FrequencyPenalty),
+                ("maxOutputTokens", ParameterReset::MaxTokens),
+                ("responseMimeType", ParameterReset::ResponseFormat),
+                ("responseJsonSchema", ParameterReset::ResponseFormat),
+                ("responseSchema", ParameterReset::ResponseFormat),
+                ("responseLogprobs", ParameterReset::Logprobs),
+                ("logprobs", ParameterReset::Logprobs),
+                ("thinkingConfig", ParameterReset::Reasoning),
+            ] {
+                if config.get(key).is_some_and(|value| {
+                    value.is_null()
+                        || (key == "responseMimeType" && value.as_str() == Some(""))
+                        || (key == "thinkingConfig" && value.as_object().is_some_and(serde_json::Map::is_empty))
+                }) {
+                    resets.push(reset);
+                }
+            }
+            if let Some(thinking) = config.get("thinkingConfig") {
+                for (key, reset) in [
+                    ("thinkingLevel", ParameterReset::ReasoningLevel),
+                    ("includeThoughts", ParameterReset::ReasoningSummary),
+                ] {
+                    if thinking.get(key).is_some_and(Value::is_null) {
+                        resets.push(reset);
+                    }
+                }
+            }
+        }
+        let mut req: GoogleRequest = serde_json::from_value(body)?;
 
         // ── System instruction ────────────────────────────────────────────────
         let needs_raw_system = req.system_instruction.as_ref().is_some_and(|si| {
@@ -81,24 +115,8 @@ impl GoogleDecoder {
             None
         };
 
-        // ── Tools: detect built-ins ───────────────────────────────────────────
-        let has_builtin_tools = req.tools.as_ref().is_some_and(|ts| {
-            ts.iter().any(|t| {
-                t.google_search.is_some()
-                    || t.code_execution.is_some()
-                    || t.google_search_retrieval.is_some()
-            })
-        });
-        let raw_tools: Option<Value> = if has_builtin_tools {
-            req.tools
-                .as_ref()
-                .and_then(|t| serde_json::to_value(t).ok())
-        } else {
-            None
-        };
-
-        let instructions = req.system_instruction.as_ref().and_then(|instruction| {
-            let text = instruction
+        let instructions = req.system_instruction.as_ref().map(|instruction| {
+            instruction
                 .parts
                 .iter()
                 .filter_map(|p| match p {
@@ -110,8 +128,7 @@ impl GoogleDecoder {
                     _ => None,
                 })
                 .collect::<Vec<_>>()
-                .join("\n");
-            (!text.is_empty()).then_some(text)
+                .join("\n")
         });
 
         // ── Messages ──────────────────────────────────────────────────────────
@@ -142,67 +159,45 @@ impl GoogleDecoder {
         }
 
         // ── Tools ─────────────────────────────────────────────────────────────
-        let tools = req.tools.as_ref().map(|entries| {
+        let mut native_tools = Vec::new();
+        let tools = req.tools.take().map(|entries| {
             let mut defs: Vec<ToolSpec> = Vec::new();
             for entry in entries {
-                if let Some(decls) = &entry.function_declarations {
+                if let Some(decls) = entry.function_declarations {
                     for fd in decls {
                         defs.push(ToolSpec {
-                            name: fd.name.clone(),
-                            description: fd.description.clone(),
-                            parameters: super::types::normalize_json_schema(
-                                fd.parameters_json_schema
-                                    .as_ref()
-                                    .or(fd.parameters.as_ref())
-                                    .cloned()
-                                    .unwrap_or(Value::Object(Default::default())),
-                            ),
+                            name: fd.name,
+                            description: fd.description,
+                            parameters: fd.parameters_json_schema.unwrap_or_else(|| {
+                                super::types::normalize_json_schema(
+                                    fd.parameters.unwrap_or(Value::Object(Default::default())),
+                                )
+                            }),
                             strict: None,
-                            cache_control: None,
-                            meta: None,
+                            defer_loading: None,
                         });
                     }
                 }
-                if entry.google_search.is_some() {
-                    defs.push(ToolSpec {
-                        name: "__builtin__google_search".into(),
-                        description: None,
-                        parameters: Value::Object(Default::default()),
-                        strict: None,
-                        cache_control: None,
-                        meta: None,
-                    });
-                }
-                if entry.code_execution.is_some() {
-                    defs.push(ToolSpec {
-                        name: "__builtin__code_execution".into(),
-                        description: None,
-                        parameters: Value::Object(Default::default()),
-                        strict: None,
-                        cache_control: None,
-                        meta: None,
-                    });
-                }
-                if entry.google_search_retrieval.is_some() {
-                    defs.push(ToolSpec {
-                        name: "__builtin__google_search_retrieval".into(),
-                        description: None,
-                        parameters: Value::Object(Default::default()),
-                        strict: None,
-                        cache_control: None,
-                        meta: None,
-                    });
+                for (key, value) in [
+                    ("googleSearch", entry.google_search),
+                    ("codeExecution", entry.code_execution),
+                    ("googleSearchRetrieval", entry.google_search_retrieval),
+                ] {
+                    if let Some(value) = value
+                        && let Some(tool) = native_tool_from_gemini(&serde_json::json!({key: value}))
+                    {
+                        native_tools.push(tool);
+                    }
                 }
             }
             defs
         });
 
-        // ── generationConfig → IR fields + GoogleExt ──────────────────────────
+        // ── generationConfig → unified controls ───────────────────────────────
         let gc = req.generation_config.as_ref();
         let max_tokens = gc.and_then(|c| c.max_output_tokens);
         let temperature = gc.and_then(|c| c.temperature);
         let top_p = gc.and_then(|c| c.top_p);
-        let stop = gc.and_then(|c| c.stop_sequences.clone());
         let seed = gc.and_then(|c| c.seed);
         let frequency_penalty = gc.and_then(|c| c.frequency_penalty);
         let presence_penalty = gc.and_then(|c| c.presence_penalty);
@@ -216,93 +211,38 @@ impl GoogleDecoder {
                         |_| anyhow::anyhow!("unsupported Gemini thinkingLevel: {value}"),
                     )?,
                 ),
+                Some(Value::Null) => None,
                 Some(_) => anyhow::bail!("Gemini thinkingLevel must be a string"),
             };
             let budget = tc
                 .get("thinkingBudget")
                 .and_then(|v| v.as_u64())
-                .map(|v| v as u32);
+                .and_then(|v| u32::try_from(v).ok());
             let include_thoughts = tc.get("includeThoughts").and_then(Value::as_bool);
             let level = effort_level.or_else(|| {
                 budget.map(stravia_runtime_contract::thinking::ThinkingLevel::from_budget)
             });
             ReasoningConfig {
-                enabled: level.is_some_and(|level| {
-                    level != stravia_runtime_contract::thinking::ThinkingLevel::Off
-                }),
+                mode: match tc.get("thinkingBudget").and_then(Value::as_i64) {
+                    Some(-1) => Some("auto".into()),
+                    Some(0) => Some("disabled".into()),
+                    Some(value) if value > 0 => Some("enabled".into()),
+                    _ => None,
+                },
                 budget_tokens: budget,
                 level,
-                display: include_thoughts
-                    .map(|enabled| if enabled { "summarized" } else { "omitted" }.into()),
+                summary: include_thoughts
+                    .map(|enabled| if enabled { ReasoningSummary::Auto } else { ReasoningSummary::None }),
                 ..Default::default()
             }
         } else {
             ReasoningConfig::default()
         };
 
-        // Safety settings
-        let safety_settings = req.safety_settings.as_ref().map(|ss| {
-            ss.iter()
-                .map(|s| SafetySettings {
-                    category: s.category.clone(),
-                    threshold: s.threshold.clone(),
-                })
-                .collect()
-        });
-
-        let plain_auto_tool_config = req
-            .tool_config
-            .as_ref()
-            .is_some_and(is_plain_auto_tool_config);
-
-        // GoogleExt
-        let google_ext = GoogleExt {
-            top_k: gc.and_then(|c| c.top_k.map(|v| v as u32)),
-            candidate_count: gc.and_then(|c| c.candidate_count),
-            response_logprobs: gc.and_then(|c| c.response_logprobs),
-            logprobs: gc.and_then(|c| c.logprobs.map(|v| v as u32)),
-            response_mime_type: gc.and_then(|c| c.response_mime_type.clone()),
-            response_json_schema: gc.and_then(|c| {
-                c.response_json_schema
-                    .as_ref()
-                    .or(c.response_schema.as_ref())
-                    .cloned()
-                    .map(super::types::normalize_json_schema)
-            }),
-            tool_config: if plain_auto_tool_config {
-                None
-            } else {
-                req.tool_config.clone()
-            },
-            cached_content: req.cached_content.clone(),
-            thinking_config: gc.and_then(|c| c.thinking_config.clone()),
-            ..Default::default()
-        };
-
-        // ── Vendor ingress bag — backward compat for old Google encoder ────────
+        // Only content that cannot be represented by ordered items uses ingress.
         let mut ingress = std::collections::HashMap::new();
-
-        if let Some(ref gen_cfg) = req.generation_config
-            && let Ok(v) = serde_json::to_value(gen_cfg)
-        {
-            ingress.insert("__google_generation_config".into(), v);
-        }
         if let Some(v) = raw_system {
             ingress.insert("__google_raw_system_instruction".into(), v);
-        }
-        if let Some(v) = raw_tools {
-            ingress.insert("__google_raw_tools".into(), v);
-        }
-        if let Some(ref ss) = req.safety_settings
-            && let Ok(v) = serde_json::to_value(ss)
-        {
-            ingress.insert("__google_safety_settings".into(), v);
-        }
-        if let Some(ref tc) = req.tool_config {
-            ingress.insert("__google_tool_config".into(), tc.clone());
-        }
-        if let Some(ref cc) = req.cached_content {
-            ingress.insert("__google_cached_content".into(), Value::String(cc.clone()));
         }
 
         // ── Build AiRequest ───────────────────────────────────────────────────
@@ -315,7 +255,10 @@ impl GoogleDecoder {
             max_tokens,
             top_p,
             seed,
-            stop,
+            stop: req
+                .generation_config
+                .as_mut()
+                .and_then(|config| config.stop_sequences.take()),
             frequency_penalty,
             presence_penalty,
         };
@@ -326,10 +269,63 @@ impl GoogleDecoder {
         ai_req.tools = tools_opt;
         ai_req.tool_choice = req.tool_config.as_ref().and_then(decode_tool_choice);
         ai_req.reasoning = reasoning;
-        ai_req.safety_settings = safety_settings;
-        ai_req.ext = Some(ProtocolExt::Google(google_ext));
+        let parameters = &mut ai_req.parameters;
+        parameters.resets = resets;
+        if let Some(mut config) = req.generation_config.take() {
+            parameters.top_k = config.top_k.map(|value| value as u32);
+            parameters.candidate_count = config.candidate_count;
+            parameters.logprobs = match config.response_logprobs {
+                Some(false) => {
+                    parameters.reset(ParameterReset::Logprobs);
+                    None
+                }
+                Some(true) => Some(config.logprobs.and_then(|value| u32::try_from(value).ok()).unwrap_or(0)),
+                None => config.logprobs.and_then(|value| u32::try_from(value).ok()),
+            };
+            parameters.modalities = config.response_modalities.map(|values| {
+                values
+                    .into_iter()
+                    .filter_map(|value| match value.to_ascii_lowercase().as_str() {
+                        "text" => Some(Modality::Text),
+                        "audio" => Some(Modality::Audio),
+                        "image" => Some(Modality::Image),
+                        _ => None,
+                    })
+                    .collect()
+            });
+            ai_req.response_format = config
+                .response_json_schema
+                .take()
+                .filter(|schema| !schema.is_null())
+                .or_else(|| {
+                    config
+                        .response_schema
+                        .take()
+                        .filter(|schema| !schema.is_null())
+                        .map(super::types::normalize_json_schema)
+                })
+                .map(|schema| ResponseFormat::JsonSchema {
+                    name: "response".into(),
+                    description: None,
+                    schema,
+                    strict: None,
+                });
+            if ai_req.response_format.is_none() {
+                ai_req.response_format = match config.response_mime_type.as_deref() {
+                    Some("application/json") => Some(ResponseFormat::JsonObject),
+                    Some("text/plain") => Some(ResponseFormat::Text),
+                    _ => None,
+                };
+            }
+            parameters.audio = config.speech_config.as_ref()
+                .and_then(|speech| speech.pointer("/voiceConfig/prebuiltVoiceConfig/voiceName"))
+                .and_then(Value::as_str)
+                .map(|voice| AudioOutput { voice: Some(voice.into()), format: None });
+        }
+        parameters.native_tools = native_tools;
         ai_req.meta.source_protocol = Some(GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA);
         ai_req.meta.vendor.ingress = ingress;
+        ai_req.normalize_parameters();
 
         Ok(ai_req)
     }

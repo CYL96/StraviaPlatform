@@ -30,17 +30,19 @@ pub fn normalize_request_tool_results(req: &mut AiRequest) {
         }
     }
 
-    let inherits_tool_calls = matches!(
-        req.ext.as_ref(),
-        Some(stravia_runtime_contract::protocol::ir::ProtocolExt::OpenResponses(extension))
-            if extension.previous_response_id.is_some()
-    ) || req
-        .meta
-        .vendor
-        .ingress
-        .get(stravia_runtime_contract::protocol::ir::request::VERIFIED_HISTORY_REPLAY_META)
-        .and_then(serde_json::Value::as_bool)
-        == Some(true);
+    let inherits_tool_calls = req
+        .parameters
+        .continuation
+        .as_ref()
+        .and_then(|continuation| continuation.previous_response_id())
+        .is_some()
+        || req
+            .meta
+            .vendor
+            .ingress
+            .get(stravia_runtime_contract::protocol::ir::request::VERIFIED_HISTORY_REPLAY_META)
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
     let mut pending_calls: VecDeque<(ToolCallId, String)> = VecDeque::new();
     let mut generated_id_seq: usize = 0;
     let mut normalized_messages: Vec<AiItem> = Vec::with_capacity(req.items.len());

@@ -1,8 +1,6 @@
 //! OpenAI Chat Completions ingress decoder — produces `AiRequest` directly.
 //!
-//! Protocol-specific fields that don't belong in the IR core are stored in:
-//! - `AiRequest.ext = Some(ProtocolExt::OpenAiChat(OpenAIChatExt { … }))` — typed Ext
-//! - `AiRequest.meta.vendor.ingress` — backward-compat bag for old encoders (PR-3 will clean up)
+//! Known controls enter unified parameters; unsupported controls are dropped.
 
 use anyhow::Result;
 use serde_json::Value;
@@ -14,16 +12,16 @@ use stravia_runtime_contract::protocol::ir::ContentBlock;
 use stravia_runtime_contract::protocol::ir::GenerationConfig;
 use stravia_runtime_contract::protocol::ir::MediaSource;
 use stravia_runtime_contract::protocol::ir::MessageContent;
-use stravia_runtime_contract::protocol::ir::OpenAIChatExt;
-use stravia_runtime_contract::protocol::ir::ProtocolExt;
 use stravia_runtime_contract::protocol::ir::ReasoningConfig;
-use stravia_runtime_contract::protocol::ir::ReasoningEffort;
 use stravia_runtime_contract::protocol::ir::ResponseFormat;
 use stravia_runtime_contract::protocol::ir::Role;
 use stravia_runtime_contract::protocol::ir::StreamConfig;
 use stravia_runtime_contract::protocol::ir::ToolCall;
 use stravia_runtime_contract::protocol::ir::ToolChoice;
 use stravia_runtime_contract::protocol::ir::ToolSpec;
+use stravia_runtime_contract::protocol::ir::{
+    AudioOutput, CacheRetention, ParameterReset, native_tool_from_chat_web_search_options,
+};
 
 use super::types::*;
 
@@ -31,6 +29,50 @@ pub struct OpenAIDecoder;
 
 impl OpenAIDecoder {
     pub(crate) fn decode_request(&self, body: Value) -> Result<AiRequest> {
+        let mut resets = Vec::new();
+        for (field, reset) in [
+            ("temperature", ParameterReset::Temperature),
+            ("top_p", ParameterReset::TopP),
+            ("presence_penalty", ParameterReset::PresencePenalty),
+            ("frequency_penalty", ParameterReset::FrequencyPenalty),
+            ("parallel_tool_calls", ParameterReset::ParallelToolCalls),
+            ("store", ParameterReset::Store),
+            ("prompt_cache_key", ParameterReset::CacheKey),
+            ("prompt_cache_retention", ParameterReset::CacheRetention),
+            ("verbosity", ParameterReset::Verbosity),
+            ("service_tier", ParameterReset::ServiceTier),
+            ("reasoning_effort", ParameterReset::ReasoningLevel),
+            ("response_format", ParameterReset::ResponseFormat),
+        ] {
+            if body.get(field).is_some_and(Value::is_null) {
+                resets.push(reset);
+            }
+        }
+        if body.get("max_completion_tokens").or_else(|| body.get("max_tokens"))
+            .is_some_and(Value::is_null)
+        {
+            resets.push(ParameterReset::MaxTokens);
+        }
+        if body.get("safety_identifier").or_else(|| body.get("user"))
+            .is_some_and(Value::is_null)
+        {
+            resets.push(ParameterReset::EndUser);
+        }
+        if body.get("web_search_options").is_some_and(Value::is_null)
+            || body.get("tools").is_some_and(|value| {
+                value.is_null() || value.as_array().is_some_and(Vec::is_empty)
+            })
+        {
+            resets.push(ParameterReset::NativeTools);
+        }
+        if body.get("logprobs").is_some_and(|v| v.is_null() || v.as_bool() == Some(false))
+            || body.get("top_logprobs").is_some_and(Value::is_null)
+        {
+            resets.push(ParameterReset::Logprobs);
+        }
+        if body.pointer("/response_format/json_schema/strict").is_some_and(Value::is_null) {
+            resets.push(ParameterReset::ResponseFormatStrict);
+        }
         let req: OpenAIRequest = serde_json::from_value(body)?;
 
         let messages = req
@@ -39,42 +81,50 @@ impl OpenAIDecoder {
             .map(decode_message)
             .collect::<Result<Vec<_>>>()?;
 
-        let tools = req.tools.as_ref().map(|tools_val| {
-            tools_val
-                .iter()
-                .filter_map(|t| {
-                    let func = t.get("function")?;
-                    Some(ToolSpec {
-                        name: func.get("name")?.as_str()?.to_string(),
-                        description: func
-                            .get("description")
-                            .and_then(|d| d.as_str())
-                            .map(String::from),
-                        parameters: func
-                            .get("parameters")
-                            .cloned()
-                            .unwrap_or(Value::Object(Default::default())),
-                        strict: func.get("strict").and_then(|v| v.as_bool()),
-                        cache_control: None,
-                        meta: None,
+        let tools = req
+            .tools
+            .map(|tools_val| {
+                tools_val
+                    .into_iter()
+                    .filter(|tool| tool.get("type").and_then(Value::as_str) == Some("function"))
+                    .map(|mut tool| {
+                        let func = tool
+                            .get_mut("function")
+                            .and_then(Value::as_object_mut)
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("Chat tool requires a function object")
+                            })?;
+                        let name = func
+                            .remove("name")
+                            .and_then(|value| value.as_str().map(str::to_owned))
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("Chat function tool requires a string name")
+                            })?;
+                        Ok(ToolSpec {
+                            name,
+                            description: func
+                                .remove("description")
+                                .and_then(|value| value.as_str().map(str::to_owned)),
+                            parameters: func
+                                .remove("parameters")
+                                .unwrap_or(Value::Object(Default::default())),
+                            strict: func.remove("strict").and_then(|value| value.as_bool()),
+                            defer_loading: None,
+                        })
                     })
-                })
-                .collect()
-        });
+                    .collect::<Result<Vec<_>>>()
+            })
+            .transpose()?;
 
-        let tool_choice = req.tool_choice.map(parse_tool_choice);
+        let tool_choice = req.tool_choice.and_then(parse_tool_choice);
 
         // Prefer max_completion_tokens (o-models), fall back to max_tokens.
         let effective_max_tokens = req.max_completion_tokens.or(req.max_tokens);
 
-        let reasoning = match &req.reasoning_effort {
-            Some(value) => ReasoningConfig {
-                enabled: true,
-                effort: Some(ReasoningEffort::from_openai_str(value)?),
-                level: Some(stravia_runtime_contract::thinking::ThinkingLevel::from_wire(value)?),
-                ..Default::default()
-            },
-            None => ReasoningConfig::default(),
+        let reasoning = ReasoningConfig {
+            level: req.reasoning_effort.as_deref().and_then(|value|
+                stravia_runtime_contract::thinking::ThinkingLevel::from_wire(value).ok()),
+            ..Default::default()
         };
 
         let include_usage = req
@@ -83,115 +133,6 @@ impl OpenAIDecoder {
             .map(|s| s.include_usage)
             .unwrap_or(false);
 
-        // ── ProtocolExt ───────────────────────────────────────────────────────
-        let oai_ext = OpenAIChatExt {
-            audio: req
-                .audio
-                .as_ref()
-                .and_then(|a| serde_json::to_value(a).ok()),
-            logit_bias: req.logit_bias.clone(),
-            modalities: req.modalities.clone(),
-            n: req.n,
-            prediction: req
-                .prediction
-                .as_ref()
-                .and_then(|p| serde_json::to_value(p).ok()),
-            stream_options: req
-                .stream_options
-                .as_ref()
-                .and_then(|s| serde_json::to_value(s).ok()),
-            ..Default::default()
-        };
-
-        // ── Vendor ingress bag — backward compat for old encoders (pre-PR-3) ──
-        // Old OpenAI encoder reads these keys from InternalRequest.extra, which
-        // is populated from meta.vendor.ingress via compat.rs.
-        let mut ingress = req.extra.clone(); // unknown flatten'd fields
-        macro_rules! put_opt_value {
-            ($key:expr, $val:expr) => {
-                if let Some(v) = $val {
-                    ingress
-                        .entry($key.to_string())
-                        .or_insert_with(|| serde_json::to_value(v).unwrap_or(Value::Null));
-                }
-            };
-        }
-        macro_rules! put_bool {
-            ($key:expr, $val:expr) => {
-                if let Some(v) = $val {
-                    ingress
-                        .entry($key.to_string())
-                        .or_insert_with(|| Value::Bool(v));
-                }
-            };
-        }
-        macro_rules! put_str {
-            ($key:expr, $val:expr) => {
-                if let Some(v) = $val {
-                    ingress
-                        .entry($key.to_string())
-                        .or_insert_with(|| Value::String(v.clone()));
-                }
-            };
-        }
-        put_opt_value!("stream_options", req.stream_options.as_ref());
-        put_bool!("parallel_tool_calls", req.parallel_tool_calls);
-        put_opt_value!("prediction", req.prediction.as_ref());
-        if let Some(ref v) = req.modalities {
-            ingress
-                .entry("modalities".to_string())
-                .or_insert_with(|| Value::Array(v.iter().cloned().map(Value::String).collect()));
-        }
-        put_opt_value!("audio", req.audio.as_ref());
-        if let Some(ref v) = req.response_format {
-            ingress
-                .entry("response_format".to_string())
-                .or_insert_with(|| serde_json::to_value(v).unwrap_or(Value::Null));
-        }
-        if let Some(v) = req.seed {
-            ingress
-                .entry("seed".to_string())
-                .or_insert_with(|| Value::from(v));
-        }
-        if let Some(ref v) = req.stop {
-            ingress
-                .entry("stop".to_string())
-                .or_insert_with(|| match v {
-                    StopToken::Single(s) => Value::String(s.clone()),
-                    StopToken::Multiple(vs) => {
-                        Value::Array(vs.iter().cloned().map(Value::String).collect())
-                    }
-                });
-        }
-        if let Some(ref v) = req.logit_bias {
-            ingress.entry("logit_bias".to_string()).or_insert_with(|| {
-                Value::Object(
-                    v.iter()
-                        .map(|(k, f)| (k.clone(), Value::from(*f)))
-                        .collect(),
-                )
-            });
-        }
-        put_str!("service_tier", req.service_tier.as_ref());
-        put_str!("reasoning_effort", req.reasoning_effort.as_ref());
-        if let Some(v) = req.frequency_penalty {
-            ingress
-                .entry("frequency_penalty".to_string())
-                .or_insert_with(|| Value::from(v));
-        }
-        if let Some(v) = req.presence_penalty {
-            ingress
-                .entry("presence_penalty".to_string())
-                .or_insert_with(|| Value::from(v));
-        }
-        if let Some(v) = req.n {
-            ingress
-                .entry("n".to_string())
-                .or_insert_with(|| Value::from(v));
-        }
-        put_str!("user", req.user.as_ref());
-
-        // Consume stop and response_format AFTER ingress bag is built.
         let stop = req.stop.map(StopToken::into_vec);
         let response_format = req.response_format.map(parse_response_format);
 
@@ -215,9 +156,41 @@ impl OpenAIDecoder {
         ai_req.parallel_tool_calls = req.parallel_tool_calls;
         ai_req.reasoning = reasoning;
         ai_req.response_format = response_format;
-        ai_req.ext = Some(ProtocolExt::OpenAiChat(oai_ext));
+        ai_req.parameters.resets = resets;
+        ai_req.parameters.audio = req.audio.map(|audio| AudioOutput {
+            voice: audio.voice,
+            format: audio.format,
+        });
+        ai_req.parameters.logit_bias = req.logit_bias;
+        ai_req.parameters.logprobs = match req.logprobs {
+            Some(false) => None,
+            Some(true) => Some(req.top_logprobs.unwrap_or(0)),
+            None => req.top_logprobs,
+        };
+        ai_req.parameters.modalities = req.modalities.map(|values| values.into_iter()
+            .filter_map(|value| serde_json::from_value(Value::String(value)).ok()).collect());
+        ai_req.parameters.candidate_count = req.n;
+        ai_req.parameters.store = req.store;
+        ai_req.parameters.metadata = req.metadata.and_then(|value| value.as_object().map(|map| {
+            map.iter().filter_map(|(key, value)| value.as_str()
+                .map(|value| (key.clone(), value.to_owned()))).collect()
+        }));
+        ai_req.parameters.end_user_id = req.safety_identifier.or(req.user);
+        ai_req.parameters.cache.key = req.prompt_cache_key;
+        ai_req.parameters.cache.retention = req.prompt_cache_retention.and_then(|value| match value.as_str() {
+            "in_memory" => Some(CacheRetention::Default),
+            "24h" => Some(CacheRetention::Extended),
+            _ => None,
+        });
+        ai_req.parameters.verbosity = req.verbosity.and_then(|value|
+            serde_json::from_value(Value::String(value)).ok());
+        ai_req.parameters.native_tools = req.web_search_options.as_ref()
+            .and_then(native_tool_from_chat_web_search_options).into_iter().collect();
+        ai_req.parameters.service_tier = req.service_tier.and_then(|value|
+            serde_json::from_value(Value::String(value)).ok());
         ai_req.meta.source_protocol = Some(OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1);
-        ai_req.meta.vendor.ingress = ingress;
+        ai_req.meta.vendor.ingress = Default::default();
+        ai_req.normalize_parameters();
 
         Ok(ai_req)
     }
@@ -334,13 +307,13 @@ fn decode_message(msg: OpenAIMessage) -> Result<AiItem> {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-fn parse_tool_choice(v: Value) -> ToolChoice {
+fn parse_tool_choice(v: Value) -> Option<ToolChoice> {
     match &v {
         Value::String(s) => match s.as_str() {
-            "none" => ToolChoice::None,
-            "auto" => ToolChoice::Auto,
-            "required" => ToolChoice::Required,
-            _ => ToolChoice::Raw(v),
+            "none" => Some(ToolChoice::None),
+            "auto" => Some(ToolChoice::Auto),
+            "required" => Some(ToolChoice::Required),
+            _ => None,
         },
         Value::Object(obj) => {
             if obj.get("type").and_then(|t| t.as_str()) == Some("function")
@@ -349,13 +322,13 @@ fn parse_tool_choice(v: Value) -> ToolChoice {
                     .and_then(|f| f.get("name"))
                     .and_then(|n| n.as_str())
             {
-                return ToolChoice::Named {
+                return Some(ToolChoice::Named {
                     name: name.to_string(),
-                };
+                });
             }
-            ToolChoice::Raw(v)
+            None
         }
-        _ => ToolChoice::Raw(v),
+        _ => None,
     }
 }
 
@@ -365,6 +338,7 @@ fn parse_response_format(f: ResponseFormatWire) -> ResponseFormat {
         ResponseFormatWire::JsonObject => ResponseFormat::JsonObject,
         ResponseFormatWire::JsonSchema { json_schema } => ResponseFormat::JsonSchema {
             name: json_schema.name,
+            description: json_schema.description,
             schema: json_schema.schema,
             strict: json_schema.strict,
         },

@@ -492,11 +492,15 @@ Open Responses `2026-04-24` 定义 canonical baseline；Ingress 可以接受其 
 
 `POST /v1/responses/compact` 是独立 HTTP unary 操作。Request 经过既有认证与协议解码后，沿正常 Route 选择当前 Target；Responses 内嵌的 `compaction_trigger` 和客户端 `context_management` 同样属于远程压缩透传。平台不提供开关或触发阈值，不注入默认控制，不按目录容量限制客户端阈值。
 
+独立 compact 的出口只保留该端点支持的字段；兼容入口接受的普通 Responses 控制（如 `reasoning`）不因此成为 compact 透传字段，`stream` 也不会发送到上游。
+
 独立 compact 操作在 Target 协议无法承载时返回 `compaction_unsupported`，不改成普通生成或本地摘要。协议可承载但能力未知时仍尝试转发，由上游裁决；不为寻找压缩能力而跳过当前 Target，不因压缩失败而重试或切换 Target，上游成功和错误均返回客户端。独立 compact 返回完整下一窗口及 opaque state，不形成空 Generation；后续回放保留既有 Principal 隔离、原生状态来源和 Target 绑定约束。WebSocket 上不新增独立 compact 操作。
 
 普通 Responses 推理中的 `context_management` 与 `compaction_trigger` 遵循 [ADR-0006](../adr/0006-own-protocol-conversion-behind-canonical-stages.md) 的兼容性优先策略：目标协议无法表达时省略，保留可表达的业务输入并正常推理，不伪造原生压缩状态，也不保证压缩意图得到执行。这不放宽已登记原生状态的来源、Principal、有效期或 Target 绑定校验。
 
 流式压缩以 `response.output_item.done` 的完整原生条目作为已完成状态。Codex V2 的终态 `response.completed.output` 可以不重复该条目，Stravia 保留此前完成的状态用于交付和回放；若终态在同一 output index 显式提供条目，则必须与已完成条目一致。未完成的 item/content part 仍阻止成功终态，不完整或被改写的密文不能借此通过校验。
+
+已登记原生状态在生成完成前回放时只关联其已确认来源。生成完整交付后，若回放包含该节点的完整客户端前缀与平台签发输出身份，即使本轮省略原压缩阈值或更改控制，也应关联该已完成后代，而不是退回状态最初来源；该后代的祖先链必须包含已确认来源。控制不匹配时只采用祖先关系及 Target 亲和，不继承旧控制、旧执行窗口或上游 response continuation；本轮显式重置仍有效。普通自动父发现与 Target Continuation 的严格控制匹配规则不变。
 
 Codex 官方客户端已[移除旧 `/responses/compact` 实现](https://github.com/openai/codex/commit/1ac689cc7de0e637d35271edbbc132d1553d1767)，改用普通 Responses 上的 V2 压缩。独立 compact 仍按当前 Target 的原生端点转发；端点不可用时原样返回上游错误，包括 404，不在平台内把 V1 改写成 V2。
 

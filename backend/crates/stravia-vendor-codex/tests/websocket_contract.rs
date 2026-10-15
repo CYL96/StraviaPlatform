@@ -6,8 +6,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
+use serde_json::Value;
 use stravia_runtime_contract::protocol::ir::{
-    AiItem, AiRequest, AiStreamDelta, MessageContent, OpenResponsesExt, ProtocolExt, Role,
+    AiItem, AiRequest, AiStreamDelta, CacheRetention, Continuation, MessageContent, Role, ServiceTier,
 };
 use stravia_runtime_contract::{CancellationToken, Deadline};
 use stravia_vendor_runtime::{
@@ -172,8 +173,8 @@ async fn http_sse_with_content_type_emits_before_eof() {
 
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires task build:vendors:all"]
-async fn http_unary_json_remains_unary() {
-    http_case("unary").await;
+async fn http_nonstream_client_uses_native_stream() {
+    http_case("nonstream").await;
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -240,15 +241,13 @@ async fn http_case(case: &'static str) {
             assert!(headers.starts_with("POST /responses/compact "));
             assert!(body.get("stream").is_none());
         } else {
-            assert_eq!(body["stream"], case != "unary");
+            assert_eq!(body["stream"], true);
         }
         if matches!(
             case,
-            "unary" | "error" | "malformed" | "truncated" | "compact" | "compact-error"
+            "error" | "malformed" | "truncated" | "compact" | "compact-error"
         ) {
-            let message = serde_json::json!({"type":"message","id":"msg_1","status":"completed","role":"assistant","content":[{"type":"output_text","text":"hello","annotations":[],"logprobs":[]}]});
             let payload = match case {
-                "unary" => response_resource("completed", serde_json::json!([message]), "resp_http").to_string(),
                 "compact" => serde_json::json!({"id":"cmp_response","object":"response.compaction","created_at":1790129810,"output":[{"type":"compaction","id":"cmp_1","encrypted_content":"synthetic-state"}]}).to_string(),
                 "error" | "compact-error" => serde_json::json!({"error":{"type":"invalid_request_error","message":"synthetic upstream rejection"}}).to_string(),
                 "malformed" => "event: response.created\ndata: {not-json}\n\n".to_string(),
@@ -329,7 +328,7 @@ async fn http_case(case: &'static str) {
         0,
     );
     let mut inference = request();
-    inference.stream.enabled = case != "unary";
+    inference.stream.enabled = case != "nonstream";
     let input = if case.starts_with("compact") {
         OperationInput::Compact {
             provider,
@@ -402,13 +401,6 @@ async fn http_case(case: &'static str) {
     assert_eq!(response.usage.reasoning_tokens, Some(12));
     assert_eq!(response.usage.cache_read_tokens, Some(0));
     assert!(response.usage.required_components_known);
-    if case == "unary" {
-        assert!(!services.deltas.lock().iter().any(|delta| matches!(
-            delta,
-            AiStreamDelta::TextDelta(_) | AiStreamDelta::TextDeltaWithMetadata { .. }
-        )));
-        return;
-    }
     let calls = response.tool_calls().collect::<Vec<_>>();
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].id, "call_1");
@@ -795,11 +787,18 @@ async fn affinity_and_account_headers_follow_actual_codex_frames() {
                 .insert("access_token".into(), access_token.into());
         }
         let mut turn_request = request();
-        turn_request.ext = Some(ProtocolExt::OpenResponses(OpenResponsesExt {
-            service_tier: tier.map(str::to_owned),
-            previous_response_id: previous_id.map(str::to_owned),
-            ..Default::default()
-        }));
+        turn_request.parameters.metadata =
+            Some(BTreeMap::from([("verification".into(), "canonical-final".into())]));
+        turn_request.parameters.cache.key = Some("canonical-final-smoke".into());
+        turn_request.parameters.cache.retention = Some(CacheRetention::Extended);
+        turn_request.parallel_tool_calls = Some(false);
+        turn_request.parameters.service_tier = tier.map(|tier| match tier {
+            "priority" => ServiceTier::Priority,
+            "flex" => ServiceTier::Flex,
+            "auto" => ServiceTier::Auto,
+            _ => ServiceTier::Default,
+        });
+        turn_request.parameters.continuation = previous_id.map(|id| Continuation::PreviousResponse(id.into()));
         let result = execute_once(
             &runtime,
             &plugin,
@@ -828,6 +827,10 @@ async fn affinity_and_account_headers_follow_actual_codex_frames() {
         assert_eq!(connections[index].reuse_max_age_millis, Some(3_300_000));
         assert_eq!(sent[index]["previous_response_id"].as_str(), *previous_id);
         assert_eq!(sent[index]["type"], "response.create");
+        assert!(sent[index].get("metadata").is_none());
+        assert!(sent[index].get("prompt_cache_retention").is_none());
+        assert_eq!(sent[index]["prompt_cache_key"], "canonical-final-smoke");
+        assert_eq!(sent[index]["parallel_tool_calls"], false);
         assert_eq!(closed[index].as_deref(), Some(*response_id));
         for (header, metadata) in [
             ("session-id", "session_id"),
@@ -844,10 +847,16 @@ async fn affinity_and_account_headers_follow_actual_codex_frames() {
             );
             assert_eq!(connections[0].headers.get(header), Some(value));
         }
-        assert_eq!(
+        assert_ne!(
             connections[index].headers.get("x-client-request-id"),
             connections[index].headers.get("thread-id")
         );
+        if index > 0 {
+            assert_ne!(
+                connections[index].headers.get("x-client-request-id"),
+                connections[index - 1].headers.get("x-client-request-id")
+            );
+        }
     }
     assert!(
         sent[0]["client_metadata"]["turn_id"]
@@ -858,7 +867,9 @@ async fn affinity_and_account_headers_follow_actual_codex_frames() {
         sent[0]["client_metadata"]["turn_id"],
         sent[1]["client_metadata"]["turn_id"]
     );
-    assert!(sent.iter().all(|frame| frame.get("service_tier").is_none()));
+    for (frame, (tier, _, _, _)) in sent.iter().zip(cases.iter()) {
+        assert_eq!(frame.get("service_tier").and_then(Value::as_str), *tier);
+    }
     assert_eq!(
         connections[0].headers.get("x-codex-routing-hint"),
         connections[1].headers.get("x-codex-routing-hint")
@@ -935,10 +946,7 @@ async fn no_code_continuation_error_requires_requested_id_before_response_create
         (Some("resp_missing"), true, false),
     ] {
         let mut turn_request = request();
-        turn_request.ext = Some(ProtocolExt::OpenResponses(OpenResponsesExt {
-            previous_response_id: previous_id.map(str::to_owned),
-            ..Default::default()
-        }));
+        turn_request.parameters.continuation = previous_id.map(|id| Continuation::PreviousResponse(id.into()));
         let mut frames = Vec::new();
         if saw_created {
             frames.push(created.clone());

@@ -5,18 +5,15 @@
 //!
 //! ## Three segments
 //!
-//! - **`ingress`** — extra fields extracted from the *client* body.  These
-//!   belong to the ingress protocol family (e.g. OpenAI `service_tier`).
-//!   Forwarded to the egress by the codec if the egress vendor understands them.
+//! - **`ingress`** — 尚未归入内容或响应元数据的源协议载体，以及旧快照的
+//!   私有 wire 字段。请求控制在入口消费到 canonical `RequestParameters`；
+//!   保留未知源值不代表允许将其透传到目标。
 //!
-//! - **`egress`** — fields injected by the egress codec or `Vendor` adapter
-//!   just before the upstream call. Examples include provider-specific header
-//!   hints and opaque context references. They are not part of the ingress body.
+//! - **`egress`** — private provider annotations and opaque context references.
+//!   This metadata does not authorize extra upstream body fields or headers.
 //!
-//! - **`passthrough_safe`** — unknown fields explicitly admitted by a codec's
-//!   allowlist. Despite the historical field name, these remain inside
-//!   canonical IR and are re-encoded by the target codec; they do not bypass
-//!   the inference pipeline.
+//! - **`passthrough_safe`** — historical snapshot metadata. Despite the old
+//!   name, it never grants unknown request fields target re-encoding permission.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -30,9 +27,9 @@ pub const CHAT_REASONING_FIELD_META: &str = "__stravia_chat_reasoning_field";
 pub struct VendorExtensions {
     /// Extra fields from the ingress body (client side).
     pub ingress: HashMap<String, Value>,
-    /// Extra fields for the egress body (provider side).
+    /// Private provider annotations, not an egress request body.
     pub egress: HashMap<String, Value>,
-    /// Allowlisted unknown fields retained in canonical IR for target re-encoding.
+    /// Historical metadata, not an upstream request-parameter authority.
     pub passthrough_safe: HashMap<String, Value>,
 }
 

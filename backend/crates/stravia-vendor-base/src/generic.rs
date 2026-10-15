@@ -73,27 +73,15 @@ pub(crate) fn execute(
                 validate_cloudflare_config(&provider, &request.options),
             ))
         }
-        OperationInput::ConfigValidation { provider, request }
-            if operation == Operation::ConfigValidation && vendor_id == "custom" =>
-        {
+        OperationInput::ConfigValidation {
+            provider,
+            request: _,
+        } if operation == Operation::ConfigValidation && vendor_id == "custom" => {
             check_channel(vendor_id, channel, &provider)?;
-            let reasoning_config = if protocol_for(vendor_id, &provider)? == OPENAI_CHAT_PROTOCOL {
-                selected_custom_reasoning_field(&request.options)
-            } else {
-                Ok(None)
-            };
-            let issues = reasoning_config
-                .err()
-                .map(|field| ValidationIssue {
-                    field: Some(field.into()),
-                    code: "invalid_reasoning_field".into(),
-                    message: crate::messages::reasoning_field_invalid(),
-                })
-                .into_iter()
-                .collect();
+            protocol_for(vendor_id, &provider)?;
             Ok(OperationOutput::ConfigValidation(
                 ConfigValidationResponse {
-                    issues,
+                    issues: Vec::new(),
                     proposed_base_url: None,
                 },
             ))
@@ -132,24 +120,16 @@ pub(crate) fn execute_inference(
     let preserve_upstream_errors = protocol == OPEN_RESPONSES_PROTOCOL
         && stravia_protocol_codec::codec::compaction::native_compaction_requested(&request);
     let reasoning_source = if provider.provider_id == "custom" && protocol == OPENAI_CHAT_PROTOCOL {
-        selected_custom_reasoning_field(&provider.options).map_err(|field| {
-            common::plugin_error(
-                ErrorKind::Invalid,
-                format!("invalid Custom reasoning field configuration: {field}"),
-            )
-        })?
+        selected_custom_reasoning_field(&provider.options)
     } else {
         None
     };
-    let mut encoded = crate::encode_inference_request(protocol, request)?;
+    let mut encoded = crate::parameters::encode(provider, protocol, request)?;
     prepare_custom_reasoning_history(provider, protocol, reasoning_source, &mut encoded.body);
     let mut headers = common::header_pairs(&encoded.headers)?;
-    for (name, value) in &provider.client_headers {
-        set_header(&mut headers, name, value.clone());
-    }
-    crate::apply_session_affinity(provider, &mut headers);
     set_header(&mut headers, "content-type", "application/json".into());
     apply_auth_headers(vendor_id, provider, protocol, &mut headers)?;
+    append_official_session_headers(vendor_id, provider, &mut headers);
     let url = inference_url(vendor_id, provider, protocol, &encoded.path)?;
     prepare_gemini_imported_tool_history(protocol, model, &url, &mut encoded.body);
     let body = stravia_runtime_contract::json::to_vec(&encoded.body).map_err(|error| {
@@ -193,42 +173,12 @@ pub(crate) fn execute_inference(
     crate::decode_inference(host, protocol, response)
 }
 
-fn selected_custom_reasoning_field(
-    options: &BTreeMap<String, Value>,
-) -> Result<Option<&str>, &'static str> {
-    let field = match options.get("reasoning_field") {
-        None => return Ok(None),
-        Some(Value::String(value)) => match value.as_str() {
-            "protocol_default" => return Ok(None),
-            "reasoning_content" => "reasoning_content",
-            "reasoning" => "reasoning",
-            "custom" => options
-                .get("custom_reasoning_field")
-                .and_then(Value::as_str)
-                .filter(|field| !field.is_empty() && field.trim() == *field)
-                .ok_or("custom_reasoning_field")?,
-            _ => return Err("reasoning_field"),
-        },
-        Some(_) => return Err("reasoning_field"),
-    };
-    if field.starts_with("__")
-        || matches!(
-            field,
-            "role"
-                | "content"
-                | "name"
-                | "tool_calls"
-                | "tool_call_id"
-                | "function_call"
-                | "refusal"
-                | "audio"
-                | "annotations"
-                | "reasoning_details"
-        )
-    {
-        return Err("custom_reasoning_field");
+fn selected_custom_reasoning_field(options: &BTreeMap<String, Value>) -> Option<&str> {
+    match options.get("reasoning_field").and_then(Value::as_str) {
+        Some("reasoning_content") => Some("reasoning_content"),
+        Some("reasoning") => Some("reasoning"),
+        _ => None,
     }
-    Ok(Some(field))
 }
 
 fn prepare_custom_reasoning_history(
@@ -691,6 +641,25 @@ fn set_header(headers: &mut Vec<(String, String)>, name: &str, value: String) {
     headers.push((name.to_owned(), value));
 }
 
+fn append_official_session_headers(
+    vendor_id: &str,
+    provider: &ProviderSnapshot,
+    headers: &mut Vec<(String, String)>,
+) {
+    // OpenRouter 明确支持 sticky/grouping；不能把私有头普发给其它兼容 API。
+    // https://openrouter.ai/docs/guides/best-practices/prompt-caching
+    if vendor_id == "openrouter"
+        && let Some(affinity) = provider
+            .operation_metadata
+            .get("session_affinity")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty() && value.len() <= 256)
+    {
+        set_header(headers, "x-session-id", affinity.to_owned());
+    }
+}
+
 fn apply_auth_headers(
     vendor_id: &str,
     provider: &ProviderSnapshot,
@@ -1039,64 +1008,42 @@ fn prepare_ollama_request(
     let body = serde_json::to_vec(&json!({"name": model})).map_err(|error| {
         common::plugin_error(ErrorKind::Trapped, format!("encode Ollama probe: {error}"))
     })?;
-    let response = match host.http_start(HttpRequest {
+    let response = host.http_start(HttpRequest {
         method: "POST".to_owned(),
         url: base.to_string(),
         headers,
         body,
-    }) {
-        Ok(response) => response,
-        Err(error)
-            if !matches!(
-                error.kind,
-                ErrorKind::Cancelled | ErrorKind::DeadlineExceeded
-            ) =>
-        {
-            return Ok(());
-        }
-        Err(error) => return Err(error),
-    };
-    let status = match response.status() {
-        Ok(status) => status,
-        Err(error)
-            if !matches!(
-                error.kind,
-                ErrorKind::Cancelled | ErrorKind::DeadlineExceeded
-            ) =>
-        {
-            return Ok(());
-        }
-        Err(error) => return Err(error),
-    };
+    })?;
+    let status = response.status()?;
     if !(200..300).contains(&status) {
-        return Ok(());
+        return Err(common::plugin_error(
+            ErrorKind::upstream_unknown(),
+            format!("Ollama capability probe returned HTTP {status}"),
+        ));
     }
-    let body = match read_http_body(&response, MAX_JSON_BODY) {
-        Ok(body) => body,
-        Err(error)
-            if !matches!(
-                error.kind,
-                ErrorKind::Cancelled | ErrorKind::DeadlineExceeded
-            ) =>
-        {
-            return Ok(());
-        }
-        Err(error) => return Err(error),
-    };
-    let supports_tools = serde_json::from_slice::<Value>(&body)
-        .ok()
-        .and_then(|value| value.get("capabilities").and_then(Value::as_array).cloned())
-        .is_some_and(|capabilities| {
-            capabilities
-                .iter()
-                .filter_map(Value::as_str)
-                .any(|capability| capability == "tools")
-        });
+    let body = read_http_body(&response, MAX_JSON_BODY)?;
+    let value = serde_json::from_slice::<Value>(&body).map_err(|error| {
+        common::plugin_error(
+            ErrorKind::upstream_unknown(),
+            format!("invalid Ollama capability response: {error}"),
+        )
+    })?;
+    let capabilities = value
+        .get("capabilities")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            common::plugin_error(
+                ErrorKind::upstream_unknown(),
+                "Ollama capability response is missing capabilities",
+            )
+        })?;
+    let supports_tools = capabilities
+        .iter()
+        .filter_map(Value::as_str)
+        .any(|capability| capability == "tools");
     if !supports_tools {
         request.tools = None;
         request.tool_choice = None;
-        request.meta.vendor.ingress.remove("tools");
-        request.meta.vendor.ingress.remove("tool_choice");
     }
     Ok(())
 }
@@ -1139,6 +1086,22 @@ fn check_channel(
 mod tests {
     use super::*;
 
+    #[test]
+    fn legacy_custom_reasoning_names_do_not_authorize_request_fields() {
+        for field in ["custom", "future", "content"] {
+            let options = BTreeMap::from([
+                ("reasoning_field".into(), json!(field)),
+                (
+                    "custom_reasoning_field".into(),
+                    json!("arbitrary_request_field"),
+                ),
+            ]);
+            assert_eq!(selected_custom_reasoning_field(&options), None);
+        }
+        let options = BTreeMap::from([("reasoning_field".into(), json!("reasoning"))]);
+        assert_eq!(selected_custom_reasoning_field(&options), Some("reasoning"));
+    }
+
     fn provider(protocol: &str, api_key: &str) -> ProviderSnapshot {
         ProviderSnapshot {
             provider_id: "custom".into(),
@@ -1152,6 +1115,31 @@ mod tests {
             client_headers: Vec::new(),
             operation_metadata: BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn official_session_header_is_scoped_to_openrouter_and_requires_host_identity() {
+        let mut snapshot = provider(OPENAI_CHAT_PROTOCOL, "key");
+        snapshot.client_headers = vec![("x-session-id".into(), "untrusted-client-session".into())];
+        snapshot
+            .operation_metadata
+            .insert("session_affinity".into(), json!("host-scoped-session"));
+        for vendor in ["openai", "custom", "anthropic", "cohere", "openrouter"] {
+            let mut headers = Vec::new();
+            append_official_session_headers(vendor, &snapshot, &mut headers);
+            if vendor == "openrouter" {
+                assert_eq!(
+                    headers,
+                    vec![("x-session-id".into(), "host-scoped-session".into())]
+                );
+            } else {
+                assert!(headers.is_empty(), "{vendor}");
+            }
+        }
+        snapshot.operation_metadata.clear();
+        let mut headers = Vec::new();
+        append_official_session_headers("openrouter", &snapshot, &mut headers);
+        assert!(headers.is_empty());
     }
 
     #[test]

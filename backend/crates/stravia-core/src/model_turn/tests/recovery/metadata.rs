@@ -178,11 +178,6 @@ async fn continuation_recovery_discards_failed_operation_metadata() {
     request.stream.enabled = true;
     request.meta.source_protocol =
         Some(stravia_runtime_contract::protocol::ids::OPEN_RESPONSES_2026_04_24);
-    request.ext = Some(
-        stravia_runtime_contract::protocol::ir::ProtocolExt::OpenResponses(
-            stravia_runtime_contract::protocol::ir::OpenResponsesExt::default(),
-        ),
-    );
 
     let turn = executor
         .execute(TurnInput::new(Principal::new(key.id), request))
@@ -238,14 +233,18 @@ async fn continuation_recovery_discards_failed_operation_metadata() {
     assert_eq!(captured.len(), 2);
     let first: AiRequest = serde_json::from_value(captured[0].clone()).unwrap();
     let replay: AiRequest = serde_json::from_value(captured[1].clone()).unwrap();
-    assert!(matches!(
-        first.ext,
-        Some(stravia_runtime_contract::protocol::ir::ProtocolExt::OpenResponses(ext))
-            if ext.previous_response_id.as_deref() == Some("resp-zdr")
-    ));
-    assert!(matches!(
-        replay.ext,
-        Some(stravia_runtime_contract::protocol::ir::ProtocolExt::OpenResponses(ext))
-            if ext.previous_response_id.is_none()
-    ));
+    assert_eq!(
+        first
+            .parameters
+            .continuation
+            .as_ref()
+            .and_then(|continuation| continuation.previous_response_id()),
+        Some("resp-zdr")
+    );
+    assert!(
+        replay
+            .parameters
+            .continuation
+            .is_none()
+    );
 }

@@ -3,7 +3,6 @@ use http::header::HeaderMap;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-use stravia_runtime_contract::protocol::ids::OPEN_RESPONSES_2026_04_24;
 
 use stravia_runtime_contract::protocol::ir::AiRequest;
 use stravia_runtime_contract::protocol::ir::ToolCall;
@@ -18,7 +17,8 @@ use stravia_runtime_contract::protocol::ir::request::ToolSpec;
 pub struct OpenAIEncoder;
 
 impl OpenAIEncoder {
-    pub(crate) fn encode_request(&self, req: AiRequest) -> Result<(Value, HeaderMap)> {
+    pub(crate) fn encode_request(&self, mut req: AiRequest) -> Result<(Value, HeaderMap)> {
+        req.normalize_parameters();
         let tools = req.tools.as_deref().unwrap_or(&[]);
         let tools_opt: Option<&[ToolSpec]> = if tools.is_empty() { None } else { Some(tools) };
 
@@ -30,9 +30,6 @@ impl OpenAIEncoder {
                 messages.push(message);
             }
         }
-
-        let mut ingress = req.meta.vendor.ingress;
-        let responses_ingress = req.meta.source_protocol == Some(OPEN_RESPONSES_2026_04_24);
 
         let mut body = object([
             ("model", Value::String(req.model)),
@@ -57,11 +54,7 @@ impl OpenAIEncoder {
                 Value::Array(stop.into_iter().map(Value::String).collect()),
             );
         }
-        if let Some(parallel) = req
-            .disable_parallel_tool_calls
-            .map(|disabled| !disabled)
-            .or(req.parallel_tool_calls)
-        {
+        if let Some(parallel) = req.parallel_tool_calls {
             obj.insert("parallel_tool_calls".into(), Value::Bool(parallel));
         }
         if let Some(format) = req.response_format {
@@ -74,6 +67,7 @@ impl OpenAIEncoder {
                 }
                 ResponseFormat::JsonSchema {
                     name,
+                    description,
                     schema,
                     strict,
                 } => {
@@ -82,15 +76,8 @@ impl OpenAIEncoder {
                     if let Some(strict) = strict {
                         json_schema["strict"] = Value::Bool(strict);
                     }
-                    // The description lives in the protected fidelity copy, not
-                    // the canonical format. Keep canonical schema controls authoritative.
-                    if let Some(description) = ingress
-                        .get_mut("response_format")
-                        .and_then(|format| format.get_mut("json_schema"))
-                        .and_then(Value::as_object_mut)
-                        .and_then(|schema| schema.remove("description"))
-                    {
-                        json_schema["description"] = description;
+                    if let Some(description) = description {
+                        json_schema["description"] = Value::String(description);
                     }
                     object([
                         ("type", Value::String("json_schema".into())),
@@ -104,15 +91,25 @@ impl OpenAIEncoder {
             Some(stravia_runtime_contract::thinking::TargetThinkingControl::Effort { value }) => {
                 obj.insert("reasoning_effort".into(), Value::String(value));
             }
-            None => {}
-            Some(control) => {
-                anyhow::bail!(
-                    "OpenAI Chat Completions cannot represent Target Thinking Control {control:?}"
-                );
+            Some(stravia_runtime_contract::thinking::TargetThinkingControl::Disabled) => {
+                obj.insert("reasoning_effort".into(), Value::String("none".into()));
             }
+            None => {
+                if req.reasoning.mode.as_deref() == Some("disabled") {
+                    obj.insert("reasoning_effort".into(), "none".into());
+                } else if let Some(level) = req.reasoning.level {
+                    let effort = match level {
+                        stravia_runtime_contract::thinking::ThinkingLevel::Off => "none",
+                        stravia_runtime_contract::thinking::ThinkingLevel::Max => "xhigh",
+                        other => other.as_str(),
+                    };
+                    obj.insert("reasoning_effort".into(), effort.into());
+                }
+            }
+            _ => {}
         }
 
-        if let Some(tools) = req.tools.filter(|tools| !tools.is_empty()) {
+        if let Some(tools) = req.tools {
             let tools_val: Vec<Value> = tools
                 .into_iter()
                 .map(|t| {
@@ -133,59 +130,82 @@ impl OpenAIEncoder {
                 .collect();
             obj.insert("tools".into(), Value::Array(tools_val));
         }
-        if let Some(tc) = req.tool_choice {
-            obj.insert("tool_choice".into(), tool_choice_to_value(tc));
+        if let Some(tc) = req.tool_choice.and_then(tool_choice_to_value) {
+            obj.insert("tool_choice".into(), tc);
         }
 
-        // Always include_usage when streaming.
+        // Stream controls have a single canonical owner.
         if req.stream.enabled {
-            let stream_opts = ingress
-                .remove("stream_options")
-                .unwrap_or_else(|| serde_json::json!({"include_usage": true}));
-            obj.insert("stream_options".into(), stream_opts);
+            let options = serde_json::json!({"include_usage": req.stream.include_usage});
+            obj.insert("stream_options".into(), options);
         }
-
-        for key in &[
-            "parallel_tool_calls",
-            "prediction",
-            "modalities",
-            "audio",
-            "response_format",
-            "seed",
-            "stop",
-            "logit_bias",
-            "service_tier",
-            "frequency_penalty",
-            "presence_penalty",
-            "n",
-            "user",
+        if let Some(value) = req.generation.seed {
+            obj.insert("seed".into(), value.into());
+        }
+        if let Some(value) = req.generation.frequency_penalty {
+            obj.insert("frequency_penalty".into(), value.into());
+        }
+        if let Some(value) = req.generation.presence_penalty {
+            obj.insert("presence_penalty".into(), value.into());
+        }
+        let parameters = req.parameters;
+        if let Some(service) = parameters.service_tier {
+            obj.insert("service_tier".into(), serde_json::to_value(service)?);
+        }
+        if let Some(logprobs) = parameters.logprobs {
+            obj.insert("logprobs".into(), Value::Bool(true));
+            obj.insert("top_logprobs".into(), logprobs.into());
+        }
+        if let Some(audio) = parameters.audio {
+            let mut value = serde_json::Map::new();
+            if let Some(voice) = audio.voice {
+                value.insert("voice".into(), voice.into());
+            }
+            if let Some(format) = audio.format {
+                value.insert("format".into(), format.into());
+            }
+            obj.insert("audio".into(), Value::Object(value));
+        }
+        for (name, value) in [
+            ("metadata", parameters.metadata.map(|value| serde_json::json!(value))),
+            (
+                "logit_bias",
+                parameters.logit_bias.map(|value| serde_json::json!(value)),
+            ),
+            (
+                "modalities",
+                parameters.modalities.map(|value| serde_json::json!(value)),
+            ),
+            ("n", parameters.candidate_count.map(Value::from)),
+            ("store", parameters.store.map(Value::from)),
+            (
+                "safety_identifier",
+                parameters.end_user_id.map(Value::String),
+            ),
+            ("verbosity", parameters.verbosity.map(|value| serde_json::json!(value))),
+            ("prompt_cache_key", parameters.cache.key.map(Value::String)),
+            (
+                "prompt_cache_retention",
+                parameters.cache.retention.map(|value| Value::String(match value {
+                    stravia_runtime_contract::protocol::ir::CacheRetention::Default => "in_memory",
+                    stravia_runtime_contract::protocol::ir::CacheRetention::Extended => "24h",
+                }.into())),
+            ),
         ] {
-            if let Some(v) = ingress.remove(*key) {
-                obj.entry(key.to_string()).or_insert(v);
+            if let Some(value) = value {
+                obj.insert(name.into(), value);
             }
         }
-
-        // Passthrough any remaining unknown extra fields.
-        // Skip cross-protocol internal keys (e.g. __anthropic_*, __google_*)
-        // that are only meaningful to their respective codecs, and gateway-owned
-        // __stravia_* state that must never reach an upstream.
-        for (k, v) in ingress {
-            if k == "reasoning"
-                || k == "reasoning_effort"
-                || k.starts_with("__stravia_")
-                || k.starts_with("__anthropic_")
-                || k.starts_with("__google_")
-                || (responses_ingress
-                    && matches!(
-                        k.as_str(),
-                        "store" | "include" | "prompt_cache_key" | "client_metadata"
-                    ))
-            {
-                continue;
-            }
-            obj.entry(k).or_insert(v);
+        if let Some(options) = parameters.native_tools.iter().find_map(
+            stravia_runtime_contract::protocol::ir::native_tool_to_chat_web_search_options
+        ) {
+            obj.insert("web_search_options".into(), options);
         }
 
+        crate::codec::control_projection::project_request(
+            &mut body,
+            crate::codec::control_projection::Family::Chat,
+        );
         Ok((body, HeaderMap::new()))
     }
 
@@ -203,8 +223,8 @@ fn object<const N: usize>(fields: [(&str, Value); N]) -> Value {
     )
 }
 
-fn tool_choice_to_value(tc: ToolChoice) -> Value {
-    match tc {
+fn tool_choice_to_value(tc: ToolChoice) -> Option<Value> {
+    Some(match tc {
         ToolChoice::Auto => Value::String("auto".into()),
         ToolChoice::None => Value::String("none".into()),
         ToolChoice::Required => Value::String("required".into()),
@@ -212,8 +232,8 @@ fn tool_choice_to_value(tc: ToolChoice) -> Value {
             ("type", Value::String("function".into())),
             ("function", object([("name", Value::String(name))])),
         ]),
-        ToolChoice::Raw(v) => v,
-    }
+        ToolChoice::Allowed { .. } | ToolChoice::Native(_) => return None,
+    })
 }
 
 fn normalize_messages_for_openai(

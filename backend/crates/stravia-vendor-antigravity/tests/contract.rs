@@ -778,7 +778,8 @@ async fn oauth_and_inference_enforce_native_wire_at_real_http_boundary() {
         });
         let mut selected_request = request.clone();
         if !summary {
-            selected_request.reasoning.display = Some("omitted".into());
+            selected_request.reasoning.summary =
+                Some(stravia_runtime_contract::protocol::ir::ReasoningSummary::None);
         }
         selected_request.reasoning.target_control =
             effort.map(
@@ -863,12 +864,15 @@ async fn oauth_and_inference_enforce_native_wire_at_real_http_boundary() {
                 ..Default::default()
             });
         }
-        selected_request.meta.vendor.ingress.insert(
-            "__google_generation_config".into(),
-            json!({"thinkingConfig":{"thinkingLevel":level}}),
+        selected_request.reasoning.mode = None;
+        selected_request.reasoning.budget_tokens = None;
+        selected_request.reasoning.level = Some(
+            stravia_runtime_contract::thinking::ThinkingLevel::from_wire(level.as_str().unwrap())
+                .unwrap(),
         );
         selected_request.reasoning.target_control = control;
-        selected_request.reasoning.display = (!summary).then(|| "omitted".into());
+        selected_request.reasoning.summary =
+            (!summary).then_some(stravia_runtime_contract::protocol::ir::ReasoningSummary::None);
         let OperationOutput::Infer(_) = run(
             &runtime,
             &plugin,
@@ -901,34 +905,6 @@ async fn oauth_and_inference_enforce_native_wire_at_real_http_boundary() {
             envelope.pointer("/request/generationConfig/thinkingConfig/includeThoughts"),
             Some(&json!(summary))
         );
-    }
-    for level in [json!("TURBO"), json!(7)] {
-        let mut invalid_request = request.clone();
-        invalid_request.reasoning.target_control = None;
-        invalid_request.meta.vendor.ingress.insert(
-            "__google_generation_config".into(),
-            json!({"thinkingConfig":{"thinkingLevel":level}}),
-        );
-        let before = fixture.received.lock().len();
-        let error = run(
-            &runtime,
-            &plugin,
-            &services,
-            OperationInput::Infer {
-                provider: provider.clone(),
-                request: invalid_request,
-            },
-        )
-        .await
-        .unwrap_err();
-        assert!(matches!(
-            &error,
-            stravia_vendor_runtime::RuntimeError::Plugin {
-                kind: ErrorKind::Invalid,
-                ..
-            }
-        ));
-        assert_eq!(fixture.received.lock().len(), before);
     }
     for metadata in [
         json!({}),

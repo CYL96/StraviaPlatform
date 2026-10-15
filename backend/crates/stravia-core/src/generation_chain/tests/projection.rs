@@ -316,10 +316,7 @@ async fn generation_parent_prefers_its_target_without_native_continuation() {
     root.persist().await.expect("persist root");
 
     let mut continuation = responses_request(vec![user_message("follow-up")]);
-    let Some(ProtocolExt::OpenResponses(extension)) = continuation.ext.as_mut() else {
-        panic!("Open Responses extension");
-    };
-    extension.previous_response_id = Some(root.id().to_owned());
+    crate::router::stamp_previous_response_id(&mut continuation, root.id());
 
     assert_eq!(
         chain
@@ -361,10 +358,7 @@ async fn hook_completion_does_not_reuse_an_earlier_target_or_upstream_response()
     write.persist().await.expect("persist Hook completion");
 
     let mut request = responses_request(vec![user_message("follow-up")]);
-    let Some(ProtocolExt::OpenResponses(extension)) = request.ext.as_mut() else {
-        panic!("Open Responses extension");
-    };
-    extension.previous_response_id = Some(write.id().to_owned());
+    crate::router::stamp_previous_response_id(&mut request, write.id());
     let resumed = chain
         .begin(owner.clone(), request)
         .await
@@ -548,14 +542,8 @@ async fn native_responses_replay_uses_whitelisted_provider_context_for_continuat
     let question = user_message("question");
     let mut initial = responses_request(vec![question.clone()]);
     initial.meta.source_protocol = Some(OPEN_RESPONSES_2026_04_24);
-    initial.meta.vendor.ingress.insert(
-        GENERATION_SESSION_ID_META.into(),
-        serde_json::Value::String("native-session".into()),
-    );
-    let Some(ProtocolExt::OpenResponses(extension)) = initial.ext.as_mut() else {
-        unreachable!();
-    };
-    extension.store = Some(false);
+    initial.parameters.session.id = Some("native-session".into());
+    initial.parameters.store = Some(false);
     let mut root = chain
         .begin(owner.clone(), initial)
         .await
@@ -600,10 +588,7 @@ async fn native_responses_replay_uses_whitelisted_provider_context_for_continuat
 
     let mut distractor_request = responses_request(vec![user_message("title question")]);
     distractor_request.meta.source_protocol = Some(OPEN_RESPONSES_2026_04_24);
-    distractor_request.meta.vendor.ingress.insert(
-        GENERATION_SESSION_ID_META.into(),
-        serde_json::Value::String("native-session".into()),
-    );
+    distractor_request.parameters.session.id = Some("native-session".into());
     let mut distractor = chain
         .begin(owner.clone(), distractor_request)
         .await
@@ -648,14 +633,8 @@ async fn native_responses_replay_uses_whitelisted_provider_context_for_continuat
     let request_for = |items| {
         let mut request = responses_request(items);
         request.meta.source_protocol = Some(OPEN_RESPONSES_2026_04_24);
-        request.meta.vendor.ingress.insert(
-            GENERATION_SESSION_ID_META.into(),
-            serde_json::Value::String("native-session".into()),
-        );
-        let Some(ProtocolExt::OpenResponses(extension)) = request.ext.as_mut() else {
-            unreachable!();
-        };
-        extension.store = Some(false);
+        request.parameters.session.id = Some("native-session".into());
+        request.parameters.store = Some(false);
         request
     };
 
@@ -744,10 +723,7 @@ async fn encrypted_reasoning_replay_omits_gateway_projected_item_id() {
 
     let mut continuation = responses_request(vec![user_message("follow-up")]);
     continuation.meta.source_protocol = Some(OPEN_RESPONSES_2026_04_24);
-    let Some(ProtocolExt::OpenResponses(extension)) = continuation.ext.as_mut() else {
-        unreachable!();
-    };
-    extension.previous_response_id = Some(root.id().to_owned());
+    crate::router::stamp_previous_response_id(&mut continuation, root.id());
     let resumed = chain
         .begin(owner.clone(), continuation)
         .await
@@ -972,9 +948,11 @@ async fn gemini_wire_thought_and_marker_replay_preserves_parent_prefix() {
             )
         );
         if !marker_carrier {
+            let mut expected = restored_item.clone();
+            source.thinking_source().unwrap().stamp_item(&mut expected);
             assert_eq!(
                 crate::history_marker::ThinkingSource::from_item(restored_item),
-                source.thinking_source(),
+                crate::history_marker::ThinkingSource::from_item(&expected),
                 "native replay must retain source rather than becoming Unknown"
             );
         }
@@ -1214,10 +1192,7 @@ async fn automatic_parent_matches_anthropic_output_replayed_as_responses_items()
         }))
         .expect("decode real Responses client replay");
     resumed_request.meta.source_protocol = Some(OPEN_RESPONSES_2026_04_24);
-    resumed_request.meta.vendor.ingress.insert(
-        GENERATION_SESSION_ID_META.into(),
-        serde_json::Value::String("responses-session".into()),
-    );
+    resumed_request.parameters.session.id = Some("responses-session".into());
     let resumed = chain
         .begin(owner, resumed_request)
         .await
@@ -1235,9 +1210,11 @@ async fn automatic_parent_matches_anthropic_output_replayed_as_responses_items()
         original_thought.thinking_ref(),
         Some(("reasoning", Some("opaque")))
     );
+    let mut expected = original_thought.clone();
+    source.thinking_source().unwrap().stamp_item(&mut expected);
     assert_eq!(
         crate::history_marker::ThinkingSource::from_item(original_thought),
-        source.thinking_source()
+        crate::history_marker::ThinkingSource::from_item(&expected)
     );
 }
 

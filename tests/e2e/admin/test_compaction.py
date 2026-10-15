@@ -421,7 +421,8 @@ def test_unknown_compaction_capability_is_forwarded(admin_env, compaction_provid
     if mode == "standalone":
         outbound = compaction_provider[2][0]
         assert outbound["path"].endswith("/responses/compact")
-        assert outbound["body"]["reasoning"]["effort"] == "low"
+        # 独立 compact 不支持推理控制，兼容入口接受不代表出口可以透传。
+        assert "reasoning" not in outbound["body"]
         assert "stream" not in outbound["body"]
 
 

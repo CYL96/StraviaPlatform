@@ -5,6 +5,7 @@ mod selector;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::codec::devin_connect::request::{SessionShape, encode_prepared_request};
+use crate::codec::devin_connect::stream::is_model_output;
 use crate::codec::devin_connect::{
     ASSIGN_MODEL_PATH, DevinClientPlatform, GET_CHAT_MESSAGE_PATH, ModelAssignment,
     decode_assign_model_response, decode_cli_model_configs,
@@ -53,6 +54,27 @@ struct PrivateState {
     assignments: BTreeMap<String, ModelAssignmentState>,
     #[serde(default)]
     next_steps: BTreeMap<String, u64>,
+}
+
+impl PrivateState {
+    /// First native step is absent; index 1 belongs to CLI title generation.
+    fn advance_session(&mut self, mut shape: SessionShape) -> SessionShape {
+        if !self.next_steps.contains_key(&shape.trajectory_id) && self.next_steps.len() >= 256 {
+            self.next_steps.clear();
+        }
+        shape.step_index = match self.next_steps.get_mut(&shape.trajectory_id) {
+            None => {
+                self.next_steps.insert(shape.trajectory_id.clone(), 2);
+                0
+            }
+            Some(next) => {
+                let value = *next;
+                *next = next.saturating_add(1);
+                value
+            }
+        };
+        shape
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -245,27 +267,13 @@ fn infer(
     request.stream.enabled = true;
 
     let mut state = read_state(host)?;
-    let base_shape = session_shape(&request, token);
-    let step_index = match state.next_steps.get_mut(&base_shape.trajectory_id) {
-        None => {
-            state.next_steps.insert(base_shape.trajectory_id.clone(), 2);
-            0
-        }
-        Some(next) => {
-            let value = *next;
-            *next = next.saturating_add(1);
-            value
-        }
-    };
-    if state.next_steps.len() > 256 {
-        state.next_steps.clear();
-        state.next_steps.insert(base_shape.trajectory_id.clone(), 2);
-    }
-    let shape = SessionShape {
-        trajectory_id: base_shape.trajectory_id,
-        cascade_id: base_shape.cascade_id,
-        step_index,
-    };
+    let shape = state.advance_session(session_shape(
+        token,
+        provider
+            .operation_metadata
+            .get("transport_affinity")
+            .and_then(Value::as_str),
+    ));
 
     let router_known = table
         .as_ref()
@@ -319,17 +327,26 @@ fn infer(
     })?;
     let status = response.status()?;
     if !(200..300).contains(&status) {
-        return Err(http_error(&response, status, "Devin Connect"));
+        return Err(http_error(
+            &response, status, "Devin Connect", protected_reasoning_untrusted(&provider),
+        ));
     }
-    decode_inference(host, response)
+    decode_inference(host, response, protected_reasoning_untrusted(&provider))
+}
+
+fn protected_reasoning_untrusted(provider: &ProviderSnapshot) -> bool {
+    provider.operation_metadata.get("protected_reasoning_untrusted") == Some(&Value::Bool(true))
 }
 
 fn decode_inference(
     host: &GuestHost,
     response: stravia_vendor_sdk::HttpResponse,
+    protected_reasoning_untrusted: bool,
 ) -> Result<OperationOutput, PluginError> {
-    let mut parser = crate::codec::devin_connect::DevinConnectStreamParser::new();
+    let mut parser = crate::codec::devin_connect::DevinConnectStreamParser::new()
+        .with_protected_reasoning_untrusted(protected_reasoning_untrusted);
     let mut accumulator = StreamResponseAccumulator::default();
+    let mut produced_output = false;
     while let Some(chunk) = response.read_body()? {
         let deltas = parser.parse_chunk(&chunk).map_err(|err| {
             common::model_error(
@@ -337,7 +354,8 @@ fn decode_inference(
                 format!("invalid Devin Connect stream: {err}"),
             )
         })?;
-        emit_deltas(host, &mut accumulator, &deltas)?;
+        emit_deltas(host, &mut accumulator, &deltas, &mut produced_output,
+            parser.protected_reasoning_rejected())?;
     }
     let deltas = parser.finish().map_err(|err| {
         common::model_error(
@@ -345,7 +363,8 @@ fn decode_inference(
             format!("incomplete Devin Connect stream: {err}"),
         )
     })?;
-    emit_deltas(host, &mut accumulator, &deltas)?;
+    emit_deltas(host, &mut accumulator, &deltas, &mut produced_output,
+        parser.protected_reasoning_rejected())?;
     let complete = accumulator.into_ai_response();
     host.emit_completed(&complete)?;
     Ok(OperationOutput::Infer(Box::new(complete)))
@@ -355,7 +374,20 @@ fn emit_deltas(
     host: &GuestHost,
     accumulator: &mut StreamResponseAccumulator,
     deltas: &[AiStreamDelta],
+    produced_output: &mut bool,
+    protected_reasoning_rejected: bool,
 ) -> Result<(), PluginError> {
+    // 首个终止错误不能先提交成流事件，否则宿主已提交输出，无法恢复请求。
+    // 同批的模型标识与用量仍先交给宿主暂存，失败尝试保留已报告用量。
+    if let Some(error) =
+        uncommitted_stream_error(deltas, *produced_output, protected_reasoning_rejected)
+    {
+        for delta in deltas.iter().filter(|delta| !is_terminal(delta)) {
+            host.emit_delta(delta)?;
+            accumulator.apply(delta);
+        }
+        return Err(error);
+    }
     let terminal = deltas.iter().find_map(|delta| match delta {
         AiStreamDelta::StreamError { error } => Some((error.kind.clone(), error.status_code)),
         AiStreamDelta::UnexpectedEof => Some((AiErrorKind::UnexpectedEof, None)),
@@ -363,6 +395,7 @@ fn emit_deltas(
     });
     for delta in deltas {
         host.emit_delta(delta)?;
+        *produced_output |= is_model_output(delta);
         accumulator.apply(delta);
     }
     if let Some((kind, status)) = terminal {
@@ -379,6 +412,39 @@ fn emit_deltas(
         return Err(failure);
     }
     Ok(())
+}
+
+fn is_terminal(delta: &AiStreamDelta) -> bool {
+    matches!(
+        delta,
+        AiStreamDelta::StreamError { .. } | AiStreamDelta::UnexpectedEof
+    )
+}
+
+fn uncommitted_stream_error(
+    deltas: &[AiStreamDelta],
+    produced_output: bool,
+    protected_reasoning_rejected: bool,
+) -> Option<PluginError> {
+    if produced_output || deltas.iter().any(is_model_output) {
+        return None;
+    }
+    deltas.iter().find_map(|delta| {
+        let (kind, status) = match delta {
+            AiStreamDelta::StreamError { error } => (error.kind.clone(), error.status_code),
+            AiStreamDelta::UnexpectedEof => (AiErrorKind::UnexpectedEof, None),
+            _ => return None,
+        };
+        Some(PluginError {
+            kind: if protected_reasoning_rejected {
+                ErrorKind::ProtectedReasoningRejected
+            } else {
+                ErrorKind::upstream(Some(kind), None)
+            },
+            message: "upstream inference stream ended with an error".into(),
+            upstream_status: status,
+        })
+    })
 }
 
 fn resolve_assignment(
@@ -412,7 +478,7 @@ fn resolve_assignment(
     };
     if !(200..300).contains(&status) {
         if required {
-            return Err(http_error(&response, status, "Devin AssignModel"));
+            return Err(http_error(&response, status, "Devin AssignModel", false));
         }
         return Ok(None);
     }
@@ -456,7 +522,7 @@ fn discover(
     })?;
     let status = response.status()?;
     if !(200..300).contains(&status) {
-        return Err(http_error(&response, status, "Devin model discovery"));
+        return Err(http_error(&response, status, "Devin model discovery", false));
     }
     let bytes = read_http_body(&response, MAX_UNARY_BODY)?;
     let entries = decode_cli_model_configs(&bytes).map_err(|err| {
@@ -581,6 +647,7 @@ fn http_error(
     response: &stravia_vendor_sdk::HttpResponse,
     status: u16,
     label: &str,
+    protected_reasoning_untrusted: bool,
 ) -> PluginError {
     let headers = match response.headers() {
         Ok(headers) => headers,
@@ -591,8 +658,22 @@ fn http_error(
         Err(error) => return error,
     };
     let mut error = common::upstream_error(status, &headers, &bytes);
+    if let Some(kind) = connect_http_error_kind(&bytes, protected_reasoning_untrusted) {
+        error.kind = kind;
+    }
     error.message = format!("{label} returned HTTP {status}: {}", error.message);
     error
+}
+
+fn connect_http_error_kind(bytes: &[u8], untrusted: bool) -> Option<ErrorKind> {
+    let body: Value = serde_json::from_slice(bytes).ok()?;
+    let code = body.get("code").and_then(Value::as_str)?;
+    // invalid_argument 本身不构成推理拒绝证据，必须结合宿主的来源声明。
+    (code == "invalid_argument").then(|| if untrusted {
+        ErrorKind::ProtectedReasoningRejected
+    } else {
+        ErrorKind::upstream(Some(AiErrorKind::InvalidRequest), None)
+    })
 }
 
 fn error(kind: ErrorKind, message: impl Into<String>) -> PluginError {
@@ -602,3 +683,157 @@ fn error(kind: ErrorKind, message: impl Into<String>) -> PluginError {
         upstream_status: None,
     }
 }
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+
+    #[test]
+    fn connect_rejection_requires_json_true_declaration() {
+        let mut provider = ProviderSnapshot {
+            provider_id: "devin".into(),
+            channel: "devin".into(),
+            base_url: DEFAULT_BASE_URL.into(),
+            protocol: "devin-connect".into(),
+            options: BTreeMap::new(),
+            credentials: BTreeMap::new(),
+            model: None,
+            model_metadata: None,
+            client_headers: Vec::new(),
+            operation_metadata: BTreeMap::new(),
+        };
+        let body = br#"{"code":"invalid_argument","message":"invalid request"}"#;
+        assert!(!protected_reasoning_untrusted(&provider));
+        for value in [Value::Null, Value::Bool(false), Value::String("true".into()), Value::from(1), Value::Bool(true)] {
+            let expected_rejection = value == Value::Bool(true);
+            provider.operation_metadata.insert("protected_reasoning_untrusted".into(), value);
+            let kind = connect_http_error_kind(body, protected_reasoning_untrusted(&provider)).unwrap();
+            assert_eq!(matches!(kind, ErrorKind::ProtectedReasoningRejected), expected_rejection);
+            if !expected_rejection {
+                assert_eq!(kind.model_error_kind(), Some(AiErrorKind::InvalidRequest));
+            }
+        }
+        assert_eq!(connect_http_error_kind(body, false).unwrap().model_error_kind(), Some(AiErrorKind::InvalidRequest));
+        assert!(connect_http_error_kind(br#"{"code":"permission_denied"}"#, true).is_none());
+    }
+
+    #[test]
+    fn errors_before_stream_output_return_without_committing_terminal_events() {
+        use stravia_runtime_contract::protocol::ir::AiError;
+        for rejected in [false, true] {
+            let deltas = [AiStreamDelta::StreamError { error: AiError::new(AiErrorKind::InvalidRequest, "rejected") }];
+            let failure = uncommitted_stream_error(&deltas, false, rejected).unwrap();
+            assert_eq!(matches!(failure.kind, ErrorKind::ProtectedReasoningRejected), rejected);
+            if !rejected {
+                assert_eq!(failure.kind.model_error_kind(), Some(AiErrorKind::InvalidRequest));
+            }
+            assert!(uncommitted_stream_error(&deltas, true, rejected).is_none());
+        }
+        assert!(uncommitted_stream_error(&[AiStreamDelta::UnexpectedEof], false, false).is_some());
+        assert!(uncommitted_stream_error(&[], false, false).is_none());
+        let error = AiStreamDelta::StreamError {
+            error: AiError::new(AiErrorKind::InvalidRequest, "rejected"),
+        };
+        let metadata = AiStreamDelta::MessageStart {
+            id: String::new(),
+            model: "resolved".into(),
+        };
+        let failure = uncommitted_stream_error(&[metadata, error.clone()], false, true).unwrap();
+        assert!(matches!(
+            failure.kind,
+            ErrorKind::ProtectedReasoningRejected
+        ));
+        let partial = [AiStreamDelta::TextDelta("partial".into()), error];
+        assert!(uncommitted_stream_error(&partial, false, true).is_none());
+    }
+
+    #[test]
+    fn persisted_state_preserves_native_steps_across_restart_and_principal_boundaries() {
+        let affinity = Some("principal-a/target-a/session");
+        let mut state = PrivateState::default();
+        let first = state.advance_session(session_shape("credential", affinity));
+        assert_eq!(first.step_index, 0);
+        assert_eq!(wire_step(&first), None);
+        // These are the same serde bytes written/read by production private state.
+        let bytes = serde_json::to_vec(&state).unwrap();
+        let mut restored: PrivateState = serde_json::from_slice(&bytes).unwrap();
+        let second = restored.advance_session(session_shape("credential", affinity));
+        assert_eq!(second.step_index, 2);
+        assert_eq!(wire_step(&second), Some(2));
+        assert_eq!(second.cascade_id, first.cascade_id);
+        let bytes = serde_json::to_vec(&restored).unwrap();
+        let mut restored: PrivateState = serde_json::from_slice(&bytes).unwrap();
+        let third = restored.advance_session(session_shape("credential", affinity));
+        assert_eq!(third.step_index, 3);
+        assert_eq!(wire_step(&third), Some(3));
+        assert_eq!(third.trajectory_id, first.trajectory_id);
+        assert_eq!(
+            restored
+                .advance_session(session_shape(
+                    "credential",
+                    Some("principal-b/target-a/session")
+                ))
+                .step_index,
+            0
+        );
+        assert_eq!(
+            restored
+                .advance_session(session_shape("credential", None))
+                .step_index,
+            0
+        );
+        assert_eq!(
+            restored
+                .advance_session(session_shape("credential", None))
+                .step_index,
+            0
+        );
+    }
+
+    fn wire_step(shape: &SessionShape) -> Option<u64> {
+        use crate::codec::devin_connect::proto::parse_fields;
+        let request = stravia_runtime_contract::protocol::ir::AiRequest::new("swe-2", Vec::new());
+        let body = encode_prepared_request(
+            &request,
+            "test-credential",
+            shape,
+            None,
+            DevinClientPlatform::Linux,
+        )
+        .unwrap();
+        let fields = parse_fields(&body).unwrap();
+        let trajectory = fields.iter().find(|field| field.number == 15).unwrap();
+        parse_fields(trajectory.bytes)
+            .unwrap()
+            .iter()
+            .find(|field| field.number == 2)
+            .map(|field| field.scalar)
+    }
+
+    #[test]
+    fn bounded_steps_preserve_existing_session_until_a_new_identity_requires_eviction() {
+        let mut state = PrivateState::default();
+        for index in 0..256 {
+            let affinity = format!("scoped/{index}");
+            assert_eq!(
+                state
+                    .advance_session(session_shape("credential", Some(&affinity)))
+                    .step_index,
+                0
+            );
+        }
+        let resumed = state.advance_session(session_shape("credential", Some("scoped/0")));
+        assert_eq!(resumed.step_index, 2);
+        assert_eq!(state.next_steps.len(), 256);
+        let fresh = state.advance_session(session_shape("credential", Some("scoped/new")));
+        assert_eq!(fresh.step_index, 0);
+        assert_eq!(state.next_steps.len(), 1);
+        assert_eq!(
+            state
+                .advance_session(session_shape("credential", Some("scoped/new")))
+                .step_index,
+            2
+        );
+    }
+}
+

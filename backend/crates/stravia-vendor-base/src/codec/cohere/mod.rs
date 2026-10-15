@@ -17,8 +17,10 @@ use stravia_runtime_contract::protocol::ir::AiRequest;
 use stravia_runtime_contract::protocol::ir::AiResponse;
 use stravia_runtime_contract::protocol::ir::AiStreamDelta;
 use stravia_runtime_contract::protocol::ir::ContentBlock;
+use stravia_runtime_contract::protocol::ir::DocumentSource;
 use stravia_runtime_contract::protocol::ir::MediaSource;
 use stravia_runtime_contract::protocol::ir::MessageContent;
+use stravia_runtime_contract::protocol::ir::ParameterReset;
 use stravia_runtime_contract::protocol::ir::ResponseFormat;
 use stravia_runtime_contract::protocol::ir::Role;
 use stravia_runtime_contract::protocol::ir::ToolCall;
@@ -67,16 +69,97 @@ impl ProtocolAdapter for CohereChatV2 {
             .and_then(Value::as_u64)
             .and_then(|value| u32::try_from(value).ok());
         request.generation.top_p = body.get("p").and_then(Value::as_f64);
+        request.parameters.top_k = body
+            .get("k")
+            .and_then(Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok());
+        request.parameters.logprobs = body
+            .get("logprobs")
+            .and_then(Value::as_bool)
+            .filter(|enabled| *enabled)
+            .map(|_| 0);
+        if body.get("logprobs").is_some_and(|value| {
+            value.is_null() || value.as_bool() == Some(false)
+        }) {
+            request.parameters.reset(ParameterReset::Logprobs);
+        }
+        if body.get("thinking").is_some_and(Value::is_null) {
+            request.parameters.reset(ParameterReset::Reasoning);
+        }
+        if body.get("response_format").is_some_and(Value::is_null) {
+            request.parameters.reset(ParameterReset::ResponseFormat);
+        }
+        request.generation.frequency_penalty =
+            body.get("frequency_penalty").and_then(Value::as_f64);
+        request.generation.presence_penalty = body.get("presence_penalty").and_then(Value::as_f64);
+        request.generation.seed = body.get("seed").and_then(Value::as_i64);
+        let documents = decode_documents(&body);
+        if !documents.is_empty() {
+            request.items.push(AiItem {
+                role: Role::User,
+                content: MessageContent::Blocks(documents),
+                tool_calls: None,
+                tool_call_id: None,
+                meta: None,
+            });
+        }
+        if let Some(thinking) = body.get("thinking").filter(|value| !value.is_null()) {
+            let enabled = match thinking.get("type").and_then(Value::as_str) {
+                Some("enabled") => true,
+                Some("disabled") => false,
+                _ => bail!("unsupported Cohere thinking type"),
+            };
+            request.reasoning.mode = Some(if enabled { "enabled" } else { "disabled" }.into());
+            request.reasoning.target_control = Some(if enabled {
+                stravia_runtime_contract::thinking::TargetThinkingControl::Enabled
+            } else {
+                stravia_runtime_contract::thinking::TargetThinkingControl::Disabled
+            });
+            request.reasoning.budget_tokens = thinking
+                .get("token_budget")
+                .and_then(Value::as_u64)
+                .and_then(|value| u32::try_from(value).ok());
+        }
         request.generation.stop = body.get("stop_sequences").and_then(string_array);
-        request.tools = body.get("tools").map(decode_tools).transpose()?;
+        request.tools = body
+            .get("tools")
+            .filter(|value| !value.is_null())
+            .map(decode_tools)
+            .transpose()?;
+        if let Some(strict) = body.get("strict_tools").and_then(Value::as_bool)
+            && let Some(tools) = &mut request.tools
+        {
+            for tool in tools {
+                tool.strict = Some(strict);
+            }
+        }
         request.tool_choice = body
             .get("tool_choice")
+            .filter(|value| !value.is_null())
             .map(decode_tool_choice)
+            .transpose()?;
+        request.response_format = body
+            .get("response_format")
+            .filter(|value| !value.is_null())
+            .map(|format| match format.get("type").and_then(Value::as_str) {
+                Some("text") => Ok(ResponseFormat::Text),
+                Some("json_object") => match format.get("json_schema") {
+                    Some(schema) => Ok(ResponseFormat::JsonSchema {
+                        name: "response".into(),
+                        description: None,
+                        schema: schema.clone(),
+                        strict: None,
+                    }),
+                    None => Ok(ResponseFormat::JsonObject),
+                },
+                _ => bail!("unsupported Cohere response format"),
+            })
             .transpose()?;
         Ok(request)
     }
 
-    fn encode_request(&self, request: AiRequest) -> anyhow::Result<(Value, HeaderMap)> {
+    fn encode_request(&self, mut request: AiRequest) -> anyhow::Result<(Value, HeaderMap)> {
+        request.normalize_parameters();
         let mut body = Map::new();
         body.insert("model".into(), Value::String(request.model.clone()));
         body.insert("messages".into(), Value::Array(encode_messages(&request)?));
@@ -84,6 +167,14 @@ impl ProtocolAdapter for CohereChatV2 {
         insert_number(&mut body, "temperature", request.generation.temperature);
         insert_u32(&mut body, "max_tokens", request.generation.max_tokens);
         insert_number(&mut body, "p", request.generation.top_p);
+        insert_u32(&mut body, "k", request.parameters.top_k);
+        if request.parameters.logprobs.is_some() {
+            body.insert("logprobs".into(), Value::Bool(true));
+        }
+        let documents = encode_documents(&request);
+        if !documents.is_empty() {
+            body.insert("documents".into(), Value::Array(documents));
+        }
         insert_number(
             &mut body,
             "presence_penalty",
@@ -103,9 +194,30 @@ impl ProtocolAdapter for CohereChatV2 {
                 Value::Array(stop.iter().cloned().map(Value::String).collect()),
             );
         }
-        if request.reasoning.enabled {
+        if matches!(
+            request.reasoning.target_control,
+            Some(stravia_runtime_contract::thinking::TargetThinkingControl::Disabled)
+        ) || (request.reasoning.target_control.is_none()
+            && request.reasoning.mode.as_deref() == Some("disabled"))
+        {
+            body.insert("thinking".into(), json!({"type": "disabled"}));
+        } else if request.reasoning.is_enabled()
+            || matches!(
+                request.reasoning.target_control,
+                Some(
+                    stravia_runtime_contract::thinking::TargetThinkingControl::Enabled
+                        | stravia_runtime_contract::thinking::TargetThinkingControl::Budget { .. }
+                )
+            )
+        {
             let mut thinking = Map::from_iter([("type".into(), Value::String("enabled".into()))]);
-            if let Some(budget) = request.reasoning.budget_tokens {
+            let budget = match request.reasoning.target_control {
+                Some(stravia_runtime_contract::thinking::TargetThinkingControl::Budget {
+                    value,
+                }) => Some(value),
+                _ => request.reasoning.budget_tokens,
+            };
+            if let Some(budget) = budget {
                 thinking.insert("token_budget".into(), Value::from(budget));
             }
             body.insert("thinking".into(), Value::Object(thinking));
@@ -117,7 +229,13 @@ impl ProtocolAdapter for CohereChatV2 {
             );
         }
 
-        let mut tools = encode_tools(request.tools.as_deref().unwrap_or(&[]));
+        let all_tools = request.tools.as_deref().unwrap_or(&[]);
+        let selected_tool = match &request.tool_choice {
+            Some(ToolChoice::Named { name }) => all_tools.iter().find(|tool| tool.name == *name),
+            _ => None,
+        };
+        let selected_tools = selected_tool.map(std::slice::from_ref).unwrap_or(all_tools);
+        let tools = encode_tools(selected_tools);
         if let Some(choice) = &request.tool_choice {
             match choice {
                 ToolChoice::Auto => {}
@@ -127,22 +245,22 @@ impl ProtocolAdapter for CohereChatV2 {
                 ToolChoice::Required => {
                     body.insert("tool_choice".into(), Value::String("REQUIRED".into()));
                 }
-                ToolChoice::Named { name } => {
-                    if tools.iter().any(|tool| {
-                        tool.pointer("/function/name").and_then(Value::as_str)
-                            == Some(name.as_str())
-                    }) {
-                        tools.retain(|tool| {
-                            tool.pointer("/function/name").and_then(Value::as_str)
-                                == Some(name.as_str())
-                        });
+                ToolChoice::Named { .. } => {
+                    if selected_tool.is_some() {
                         body.insert("tool_choice".into(), Value::String("REQUIRED".into()));
                     }
                 }
-                ToolChoice::Raw(_) => {}
+                ToolChoice::Allowed { .. } | ToolChoice::Native(_) => {}
             }
         }
         if !tools.is_empty() {
+            // Cohere 只有请求级开关，不能让未声明 strict 的工具被隐式收紧。
+            if selected_tools.iter().any(|tool| tool.strict.is_some()) {
+                body.insert(
+                    "strict_tools".into(),
+                    Value::Bool(selected_tools.iter().all(|tool| tool.strict == Some(true))),
+                );
+            }
             body.insert("tools".into(), Value::Array(tools));
         }
 
@@ -657,17 +775,65 @@ fn encode_tool_calls(item: &AiItem) -> Vec<Value> {
         .collect()
 }
 
+fn decode_documents(body: &Value) -> Vec<ContentBlock> {
+    body.get("documents")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|document| {
+            let data = document.get("data")?;
+            let text = data.as_str().or_else(|| data.get("text")?.as_str())?;
+            Some(ContentBlock::Document {
+                source: DocumentSource::PlainText { data: text.into() },
+                title: data.get("title").and_then(Value::as_str).map(str::to_owned),
+                context: None,
+                cache_control: None,
+            })
+        })
+        .collect()
+}
+
+fn encode_documents(request: &AiRequest) -> Vec<Value> {
+    request
+        .items
+        .iter()
+        .filter(|item| item.role == Role::User)
+        .flat_map(|item| match &item.content {
+            MessageContent::Blocks(blocks) => blocks.as_slice(),
+            MessageContent::Text(_) => &[],
+        })
+        .filter_map(|block| {
+            let ContentBlock::Document {
+                source: DocumentSource::PlainText { data },
+                title,
+                ..
+            } = block
+            else {
+                return None;
+            };
+            let mut document = Map::from_iter([("text".into(), Value::String(data.clone()))]);
+            if let Some(title) = title {
+                document.insert("title".into(), Value::String(title.clone()));
+            }
+            Some(json!({"data": document}))
+        })
+        .collect()
+}
+
 fn encode_tools(tools: &[stravia_runtime_contract::protocol::ir::ToolSpec]) -> Vec<Value> {
     tools
         .iter()
         .map(|tool| {
+            let mut function = Map::from_iter([
+                ("name".into(), Value::String(tool.name.clone())),
+                ("parameters".into(), tool.parameters.clone()),
+            ]);
+            if let Some(description) = &tool.description {
+                function.insert("description".into(), Value::String(description.clone()));
+            }
             json!({
                 "type": "function",
-                "function": {
-                    "name": tool.name,
-                    "description": tool.description,
-                    "parameters": tool.parameters,
-                },
+                "function": function,
             })
         })
         .collect()
@@ -790,8 +956,7 @@ fn decode_tools(
                     .cloned()
                     .unwrap_or_else(|| json!({})),
                 strict: None,
-                cache_control: None,
-                meta: None,
+                defer_loading: None,
             })
         })
         .collect()
@@ -809,7 +974,7 @@ fn decode_tool_choice(value: &Value) -> anyhow::Result<ToolChoice> {
 
 fn encode_response_format(value: &ResponseFormat) -> anyhow::Result<Value> {
     match value {
-        ResponseFormat::Text => bail!("Cohere does not accept an explicit text response format"),
+        ResponseFormat::Text => Ok(json!({"type": "text"})),
         ResponseFormat::JsonObject => Ok(json!({"type": "json_object"})),
         ResponseFormat::JsonSchema { schema, .. } => {
             Ok(json!({"type": "json_object", "json_schema": schema}))

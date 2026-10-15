@@ -54,6 +54,24 @@ fn clamp_tokens(value: u64) -> u32 {
     u32::try_from(value).unwrap_or(u32::MAX)
 }
 
+/// 与宿主首个输出提交规则一致：模型标识、元数据与用量只是前导信息，不代表上游已接受请求。
+pub(crate) fn is_model_output(delta: &AiStreamDelta) -> bool {
+    match delta {
+        AiStreamDelta::TextDelta(text)
+        | AiStreamDelta::RefusalDelta(text)
+        | AiStreamDelta::ThinkingDelta(text) => !text.is_empty(),
+        AiStreamDelta::TextDeltaWithMetadata { text, .. }
+        | AiStreamDelta::RefusalDeltaWithIndex { text, .. }
+        | AiStreamDelta::ThinkingDeltaWithMetadata { text, .. }
+        | AiStreamDelta::ReasoningSummaryDelta { text, .. } => !text.is_empty(),
+        AiStreamDelta::ToolCallStart { .. }
+        | AiStreamDelta::ToolCallDelta { .. }
+        | AiStreamDelta::ToolCallComplete { .. }
+        | AiStreamDelta::ItemDone { .. } => true,
+        _ => false,
+    }
+}
+
 /// One in-flight native tool call being accumulated across frames.
 struct OpenToolCall {
     id: String,
@@ -126,6 +144,9 @@ struct UsageStats {
 
 pub struct DevinConnectStreamParser {
     reader: ConnectFrameReader,
+    protected_reasoning_untrusted: bool,
+    protected_reasoning_rejected: bool,
+    produced_output: bool,
     started: bool,
     last_model: Option<String>,
     done: bool,
@@ -150,6 +171,9 @@ impl DevinConnectStreamParser {
     pub fn new() -> Self {
         Self {
             reader: ConnectFrameReader::new(),
+            protected_reasoning_untrusted: false,
+            protected_reasoning_rejected: false,
+            produced_output: false,
             started: false,
             last_model: None,
             done: false,
@@ -170,6 +194,15 @@ impl DevinConnectStreamParser {
         }
     }
 
+    pub fn with_protected_reasoning_untrusted(mut self, untrusted: bool) -> Self {
+        self.protected_reasoning_untrusted = untrusted;
+        self
+    }
+
+    pub fn protected_reasoning_rejected(&self) -> bool {
+        self.protected_reasoning_rejected
+    }
+
     pub fn parse_chunk(&mut self, raw: &[u8]) -> anyhow::Result<Vec<AiStreamDelta>> {
         let mut deltas = Vec::new();
         if self.done || self.saw_end_stream {
@@ -177,7 +210,10 @@ impl DevinConnectStreamParser {
         }
         for frame in self.reader.push(raw)? {
             match frame {
-                ConnectFrame::Data(payload) => self.parse_data_frame(&payload, &mut deltas),
+                ConnectFrame::Data(payload) => {
+                    self.parse_data_frame(&payload, &mut deltas);
+                    self.produced_output |= deltas.iter().any(is_model_output);
+                }
                 ConnectFrame::EndStream(payload) => {
                     self.saw_end_stream = true;
                     self.parse_trailer(&payload, &mut deltas);
@@ -707,7 +743,12 @@ impl DevinConnectStreamParser {
             .and_then(Value::as_str)
             .unwrap_or("Devin Connect stream error")
             .to_string();
-        let kind = connect_error_kind(error.get("code").and_then(Value::as_str));
+        let code = error.get("code").and_then(Value::as_str);
+        // 恢复分类属于插件错误契约，不扩展 canonical IR。
+        self.protected_reasoning_rejected = code == Some("invalid_argument")
+            && self.protected_reasoning_untrusted
+            && !self.produced_output;
+        let kind = connect_error_kind(code);
         self.done = true;
         deltas.push(AiStreamDelta::StreamError {
             error: AiError::new(kind, message).with_raw(parsed),
@@ -780,6 +821,71 @@ mod tests {
         let mut payload = Vec::new();
         write_string_field(&mut payload, 3, text);
         payload
+    }
+
+    #[test]
+    fn invalid_argument_trailer_requires_untrusted_reasoning_before_output() {
+        let trailer = trailer_frame(r#"{"error":{"code":"invalid_argument","message":"rejected"}}"#);
+        for untrusted in [false, true] {
+            let mut parser = DevinConnectStreamParser::new()
+                .with_protected_reasoning_untrusted(untrusted);
+            let deltas = parser.parse_chunk(&trailer).unwrap();
+            assert!(matches!(&deltas[..], [AiStreamDelta::StreamError { error }]
+                if error.kind == AiErrorKind::InvalidRequest));
+            assert_eq!(parser.protected_reasoning_rejected(), untrusted);
+            assert!(parser.finish().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn invalid_argument_after_output_is_never_a_reasoning_rejection() {
+        let trailer = trailer_frame(r#"{"error":{"code":"invalid_argument"}}"#);
+        for same_chunk in [false, true] {
+            let mut parser = DevinConnectStreamParser::new()
+                .with_protected_reasoning_untrusted(true);
+            let mut wire = data_frame(&text_payload("answer"));
+            if same_chunk {
+                wire.extend_from_slice(&trailer);
+            } else {
+                assert!(!parser.parse_chunk(&wire).unwrap().is_empty());
+                wire = trailer.clone();
+            }
+            let deltas = parser.parse_chunk(&wire).unwrap();
+            assert!(matches!(deltas.last(), Some(AiStreamDelta::StreamError { error })
+                if error.kind == AiErrorKind::InvalidRequest));
+            assert!(!parser.protected_reasoning_rejected());
+        }
+    }
+
+    #[test]
+    fn ordinary_connect_argument_errors_do_not_gain_reasoning_classification() {
+        for code in ["failed_precondition", "out_of_range"] {
+            assert_eq!(connect_error_kind(Some(code)), AiErrorKind::InvalidRequest);
+        }
+    }
+
+    #[test]
+    fn model_metadata_before_rejection_keeps_reasoning_recovery() {
+        // 真实 Devin 在拒绝 trailer 前会先发模型标识与用量帧；它们不是模型输出。
+        let trailer = trailer_frame(r#"{"error":{"code":"invalid_argument"}}"#);
+        for same_chunk in [false, true] {
+            let mut parser =
+                DevinConnectStreamParser::new().with_protected_reasoning_untrusted(true);
+            let mut metadata = Vec::new();
+            write_string_field(&mut metadata, 9, "resolved-model");
+            let mut payload = Vec::new();
+            write_message_field(&mut payload, 7, &metadata);
+            let mut wire = data_frame(&payload);
+            if same_chunk {
+                wire.extend_from_slice(&trailer);
+            } else {
+                assert!(!parser.parse_chunk(&wire).unwrap().is_empty());
+                wire = trailer.clone();
+            }
+            let deltas = parser.parse_chunk(&wire).unwrap();
+            assert!(matches!(deltas.last(), Some(AiStreamDelta::StreamError { .. })));
+            assert!(parser.protected_reasoning_rejected(), "same_chunk={same_chunk}");
+        }
     }
 
     #[test]
@@ -1179,12 +1285,12 @@ mod tests {
         let response = accumulator.into_ai_response();
         let mut request = AiRequest::new("swe-2-high", response.items);
         request.generation.stop = Some(vec!["unsupported stop".into()]);
-        stravia_protocol_codec::transform::prepare_thinking_replay(&mut request, |_| true);
+        stravia_protocol_codec::transform::prepare_thinking_replay(&mut request, |_, _| true);
         let snapshot = serde_json::to_value(&request).unwrap();
         let body = encode_get_chat_message_request_with_platform(
             &request,
             "test-token",
-            &session_shape(&request, "test-token"),
+            &session_shape("test-token", None),
             None,
             DevinClientPlatform::Linux,
         )
@@ -1323,11 +1429,11 @@ mod tests {
         let mut request = responses
             .decode_request(serde_json::json!({"model":"swe-2","input":input}))
             .unwrap();
-        stravia_protocol_codec::transform::prepare_thinking_replay(&mut request, |_| true);
+        stravia_protocol_codec::transform::prepare_thinking_replay(&mut request, |_, _| true);
         let body = super::super::request::encode_get_chat_message_request_with_platform(
             &request,
             "test-token",
-            &super::super::request::session_shape(&request, "test-token"),
+            &super::super::request::session_shape("test-token", None),
             None,
             super::super::request::DevinClientPlatform::Linux,
         )
@@ -1409,7 +1515,7 @@ mod tests {
                 "messages": [{"role": "assistant", "content": [redacted]}],
             }))
             .unwrap();
-        stravia_protocol_codec::transform::prepare_thinking_replay(&mut request, |_| true);
+        stravia_protocol_codec::transform::prepare_thinking_replay(&mut request, |_, _| true);
         assert!(
             matches!(&request.items[0].content, MessageContent::Blocks(blocks)
             if matches!(&blocks[0], ContentBlock::RedactedThinking { .. }))

@@ -3,13 +3,19 @@ use stravia_runtime_contract::artifact::{ArtifactStore, bytes_stream};
 
 #[tokio::test]
 async fn completed_inline_window_is_the_parent_after_cold_restore() {
-    let durable = Arc::new(crate::turn_chain::test_store().await);
+    let pool = crate::test_support::migrated_sqlite_pool().await.unwrap();
+    let compaction = crate::compaction::Compaction::sqlite(pool.clone());
+    let durable = Arc::new(crate::turn_chain::SqlTurnChainStore::sqlite(
+        pool,
+        Arc::new(tokio::sync::Mutex::new(())),
+    ));
     let chain = GenerationChain::from_turn_chain(
         durable.clone(),
         DEFAULT_GENERATION_CHAIN_TTL,
         None,
         crate::runtime_cache::RuntimeCache::tinyufo(16 * 1024 * 1024),
-    );
+    )
+    .with_compaction(compaction.clone());
     let owner = principal("inline-owner");
     let state = stravia_protocol_codec::codec::open_responses::decoder::decode_input_item(
         &serde_json::json!({
@@ -56,12 +62,10 @@ async fn completed_inline_window_is_the_parent_after_cold_restore() {
     let mut first_request = responses_request(full_history.clone());
     // Exercise source-only adoption even when a trigger or new input follows the prefix.
     first_request.instructions = Some("Prepare the native compacted window".into());
-    if let Some(ProtocolExt::OpenResponses(extension)) = first_request.ext.as_mut() {
-        extension.passthrough_body.insert(
-            "context_management".into(),
-            serde_json::json!([{"type": "compaction", "compact_threshold": 2000}]),
-        );
-    }
+    first_request.parameters.compaction =
+        Some(stravia_runtime_contract::protocol::ir::CompactionControl {
+            threshold_tokens: Some(2000),
+        });
     let mut below_threshold = chain
         .begin_native_compaction(owner.clone(), first_request.clone())
         .await
@@ -77,7 +81,8 @@ async fn completed_inline_window_is_the_parent_after_cold_restore() {
         DEFAULT_GENERATION_CHAIN_TTL,
         None,
         crate::runtime_cache::RuntimeCache::tinyufo(16 * 1024 * 1024),
-    );
+    )
+    .with_compaction(compaction.clone());
     let mut continuation = responses_request(vec![user_message("after ordinary answer")]);
     crate::router::stamp_previous_response_id(&mut continuation, below_threshold.id());
     let continued = cold_chain.begin(owner.clone(), continuation).await.unwrap();
@@ -119,9 +124,46 @@ async fn completed_inline_window_is_the_parent_after_cold_restore() {
         history_context_fingerprint(&with_new_input.request_delta().items),
         history_context_fingerprint(&[trigger, user_message("new after source")])
     );
-    Arc::make_mut(&mut write.parent)
-        .fresh_inline_states
-        .push(state.clone());
+    let record = compaction
+        .register(
+            &owner,
+            crate::compaction::CompactionRegistration {
+                source_generation_id: Some(source.id().to_owned()),
+                source_record_ids: Vec::new(),
+                operation_id: write.id().to_owned(),
+                target: crate::compaction::CompactionTarget {
+                    target_key: "provider:model".into(),
+                    namespace: "provider:model".into(),
+                    model: "model".into(),
+                    protocol: OPEN_RESPONSES_2026_04_24.to_string(),
+                },
+                window: vec![state.clone()],
+                state_items: vec![state.clone()],
+            },
+        )
+        .await
+        .unwrap();
+    write.record_inline_publications(&[crate::model_turn::CompactionPublication {
+        record_id: record.id,
+        operation_id: record.operation_id,
+        model_turn_id: "inline-model-turn".into(),
+        mode: crate::interaction_observation::CompactionMode::Inline,
+        source_generation_id: Some(source.id().to_owned()),
+        state: state.clone(),
+        receipt: crate::model_turn::CompactionReceipt::Delivered,
+    }]);
+    let mut immediate = chain
+        .begin(
+            owner.clone(),
+            responses_request(vec![state.clone(), user_message("immediate replay")]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(immediate.parent_id(), Some(source.id()));
+    let mut immediate_answer = AiResponse::new("immediate-response", "model");
+    immediate_answer.push_output_text("immediate answer");
+    assert!(immediate.stage(&mut immediate_answer, &generation_source(), None));
+    immediate.persist().await.unwrap();
     let mut response = AiResponse::new("inline-response", "model");
     response.items = vec![state.clone(), AiItem::output_text("inline answer")];
     response.items[1].set_graph_metadata(
@@ -147,13 +189,39 @@ async fn completed_inline_window_is_the_parent_after_cold_restore() {
                 None,
                 crate::runtime_cache::RuntimeCache::tinyufo(16 * 1024 * 1024),
             )
+            .with_compaction(compaction.clone())
         } else {
             chain.clone()
         };
+        for reset_instructions in [false, true] {
+            let mut items = response.items.clone();
+            let new_user = user_message("next without compaction controls");
+            items.push(new_user.clone());
+            let mut request = responses_request(items.clone());
+            if reset_instructions {
+                request.parameters.resets.push(ParameterReset::Instructions);
+            } else {
+                request.instructions = write.request().instructions.clone();
+            }
+            let instructions = request.instructions.clone();
+            let resumed = chain.begin(owner.clone(), request).await.unwrap();
+            assert_eq!(resumed.parent_id(), Some(inline_id.as_str()));
+            assert_eq!(resumed.root_id(), source.root_id());
+            assert!(items_equal(&resumed.request().items, &items));
+            assert!(items_equal(
+                &resumed.request_delta().items,
+                std::slice::from_ref(&new_user)
+            ));
+            assert_eq!(resumed.request().instructions, instructions);
+            assert!(resumed.request().parameters.compaction.is_none());
+            assert!(resumed.parent.parent_state.is_none());
+            assert!(resumed.parent.parent_upstream_response_id.is_none());
+        }
         let mut items = response.items.clone();
         items.push(user_message("next user"));
         let mut next_request = responses_request(items);
         next_request.instructions = write.request().instructions.clone();
+        next_request.parameters.compaction = write.request().parameters.compaction.clone();
         let mut next = chain.begin(owner.clone(), next_request).await.unwrap();
         assert_eq!(next.parent_id(), Some(inline_id.as_str()));
         assert_eq!(
@@ -196,6 +264,7 @@ async fn completed_inline_window_is_the_parent_after_cold_restore() {
         continuation.push(user_message("third user"));
         let mut third_request = responses_request(continuation);
         third_request.instructions = write.request().instructions.clone();
+        third_request.parameters.compaction = write.request().parameters.compaction.clone();
         let third = chain.begin(owner.clone(), third_request).await.unwrap();
         assert_eq!(third.parent_id(), Some(next.id()));
         assert_eq!(
@@ -743,10 +812,7 @@ async fn observe_effective_persists_marker_at_ordered_projection_atom() {
     );
 
     let mut replay = responses_request(Vec::new());
-    let Some(ProtocolExt::OpenResponses(extension)) = replay.ext.as_mut() else {
-        panic!("Open Responses request");
-    };
-    extension.previous_response_id = Some(id);
+    crate::router::stamp_previous_response_id(&mut replay, &id);
     let replay = chain
         .begin(owner.clone(), replay)
         .await
@@ -816,10 +882,7 @@ async fn persisted_unavailable_marker_text_does_not_poison_a_continuation() {
         .expect("persist unavailable marker as inert client text");
 
     let mut request = responses_request(vec![user_message("follow-up")]);
-    let Some(ProtocolExt::OpenResponses(extension)) = request.ext.as_mut() else {
-        panic!("Open Responses request");
-    };
-    extension.previous_response_id = Some(root_id);
+    crate::router::stamp_previous_response_id(&mut request, &root_id);
     let mut continuation = chain
         .begin(owner, request)
         .await
@@ -839,10 +902,7 @@ async fn begin_reports_a_typed_missing_parent_error() {
     let chain = generation_chain().await;
     let owner = principal("owner");
     let mut request = responses_request(vec![user_message("new input")]);
-    let Some(ProtocolExt::OpenResponses(extension)) = request.ext.as_mut() else {
-        panic!("Open Responses request");
-    };
-    extension.previous_response_id = Some("resp_missing".into());
+    crate::router::stamp_previous_response_id(&mut request, "resp_missing");
 
     let error = chain
         .begin(owner, request)
@@ -892,10 +952,7 @@ async fn write_materializes_an_explicit_parent_before_observation() {
     root.persist().await.expect("persist root");
 
     let mut continuation = responses_request(vec![user_message("follow-up")]);
-    let Some(ProtocolExt::OpenResponses(extension)) = continuation.ext.as_mut() else {
-        panic!("Open Responses request");
-    };
-    extension.previous_response_id = Some(root_id.clone());
+    crate::router::stamp_previous_response_id(&mut continuation, &root_id);
     let write = chain
         .begin(owner, continuation)
         .await
@@ -990,10 +1047,7 @@ async fn a_later_stage_replaces_the_unpersisted_response() {
     write.persist().await.expect("persist final response");
 
     let mut continuation = responses_request(vec![user_message("follow-up")]);
-    let Some(ProtocolExt::OpenResponses(extension)) = continuation.ext.as_mut() else {
-        panic!("Open Responses request");
-    };
-    extension.previous_response_id = Some(id);
+    crate::router::stamp_previous_response_id(&mut continuation, &id);
     let continuation = chain
         .begin(owner, continuation)
         .await
@@ -1037,10 +1091,7 @@ async fn observe_effective_persists_rewritten_history() {
     );
 
     let mut continuation = responses_request(vec![user_message("follow-up")]);
-    let Some(ProtocolExt::OpenResponses(extension)) = continuation.ext.as_mut() else {
-        panic!("Open Responses request");
-    };
-    extension.previous_response_id = Some(id);
+    crate::router::stamp_previous_response_id(&mut continuation, &id);
     let continuation = chain
         .begin(owner, continuation)
         .await
@@ -1154,10 +1205,7 @@ async fn begin_does_not_resolve_a_parent_across_principals() {
     owner_write.persist().await.expect("persist owner write");
 
     let mut request = responses_request(vec![user_message("guess")]);
-    let Some(ProtocolExt::OpenResponses(extension)) = request.ext.as_mut() else {
-        panic!("Open Responses request");
-    };
-    extension.previous_response_id = Some(owner_id);
+    crate::router::stamp_previous_response_id(&mut request, &owner_id);
 
     let error = chain
         .begin(principal("attacker"), request)
@@ -1189,10 +1237,7 @@ async fn completed_and_incomplete_writes_can_both_be_parents() {
         root.persist().await.expect("persist terminal response");
 
         let mut request = responses_request(vec![user_message("follow-up")]);
-        let Some(ProtocolExt::OpenResponses(extension)) = request.ext.as_mut() else {
-            panic!("Open Responses request");
-        };
-        extension.previous_response_id = Some(root_id);
+        crate::router::stamp_previous_response_id(&mut request, &root_id);
         assert!(
             chain.begin(owner, request).await.is_ok(),
             "{status} response must be a valid parent"

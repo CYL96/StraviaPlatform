@@ -16,8 +16,12 @@
 //!                              #18 signature_type }
 //!   #7  request source enum (5)
 //!   #8  CompletionConfig { #1 enabled, #2 max_tokens, #3 max_newlines,
-//!                          #5 f64 temperature, #7 top_k, #8 f64 top_p }
+//!                          #5 f64 temperature, #7 top_k, #8 f64 top_p,
+//!                          #9 repeated stop_patterns, #10 uint64 seed,
+//!                          #16 return_logprob, #17 service_tier }
 //!   #10 repeated ToolDef { #1 name, #2 description, #3 parameters JSON }
+//!   #11 disable_parallel_tool_calls (inverse canonical parallel_tool_calls)
+//!   #12 ChatToolChoice { oneof #1 option_name("auto"), #2 tool_name }
 //!   #15 CortexTrajectoryReference { #1 trajectory_id, #2 step_index (>0 only),
 //!                                   #3 =4 CASCADE, #4 =14 USER_INPUT }
 //!   #16 cascade id
@@ -25,6 +29,13 @@
 //!   #21 model uid
 //!   #26 assignment jwt — present only when AssignModel resolved the uid
 //! ```
+//!
+//! The first-party Devin desktop distribution's
+//! `resources/app/extensions/windsurf/dist/extension.js` confirms
+//! `exa.codeium_common_pb.CompletionConfiguration` #16 `return_logprob` as
+//! protobuf bool and #17 `service_tier` as string. The string descriptor
+//! does not establish supported tier values; only the existing native
+//! `priority` mapping is retained, not guessed mappings for other tiers.
 //!
 //! The #15/#16/#26 shape mirrors current devin CLI captures (3000.10.x): the
 //! CLI calls `AssignModel` per session and carries the returned jwt at #26.
@@ -54,7 +65,6 @@
 //!   `invalid_argument` — both are handled before encoding.
 
 use std::collections::HashMap;
-use std::sync::{LazyLock, Mutex};
 
 use anyhow::{Context, bail};
 use serde_json::Value;
@@ -74,6 +84,7 @@ use stravia_runtime_contract::protocol::ir::DocumentSource;
 use stravia_runtime_contract::protocol::ir::MediaSource;
 use stravia_runtime_contract::protocol::ir::MessageContent;
 use stravia_runtime_contract::protocol::ir::Role;
+use stravia_runtime_contract::protocol::ir::ServiceTier;
 
 /// Connect-RPC method path on the Devin api-server host.
 pub const GET_CHAT_MESSAGE_PATH: &str = "/exa.api_server_pb.ApiServerService/GetChatMessage";
@@ -130,7 +141,7 @@ const TOOLS_FALLBACK_SYSTEM: &str =
 /// (3000.10.x captures): `#15.1` trajectory id and `#16` cascade id are
 /// stable per conversation, `#15.2` step_index increments once per
 /// GetChatMessage call (absent at 0; the CLI's title-gen call consumes 1).
-/// Both ids derive deterministically from the request — AssignModel binds
+/// Both ids derive from the scoped transport identity — AssignModel binds
 /// its jwt to the cascade id, so it must be computable before the chat
 /// request exists.
 #[derive(Debug)]
@@ -140,58 +151,26 @@ pub struct SessionShape {
     pub step_index: u64,
 }
 
-/// Derives the session shape. Ids are seeded by the credential plus the
-/// system prompt head and the first user message head — stable across turns
-/// and restarts (which keeps upstream prompt-prefix caching effective), and
-/// distinct between conversations. `#22`/`#18`/`#13` are never emitted:
-/// current captures show them absent.
-pub fn session_shape(req: &AiRequest, session_token: &str) -> SessionShape {
+/// Only host-scoped Principal+Target transport affinity may reuse a session.
+/// Raw request session/cache/correlation ids and prompt contents are not
+/// identities. Without scoped affinity each request receives fresh native ids.
+/// Persisted production state, not this pure identity function, owns steps.
+pub fn session_shape(session_token: &str, transport_affinity: Option<&str>) -> SessionShape {
     let mut hasher = Sha256::new();
-    hasher.update(session_token.as_bytes());
     hasher.update(b"devin-session-root");
-    let system = collect_system_prompt(req);
-    let bytes = system.as_bytes();
-    hasher.update(&bytes[..bytes.len().min(4096)]);
-    if let Some(anchor) = req
-        .items
-        .iter()
-        .find(|item| matches!(item.role, Role::User))
-        .map(|item| item.content.to_text())
-    {
-        let bytes = anchor.as_bytes();
-        hasher.update(&bytes[..bytes.len().min(1024)]);
+    hasher.update((session_token.len() as u64).to_be_bytes());
+    hasher.update(session_token.as_bytes());
+    if let Some(affinity) = transport_affinity.filter(|value| !value.trim().is_empty()) {
+        hasher.update(affinity.as_bytes());
+    } else {
+        hasher.update(Uuid::new_v4().as_bytes());
     }
     let root: [u8; 32] = hasher.finalize().into();
     let trajectory_id = uuid_from_seed(&root, 0);
     SessionShape {
         cascade_id: uuid_from_seed(&root, 1),
-        step_index: next_step_index(&trajectory_id),
+        step_index: 0,
         trajectory_id,
-    }
-}
-
-/// Per-trajectory step_index counter. The real CLI increments once per
-/// GetChatMessage call — tool-loop rounds included — starting absent(0);
-/// its title-gen call takes index 1, which we never send, so our sequence
-/// jumps straight to 2 to match the observed wire. The map is bounded and
-/// wholesale-cleared when full: resetting a bookkeeping counter is harmless.
-fn next_step_index(trajectory_id: &str) -> u64 {
-    static STEPS: LazyLock<Mutex<HashMap<String, u64>>> =
-        LazyLock::new(|| Mutex::new(HashMap::new()));
-    let mut counts = STEPS.lock().unwrap_or_else(|e| e.into_inner());
-    if counts.len() >= 65_536 {
-        counts.clear();
-    }
-    match counts.get_mut(trajectory_id) {
-        None => {
-            counts.insert(trajectory_id.to_owned(), 2);
-            0
-        }
-        Some(next) => {
-            let value = *next;
-            *next += 1;
-            value
-        }
     }
 }
 
@@ -277,6 +256,24 @@ pub(crate) fn encode_prepared_request(
     write_message_field(&mut out, 8, &completion_config(req));
     for tool_def in &tool_defs {
         write_message_field(&mut out, 10, tool_def);
+    }
+    if let Some(parallel) = req.parallel_tool_calls {
+        write_varint_field(&mut out, 11, u64::from(!parallel));
+    }
+    let mut choice = Vec::new();
+    match req.tool_choice.as_ref() {
+        Some(stravia_runtime_contract::protocol::ir::ToolChoice::Auto) => {
+            write_string_field(&mut choice, 1, "auto");
+        }
+        Some(stravia_runtime_contract::protocol::ir::ToolChoice::Named { name })
+            if valid_tool_name(name) =>
+        {
+            write_string_field(&mut choice, 2, name);
+        }
+        _ => {}
+    }
+    if !choice.is_empty() {
+        write_message_field(&mut out, 12, &choice);
     }
     write_message_field(&mut out, 15, &trajectory_ref(shape));
     write_string_field(&mut out, 16, &shape.cascade_id);
@@ -584,8 +581,33 @@ fn completion_config(req: &AiRequest) -> Vec<u8> {
     );
     write_varint_field(&mut out, 3, WIRE_MAX_NEWLINES);
     write_fixed64_field(&mut out, 5, temperature);
-    write_varint_field(&mut out, 7, DEFAULT_TOP_K);
+    write_varint_field(
+        &mut out,
+        7,
+        req.parameters.top_k.map(u64::from).unwrap_or(DEFAULT_TOP_K),
+    );
     write_fixed64_field(&mut out, 8, req.generation.top_p.unwrap_or(DEFAULT_TOP_P));
+    for stop in req.generation.stop.as_deref().unwrap_or_default() {
+        write_string_field(&mut out, 9, stop);
+    }
+    if let Some(seed) = req
+        .generation
+        .seed
+        .and_then(|seed| u64::try_from(seed).ok())
+    {
+        write_varint_field(&mut out, 10, seed);
+    }
+    // Devin exposes only a return_logprob boolean, not a candidate count.
+    // Some(0) still requests the selected token's log probability.
+    if req.parameters.logprobs.is_some() {
+        write_varint_field(&mut out, 16, 1);
+    }
+    // CompletionConfiguration #17 is a string in the first-party Devin
+    // extension schema. Priority is the existing native mapping; other
+    // unified tiers have no confirmed Devin mapping and remain omitted.
+    if req.parameters.service_tier == Some(ServiceTier::Priority) {
+        write_string_field(&mut out, 17, "priority");
+    }
     out
 }
 
@@ -969,8 +991,7 @@ fn encode_assistant_item(item: &AiItem, out: &mut Vec<ChatMsg>) -> anyhow::Resul
     Ok(())
 }
 
-/// 无承载能力的思考块返回 None（跳过整条消息），永不报错：
-/// 回放契约要求 codec 静默处理异源或损坏的受保护载荷。
+/// Devin 的签名位置可承载不透明载荷，首次回放不按来源提前过滤。
 fn encode_thinking(block: &ContentBlock) -> Option<ChatMsg> {
     let (text, signature, redacted) = match block {
         ContentBlock::Thinking {
@@ -992,7 +1013,11 @@ fn encode_thinking(block: &ContentBlock) -> Option<ChatMsg> {
             encrypted_content.as_deref(),
             false,
         ),
-        ContentBlock::RedactedThinking { data } => (String::new(), Some(data.as_str()), true),
+        ContentBlock::RedactedThinking { data } => (
+            String::new(),
+            Some(data.as_str()),
+            true,
+        ),
         _ => unreachable!("thinking block"),
     };
     let Some(signature) = signature.filter(|value| !value.is_empty()) else {
@@ -1004,13 +1029,15 @@ fn encode_thinking(block: &ContentBlock) -> Option<ChatMsg> {
             ..ChatMsg::default()
         });
     };
-    // #12 是 opaque 字符串：异源 blob 与损坏的 devin-thinking-v1 载荷都
-    // 无法解析出重放状态，按原生格式原样上送由上游裁决（乐观回放，
-    // 被拒绝时由宿主剥离重试），codec 不判断来源也不报错。
-    let mut replay = ThinkingReplay::decode(signature).unwrap_or_else(|_| ThinkingReplay {
-        signature: signature.to_owned(),
-        ..ThinkingReplay::default()
-    });
+    // 仅插件前缀表示可解包状态；无法解包时仍让上游尝试原始载荷。
+    let mut replay = signature
+        .starts_with(ThinkingReplay::PREFIX)
+        .then(|| ThinkingReplay::decode(signature).ok())
+        .flatten()
+        .unwrap_or_else(|| ThinkingReplay {
+            signature: signature.to_owned(),
+            ..ThinkingReplay::default()
+        });
     let thinking = if redacted {
         std::mem::take(&mut replay.redacted_text)
     } else {
@@ -1649,8 +1676,8 @@ mod tests {
         Box::leak(bytes.into_boxed_slice())
     }
 
-    fn shape(req: &AiRequest) -> SessionShape {
-        session_shape(req, "tok")
+    fn shape(_req: &AiRequest) -> SessionShape {
+        session_shape("tok", None)
     }
 
     #[test]
@@ -1668,6 +1695,39 @@ mod tests {
 
     fn top_level(req: &AiRequest) -> Vec<crate::codec::devin_connect::proto::ProtoField<'static>> {
         parse_fields(wire(req)).unwrap()
+    }
+
+    #[test]
+    fn unknown_parameter_pockets_cannot_add_protobuf_fields() {
+        let request = AiRequest::new("m", vec![text_item(Role::User, "hello")]);
+        let mut injected = request.clone();
+        injected.parameters = serde_json::from_value(serde_json::json!({
+            "extra_body":{"permissionMode":"bypass"},
+            "options":{"temperature":99},
+            "extensions":{"devin":{"arbitrary_field":true}}
+        }))
+        .unwrap();
+        let shape = shape(&request);
+        let baseline = encode_test_chat_request(&request, "tok", &shape, None).unwrap();
+        let injected = encode_test_chat_request(&injected, "tok", &shape, None).unwrap();
+        let baseline = parse_fields(&baseline).unwrap();
+        let injected = parse_fields(&injected).unwrap();
+        assert_eq!(baseline.len(), injected.len());
+        for (baseline, injected) in baseline.iter().zip(&injected) {
+            if baseline.number == 3 {
+                assert_eq!(injected.number, 3);
+                let baseline = parse_fields(baseline.bytes).unwrap();
+                let injected = parse_fields(injected.bytes).unwrap();
+                // 原生消息 ID 每次编码重新生成，只排除该随机值。
+                for fields in [&baseline, &injected] {
+                    assert_eq!(fields[0].number, 1);
+                    Uuid::parse_str(std::str::from_utf8(fields[0].bytes).unwrap()).unwrap();
+                }
+                assert_eq!(baseline[1..], injected[1..]);
+            } else {
+                assert_eq!(baseline, injected);
+            }
+        }
     }
 
     fn sub_message<'a>(
@@ -2077,15 +2137,15 @@ mod tests {
         }
     }
 
-    // #12 是 opaque 字符串：异源 blob 与损坏的 devin-thinking-v1 载荷都按原生
-    // 格式原样上送，codec 不判断来源也不报错；上游拒绝时由宿主剥离重试。
+    // 原始签名和无法解包的插件载荷都必须首发给上游尝试。
     #[test]
-    fn opaque_or_corrupt_signature_still_rides_native_field() {
+    fn opaque_native_signature_and_corrupt_wrapper_are_replayed() {
         let request = AiRequest::new(
             "swe-2",
             vec![
                 text_item(Role::User, "go"),
                 AiItem::thinking("foreign draft", Some("anthropic-blob".into())),
+                text_item(Role::User, "continue"),
                 AiItem::thinking("corrupt draft", Some("devin-thinking-v1:{oops".into())),
             ],
         );
@@ -2094,30 +2154,27 @@ mod tests {
             .filter(|field| field.number == 3)
             .map(|field| parse_fields(field.bytes).unwrap())
             .collect();
-        // 两个签名块各占一条 prompt：独立签名不能合并进同一 #12。
-        assert_eq!(prompts.len(), 3);
-        for (index, thinking, signature) in [
-            (1, "foreign draft", "anthropic-blob"),
-            (2, "corrupt draft", "devin-thinking-v1:{oops"),
-        ] {
-            let prompt = &prompts[index];
-            assert!(
-                prompt
-                    .iter()
-                    .any(|field| field.number == 11 && field.bytes == thinking.as_bytes())
-            );
-            assert!(
-                prompt
-                    .iter()
-                    .any(|field| field.number == 12 && field.bytes == signature.as_bytes())
-            );
-            // 受保护载荷只出现在 #12，绝不写进正文 #3。
-            assert!(
-                !prompt
-                    .iter()
-                    .any(|field| field.number == 3 && field.bytes == signature.as_bytes())
-            );
-        }
+        assert_eq!(prompts.len(), 4);
+        assert!(
+            prompts[1]
+                .iter()
+                .any(|f| f.number == 11 && f.bytes == b"foreign draft")
+        );
+        assert!(
+            prompts[1]
+                .iter()
+                .any(|f| f.number == 12 && f.bytes == b"anthropic-blob")
+        );
+        assert!(
+            prompts[3]
+                .iter()
+                .any(|f| f.number == 11 && f.bytes == b"corrupt draft")
+        );
+        assert!(
+            prompts[3]
+                .iter()
+                .any(|f| f.number == 12 && f.bytes == b"devin-thinking-v1:{oops")
+        );
     }
 
     // redacted 有原生载体（#12 载荷 + #13 标记）：独立成条的 redacted 历史
@@ -2131,7 +2188,11 @@ mod tests {
                 AiItem {
                     role: Role::Assistant,
                     content: MessageContent::Blocks(vec![ContentBlock::RedactedThinking {
-                        data: "sealed-blob".into(),
+                        data: ThinkingReplay {
+                            signature: "sealed-blob".into(),
+                            ..ThinkingReplay::default()
+                        }
+                        .encode(),
                     }]),
                     tool_calls: None,
                     tool_call_id: None,
@@ -2167,6 +2228,186 @@ mod tests {
             assert!(!redacted.iter().any(|field| field.number == number));
         }
         assert_eq!(serde_json::to_value(&request).unwrap(), snapshot);
+    }
+
+    #[test]
+    fn responses_foreign_ciphertext_is_replayed_without_mutating_readable_history() {
+        let request = stravia_protocol_codec::registry::ProtocolRegistry::global()
+            .adapter(&stravia_runtime_contract::protocol::ids::OPEN_RESPONSES_2026_04_24)
+            .unwrap()
+            .decode_request(serde_json::json!({
+                "model":"swe-2",
+                "input":[
+                    {"role":"user","content":"Inspect fixtures."},
+                    {"type":"reasoning","summary":[{"type":"summary_text","text":"Readable summary."}],
+                     "content":[{"type":"reasoning_text","text":"Readable reasoning."}],
+                     "encrypted_content":"gAAAA_foreign_responses_ciphertext"},
+                    {"type":"reasoning","summary":[],"encrypted_content":"gAAAA_empty_ciphertext"},
+                    {"role":"assistant","content":"Visible answer."}
+                ]
+            })).unwrap();
+        let snapshot = serde_json::to_value(&request).unwrap();
+        let prompts: Vec<_> = top_level(&request)
+            .into_iter()
+            .filter(|f| f.number == 3)
+            .map(|f| parse_fields(f.bytes).unwrap())
+            .collect();
+        let text = prompts
+            .iter()
+            .flat_map(|p| p.iter())
+            .filter(|f| [3, 11].contains(&f.number))
+            .map(|f| String::from_utf8_lossy(f.bytes))
+            .collect::<Vec<_>>()
+            .join("");
+        for expected in [
+            "Readable summary.",
+            "Readable reasoning.",
+            "Visible answer.",
+        ] {
+            assert!(text.contains(expected));
+        }
+        assert!(!text.contains("ciphertext"));
+        assert!(
+            prompts
+                .iter()
+                .flatten()
+                .any(|f| f.number == 12 && f.bytes == b"gAAAA_foreign_responses_ciphertext")
+        );
+        assert!(
+            prompts.iter().flatten().any(|f|
+                f.number == 12 && f.bytes == b"gAAAA_empty_ciphertext")
+        );
+        assert_eq!(serde_json::to_value(&request).unwrap(), snapshot);
+
+        let mut redacted = text_item(Role::Assistant, "");
+        redacted.content = MessageContent::Blocks(vec![ContentBlock::RedactedThinking {
+            data: "foreign-redacted-ciphertext".into(),
+        }]);
+        let request = AiRequest::new("swe-2", vec![text_item(Role::User, "go"), redacted]);
+        let fields = top_level(&request);
+        let prompts: Vec<_> = fields.iter().filter(|f| f.number == 3)
+            .map(|f| parse_fields(f.bytes).unwrap()).collect();
+        assert_eq!(prompts.len(), 2);
+        assert!(prompts[1].iter().any(|f|
+            f.number == 12 && f.bytes == b"foreign-redacted-ciphertext"));
+        assert!(prompts[1].iter().any(|f| f.number == 13 && f.scalar == 1));
+    }
+
+    #[test]
+    fn canonical_controls_encode_only_supported_native_fields() {
+        use stravia_runtime_contract::protocol::ir::{NativeToolKind, ToolChoice};
+        let mut req = AiRequest::new("m", vec![text_item(Role::User, "hello")]);
+        req.generation.temperature = Some(0.25);
+        req.generation.top_p = Some(0.8);
+        req.generation.seed = Some(42);
+        req.generation.stop = Some(vec!["END".into(), "STOP".into()]);
+        req.parameters.top_k = Some(7);
+        req.parameters.logprobs = Some(0);
+        req.parameters.service_tier = Some(ServiceTier::Priority);
+        req.parallel_tool_calls = Some(false);
+        req.tool_choice = Some(ToolChoice::Named {
+            name: "read".into(),
+        });
+        let fields = top_level(&req);
+        let config = sub_message(&fields, 8, 0);
+        assert!(
+            config
+                .iter()
+                .any(|f| f.number == 5 && f.scalar == 0.25f64.to_bits())
+        );
+        assert!(config.iter().any(|f| f.number == 7 && f.scalar == 7));
+        assert!(
+            config
+                .iter()
+                .any(|f| f.number == 8 && f.scalar == 0.8f64.to_bits())
+        );
+        assert_eq!(
+            config
+                .iter()
+                .filter(|f| f.number == 9)
+                .map(|f| f.bytes)
+                .collect::<Vec<_>>(),
+            vec![b"END".as_slice(), b"STOP".as_slice()]
+        );
+        assert!(config.iter().any(|f| f.number == 10 && f.scalar == 42));
+        assert!(config.iter().any(|f| f.number == 16 && f.scalar == 1));
+        assert!(
+            config
+                .iter()
+                .any(|f| f.number == 17 && f.bytes == b"priority")
+        );
+        assert!(fields.iter().any(|f| f.number == 11 && f.scalar == 1));
+        assert!(
+            sub_message(&fields, 12, 0)
+                .iter()
+                .any(|f| f.number == 2 && f.bytes == b"read")
+        );
+
+        req.parallel_tool_calls = Some(true);
+        req.tool_choice = Some(ToolChoice::Auto);
+        req.generation.seed = Some(-1);
+        req.parameters.service_tier = None;
+        let fields = top_level(&req);
+        assert!(fields.iter().any(|f| f.number == 11 && f.scalar == 0));
+        assert!(
+            sub_message(&fields, 12, 0)
+                .iter()
+                .any(|f| f.number == 1 && f.bytes == b"auto")
+        );
+        assert!(
+            sub_message(&fields, 8, 0)
+                .iter()
+                .all(|f| ![10, 17].contains(&f.number))
+        );
+        for choice in [
+            ToolChoice::None,
+            ToolChoice::Required,
+            ToolChoice::Allowed {
+                names: vec!["read".into()],
+                required: false,
+            },
+            ToolChoice::Allowed {
+                names: vec!["read".into()],
+                required: true,
+            },
+            ToolChoice::Native(NativeToolKind::WebSearch),
+        ] {
+            req.tool_choice = Some(choice);
+            assert!(top_level(&req).iter().all(|f| f.number != 12));
+        }
+    }
+
+    #[test]
+    fn logprobs_count_projects_to_native_boolean() {
+        let mut req = AiRequest::new("m", vec![text_item(Role::User, "hello")]);
+        let config = completion_config(&req);
+        assert!(
+            parse_fields(&config)
+                .unwrap()
+                .iter()
+                .all(|field| field.number != 16)
+        );
+        for count in [0, 1, 20, u32::MAX] {
+            req.parameters.logprobs = Some(count);
+            let config = completion_config(&req);
+            let fields = parse_fields(&config).unwrap();
+            assert!(
+                fields
+                    .iter()
+                    .any(|field| field.number == 16 && field.scalar == 1)
+            );
+        }
+    }
+
+    #[test]
+    fn unconfirmed_service_tiers_are_omitted() {
+        let mut req = AiRequest::new("m", vec![text_item(Role::User, "hello")]);
+        for tier in [ServiceTier::Auto, ServiceTier::Default, ServiceTier::Flex] {
+            req.parameters.service_tier = Some(tier);
+            let config = completion_config(&req);
+            let fields = parse_fields(&config).unwrap();
+            assert!(fields.iter().all(|field| field.number != 17));
+        }
     }
 
     /// The upstream rejects "all calls, then all results" groupings and
@@ -2412,8 +2653,7 @@ mod tests {
                 "$schema": "http://json-schema.org/draft-07/schema#",
             }),
             strict: None,
-            cache_control: None,
-            meta: None,
+            defer_loading: None,
         }]);
         let fields = top_level(&req);
         // Fallback system prompt injected because tools exist without one.
@@ -2447,8 +2687,7 @@ mod tests {
             description: description.map(str::to_string),
             parameters,
             strict: None,
-            cache_control: None,
-            meta: None,
+            defer_loading: None,
         }
     }
 
@@ -2864,8 +3103,7 @@ mod tests {
 
     #[test]
     fn session_shape_derives_stable_trajectory_and_steps() {
-        let turn1 = AiRequest::new("m", vec![text_item(Role::User, "open")]);
-        let first = session_shape(&turn1, "tok");
+        let first = session_shape("tok", Some("principal-a/target-a/session"));
         // First GetChatMessage on a trajectory omits step_index on the wire.
         assert_eq!(first.step_index, 0);
         assert!(Uuid::parse_str(&first.trajectory_id).is_ok());
@@ -2873,37 +3111,23 @@ mod tests {
         assert_ne!(first.trajectory_id, first.cascade_id);
         // Ids are deterministic from the start — AssignModel binds its jwt to
         // the cascade id before the chat request exists.
-        let second = session_shape(&turn1, "tok");
+        let second = session_shape("tok", Some("principal-a/target-a/session"));
         assert_eq!(second.cascade_id, first.cascade_id);
-        // step_index increments per call: 0, 2, 3… (the CLI's title-gen
-        // takes index 1).
-        assert_eq!(second.step_index, 2);
-
-        // A continuing conversation keeps the same ids — the seed reads the
-        // system prompt head and first user message, not the whole history.
-        let turn2 = AiRequest::new(
-            "m",
-            vec![
-                text_item(Role::User, "open"),
-                text_item(Role::Assistant, "reply"),
-                text_item(Role::User, "again"),
-            ],
+        assert_eq!(second.trajectory_id, first.trajectory_id);
+        assert_eq!(second.step_index, 0);
+        for (token, affinity) in [
+            ("tok", Some("principal-b/target-a/session")),
+            ("tok", Some("principal-a/target-b/session")),
+            ("tok2", Some("principal-a/target-a/session")),
+            ("tok", None),
+            ("tok", Some("")),
+        ] {
+            assert_ne!(session_shape(token, affinity).cascade_id, first.cascade_id);
+        }
+        assert_ne!(
+            session_shape("tok", None).cascade_id,
+            session_shape("tok", None).cascade_id
         );
-        let pinned = session_shape(&turn2, "tok");
-        assert_eq!(pinned.cascade_id, first.cascade_id);
-        assert_eq!(pinned.trajectory_id, first.trajectory_id);
-
-        // A different opener or credential is a different session.
-        let other = AiRequest::new(
-            "m",
-            vec![
-                text_item(Role::User, "different opener"),
-                text_item(Role::Assistant, "reply"),
-                text_item(Role::User, "again"),
-            ],
-        );
-        assert_ne!(session_shape(&other, "tok").cascade_id, pinned.cascade_id);
-        assert_ne!(session_shape(&turn2, "tok2").cascade_id, pinned.cascade_id);
     }
 
     #[test]

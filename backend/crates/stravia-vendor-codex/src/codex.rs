@@ -1,9 +1,10 @@
 use std::collections::HashMap;
 
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use stravia_runtime_contract::protocol::{
     ids::OPEN_RESPONSES_2026_04_24,
-    ir::{AiResponse, ServerToolUsage, Usage},
+    ir::{AiResponse, ServerToolUsage, SessionParameters, Usage},
 };
 use stravia_vendor_sdk::{
     GuestHost, ProviderSnapshot, SearchRequest, SearchResponse, SearchSource, WsMessage, WsRequest,
@@ -20,22 +21,435 @@ const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const WEBSOCKET_REUSE_MAX_AGE_MILLIS: u64 = 55 * 60 * 1000;
 const ORIGINATOR: &str = "codex_cli_rs";
 
+/// One identity projection shared by the HTTP body, HTTP headers and WS handshake.
+/// Only the host-scoped affinity may select a reusable native session.
+pub(super) struct NativeSession {
+    request_id: String,
+    metadata: Value,
+    headers: Vec<(String, String)>,
+}
+
+impl NativeSession {
+    pub(super) fn new(provider: &ProviderSnapshot, session: &SessionParameters) -> Self {
+        let seed = uuid::Uuid::new_v4().to_string();
+        let affinity = clean_id(
+            provider
+                .operation_metadata
+                .get("transport_affinity")
+                .and_then(Value::as_str),
+        )
+        .unwrap_or(&seed);
+        let session_id = format!("session-{affinity}");
+        let thread_id = format!("thread-{affinity}");
+        let window_id = format!("window-{affinity}");
+        let turn_id = clean_id(session.turn_id.as_deref())
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("turn-{seed}"));
+        let request_id = clean_id(session.request_id.as_deref())
+            .map(str::to_owned)
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let mut metadata = json!({
+            "session_id": session_id,
+            "thread_id": thread_id,
+            "x-codex-window-id": window_id,
+            "turn_id": turn_id,
+        });
+        if let Some(parent_turn) = clean_id(session.parent_turn_id.as_deref()) {
+            metadata["parent_turn_id"] = parent_turn.into();
+        }
+        if let Some(root_turn) = clean_id(session.root_turn_id.as_deref()) {
+            metadata["root_turn_id"] = root_turn.into();
+        }
+        for (affinity_key, metadata_key) in [
+            (
+                "parent_thread_transport_affinity",
+                "x-codex-parent-thread-id",
+            ),
+            (
+                "forked_from_thread_transport_affinity",
+                "forked_from_thread_id",
+            ),
+        ] {
+            if let Some(affinity) = clean_id(
+                provider
+                    .operation_metadata
+                    .get(affinity_key)
+                    .and_then(Value::as_str),
+            ) {
+                metadata[metadata_key] = format!("thread-{affinity}").into();
+            }
+        }
+        if let Some(affinity) = clean_id(
+            provider
+                .operation_metadata
+                .get("context_window_transport_affinity")
+                .and_then(Value::as_str),
+        ) {
+            use sha2::{Digest, Sha256};
+            let digest = Sha256::digest(affinity.as_bytes());
+            let bytes: [u8; 16] = digest[..16].try_into().expect("digest has 16 bytes");
+            metadata["context_window_id"] = uuid::Builder::from_random_bytes(bytes)
+                .into_uuid()
+                .to_string()
+                .into();
+        }
+        let mut headers = vec![
+            ("session-id".into(), session_id),
+            ("thread-id".into(), thread_id),
+            ("x-codex-window-id".into(), window_id),
+        ];
+        if let Some(parent_thread) = metadata
+            .get("x-codex-parent-thread-id")
+            .and_then(Value::as_str)
+        {
+            headers.push(("x-codex-parent-thread-id".into(), parent_thread.into()));
+        }
+        let mut turn_metadata = serde_json::Map::new();
+        for name in [
+            "session_id",
+            "thread_id",
+            "turn_id",
+            "parent_turn_id",
+            "root_turn_id",
+        ] {
+            if let Some(value) = metadata.get(name) {
+                turn_metadata.insert(name.into(), value.clone());
+            }
+        }
+        if let Some(parent_thread) = metadata.get("x-codex-parent-thread-id") {
+            turn_metadata.insert("parent_thread_id".into(), parent_thread.clone());
+        }
+        // These official lineage fields occur only inside the turn snapshot,
+        // not as independent flat client_metadata compatibility keys.
+        for name in ["forked_from_thread_id", "context_window_id"] {
+            if let Some(value) = metadata
+                .as_object_mut()
+                .and_then(|metadata| metadata.remove(name))
+            {
+                turn_metadata.insert(name.into(), value);
+            }
+        }
+        turn_metadata.insert("window_id".into(), metadata["x-codex-window-id"].clone());
+        let turn_metadata = Value::Object(turn_metadata).to_string();
+        headers.push(("x-codex-turn-metadata".into(), turn_metadata.clone()));
+        metadata["x-codex-turn-metadata"] = turn_metadata.into();
+        Self {
+            request_id,
+            metadata,
+            headers,
+        }
+    }
+
+    pub(super) fn apply_body(&self, body: &mut Value) {
+        body["client_metadata"] = self.metadata.clone();
+    }
+
+    pub(super) fn resolve_identity(
+        &mut self,
+        host: &GuestHost,
+        provider: &ProviderSnapshot,
+    ) -> Result<(), stravia_vendor_sdk::PluginError> {
+        let (mut root, mut identities) = read_identities(host)?;
+        let key = credential_key(provider)?;
+        let created = !identities.contains_key(&key);
+        let identity = identities.entry(key).or_insert_with(NativeIdentity::new);
+        if uuid::Uuid::parse_str(&identity.installation_id).is_err() {
+            return Err(invalid("Codex native installation identity is invalid"));
+        }
+        let installation = identity.installation_id.clone();
+        let turn = self.turn_key();
+        if let Some((_, state)) = identity.turns.iter().find(|(key, _)| key == &turn) {
+            self.headers.push(("x-codex-turn-state".into(), state.clone()));
+            self.metadata["x-codex-turn-state"] = state.clone().into();
+        }
+        if created {
+            write_identities(host, &mut root, identities)?;
+        }
+        self.headers.push(("x-codex-installation-id".into(), installation.clone()));
+        self.metadata["x-codex-installation-id"] = installation.clone().into();
+        let mut turn_metadata: Value = serde_json::from_str(
+            self.metadata["x-codex-turn-metadata"].as_str().expect("native turn metadata"),
+        )
+        .map_err(|_| invalid("Codex native turn metadata is invalid"))?;
+        turn_metadata["installation_id"] = installation.into();
+        let turn_metadata = turn_metadata.to_string();
+        set_header(&mut self.headers, "x-codex-turn-metadata", turn_metadata.clone());
+        self.metadata["x-codex-turn-metadata"] = turn_metadata.into();
+        Ok(())
+    }
+
+    fn turn_key(&self) -> String {
+        format!("{}:{}", self.metadata["session_id"], self.metadata["turn_id"])
+    }
+
+    pub(super) fn capture_turn_state(
+        &self,
+        host: &GuestHost,
+        provider: &ProviderSnapshot,
+        headers: &[(String, String)],
+    ) -> Result<(), stravia_vendor_sdk::PluginError> {
+        let Some(state) = headers.iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("x-codex-turn-state"))
+            .and_then(|(_, value)| clean_id(Some(value)))
+        else {
+            return Ok(());
+        };
+        let (mut root, mut identities) = read_identities(host)?;
+        let Some(identity) = identities.get_mut(&credential_key(provider)?) else {
+            return Err(invalid("Codex native installation identity is missing"));
+        };
+        let turn = self.turn_key();
+        if !identity.capture(turn, state) {
+            return Ok(());
+        }
+        write_identities(host, &mut root, identities)
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+// https://github.com/openai/codex/blob/main/codex-rs/core/src/installation_id.rs
+// https://github.com/openai/codex/blob/main/codex-rs/core/src/client.rs
+// 官方安装 UUID 持久化；turn-state 只复用本 turn 首个上游响应头。
+struct NativeIdentity {
+    installation_id: String,
+    #[serde(default)]
+    turns: std::collections::VecDeque<(String, String)>,
+}
+
+impl NativeIdentity {
+    fn new() -> Self {
+        Self {
+            installation_id: uuid::Uuid::new_v4().to_string(),
+            turns: Default::default(),
+        }
+    }
+
+    fn capture(&mut self, turn: String, state: &str) -> bool {
+        // 官方 OnceLock 保留同一 turn 的首个响应值，不让后续响应切换路由。
+        if self.turns.iter().any(|(key, _)| key == &turn) {
+            return false;
+        }
+        if self.turns.len() >= 256 {
+            self.turns.pop_front();
+        }
+        self.turns.push_back((turn, state.into()));
+        true
+    }
+}
+
+type Identities = std::collections::BTreeMap<String, NativeIdentity>;
+
+fn credential_key(provider: &ProviderSnapshot) -> Result<String, stravia_vendor_sdk::PluginError> {
+    use base64::Engine;
+    use sha2::{Digest, Sha256};
+    let token = secret(provider, "access_token")?;
+    // 账号身份跨 OAuth 刷新保持稳定；没有账号声明的凭据只按自身散列隔离。
+    let account = provider.credentials.get("account_id").and_then(Value::as_str).map(str::to_owned)
+        .or_else(|| account_id_from_jwt(token));
+    let identity = account.as_deref().unwrap_or(token);
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(identity.as_bytes())))
+}
+
+fn read_identities(
+    host: &GuestHost,
+) -> Result<(serde_json::Map<String, Value>, Identities), stravia_vendor_sdk::PluginError> {
+    let mut root = match host.read_private_state()? {
+        Some(bytes) => serde_json::from_slice::<serde_json::Map<String, Value>>(&bytes)
+            .map_err(|_| invalid("Codex native identity state is invalid"))?,
+        None => Default::default(),
+    };
+    let identities = root.remove("native_identities")
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|_| invalid("Codex native identity state is invalid"))?
+        .unwrap_or_default();
+    Ok((root, identities))
+}
+
+fn write_identities(
+    host: &GuestHost,
+    root: &mut serde_json::Map<String, Value>,
+    identities: Identities,
+) -> Result<(), stravia_vendor_sdk::PluginError> {
+    root.insert("native_identities".into(), serde_json::to_value(identities)
+        .map_err(|_| invalid("Codex native identity state could not be encoded"))?);
+    host.write_private_state(&serde_json::to_vec(root)
+        .map_err(|_| invalid("Codex native identity state could not be encoded"))?)
+}
+
+fn clean_id(value: Option<&str>) -> Option<&str> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && !value.contains(['\r', '\n']))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum BodyOperation {
+    Http,
+    WebSocket,
+    Compact,
+    Search,
+    Image,
+}
+
+pub(super) fn inference_include(
+    request: &stravia_runtime_contract::protocol::ir::AiRequest,
+) -> Vec<Value> {
+    use stravia_runtime_contract::thinking::{TargetThinkingControl, ThinkingLevel};
+    let reasoning = &request.reasoning;
+    let enabled = reasoning.mode.as_deref() != Some("disabled")
+        && reasoning.level != Some(ThinkingLevel::Off)
+        && !matches!(reasoning.target_control, Some(TargetThinkingControl::Disabled))
+        && (matches!(reasoning.mode.as_deref(), Some("enabled" | "auto"))
+            || reasoning.level.is_some()
+            || reasoning.target_control.is_some()
+            || reasoning.budget_tokens.is_some());
+    let mut include = Vec::with_capacity(2);
+    if request.parameters.store == Some(false) && enabled {
+        include.push("reasoning.encrypted_content".into());
+    }
+    if request.parameters.logprobs.is_some() {
+        include.push("message.output_text.logprobs".into());
+    }
+    include
+}
+
+pub(super) fn encode_tools(
+    request: &stravia_runtime_contract::protocol::ir::AiRequest,
+    operation: BodyOperation,
+) -> Vec<Value> {
+    use stravia_runtime_contract::protocol::ir::{NativeTool, native_tool_to_responses};
+    let functions = request.tools.as_deref().unwrap_or_default();
+    let mut tools = Vec::with_capacity(functions.len() + request.parameters.native_tools.len());
+    for tool in functions {
+        let mut encoded = json!({"type":"function", "name":tool.name, "parameters":tool.parameters});
+        if let Some(description) = &tool.description {
+            encoded["description"] = description.clone().into();
+        }
+        if let Some(strict) = tool.strict {
+            encoded["strict"] = strict.into();
+        }
+        if let Some(defer_loading) = tool.defer_loading {
+            encoded["defer_loading"] = defer_loading.into();
+        }
+        tools.push(encoded);
+    }
+    for tool in &request.parameters.native_tools {
+        if matches!(tool, NativeTool::CodeExecution(_))
+            || (matches!(tool, NativeTool::ImageGeneration(_)) && operation != BodyOperation::Image)
+        {
+            continue;
+        }
+        if let Some(mut encoded) = native_tool_to_responses(tool)
+            && restrict_native_tool(&mut encoded, operation, false)
+        {
+            tools.push(encoded);
+        }
+    }
+    tools
+}
+
+// Closed wire contracts: codex-api/src/common.rs ResponsesApiRequest and
+// ResponseCreateWsRequest; installed official codex-cli 0.159.2 HTTP capture.
+// `instructions` is emitted by that release (newer main uses input items).
+const RESPONSE_FIELDS: &[&str] = &[
+    "model",
+    "instructions",
+    "input",
+    "tools",
+    "tool_choice",
+    "parallel_tool_calls",
+    "reasoning",
+    "store",
+    "stream",
+    "include",
+    "service_tier",
+    "prompt_cache_key",
+    "text",
+    "client_metadata",
+];
+// rust-v0.134.0 codex-api/src/common.rs::CompactionInput, the official
+// /responses/compact contract retained for this platform's compact operation.
+const COMPACT_FIELDS: &[&str] = &[
+    "model",
+    "input",
+    "instructions",
+    "tools",
+    "parallel_tool_calls",
+    "reasoning",
+    "service_tier",
+    "prompt_cache_key",
+    "text",
+];
+
 pub(super) fn prepare_body(body: &mut Value) -> Result<(), stravia_vendor_sdk::PluginError> {
+    prepare_operation_body(body, BodyOperation::Http)
+}
+
+pub(super) fn prepare_operation_body(
+    body: &mut Value,
+    operation: BodyOperation,
+) -> Result<(), stravia_vendor_sdk::PluginError> {
     let object = body
         .as_object_mut()
         .ok_or_else(|| invalid("Codex Responses request body must be an object"))?;
-    object.insert("store".into(), Value::Bool(false));
-    for field in [
-        "frequency_penalty",
-        "presence_penalty",
-        "temperature",
-        "top_p",
-        "top_logprobs",
-        "truncation",
-        "max_output_tokens",
-        "max_tool_calls",
-    ] {
-        object.remove(field);
+    object.retain(|key, value| {
+        !value.is_null() && if operation == BodyOperation::Compact {
+            COMPACT_FIELDS.contains(&key.as_str())
+        } else {
+            RESPONSE_FIELDS.contains(&key.as_str())
+                || (operation == BodyOperation::WebSocket
+                    && matches!(key.as_str(), "previous_response_id" | "generate"))
+        }
+    });
+    if operation != BodyOperation::Compact {
+        object.insert("store".into(), Value::Bool(false));
+        // The native endpoint rejects stream:false. Client delivery remains
+        // host-owned; even a unary client request uses the official SSE wire.
+        object.insert("stream".into(), Value::Bool(true));
+    }
+    // Filter control envelopes, never user input, tool schemas, grammars or
+    // image/search business data.
+    retain_control_fields(object.get_mut("reasoning"), &["effort", "summary"]);
+    if let Some(text) = object.get_mut("text").and_then(Value::as_object_mut) {
+        text.retain(|key, _| matches!(key.as_str(), "verbosity" | "format"));
+        retain_control_fields(
+            text.get_mut("format"),
+            &["type", "strict", "schema", "name"],
+        );
+    }
+    // Client metadata has one authority: NativeSession::apply_body.
+    object.remove("client_metadata");
+    let dropped_all_tools = if let Some(Value::Array(tools)) = object.get_mut("tools") {
+        let had_tools = !tools.is_empty();
+        tools.retain_mut(|tool| restrict_native_tool(tool, operation, false));
+        had_tools && tools.is_empty()
+    } else {
+        false
+    };
+    if dropped_all_tools {
+        object.remove("tool_choice");
+    }
+    if let Some(choice) = object.get_mut("tool_choice") {
+        let supported = match choice {
+            Value::String(choice) => matches!(choice.as_str(), "auto" | "none" | "required"),
+            Value::Object(choice) => {
+                let tool_type = choice.get("type").and_then(Value::as_str);
+                let supported = matches!(
+                    (operation, tool_type),
+                    (_, Some("web_search" | "tool_search"))
+                        | (BodyOperation::Image, Some("image_generation"))
+                );
+                if supported {
+                    choice.retain(|key, _| key == "type");
+                }
+                supported
+            }
+            _ => false,
+        };
+        if !supported {
+            object.remove("tool_choice");
+        }
     }
     if object.get("service_tier").and_then(Value::as_str) == Some("auto") {
         object.remove("service_tier");
@@ -43,20 +457,75 @@ pub(super) fn prepare_body(body: &mut Value) -> Result<(), stravia_vendor_sdk::P
     Ok(())
 }
 
+// https://github.com/openai/codex/blob/main/codex-rs/tools/src/tool_spec.rs
+// Official codex-tools ToolSpec/ResponsesApiNamespaceTool. Auxiliary hosted
+// image generation has its own fixed constructor, not client inference access.
+fn restrict_native_tool(tool: &mut Value, operation: BodyOperation, namespaced: bool) -> bool {
+    let Some(tool) = tool.as_object_mut() else {
+        return false;
+    };
+    let fields: &[&str] = match tool.get("type").and_then(Value::as_str) {
+        Some("function") => &[
+            "type",
+            "name",
+            "description",
+            "strict",
+            "defer_loading",
+            "parameters",
+        ],
+        Some("custom") => &["type", "name", "description", "defer_loading", "format"],
+        Some("namespace") if !namespaced => &["type", "name", "description", "tools"],
+        Some("tool_search") if !namespaced => &["type", "execution", "description", "parameters"],
+        Some("web_search") if !namespaced => &[
+            "type",
+            "external_web_access",
+            "indexed_web_access",
+            "filters",
+            "user_location",
+            "search_context_size",
+            "search_content_types",
+        ],
+        Some("image_generation") if !namespaced && operation == BodyOperation::Image => {
+            &["type", "action", "output_format", "size", "quality"]
+        }
+        _ => return false,
+    };
+    tool.retain(|key, _| fields.contains(&key.as_str()));
+    retain_control_fields(tool.get_mut("format"), &["type", "syntax", "definition"]);
+    retain_control_fields(tool.get_mut("filters"), &["allowed_domains"]);
+    retain_control_fields(
+        tool.get_mut("user_location"),
+        &["type", "country", "region", "city", "timezone"],
+    );
+    if let Some(Value::Array(children)) = tool.get_mut("tools") {
+        children.retain_mut(|child| restrict_native_tool(child, operation, true));
+        return !children.is_empty();
+    }
+    true
+}
+
+fn retain_control_fields(value: Option<&mut Value>, fields: &[&str]) {
+    if let Some(object) = value.and_then(Value::as_object_mut) {
+        object.retain(|key, value| !value.is_null() && fields.contains(&key.as_str()));
+    }
+}
+
 pub(super) fn append_runtime_headers(
     provider: &ProviderSnapshot,
     body: &Value,
+    session: &NativeSession,
     headers: &mut Vec<(String, String)>,
 ) -> Result<(), stravia_vendor_sdk::PluginError> {
-    append_forwarded_client_headers(provider, headers);
+    // Codec/ingress headers are not native identity authority. Build this
+    // target's complete header set rather than retaining alternate session keys.
+    headers.retain(|(name, _)| {
+        name.eq_ignore_ascii_case("content-type") || name.eq_ignore_ascii_case("accept")
+    });
     append_identity_headers(provider, headers)?;
-    set_header(
-        headers,
-        "openai-beta",
-        "responses_websockets=2026-02-06".into(),
-    );
-    let request_id = request_id(body);
-    set_header(headers, "x-client-request-id", request_id);
+    for (name, value) in &session.headers {
+        set_header(headers, name, value.clone());
+    }
+    set_header(headers, "x-client-request-id", session.request_id.clone());
     set_header(headers, "x-codex-routing-hint", routing_hint(body)?);
     Ok(())
 }
@@ -64,31 +533,6 @@ pub(super) fn append_runtime_headers(
 fn set_header(headers: &mut Vec<(String, String)>, name: &str, value: String) {
     headers.retain(|(candidate, _)| !candidate.eq_ignore_ascii_case(name));
     headers.push((name.into(), value));
-}
-
-fn append_forwarded_client_headers(
-    provider: &ProviderSnapshot,
-    headers: &mut Vec<(String, String)>,
-) {
-    for (name, value) in &provider.client_headers {
-        let name = name.to_ascii_lowercase();
-        if (matches!(
-            name.as_str(),
-            "accept"
-                | "accept-language"
-                | "idempotency-key"
-                | "openai-beta"
-                | "session-id"
-                | "session_id"
-                | "conversation_id"
-                | "thread-id"
-                | "x-client-request-id"
-        ) || super::CODEX_CLIENT_HEADER_NAMES.contains(&name.as_str()))
-            && !value.contains(['\r', '\n'])
-        {
-            set_header(headers, &name, value.clone());
-        }
-    }
 }
 
 pub(super) fn append_identity_headers(
@@ -139,10 +583,6 @@ fn routing_hint(body: &Value) -> Result<String, stravia_vendor_sdk::PluginError>
     )
 }
 
-fn request_id(_body: &Value) -> String {
-    uuid::Uuid::new_v4().to_string()
-}
-
 pub(super) fn websocket_available(provider: &ProviderSnapshot) -> bool {
     configured_websocket_url(provider).is_some()
         || url::Url::parse(&provider.base_url).is_ok_and(|url| {
@@ -156,35 +596,16 @@ pub(super) fn infer_websocket(
     host: &GuestHost,
     provider: &ProviderSnapshot,
     body: &Value,
+    session: &NativeSession,
     preserve_upstream_errors: bool,
 ) -> Result<AiResponse, stravia_vendor_sdk::PluginError> {
-    let seed = request_id(body);
-    let affinity = provider
-        .operation_metadata
-        .get("transport_affinity")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    let session_id = affinity.map_or_else(
-        || operation_id(provider, "session_id", &format!("session-{seed}")),
-        |affinity| format!("session-{affinity}"),
-    );
-    let thread_id = affinity.map_or_else(
-        || operation_id(provider, "thread_id", &format!("thread-{seed}")),
-        |affinity| format!("thread-{affinity}"),
-    );
-    let window_id = affinity.map_or_else(
-        || operation_id(provider, "window_id", &format!("window-{seed}")),
-        |affinity| format!("window-{affinity}"),
-    );
-    let turn_id = operation_id(provider, "turn_id", &format!("turn-{seed}"));
-
     let mut headers = Vec::new();
-    append_runtime_headers(provider, body, &mut headers)?;
-    set_header(&mut headers, "session-id", session_id.clone());
-    set_header(&mut headers, "thread-id", thread_id.clone());
-    set_header(&mut headers, "x-client-request-id", thread_id.clone());
-    set_header(&mut headers, "x-codex-window-id", window_id.clone());
+    append_runtime_headers(provider, body, session, &mut headers)?;
+    set_header(
+        &mut headers,
+        "openai-beta",
+        "responses_websockets=2026-02-06".into(),
+    );
 
     let url = if let Some(url) = configured_websocket_url(provider) {
         url.to_owned()
@@ -221,19 +642,9 @@ pub(super) fn infer_websocket(
     let object = frame
         .as_object_mut()
         .ok_or_else(|| invalid("Codex Responses request body must be an object"))?;
-    object.remove("stream");
-    object.remove("background");
-    object.remove("service_tier");
+    // This body was projected as WebSocket before the scoped identity was
+    // attached. The WS schema includes stream and service_tier as well.
     object.insert("type".into(), Value::String("response.create".into()));
-    object.insert(
-        "client_metadata".into(),
-        json!({
-            "session_id": session_id,
-            "thread_id": thread_id,
-            "x-codex-window-id": window_id,
-            "turn_id": turn_id,
-        }),
-    );
     host.emit_started()?;
     connection
         .send(&WsMessage::Text(serde_json::to_string(&frame).map_err(
@@ -250,17 +661,6 @@ pub(super) fn infer_websocket(
             super::classify_codex_websocket_error(value, saw_response_event, continuation_requested)
         },
     )
-}
-
-fn operation_id(provider: &ProviderSnapshot, key: &str, fallback: &str) -> String {
-    provider
-        .operation_metadata
-        .get(key)
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or(fallback)
-        .to_owned()
 }
 
 pub(super) fn search(
@@ -309,12 +709,15 @@ pub(super) fn search(
         "stream": true,
         "include": ["reasoning.encrypted_content", "web_search_call.action.sources"]
     });
-    prepare_body(&mut body)?;
+    prepare_operation_body(&mut body, BodyOperation::Search)?;
+    let mut session = NativeSession::new(provider, &SessionParameters::default());
+    session.resolve_identity(host, provider)?;
+    session.apply_body(&mut body);
     let mut headers = vec![
         ("content-type".into(), "application/json".into()),
         ("accept".into(), "text/event-stream".into()),
     ];
-    append_runtime_headers(provider, &body, &mut headers)?;
+    append_runtime_headers(provider, &body, &session, &mut headers)?;
     host.emit_started()?;
     let response = host.http_start(stravia_vendor_sdk::wit::types::HttpRequest {
         method: "POST".into(),
@@ -324,6 +727,7 @@ pub(super) fn search(
             .map_err(|_| invalid("Codex Search request could not be encoded"))?,
     })?;
     ensure_success(&response, "Codex Search")?;
+    session.capture_turn_state(host, provider, &response.headers()?)?;
     let bytes = stravia_vendor_sdk::read_http_body(&response, MAX_RESPONSE_BYTES)?;
     let response = parse_responses_body(&bytes)?;
     let report_id = provider
@@ -607,4 +1011,298 @@ pub(super) fn usage_from_response(response: &Value) -> Option<Usage> {
             web_fetch_requests: 0,
         }),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn installation_identity_persists_and_turn_state_stays_with_its_turn_and_credential() {
+        let mut identities = Identities::new();
+        let first_key = credential_key(&provider()).unwrap();
+        let identity = identities.entry(first_key.clone()).or_insert_with(NativeIdentity::new);
+        let installation = identity.installation_id.clone();
+        assert_eq!(uuid::Uuid::parse_str(&installation).unwrap().get_version_num(), 4);
+        assert!(identity.capture("session-a:turn-a".into(), "first-state"));
+        assert!(!identity.capture("session-a:turn-a".into(), "replacement"));
+        assert!(identity.capture("session-a:turn-b".into(), "next-turn"));
+        let mut restored: Identities = serde_json::from_slice(&serde_json::to_vec(&identities).unwrap()).unwrap();
+        let identity = restored.get_mut(&first_key).unwrap();
+        assert_eq!(identity.installation_id, installation);
+        assert_eq!(identity.turns[0], ("session-a:turn-a".into(), "first-state".into()));
+        assert_eq!(identity.turns[1], ("session-a:turn-b".into(), "next-turn".into()));
+        let mut other = provider();
+        other.credentials.insert("access_token".into(), "other-token".into());
+        let other_key = credential_key(&other).unwrap();
+        assert_ne!(first_key, other_key);
+        let other_identity = restored.entry(other_key).or_insert_with(NativeIdentity::new);
+        assert_ne!(other_identity.installation_id, installation);
+        assert!(other_identity.turns.is_empty());
+    }
+
+    #[test]
+    fn canonical_native_choice_selects_search_but_not_unsupported_execution() {
+        use stravia_runtime_contract::protocol::ir::{
+            AiItem, AiRequest, MessageContent, NativeTool, NativeToolKind, Role, ToolChoice, WebSearchTool,
+        };
+        let mut request = AiRequest::new("gpt-5.4", vec![AiItem {
+            role: Role::User,
+            content: MessageContent::Text("hello".to_owned().into()),
+            tool_calls: None,
+            tool_call_id: None,
+            meta: None,
+        }]);
+        request.parameters.native_tools.push(NativeTool::WebSearch(WebSearchTool::default()));
+        request.tool_choice = Some(ToolChoice::Native(NativeToolKind::WebSearch));
+        let mut body = stravia_vendor_common::common::encode_inference_request(
+            &OPEN_RESPONSES_2026_04_24.to_string(), request.clone(),
+        ).unwrap().body;
+        body["tools"] = encode_tools(&request, BodyOperation::Http).into();
+        prepare_body(&mut body).unwrap();
+        assert_eq!(body["tools"][0]["type"], "web_search");
+        assert_eq!(body["tool_choice"], json!({"type":"web_search"}));
+        body["tool_choice"] = json!({"type":"code_interpreter"});
+        prepare_body(&mut body).unwrap();
+        assert!(body.get("tool_choice").is_none());
+    }
+
+    #[test]
+    fn inference_include_is_derived_from_reasoning_storage_and_logprob_intent() {
+        use stravia_runtime_contract::protocol::ir::AiRequest;
+        let mut request = AiRequest::new("gpt-5.4", Vec::new());
+        request.parameters.store = Some(false);
+        request.parameters.logprobs = Some(0);
+        assert_eq!(inference_include(&request), vec![json!("message.output_text.logprobs")]);
+        request.reasoning.mode = Some("enabled".into());
+        assert_eq!(inference_include(&request), vec![
+            json!("reasoning.encrypted_content"), json!("message.output_text.logprobs"),
+        ]);
+        request.reasoning.mode = Some("disabled".into());
+        assert_eq!(inference_include(&request), vec![json!("message.output_text.logprobs")]);
+    }
+
+    #[test]
+    fn native_operation_allowlists_ignore_unknown_controls_without_touching_business_json() {
+        let original = json!({
+            "model":"gpt-5.4", "instructions":"native",
+            "input":[{"role":"user","content":[{"type":"input_text","text":"hi"}]}],
+            "tools":[{"type":"function","name":"business","parameters":{
+                "type":"object","properties":{"private_parameter":{"type":"string"}}
+            }}],
+            "tool_choice":"auto", "parallel_tool_calls":false,
+            "reasoning":{"effort":"high","summary":"auto","context":"all_turns","private_parameter":1},
+            "text":{"verbosity":"low","format":{"type":"json_schema","name":"out","strict":true,
+                "schema":{"type":"object","properties":{"private_parameter":{"type":"string"}}},
+                "private_parameter":1},"private_parameter":1},
+            "stream":true, "stream_options":{"reasoning_summary_delivery":"sequential_cutoff","private_parameter":1},
+            "access_programs":{"cyber":"standard","private_parameter":1},
+            "service_tier":"priority","include":["reasoning.encrypted_content"],
+            "prompt_cache_key":"cache","store":true,
+            "previous_response_id":"previous","generate":false,
+            "metadata":{"private_parameter":1},"prompt_cache_retention":"24h",
+            "client_metadata":{"session_id":"spoofed"},"private_parameter":{"arbitrary":true}
+        });
+        for operation in [
+            BodyOperation::Http,
+            BodyOperation::WebSocket,
+            BodyOperation::Compact,
+            BodyOperation::Search,
+            BodyOperation::Image,
+        ] {
+            let mut body = original.clone();
+            prepare_operation_body(&mut body, operation).unwrap();
+            for absent in [
+                "private_parameter",
+                "metadata",
+                "prompt_cache_retention",
+                "client_metadata",
+            ] {
+                assert!(body.get(absent).is_none(), "{absent}");
+            }
+            assert_eq!(body["tools"], original["tools"]);
+            assert_eq!(body["input"], original["input"]);
+            assert_eq!(
+                body["text"]["format"]["schema"],
+                original["text"]["format"]["schema"]
+            );
+            assert!(body["reasoning"].get("private_parameter").is_none());
+            assert!(body["text"]["format"].get("private_parameter").is_none());
+            assert!(body["text"].get("private_parameter").is_none());
+            if operation == BodyOperation::WebSocket {
+                assert_eq!(body["previous_response_id"], "previous");
+                assert_eq!(body["generate"], false);
+            } else {
+                assert!(body.get("previous_response_id").is_none());
+                assert!(body.get("generate").is_none());
+            }
+            if operation == BodyOperation::Compact {
+                assert!(body.get("stream").is_none());
+                assert!(body.get("store").is_none());
+                assert!(body.get("access_programs").is_none());
+            } else {
+                assert_eq!(body["store"], false);
+            }
+            assert_eq!(body["service_tier"], "priority");
+        }
+    }
+
+    fn provider() -> ProviderSnapshot {
+        ProviderSnapshot {
+            provider_id: "openai-codex".into(),
+            channel: "codex".into(),
+            base_url: "https://chatgpt.com/backend-api/codex".into(),
+            protocol: "open-responses".into(),
+            options: BTreeMap::new(),
+            credentials: BTreeMap::from([("access_token".into(), "test-token".into())]),
+            model: Some("gpt-6-astra".into()),
+            model_metadata: None,
+            client_headers: vec![
+                ("session-id".into(), "untrusted-session".into()),
+                ("thread-id".into(), "untrusted-thread".into()),
+                ("x-client-request-id".into(), "untrusted-request".into()),
+                ("x-codex-window-id".into(), "untrusted-window".into()),
+                ("x-codex-beta-features".into(), "native-beta".into()),
+                ("x-codex-turn-state".into(), "native-turn-state".into()),
+                (
+                    "x-codex-turn-metadata".into(),
+                    json!({"thread_id":"spoofed", "session_id":"spoofed",
+                        "turn_id":"spoofed", "custom_hint":"preserved"})
+                    .to_string(),
+                ),
+            ],
+            operation_metadata: BTreeMap::from([
+                ("transport_affinity".into(), "principal-target-scope".into()),
+                ("thread_id".into(), "not-a-scoped-key".into()),
+            ]),
+        }
+    }
+
+    #[test]
+    fn scoped_parent_thread_and_fork_lineage_match_previous_native_thread_identity() {
+        let mut provider = provider();
+        provider.operation_metadata.insert(
+            "parent_thread_transport_affinity".into(),
+            "scoped-parent".into(),
+        );
+        provider.operation_metadata.insert(
+            "forked_from_thread_transport_affinity".into(),
+            "scoped-fork".into(),
+        );
+        provider.operation_metadata.insert(
+            "context_window_transport_affinity".into(),
+            "scoped-window".into(),
+        );
+        let canonical = SessionParameters {
+            parent_id: Some("raw-parent".into()),
+            forked_from_id: Some("raw-fork".into()),
+            context_window_id: Some("raw-window".into()),
+            root_turn_id: Some("canonical-root-turn".into()),
+            ..Default::default()
+        };
+        let child = NativeSession::new(&provider, &canonical);
+        let mut earlier_parent = provider.clone();
+        earlier_parent
+            .operation_metadata
+            .insert("transport_affinity".into(), "scoped-parent".into());
+        let parent = NativeSession::new(&earlier_parent, &Default::default());
+        assert_eq!(
+            child.metadata["x-codex-parent-thread-id"],
+            parent.metadata["thread_id"]
+        );
+        let turn: Value =
+            serde_json::from_str(child.metadata["x-codex-turn-metadata"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(turn["parent_thread_id"], parent.metadata["thread_id"]);
+        assert_eq!(turn["forked_from_thread_id"], "thread-scoped-fork");
+        assert_eq!(turn["root_turn_id"], "canonical-root-turn");
+        assert!(uuid::Uuid::parse_str(turn["context_window_id"].as_str().unwrap()).is_ok());
+        assert!(child.metadata.get("forked_from_thread_id").is_none());
+        assert!(child.metadata.get("context_window_id").is_none());
+        provider.operation_metadata.insert(
+            "parent_thread_transport_affinity".into(),
+            "other-principal-target-parent".into(),
+        );
+        let other = NativeSession::new(&provider, &canonical);
+        assert_ne!(
+            other.metadata["x-codex-parent-thread-id"],
+            child.metadata["x-codex-parent-thread-id"]
+        );
+    }
+
+    #[test]
+    fn canonical_native_identity_is_shared_and_scoped_not_raw_client_identity() {
+        let provider = provider();
+        let canonical = SessionParameters {
+            id: Some("raw-affinity".into()),
+            request_id: Some("request-correlation".into()),
+            turn_id: Some("canonical-turn".into()),
+            ..Default::default()
+        };
+        let session = NativeSession::new(&provider, &canonical);
+        let mut body = json!({"model":"gpt-6-astra", "client_metadata":{"session_id":"spoofed"}});
+        session.apply_body(&mut body);
+        let mut headers = vec![
+            ("session_id".into(), "codec-raw-session".into()),
+            ("conversation_id".into(), "codec-raw-conversation".into()),
+            ("x-unapproved".into(), "not-native".into()),
+        ];
+        append_runtime_headers(&provider, &body, &session, &mut headers).unwrap();
+        let headers: BTreeMap<_, _> = headers.into_iter().collect();
+        for (header, key) in [
+            ("session-id", "session_id"),
+            ("thread-id", "thread_id"),
+            ("x-codex-window-id", "x-codex-window-id"),
+            ("x-codex-turn-metadata", "x-codex-turn-metadata"),
+        ] {
+            assert_eq!(
+                body["client_metadata"][key].as_str(),
+                Some(headers[header].as_str())
+            );
+        }
+        assert_eq!(headers["session-id"], "session-principal-target-scope");
+        assert_eq!(headers["thread-id"], "thread-principal-target-scope");
+        assert_eq!(headers["x-client-request-id"], "request-correlation");
+        assert!(!headers.contains_key("x-codex-beta-features"));
+        assert!(!headers.contains_key("x-codex-turn-state"));
+        assert!(!headers.contains_key("x-openai-subagent"));
+        assert!(!headers.contains_key("session_id"));
+        assert!(!headers.contains_key("conversation_id"));
+        assert!(!headers.contains_key("x-unapproved"));
+        assert!(!headers.contains_key("openai-beta"));
+        let turn: Value = serde_json::from_str(&headers["x-codex-turn-metadata"]).unwrap();
+        assert_eq!(turn["thread_id"], body["client_metadata"]["thread_id"]);
+        assert_eq!(turn["session_id"], body["client_metadata"]["session_id"]);
+        assert_eq!(turn["turn_id"], "canonical-turn");
+        assert!(turn.get("custom_hint").is_none());
+        assert!(body["client_metadata"].get("custom_hint").is_none());
+    }
+
+    #[test]
+    fn scoped_sessions_are_stable_but_request_ids_and_turns_are_distinct() {
+        let mut provider = provider();
+        let first = NativeSession::new(&provider, &SessionParameters::default());
+        let second = NativeSession::new(&provider, &SessionParameters::default());
+        assert_eq!(first.metadata["session_id"], second.metadata["session_id"]);
+        assert_eq!(first.metadata["thread_id"], second.metadata["thread_id"]);
+        assert_ne!(first.request_id, second.request_id);
+        assert_ne!(first.metadata["turn_id"], second.metadata["turn_id"]);
+        assert_ne!(
+            first.request_id,
+            first.metadata["thread_id"].as_str().unwrap()
+        );
+        provider
+            .operation_metadata
+            .insert("transport_affinity".into(), "other-principal-target".into());
+        let other = NativeSession::new(&provider, &SessionParameters::default());
+        assert_ne!(first.metadata["session_id"], other.metadata["session_id"]);
+        provider.operation_metadata.remove("transport_affinity");
+        let isolated = NativeSession::new(&provider, &SessionParameters::default());
+        let another = NativeSession::new(&provider, &SessionParameters::default());
+        assert_ne!(
+            isolated.metadata["session_id"],
+            another.metadata["session_id"]
+        );
+    }
 }

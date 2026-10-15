@@ -28,6 +28,7 @@ mod envelope;
 pub mod guest;
 mod host_api;
 mod language_tag;
+mod request_compat;
 
 #[cfg(test)]
 #[allow(dead_code)]
@@ -43,7 +44,10 @@ pub use descriptor::{
     MODEL_CAPABILITY_THINKING_TOGGLE, MODELS_SOURCE_CATALOG, NetworkDeclaration, OriginDeclaration,
     ProviderDescriptor, VendorDescriptor, VendorKind,
 };
-pub use envelope::{CANONICAL_FORMAT_VERSION, CanonicalEnvelope, decode_payload, encode_payload};
+pub use envelope::{
+    CANONICAL_FORMAT_VERSION, CanonicalEnvelope, decode_payload, encode_payload,
+    encode_request_payload,
+};
 pub use guest::{
     AllowanceAmount, AllowanceItem, AllowanceRequest, AllowanceResponse, AuthRequest, AuthResponse,
     AuthStep, CatalogSyncOutcome, CatalogSyncRequest, ConfigValidationRequest,

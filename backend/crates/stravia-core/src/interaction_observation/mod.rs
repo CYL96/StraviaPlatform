@@ -3410,6 +3410,19 @@ mod snapshot_tests {
         ]);
         // Identical text is a new input when its canonical item follows history.
         input.push(user);
+        for id in ["preview-failed", "preview-retry", "preview-second-retry"] {
+            let failed = publish(id, &input);
+            failed.finish(RunOutcome {
+                client_output_committed: false,
+                delivery: None,
+                delivery_completed_at: None,
+                status: "failed".into(),
+                terminal_reason: Some("upstream_stream_error".into()),
+                generation_node_id: None,
+                generation_root_id: None,
+            });
+            observation.flush().await?;
+        }
         let followup = publish("preview-followup", &input);
         let call = deliver(&followup, &input, "preview-call-3");
         observation.flush().await?;
@@ -3445,7 +3458,7 @@ mod snapshot_tests {
             [
                 "preview-initial",
                 "preview-fork",
-                "preview-followup",
+                "preview-failed",
                 "preview-unavailable"
             ]
         );
@@ -3483,7 +3496,7 @@ mod snapshot_tests {
         assert_eq!(
             queried_previews,
             [
-                "preview-followup",
+                "preview-failed",
                 "preview-fork",
                 "preview-initial",
                 "preview-unavailable"

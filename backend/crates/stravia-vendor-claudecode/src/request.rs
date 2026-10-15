@@ -1,11 +1,10 @@
 //! 把 codec 编码出的 Anthropic Messages 请求改写为 Claude Code CLI 的线上形态。
 //!
-//! Anthropic 对订阅 OAuth 令牌只放行「看起来像 Claude Code」的推理请求。本模块
-//! 复刻 oh-my-pi v18.4.2 的 OAuth 塑形（`packages/ai/src/providers/anthropic.ts`
-//! 与 `anthropic-identity.ts`）：`system[0]` 计费头 + `system[1]` 身份块、自定义
-//! 工具名加 `_` 前缀、`metadata.user_id` JSON 身份、缓存 TTL 默认 1 小时，以及
-//! 对最终请求体字节计算的 `cch` 校验值。这些值是与上游的线上约定，改动前应先用
-//! 真实 Claude Code 或 oh-my-pi 抓包确认。
+//! 原生控制闭集按官方 Claude Code 2.1.300 发行包内的请求构造器、官方 SDK 类型
+//! 及本地合成凭据 loopback 抓包维护；不接纳 CLI 的任意 EXTRA_BODY/EXTRA_METADATA。
+//! 既有 OAuth 塑形包括 `system[0]` 计费头、`system[1]` 身份块、自定义工具名 `_`
+//! 前缀、重建 `metadata.user_id`、缓存 TTL 与最终字节 `cch` 校验。业务内容、工具
+//! 定义和 JSON schema 不按请求参数递归过滤。
 
 use serde::Serialize;
 use serde_json::{Map, Value, json};
@@ -17,7 +16,7 @@ use crate::thinking::{self, ModelProfile};
 use crate::xxhash::xxh64;
 
 /// 未配置覆盖值时上报的 Claude Code CLI 正式发行版本。
-pub(crate) const DEFAULT_CLIENT_VERSION: &str = "2.1.299";
+pub(crate) const DEFAULT_CLIENT_VERSION: &str = "2.1.300";
 /// 与该 Claude Code 发布包内的 `@anthropic-ai/sdk` 身份保持一致。
 pub(crate) const SDK_VERSION: &str = "0.128.0";
 const RUNTIME_VERSION: &str = "v26.3.0";
@@ -106,9 +105,11 @@ const KEY_ORDER: &[&str] = &[
     "ttl",
 ];
 
-/// Claude Code（oh-my-pi）在订阅 OAuth 通道会写入的顶层字段。其余字段（
-/// `container`、`service_tier` 等）来自其他入口协议，真实客户端不会发送，
-/// 上游会据此拒绝或识别为非 Claude Code 流量，统一丢弃。
+/// Closed first-party CLI contract, checked against installed Claude Code
+/// 2.1.248 loopback captures and the official npm 2.1.300 native package's
+/// embedded queryModel / sideQuery request constructors. Generic SDK fields
+/// and CLI EXTRA_BODY / EXTRA_METADATA injection are deliberately not admitted.
+/// Nested parameter types follow anthropic-sdk-typescript beta/messages.
 const CLAUDE_CODE_FIELDS: &[&str] = &[
     "model",
     "messages",
@@ -125,12 +126,20 @@ const CLAUDE_CODE_FIELDS: &[&str] = &[
     "top_k",
     "stop_sequences",
     "tool_choice",
+    "speed",
+    "cache_control",
+    "thread",
+    "diagnostics",
+    "context_hint",
+    "safeguards",
+    "fallbacks",
 ];
 
 /// 已登录账号在请求元数据里的身份。
 pub(crate) struct AccountIdentity<'a> {
     pub account_uuid: Option<&'a str>,
     pub device_id: Option<&'a str>,
+    pub parent_session_id: Option<&'a str>,
 }
 
 pub(crate) struct ShapedRequest {
@@ -140,7 +149,7 @@ pub(crate) struct ShapedRequest {
 }
 
 /// 塑形 codec 产出的请求体并序列化为最终线上字节（已写入 `cch`）。
-/// `fallback_session_id` 仅在客户端元数据没有可复用会话 ID 时调用。
+/// 会话仅由宿主的 principal/target scoped operation metadata 派生。
 pub(crate) fn shape(
     mut body: Value,
     client_version: &str,
@@ -154,13 +163,26 @@ pub(crate) fn shape(
     // Claude Code 只走流式推理；流式同时避开非流式请求的长输出时限。
     object.insert("stream".into(), Value::Bool(true));
     restrict_to_claude_code_fields(object);
+    let block_binding = object
+        .get_mut("thinking")
+        .and_then(Value::as_object_mut)
+        .and_then(|thinking| thinking.remove("block_binding"));
     thinking::normalize(object, caps);
+    if let Some(block_binding) = block_binding
+        && let Some(thinking) = object.get_mut("thinking").and_then(Value::as_object_mut)
+        && matches!(
+            thinking.get("type").and_then(Value::as_str),
+            Some("adaptive" | "enabled")
+        )
+    {
+        thinking.insert("block_binding".into(), block_binding);
+    }
     capabilities::constrain(object, caps);
     drop_disallowed_sampling(object, caps);
     drop_unsupported_prefill(object, caps);
     prefix_tool_names(object);
     default_tool_result_errors(object);
-    let session_id = client_session_id(object.get("metadata")).unwrap_or_else(fallback_session_id);
+    let session_id = fallback_session_id();
     let first_user_text = first_user_text(object.get("messages"));
     rebuild_system(object, &first_user_text, client_version)?;
     cache::enforce(object);
@@ -214,7 +236,8 @@ pub(crate) fn inference_headers(
 }
 
 pub(crate) fn cli_user_agent(client_version: &str) -> String {
-    format!("claude-cli/{client_version} (external, cli)")
+    // Official 2.1.300 non-interactive --print loopback capture.
+    format!("claude-cli/{client_version} (external, sdk-cli)")
 }
 
 /// 响应侧还原：去掉请求时加上的一个 `_` 前缀。
@@ -225,6 +248,149 @@ pub(crate) fn decode_tool_name(name: &str) -> Option<String> {
 /// 丢弃真实 Claude Code 不会发送的顶层字段。
 fn restrict_to_claude_code_fields(object: &mut Map<String, Value>) {
     object.retain(|key, _| CLAUDE_CODE_FIELDS.contains(&key.as_str()));
+    let dropped_tools = object
+        .get_mut("tools")
+        .and_then(Value::as_array_mut)
+        .is_some_and(|tools| {
+            let original_count = tools.len();
+            tools.retain_mut(restrict_claude_code_tool);
+            tools.len() != original_count
+        });
+    if dropped_tools && let Some(tools) = object.get("tools").and_then(Value::as_array) {
+        let unavailable_choice = object
+            .get("tool_choice")
+            .and_then(|choice| choice.get("name"))
+            .and_then(Value::as_str)
+            .is_some_and(|name| {
+                !tools
+                    .iter()
+                    .any(|tool| tool.get("name").and_then(Value::as_str) == Some(name))
+            });
+        if tools.is_empty() || unavailable_choice {
+            object.remove("tool_choice");
+        }
+    }
+    retain_control_fields(
+        object.get_mut("thinking"),
+        &["type", "budget_tokens", "display", "block_binding"],
+    );
+    if let Some(thinking) = object.get_mut("thinking").and_then(Value::as_object_mut) {
+        retain_control_fields(
+            thinking.get_mut("block_binding"),
+            &["prefix_mismatch_behavior"],
+        );
+    }
+    retain_control_fields(
+        object.get_mut("tool_choice"),
+        &["type", "name", "disable_parallel_tool_use"],
+    );
+    retain_control_fields(
+        object.get_mut("cache_control"),
+        &["type", "ttl", "scope", "evict_on_complete"],
+    );
+    retain_control_fields(object.get_mut("thread"), &["type", "previous_message_id"]);
+    retain_control_fields(object.get_mut("diagnostics"), &["previous_message_id"]);
+    retain_control_fields(
+        object.get_mut("context_hint"),
+        &["enabled", "target_tokens_saved"],
+    );
+    if let Some(config) = object
+        .get_mut("output_config")
+        .and_then(Value::as_object_mut)
+    {
+        config.retain(|key, _| matches!(key.as_str(), "effort" | "format" | "task_budget"));
+        retain_control_fields(config.get_mut("format"), &["type", "schema"]);
+        retain_control_fields(
+            config.get_mut("task_budget"),
+            &["type", "total", "remaining"],
+        );
+    }
+    if let Some(context) = object
+        .get_mut("context_management")
+        .and_then(Value::as_object_mut)
+    {
+        context.retain(|key, _| key == "edits");
+        if let Some(edits) = context.get_mut("edits").and_then(Value::as_array_mut) {
+            edits.retain_mut(|edit| {
+                let Some(edit) = edit.as_object_mut() else {
+                    return false;
+                };
+                let fields: &[&str] = match edit.get("type").and_then(Value::as_str) {
+                    Some("clear_thinking_20251015") => &["type", "keep"],
+                    Some("clear_tool_uses_20250919") => &[
+                        "type",
+                        "clear_at_least",
+                        "clear_tool_inputs",
+                        "exclude_tools",
+                        "keep",
+                        "trigger",
+                    ],
+                    Some("compact_20260112") => {
+                        &["type", "instructions", "pause_after_compaction", "trigger"]
+                    }
+                    _ => return false,
+                };
+                edit.retain(|key, _| fields.contains(&key.as_str()));
+                for key in ["keep", "trigger", "clear_at_least"] {
+                    retain_control_fields(edit.get_mut(key), &["type", "value"]);
+                }
+                true
+            });
+        }
+    }
+    if let Some(safeguards) = object.get_mut("safeguards").and_then(Value::as_array_mut) {
+        for safeguard in safeguards {
+            // classifier_context is the official classifier's business JSON,
+            // not an open request-parameter namespace.
+            retain_control_fields(Some(safeguard), &["type", "classifier_context"]);
+        }
+    }
+    if let Some(fallbacks) = object.get_mut("fallbacks").and_then(Value::as_array_mut) {
+        for fallback in fallbacks {
+            retain_control_fields(Some(fallback), &["model"]);
+        }
+    }
+}
+
+fn restrict_claude_code_tool(tool: &mut Value) -> bool {
+    let Some(tool) = tool.as_object_mut() else {
+        return false;
+    };
+    // Official npm @anthropic-ai/claude-code-win32-x64@2.1.300, embedded
+    // a$/x1t serializer: eager_input_streaming depends on the tengu_fgts
+    // feature gate (or an environment override), so it is not an always-send
+    // CLI field. Cache anchors are generated later by cache::enforce, never
+    // copied from the client tool definition.
+    let fields: &[&str] = match tool.get("type").and_then(Value::as_str) {
+        None | Some("custom") if tool.contains_key("input_schema") => &[
+            "name",
+            "description",
+            "input_schema",
+            "strict",
+            "defer_loading",
+        ],
+        Some("web_search_20250305") => &[
+            "type",
+            "name",
+            "allowed_domains",
+            "blocked_domains",
+            "max_uses",
+            "user_location",
+        ],
+        _ => return false,
+    };
+    tool.retain(|key, _| fields.contains(&key.as_str()));
+    retain_control_fields(
+        tool.get_mut("user_location"),
+        &["type", "country", "region", "city", "timezone"],
+    );
+    true
+}
+
+fn retain_control_fields(value: Option<&mut Value>, fields: &[&str]) {
+    if let Some(object) = value.and_then(Value::as_object_mut) {
+        object.retain(|key, _| fields.contains(&key.as_str()));
+    }
 }
 
 /// 不支持 prefill 时省略末尾 assistant，不把助手内容冒充用户，也不插入合成提示。
@@ -344,23 +510,6 @@ fn default_tool_result_errors(object: &mut Map<String, Value>) {
     }
 }
 
-/// 复用客户端元数据里的会话 ID：Claude Code JSON 形态取 `session_id`，旧版
-/// `user_…_account_…_session_<uuid>` 形态取末段。
-fn client_session_id(metadata: Option<&Value>) -> Option<String> {
-    let user_id = metadata?.get("user_id")?.as_str()?.trim();
-    if user_id.starts_with('{') {
-        let parsed: Value = serde_json::from_str(user_id).ok()?;
-        return parsed
-            .get("session_id")?
-            .as_str()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_owned);
-    }
-    let (_, session) = user_id.rsplit_once("_session_")?;
-    (user_id.starts_with("user_") && session.len() == 36).then(|| session.to_owned())
-}
-
 fn first_user_text(messages: Option<&Value>) -> String {
     let Some(message) = messages.and_then(Value::as_array).and_then(|messages| {
         messages
@@ -441,16 +590,18 @@ fn rebuild_system(
 struct MetadataUserId<'a> {
     session_id: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
+    parent_session_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     account_uuid: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     device_id: Option<&'a str>,
 }
 
-/// `metadata.user_id` 由上游账号身份重建，只沿用客户端的会话 ID：客户端
-/// 自带的账号/设备字段描述的是客户端自己的凭据，不是本连接的订阅账号。
+/// `metadata.user_id` 由上游账号身份和宿主 scoped 会话/父会话标签重建。
 fn metadata_user_id(session_id: &str, identity: &AccountIdentity<'_>) -> String {
     serde_json::to_string(&MetadataUserId {
         session_id,
+        parent_session_id: identity.parent_session_id,
         account_uuid: identity.account_uuid,
         device_id: identity.device_id,
     })
@@ -486,6 +637,74 @@ fn beta_header(object: &Map<String, Value>) -> String {
         && !betas.contains(&EFFORT_BETA)
     {
         betas.push(EFFORT_BETA);
+    }
+    for (present, beta) in [
+        (
+            object
+                .get("output_config")
+                .and_then(|v| v.get("format"))
+                .is_some(),
+            "structured-outputs-2025-12-15",
+        ),
+        (
+            object
+                .get("output_config")
+                .and_then(|v| v.get("task_budget"))
+                .is_some(),
+            "task-budgets-2026-03-13",
+        ),
+        (
+            object
+                .get("cache_control")
+                .and_then(|v| v.get("evict_on_complete"))
+                .and_then(Value::as_bool)
+                == Some(true),
+            "prompt-caching-evict-2026-05-12",
+        ),
+        (object.contains_key("thread"), "message-threads-2026-08-12"),
+        (
+            object.contains_key("diagnostics"),
+            "cache-diagnosis-2026-04-07",
+        ),
+        (
+            object.contains_key("context_hint"),
+            "context-hint-2026-04-09",
+        ),
+        (
+            object.get("speed").and_then(Value::as_str) == Some("fast"),
+            "fast-mode-2026-02-01",
+        ),
+        (
+            object.contains_key("safeguards"),
+            "dangerous-tool-use-2026-09-03",
+        ),
+        (
+            object
+                .get("thinking")
+                .and_then(|v| v.get("block_binding"))
+                .is_some(),
+            "thinking-binding-controls-2026-08-01",
+        ),
+        (
+            object
+                .get("thinking")
+                .and_then(|v| v.get("display"))
+                .and_then(Value::as_str)
+                == Some("updates"),
+            "thinking-display-updates-2026-08-18",
+        ),
+        (
+            object.contains_key("fallbacks"),
+            if object.get("fallbacks").and_then(Value::as_str) == Some("default") {
+                "server-side-fallback-2026-07-01"
+            } else {
+                "server-side-fallback-2026-06-01"
+            },
+        ),
+    ] {
+        if present && !betas.contains(&beta) {
+            betas.push(beta);
+        }
     }
     betas.join(",")
 }
@@ -561,6 +780,7 @@ mod tests {
         AccountIdentity {
             account_uuid: Some("00000000-0000-4000-8000-0000000000aa"),
             device_id: Some("d".repeat(64).leak()),
+            parent_session_id: None,
         }
     }
 
@@ -787,42 +1007,6 @@ mod tests {
     }
 
     #[test]
-    fn custom_tools_and_history_get_prefix_but_builtin_and_typed_tools_do_not() {
-        let (body, _) = shaped(json!({
-            "model": "m",
-            "max_tokens": 1,
-            "tools": [
-                {"name": "read", "input_schema": {}},
-                {"name": "Web_Search", "input_schema": {}},
-                {"type": "bash_20250124", "name": "bash"},
-                {"type": "custom", "name": "grep", "input_schema": {}}
-            ],
-            "tool_choice": {"type": "tool", "name": "read"},
-            "messages": [
-                {"role": "user", "content": "hi"},
-                {"role": "assistant", "content": [
-                    {"type": "tool_use", "id": "t1", "name": "read", "input": {}},
-                    {"type": "tool_use", "id": "t2", "name": "bash", "input": {}}
-                ]},
-                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]}
-            ],
-        }));
-        let names: Vec<&str> = body["tools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|tool| tool["name"].as_str().unwrap())
-            .collect();
-        assert_eq!(names, ["_read", "Web_Search", "bash", "_grep"]);
-        assert_eq!(body["tool_choice"]["name"], "_read");
-        assert_eq!(body["messages"][1]["content"][0]["name"], "_read");
-        assert_eq!(body["messages"][1]["content"][1]["name"], "bash");
-        assert_eq!(decode_tool_name("_read").as_deref(), Some("read"));
-        assert_eq!(decode_tool_name("__private").as_deref(), Some("_private"));
-        assert_eq!(decode_tool_name("bash"), None);
-    }
-
-    #[test]
     fn tool_results_without_is_error_are_sent_as_explicit_false() {
         let (body, _) = shaped(json!({
             "model": "m",
@@ -887,17 +1071,17 @@ mod tests {
     }
 
     #[test]
-    fn metadata_reuses_client_session_and_injects_account_identity() {
+    fn metadata_ignores_client_session_and_injects_account_identity() {
         let (body, shaped) = shaped(json!({
             "model": "m",
             "max_tokens": 1,
             "metadata": {"user_id": "{\"session_id\":\"s-1\",\"account_uuid\":\"client\"}"},
             "messages": [{"role": "user", "content": "hi"}],
         }));
-        assert_eq!(shaped.session_id, "s-1");
+        assert_eq!(shaped.session_id, "fallback-session");
         let user_id: Value =
             serde_json::from_str(body["metadata"]["user_id"].as_str().unwrap()).unwrap();
-        assert_eq!(user_id["session_id"], "s-1");
+        assert_eq!(user_id["session_id"], "fallback-session");
         assert_eq!(
             user_id["account_uuid"],
             "00000000-0000-4000-8000-0000000000aa"
@@ -906,9 +1090,31 @@ mod tests {
 
         let (_, shaped) =
             shaped_with_metadata("user_abc_account_x_session_12345678-1234-1234-1234-123456789012");
-        assert_eq!(shaped.session_id, "12345678-1234-1234-1234-123456789012");
+        assert_eq!(shaped.session_id, "fallback-session");
         let (_, shaped) = shaped_with_metadata("opaque-client-user");
         assert_eq!(shaped.session_id, "fallback-session");
+    }
+
+    #[test]
+    fn non_strict_nullable_tool_schema_is_preserved_without_schema_surgery() {
+        let properties: Map<String, Value> = (0..39)
+            .map(|index| {
+                (
+                    format!("field_{index}"),
+                    json!({"anyOf":[{"type":"string"},{"type":"null"}]}),
+                )
+            })
+            .collect();
+        let schema = json!({"type":"object", "properties":properties});
+        let (body, _) = shaped(json!({
+            "model":"claude-sonnet-4-5",
+            "max_tokens":1024,
+            "tools":[{"name":"nullable_tool", "input_schema":schema}],
+            "messages":[{"role":"user", "content":"hi"}]
+        }));
+        assert_eq!(body["tools"][0]["name"], "_nullable_tool");
+        assert_eq!(body["tools"][0]["input_schema"], schema);
+        assert!(body["tools"][0].get("strict").is_none());
     }
 
     #[test]
@@ -1021,6 +1227,157 @@ mod tests {
             assert!(CLAUDE_CODE_FIELDS.contains(key), "unexpected field {key}");
         }
         assert!(keys.contains(&"stop_sequences") && keys.contains(&"tool_choice"));
+    }
+
+    #[test]
+    fn unsupported_tool_projection_does_not_leave_an_invalid_forced_choice() {
+        for supported_tool in [false, true] {
+            let mut body = json!({
+                "tools": [{"type":"code_execution_20260120","name":"API-only"}],
+                "tool_choice": {"type":"tool","name":"API-only"}
+            });
+            if supported_tool {
+                body["tools"].as_array_mut().unwrap().push(json!({
+                    "name":"available","input_schema":{"type":"object"}
+                }));
+            }
+            restrict_to_claude_code_fields(body.as_object_mut().unwrap());
+            assert!(body.get("tool_choice").is_none());
+            assert!(
+                !body["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|tool| tool["name"] == "API-only")
+            );
+            if supported_tool {
+                assert_eq!(
+                    body["tools"],
+                    json!([{"name":"available","input_schema":{"type":"object"}}])
+                );
+            } else {
+                assert_eq!(body["tools"], json!([]));
+            }
+        }
+    }
+
+    #[test]
+    fn official_nested_controls_survive_but_unknown_parameter_keys_do_not() {
+        let schema = json!({"type":"object","properties":{"private_parameter":{"type":"string"}}});
+        let mut body = json!({
+            "model":"claude-opus-4-6", "messages":[{"role":"user","content":"hi"}],
+            "tools":[
+                {"name":"business","input_schema":schema,"defer_loading":false,
+                 "eager_input_streaming":true,"citations":{"enabled":true,"private_parameter":1},
+                 "cache_control":{"type":"ephemeral","ttl":"5m"},
+                 "allowed_callers":["direct"],"input_examples":[{"query":"SDK-only"}],
+                 "private_parameter":1},
+                {"type":"web_search_20250305","name":"web_search","max_uses":8,
+                 "user_location":{"type":"approximate","city":"Paris","private_parameter":1},
+                 "search_profile":"official-profile","allowed_domains":["example.com"],"private_parameter":1},
+                {"type":"code_execution_20260120","name":"API-only"}
+            ],
+            "metadata":{"user_id":"spoofed","private_parameter":1},
+            "max_tokens":4096,"private_parameter":1,
+            "thinking":{"type":"adaptive","display":"omitted","private_parameter":1,
+                "block_binding":{"prefix_mismatch_behavior":"error","private_parameter":1}},
+            "output_config":{"effort":"high","private_parameter":1,
+                "format":{"type":"json_schema","schema":schema,"private_parameter":1},
+                "task_budget":{"type":"tokens","total":100000,"remaining":90000,"private_parameter":1}},
+            "context_management":{"private_parameter":1,"edits":[
+                {"type":"clear_thinking_20251015","keep":"all","private_parameter":1},
+                {"type":"clear_tool_uses_20250919","trigger":{"type":"input_tokens","value":1000,"private_parameter":1}},
+                {"type":"unknown_private_edit","private_parameter":1}]},
+            "tool_choice":{"type":"auto","disable_parallel_tool_use":true,"private_parameter":1},
+            "speed":"fast",
+            "thread":{"type":"continue","previous_message_id":"msg_previous","private_parameter":1},
+            "diagnostics":{"previous_message_id":"msg_previous","private_parameter":1},
+            "cache_control":{"type":"ephemeral","ttl":"1h","evict_on_complete":true,"private_parameter":1},
+            "context_hint":{"enabled":true,"target_tokens_saved":1000,"private_parameter":1},
+            "safeguards":[{"type":"dangerous_tool_use","classifier_context":{"business_key":1},"private_parameter":1}],
+            "fallbacks":[{"model":"claude-sonnet-4-5","private_parameter":1}]
+        });
+        restrict_to_claude_code_fields(body.as_object_mut().unwrap());
+        assert!(body.get("private_parameter").is_none());
+        assert_eq!(body["tools"].as_array().unwrap().len(), 2);
+        assert_eq!(body["tools"][0]["input_schema"], schema);
+        assert_eq!(body["tools"][0]["defer_loading"], false);
+        for field in [
+            "eager_input_streaming", "citations", "cache_control",
+            "allowed_callers", "input_examples", "private_parameter",
+        ] {
+            assert!(body["tools"][0].get(field).is_none(), "{field}");
+        }
+        assert!(body["tools"][1].get("search_profile").is_none());
+        assert_eq!(
+            body["tools"][1]["user_location"],
+            json!({"type":"approximate","city":"Paris"})
+        );
+        assert!(body["tools"][1].get("private_parameter").is_none());
+        assert_eq!(body["output_config"]["format"]["schema"], schema);
+        assert_eq!(
+            body["thinking"]["block_binding"],
+            json!({"prefix_mismatch_behavior":"error"})
+        );
+        assert_eq!(
+            body["output_config"]["task_budget"],
+            json!({"type":"tokens","total":100000,"remaining":90000})
+        );
+        assert_eq!(
+            body["context_management"]["edits"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            body["context_management"]["edits"][1]["trigger"],
+            json!({"type":"input_tokens","value":1000})
+        );
+        for field in [
+            "thinking",
+            "output_config",
+            "tool_choice",
+            "thread",
+            "diagnostics",
+            "cache_control",
+            "context_hint",
+        ] {
+            assert!(body[field].get("private_parameter").is_none(), "{field}");
+        }
+        assert_eq!(
+            body["safeguards"][0],
+            json!({"type":"dangerous_tool_use","classifier_context":{"business_key":1}})
+        );
+        assert_eq!(body["fallbacks"], json!([{"model":"claude-sonnet-4-5"}]));
+        let betas = beta_header(body.as_object().unwrap());
+        for beta in [
+            "task-budgets-2026-03-13",
+            "message-threads-2026-08-12",
+            "dangerous-tool-use-2026-09-03",
+            "fast-mode-2026-02-01",
+        ] {
+            assert!(betas.split(',').any(|actual| actual == beta));
+        }
+        // End-to-end shaping replaces the entire metadata object; neither
+        // user-supplied identity nor private metadata can become an authority.
+        let (shaped, request) = shaped(body);
+        assert_eq!(
+            shaped["thinking"]["block_binding"],
+            json!({"prefix_mismatch_behavior":"error"})
+        );
+        let identity: Value =
+            serde_json::from_str(shaped["metadata"]["user_id"].as_str().unwrap()).unwrap();
+        assert_eq!(identity["session_id"], request.session_id);
+        assert!(shaped["tools"][0].get("eager_input_streaming").is_none());
+        assert!(shaped["tools"][0].get("cache_control").is_none());
+        assert_eq!(shaped["tools"][1]["name"], "web_search");
+        assert_eq!(
+            shaped["tools"][1]["cache_control"],
+            json!({"type":"ephemeral","ttl":"1h"})
+        );
+        assert_eq!(shaped["metadata"].as_object().unwrap().len(), 1);
+        assert!(identity.get("private_parameter").is_none());
     }
 
     fn shaped_with_metadata(user_id: &str) -> (Value, ShapedRequest) {

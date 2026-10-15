@@ -132,14 +132,10 @@ impl AgentToolRegistry {
                         ),
                     ));
                 }
-                Ok(ToolSpec {
-                    name,
-                    description: Some(tool.description().to_owned()),
-                    parameters: tool.input_schema(),
-                    strict: Some(tool.strict_schema()),
-                    cache_control: None,
-                    meta: None,
-                })
+                Ok(ToolSpec { name,
+                description: Some(tool.description().to_owned()),
+                parameters: tool.input_schema(),
+                strict: Some(tool.strict_schema()), defer_loading: None })
             })
             .collect()
     }

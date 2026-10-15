@@ -6,6 +6,10 @@ use http::header::{HeaderMap, HeaderValue};
 use serde_json::Value;
 
 use stravia_runtime_contract::protocol::ir::AiRequest;
+use stravia_runtime_contract::protocol::ir::{
+    CacheRetention, NativeTool, NativeToolKind, ParameterReset, ReasoningSummary, ServiceTier,
+    native_tool_to_anthropic,
+};
 use stravia_runtime_contract::protocol::ir::request::AiItem;
 use stravia_runtime_contract::protocol::ir::request::ContentBlock;
 use stravia_runtime_contract::protocol::ir::request::MediaSource;
@@ -18,6 +22,8 @@ pub struct AnthropicEncoder;
 
 impl AnthropicEncoder {
     pub(crate) fn encode_request(&self, mut req: AiRequest) -> Result<(Value, HeaderMap)> {
+        req.normalize_parameters();
+        let strict_budget_exceeded = strict_budget_exceeded(&req);
         let ingress = &mut req.meta.vendor.ingress;
         let supplied_tool_ids = if ingress.contains_key("__anthropic_raw_messages") {
             HashSet::new()
@@ -92,65 +98,64 @@ impl AnthropicEncoder {
         }
 
         // ── Tools ─────────────────────────────────────────────────────────────
-        // Prefer raw tools (preserves cache_control) if present.
-        if let Some(raw_tools) = ingress.remove("__anthropic_raw_tools") {
-            obj.insert("tools".into(), raw_tools);
-        } else if let Some(tools) = req.tools {
-            let tools_val: Vec<Value> = tools
-                .into_iter()
-                .map(|t| {
-                    if let Some(builtin_type) = t.name.strip_prefix("__builtin__") {
-                        let mut entry = serde_json::json!({
-                            "type": builtin_type,
-                            "name": builtin_type,
-                        });
-                        if let Some(desc) = t.description {
-                            entry
-                                .as_object_mut()
-                                .unwrap()
-                                .insert("description".into(), Value::String(desc));
-                        }
-                        entry
-                    } else {
-                        let mut parameters = t.parameters;
-                        let strict = t
-                            .strict
-                            .filter(|strict| !*strict || !schema_has_open_object(&parameters));
-                        if strict == Some(true) {
-                            omit_unsupported_schema_constraints(&mut parameters);
-                        }
-                        let mut entry = object([
-                            ("name", Value::String(t.name)),
-                            (
-                                "description",
-                                t.description.map(Value::String).unwrap_or(Value::Null),
-                            ),
-                            ("input_schema", parameters),
-                        ]);
-                        if let Some(strict) = strict {
-                            entry
-                                .as_object_mut()
-                                .unwrap()
-                                .insert("strict".into(), strict.into());
-                        }
-                        entry
-                    }
-                })
-                .collect();
+        let has_tools = req.tools.is_some();
+        let container = req.parameters.native_tools.iter().find_map(|tool| match tool {
+            NativeTool::CodeExecution(tool) => tool.container.as_ref(),
+            _ => None,
+        });
+        if let Some(container) = container {
+            obj.insert("container".into(), container.clone().into());
+        }
+        let mut tools_val: Vec<Value> = req
+            .tools
+            .unwrap_or_default()
+            .into_iter()
+            .map(|t| {
+                let strict = t
+                    .strict
+                    .filter(|strict| !*strict || !strict_budget_exceeded);
+                let mut entry = object([
+                    ("name", Value::String(t.name)),
+                    ("input_schema", t.parameters),
+                ]);
+                if let Some(description) = t.description {
+                    entry
+                        .as_object_mut()
+                        .unwrap()
+                        .insert("description".into(), description.into());
+                }
+                if let Some(strict) = strict {
+                    entry
+                        .as_object_mut()
+                        .unwrap()
+                        .insert("strict".into(), strict.into());
+                }
+                if let Some(defer_loading) = t.defer_loading {
+                    entry
+                        .as_object_mut()
+                        .unwrap()
+                        .insert("defer_loading".into(), defer_loading.into());
+                }
+                entry
+            })
+            .collect();
+        tools_val.extend(
+            req.parameters
+                .native_tools
+                .iter()
+                .filter_map(native_tool_to_anthropic),
+        );
+        if (has_tools && !req.parameters.resets(ParameterReset::NativeTools)) || !tools_val.is_empty() {
             obj.insert("tools".into(), Value::Array(tools_val));
         }
 
         // ── Tool choice ───────────────────────────────────────────────────────
-        if let Some(tc) = req.tool_choice {
-            let raw = tool_choice_to_value_raw(tc);
-            if let Some(mapped) = map_tool_choice_for_anthropic(&raw) {
-                obj.insert("tool_choice".into(), mapped);
-            }
-        }
-        if let Some(disabled) = req
-            .disable_parallel_tool_calls
-            .or_else(|| req.parallel_tool_calls.map(|parallel| !parallel))
+        if let Some(tc) = req.tool_choice
+            && let Some(mapped) = tool_choice_for_anthropic(tc)
         {
+            obj.insert("tool_choice".into(), mapped);
+        }
+        if let Some(parallel) = req.parallel_tool_calls {
             let choice = obj
                 .entry("tool_choice")
                 .or_insert_with(|| serde_json::json!({"type": "auto"}));
@@ -158,7 +163,7 @@ impl AnthropicEncoder {
                 choice
                     .as_object_mut()
                     .unwrap()
-                    .insert("disable_parallel_tool_use".into(), disabled.into());
+                    .insert("disable_parallel_tool_use".into(), (!parallel).into());
             }
         }
         if let Some(stop) = req.generation.stop {
@@ -167,55 +172,23 @@ impl AnthropicEncoder {
 
         let mut output_config = serde_json::Map::new();
         if let Some(stravia_runtime_contract::protocol::ir::ResponseFormat::JsonSchema {
-            mut schema,
+            schema,
             ..
         }) = req.response_format
-            && schema.is_object()
-            && !schema_has_open_object(&schema)
         {
-            omit_unsupported_schema_constraints(&mut schema);
             output_config.insert(
                 "format".into(),
                 serde_json::json!({"type": "json_schema", "schema": schema}),
             );
         }
-        // 原生扩展优先于通用 format；effort 只合并到对应键，不能覆盖 format。
-        let native_output_config = match req.ext {
-            Some(stravia_runtime_contract::protocol::ir::ProtocolExt::Anthropic(ext)) => {
-                ext.output_config
+        if let Some(mut thinking) = encode_thinking(&req.reasoning, max_tokens, &mut output_config)? {
+            if let Some(summary) = req.reasoning.summary {
+                thinking["display"] = match summary {
+                    ReasoningSummary::None => "omitted",
+                    ReasoningSummary::Auto | ReasoningSummary::Concise | ReasoningSummary::Detailed => "summarized",
+                }.into();
             }
-            _ => None,
-        }
-        .or_else(|| ingress.remove("__anthropic_output_config"));
-        if let Some(native) = native_output_config {
-            let Value::Object(native) = native else {
-                anyhow::bail!("Anthropic output_config must be an object");
-            };
-            output_config.extend(native);
-        }
-
-        if let Some(control) = req.reasoning.target_control.as_ref() {
-            let thinking = match control {
-                stravia_runtime_contract::thinking::TargetThinkingControl::Budget { value } => {
-                    Some(serde_json::json!({"type": "enabled", "budget_tokens": value}))
-                }
-                stravia_runtime_contract::thinking::TargetThinkingControl::Enabled => {
-                    Some(serde_json::json!({"type": "enabled"}))
-                }
-                stravia_runtime_contract::thinking::TargetThinkingControl::Disabled => {
-                    Some(serde_json::json!({"type": "disabled"}))
-                }
-                stravia_runtime_contract::thinking::TargetThinkingControl::Effort { value } => {
-                    output_config
-                        .entry("effort")
-                        .or_insert_with(|| Value::String(value.clone()));
-                    Some(serde_json::json!({"type": "adaptive"}))
-                }
-                stravia_runtime_contract::thinking::TargetThinkingControl::Hidden => None,
-            };
-            if let Some(thinking) = thinking {
-                obj.insert("thinking".into(), thinking);
-            }
+            obj.insert("thinking".into(), thinking);
         }
 
         if !output_config.is_empty() {
@@ -223,22 +196,38 @@ impl AnthropicEncoder {
         }
 
         // ── Extra fields ──────────────────────────────────────────────────────
-        if let Some(v) = ingress.remove("__anthropic_context_management") {
-            obj.insert("context_management".into(), v);
+        if let Some(retention) = req.parameters.cache.retention {
+            let ttl = match retention {
+                CacheRetention::Default => "5m",
+                CacheRetention::Extended => "1h",
+            };
+            obj.insert("cache_control".into(), serde_json::json!({"type": "ephemeral", "ttl": ttl}));
         }
-        for key in &[
-            "__anthropic_container",
-            "__anthropic_service_tier",
-            "__anthropic_metadata",
-            "__anthropic_stop_sequences",
-            "__anthropic_top_k",
-        ] {
-            if let Some(v) = ingress.remove(*key) {
-                let field_name = key.trim_start_matches("__anthropic_");
-                obj.insert(field_name.into(), v);
+        if let Some(compaction) = req.parameters.compaction {
+            let mut edit = serde_json::json!({"type": "compact_20260112"});
+            if let Some(threshold) = compaction.threshold_tokens {
+                edit["trigger"] = serde_json::json!({"type": "input_tokens", "value": threshold});
             }
+            obj.insert("context_management".into(), serde_json::json!({"edits": [edit]}));
+        }
+        if let Some(tier) = req.parameters.service_tier.and_then(|tier| match tier {
+            ServiceTier::Auto => Some("auto"),
+            ServiceTier::Default => Some("standard_only"),
+            ServiceTier::Flex | ServiceTier::Priority => None,
+        }) {
+            obj.insert("service_tier".into(), tier.into());
+        }
+        if let Some(v) = req.parameters.top_k {
+            obj.insert("top_k".into(), v.into());
+        }
+        if let Some(user_id) = req.parameters.end_user_id {
+            obj.insert("metadata".into(), serde_json::json!({"user_id": user_id}));
         }
 
+        crate::codec::control_projection::project_request(
+            &mut body,
+            crate::codec::control_projection::Family::Anthropic,
+        );
         validate_anthropic_payload(&body)?;
 
         let mut headers = HeaderMap::new();
@@ -291,46 +280,92 @@ fn append_system_content(target: &mut String, content: MessageContent) {
     }
 }
 
-// 只删目标不能表达的约束，不收紧对象、不改写枚举值或 schema 的数据字段。
-fn omit_unsupported_schema_constraints(schema: &mut Value) {
-    let mut recursive_refs = HashSet::new();
-    collect_recursive_schema_refs(schema, schema, &mut recursive_refs);
-    omit_schema_constraints(schema, &recursive_refs);
-}
-
-fn schema_has_open_object(schema: &Value) -> bool {
-    let object_type = schema.get("type").is_some_and(|kind| {
-        kind == "object"
-            || kind
-                .as_array()
-                .is_some_and(|types| types.iter().any(|kind| kind == "object"))
-    });
-    if (object_type
-        || schema.get("properties").is_some()
-        || schema.get("additionalProperties").is_some())
-        && schema.get("additionalProperties") != Some(&Value::Bool(false))
-    {
+/// Compilation limits are aggregate request limits. Relax strict mode, never
+/// the user's schema, when a known limit is exceeded.
+fn strict_budget_exceeded(request: &AiRequest) -> bool {
+    let tools = request.tools.as_deref().unwrap_or_default();
+    let native_count = request
+        .parameters
+        .native_tools
+        .iter()
+        .filter(|tool| matches!(tool, NativeTool::WebSearch(_) | NativeTool::CodeExecution(_)))
+        .count();
+    let tool_count = tools.len() + native_count;
+    if tool_count > 20 {
         return true;
     }
-    let mut open = false;
-    schema_children(schema, |child| {
-        if !open {
-            open = schema_has_open_object(child);
-        }
-    });
-    open
+    let mut optional = 0;
+    let mut unions = 0;
+    for tool in tools {
+        count_schema_budget(&tool.parameters, &mut optional, &mut unions);
+    }
+    if let Some(stravia_runtime_contract::protocol::ir::ResponseFormat::JsonSchema {
+        schema, ..
+    }) = &request.response_format
+    {
+        count_schema_budget(schema, &mut optional, &mut unions);
+    }
+    optional > 24 || unions > 16
+}
+
+fn count_schema_budget(schema: &Value, optional: &mut usize, unions: &mut usize) {
+    if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
+        let required = schema.get("required").and_then(Value::as_array);
+        *optional += properties
+            .keys()
+            .filter(|name| {
+                !required.is_some_and(|required| {
+                    required
+                        .iter()
+                        .any(|value| value.as_str() == Some(name.as_str()))
+                })
+            })
+            .count();
+    }
+    for key in ["anyOf", "oneOf"] {
+        *unions += schema
+            .get(key)
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len);
+    }
+    schema_children(schema, |child| count_schema_budget(child, optional, unions));
 }
 
 fn schema_children<'a>(schema: &'a Value, mut visit: impl FnMut(&'a Value)) {
-    for key in ["properties", "$defs", "$def", "definitions"] {
+    for key in [
+        "properties",
+        "$defs",
+        "$def",
+        "definitions",
+        "patternProperties",
+        "dependentSchemas",
+    ] {
         if let Some(children) = schema.get(key).and_then(Value::as_object) {
             for child in children.values() {
                 visit(child);
             }
         }
     }
-    if let Some(items) = schema.get("items") {
-        visit(items);
+    for key in [
+        "items",
+        "additionalProperties",
+        "contains",
+        "not",
+        "if",
+        "then",
+        "else",
+        "propertyNames",
+        "unevaluatedProperties",
+    ] {
+        if let Some(child) = schema.get(key) {
+            if let Some(items) = child.as_array() {
+                for item in items {
+                    visit(item);
+                }
+            } else {
+                visit(child);
+            }
+        }
     }
     for key in ["anyOf", "allOf", "oneOf", "prefixItems"] {
         if let Some(children) = schema.get(key).and_then(Value::as_array) {
@@ -341,256 +376,88 @@ fn schema_children<'a>(schema: &'a Value, mut visit: impl FnMut(&'a Value)) {
     }
 }
 
-fn schema_has_reference_cycle<'a>(
-    root: &'a Value,
-    schema: &'a Value,
-    active: &mut HashSet<&'a str>,
-) -> bool {
-    if let Some(reference) = schema.get("$ref").and_then(Value::as_str)
-        && let Some(pointer) = reference.strip_prefix('#')
-        && let Some(target) = root.pointer(pointer)
-    {
-        if !active.insert(reference) {
-            return true;
+fn encode_thinking(
+    reasoning: &stravia_runtime_contract::protocol::ir::ReasoningConfig,
+    max_tokens: u32,
+    output: &mut serde_json::Map<String, Value>,
+) -> Result<Option<Value>> {
+    use stravia_runtime_contract::thinking::{TargetThinkingControl, ThinkingLevel};
+    let (mode, budget, effort) = match reasoning.target_control.as_ref() {
+        Some(TargetThinkingControl::Budget { value }) => ("enabled", Some(*value), None),
+        Some(TargetThinkingControl::Enabled) => ("enabled", reasoning.budget_tokens, None),
+        Some(TargetThinkingControl::Disabled) => ("disabled", None, None),
+        Some(TargetThinkingControl::Effort { value }) => ("adaptive", None, Some(value.as_str())),
+        Some(TargetThinkingControl::Hidden) => return Ok(None),
+        None => {
+            let mode = match reasoning.mode.as_deref() {
+                Some("enabled") => "enabled",
+                Some("disabled") => "disabled",
+                Some("auto") => "adaptive",
+                Some(other) => anyhow::bail!("unsupported Anthropic thinking mode: {other}"),
+                None if reasoning.level == Some(ThinkingLevel::Off) => "disabled",
+                None if reasoning.level.is_some() => "adaptive",
+                None => return Ok(None),
+            };
+            (mode, reasoning.budget_tokens, None)
         }
-        let recursive = schema_has_reference_cycle(root, target, active);
-        active.remove(reference);
-        if recursive {
-            return true;
-        }
-    }
-    let mut recursive = false;
-    schema_children(schema, |child| {
-        if !recursive {
-            recursive = schema_has_reference_cycle(root, child, active);
-        }
-    });
-    recursive
-}
-
-fn collect_recursive_schema_refs(
-    root: &Value,
-    schema: &Value,
-    recursive_refs: &mut HashSet<String>,
-) {
-    if let Some(reference) = schema.get("$ref").and_then(Value::as_str)
-        && reference.starts_with('#')
-        && schema_has_reference_cycle(root, schema, &mut HashSet::new())
-    {
-        recursive_refs.insert(reference.to_owned());
-    }
-    schema_children(schema, |child| {
-        collect_recursive_schema_refs(root, child, recursive_refs)
-    });
-}
-
-fn pattern_has_unsupported_tokens(pattern: &str) -> bool {
-    let bytes = pattern.as_bytes();
-    let mut index = 0;
-    let mut in_class = false;
-    while index < bytes.len() {
-        if bytes[index] == b'\\' {
-            if let Some(next) = bytes.get(index + 1)
-                && !in_class
-                && (matches!(*next, b'b' | b'B' | b'1'..=b'9'))
-            {
-                return true;
-            }
-            index += 2;
-            continue;
-        }
-        if bytes[index] == b'[' {
-            in_class = true;
-        }
-        if bytes[index] == b']' {
-            in_class = false;
-        }
-        if !in_class && bytes[index] == b'(' {
-            let suffix = &bytes[index..];
-            if suffix.starts_with(b"(?=")
-                || suffix.starts_with(b"(?!")
-                || suffix.starts_with(b"(?<=")
-                || suffix.starts_with(b"(?<!")
-            {
-                return true;
-            }
-        }
-        index += 1;
-    }
-    false
-}
-
-fn omit_schema_constraints(schema: &mut Value, recursive_refs: &HashSet<String>) {
-    let Some(schema) = schema.as_object_mut() else {
-        return;
     };
-    for key in [
-        "minimum",
-        "maximum",
-        "exclusiveMinimum",
-        "exclusiveMaximum",
-        "multipleOf",
-        "minLength",
-        "maxLength",
-        "maxItems",
-        "uniqueItems",
-        "contains",
-        "minContains",
-        "maxContains",
-    ] {
-        schema.remove(key);
+    if mode == "adaptive" {
+        let effort = match effort {
+            Some(effort @ ("low" | "medium" | "high" | "max")) => effort,
+            Some(other) => anyhow::bail!("unsupported Anthropic thinking effort: {other}"),
+            None => match reasoning.level {
+                Some(ThinkingLevel::Off | ThinkingLevel::Minimal | ThinkingLevel::Low) => "low",
+                Some(ThinkingLevel::Medium) => "medium",
+                Some(ThinkingLevel::Max) => "max",
+                _ => "high",
+            },
+        };
+        output.insert("effort".into(), effort.into());
+        return Ok(Some(serde_json::json!({"type": "adaptive"})));
     }
-    if schema
-        .get("minItems")
-        .is_some_and(|value| !matches!(value.as_u64(), Some(0 | 1)))
-    {
-        schema.remove("minItems");
+    if mode == "disabled" {
+        return Ok(Some(serde_json::json!({"type": "disabled"})));
     }
-    if schema
-        .get("additionalProperties")
-        .is_some_and(|value| value != &Value::Bool(false))
-    {
-        schema.remove("additionalProperties");
+    // Enabled thinking needs at least 1024 tokens and room for output.
+    // Do not silently alter an explicitly chosen generation limit.
+    if max_tokens <= 1024 {
+        anyhow::bail!("Anthropic enabled thinking requires max_tokens greater than 1024");
     }
-    if schema
-        .get("$ref")
-        .and_then(Value::as_str)
-        .is_some_and(|reference| !reference.starts_with('#') || recursive_refs.contains(reference))
-    {
-        schema.remove("$ref");
-    }
-    if schema
-        .get("enum")
-        .and_then(Value::as_array)
-        .is_some_and(|values| {
-            values
-                .iter()
-                .any(|value| value.is_object() || value.is_array())
+    let budget = budget
+        .unwrap_or(match reasoning.level {
+            Some(ThinkingLevel::Low) => 2048,
+            Some(ThinkingLevel::Medium) => 8192,
+            Some(ThinkingLevel::High | ThinkingLevel::Xhigh | ThinkingLevel::Max) => 16384,
+            _ => 1024,
         })
-    {
-        schema.remove("enum");
-    }
-    if schema
-        .get("format")
-        .and_then(Value::as_str)
-        .is_some_and(|format| {
-            !matches!(
-                format,
-                "date-time"
-                    | "time"
-                    | "date"
-                    | "duration"
-                    | "email"
-                    | "hostname"
-                    | "uri"
-                    | "ipv4"
-                    | "ipv6"
-                    | "uuid"
-            )
-        })
-    {
-        schema.remove("format");
-    }
-    if schema
-        .get("pattern")
-        .and_then(Value::as_str)
-        .is_some_and(pattern_has_unsupported_tokens)
-    {
-        schema.remove("pattern");
-    }
-    for key in ["properties", "$defs", "$def", "definitions"] {
-        if let Some(children) = schema.get_mut(key).and_then(Value::as_object_mut) {
-            for child in children.values_mut() {
-                omit_schema_constraints(child, recursive_refs);
-            }
-        }
-    }
-    if let Some(items) = schema.get_mut("items") {
-        omit_schema_constraints(items, recursive_refs);
-    }
-    for key in ["anyOf", "allOf", "oneOf", "prefixItems"] {
-        if let Some(children) = schema.get_mut(key).and_then(Value::as_array_mut) {
-            if key == "allOf" {
-                for child in children.iter_mut() {
-                    if let Some(child) = child.as_object_mut() {
-                        child.remove("$ref");
-                    }
-                }
-            }
-            for child in children {
-                omit_schema_constraints(child, recursive_refs);
-            }
-        }
-    }
+        .clamp(1024, max_tokens - 1);
+    Ok(Some(
+        serde_json::json!({"type": "enabled", "budget_tokens": budget}),
+    ))
 }
 
-fn tool_choice_to_value_raw(tc: ToolChoice) -> Value {
+fn tool_choice_for_anthropic(tc: ToolChoice) -> Option<Value> {
     match tc {
-        ToolChoice::Auto => Value::String("auto".into()),
-        ToolChoice::None => Value::String("none".into()),
-        ToolChoice::Required => Value::String("required".into()),
-        ToolChoice::Named { name } => object([
+        ToolChoice::Auto => Some(serde_json::json!({"type": "auto"})),
+        ToolChoice::None => Some(serde_json::json!({"type": "none"})),
+        ToolChoice::Required => Some(serde_json::json!({"type": "any"})),
+        ToolChoice::Named { name } => Some(object([
             ("type", Value::String("tool".into())),
             ("name", Value::String(name)),
-        ]),
-        ToolChoice::Raw(v) => v,
-    }
-}
-
-fn map_tool_choice_for_anthropic(raw: &Value) -> Option<Value> {
-    if let Some(s) = raw.as_str() {
-        return match s {
-            "auto" => Some(serde_json::json!({ "type": "auto" })),
-            "required" => Some(serde_json::json!({ "type": "any" })),
-            "none" => Some(serde_json::json!({ "type": "none" })),
-            _ => None,
-        };
-    }
-
-    let obj = raw.as_object()?;
-    let kind = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
-    let disable_parallel = obj
-        .get("disable_parallel_tool_use")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-
-    let mut result = match kind {
-        "auto" => serde_json::json!({ "type": "auto" }),
-        "required" | "any" => serde_json::json!({ "type": "any" }),
-        "none" => serde_json::json!({ "type": "none" }),
-        "tool" => {
-            let name = obj.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            if name.is_empty() {
-                return None;
-            }
-            serde_json::json!({ "type": "tool", "name": name })
+        ])),
+        ToolChoice::Allowed { names, required: true } if names.len() == 1 => {
+            names.into_iter().next().map(|name| serde_json::json!({"type": "tool", "name": name}))
         }
-        "function" => {
-            let name = obj
-                .get("name")
-                .and_then(|v| v.as_str())
-                .or_else(|| {
-                    obj.get("function")
-                        .and_then(|f| f.get("name"))
-                        .and_then(|v| v.as_str())
-                })
-                .unwrap_or("");
-            if name.is_empty() {
-                return None;
-            }
-            serde_json::json!({ "type": "tool", "name": name })
+        ToolChoice::Native(kind) => {
+            let name = match kind {
+                NativeToolKind::WebSearch => "web_search",
+                NativeToolKind::CodeExecution => "code_execution",
+                NativeToolKind::ImageGeneration | NativeToolKind::ToolSearch => return None,
+            };
+            Some(serde_json::json!({"type": "tool", "name": name}))
         }
-        _ => return None,
-    };
-
-    if disable_parallel && kind != "none" {
-        result
-            .as_object_mut()
-            .unwrap()
-            .insert("disable_parallel_tool_use".into(), Value::Bool(true));
+        ToolChoice::Allowed { .. } => None,
     }
-
-    Some(result)
 }
 
 // ── Payload validation ────────────────────────────────────────────────────────

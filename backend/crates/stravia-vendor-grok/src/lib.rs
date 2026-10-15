@@ -188,10 +188,30 @@ fn execute_inference(
         OPEN_RESPONSES_PROTOCOL,
         &mut request,
     )?;
-    let encoded = common::encode_inference_request(OPEN_RESPONSES_PROTOCOL, request)?;
-    let mut headers = common::header_pairs(&encoded.headers)?;
+    let web_search_tools: Vec<Value> = std::mem::take(&mut request.parameters.native_tools)
+        .into_iter()
+        .filter_map(project_native_tool)
+        .collect();
+    if matches!(
+        request.tool_choice,
+        Some(stravia_runtime_contract::protocol::ir::ToolChoice::Native(kind))
+            if kind != stravia_runtime_contract::protocol::ir::NativeToolKind::WebSearch
+    ) {
+        request.tool_choice = None;
+    }
+    let mut encoded = common::encode_inference_request(OPEN_RESPONSES_PROTOCOL, request)?;
+    if !web_search_tools.is_empty() {
+        if let Some(tools) = encoded.body["tools"].as_array_mut() {
+            tools.extend(web_search_tools);
+        } else {
+            encoded.body["tools"] = Value::Array(web_search_tools);
+        }
+    }
+    project_body(&mut encoded.body);
+    let mut headers = Vec::new();
     headers.push(("content-type".into(), "application/json".into()));
     apply_auth_headers(provider, &mut headers)?;
+    apply_session_headers(provider, model, &mut headers);
     let url = common::endpoint_url(&provider.base_url, &encoded.path)?;
     let body = serde_json::to_vec(&encoded.body).map_err(|error| {
         common::plugin_error(
@@ -207,6 +227,127 @@ fn execute_inference(
         body,
     })?;
     common::decode_inference(host, OPEN_RESPONSES_PROTOCOL, response)
+}
+
+fn project_native_tool(tool: stravia_runtime_contract::protocol::ir::NativeTool) -> Option<Value> {
+    let stravia_runtime_contract::protocol::ir::NativeTool::WebSearch(tool) = tool else {
+        return None;
+    };
+    let mut definition = serde_json::json!({"type": "web_search"});
+    let mut filters = serde_json::Map::new();
+    if !tool.allowed_domains.is_empty() {
+        filters.insert("allowed_domains".into(), serde_json::json!(tool.allowed_domains));
+    }
+    if !tool.blocked_domains.is_empty() {
+        filters.insert("excluded_domains".into(), serde_json::json!(tool.blocked_domains));
+    }
+    if !filters.is_empty() {
+        definition["filters"] = Value::Object(filters);
+    }
+    Some(definition)
+}
+
+// grok-build 9684fa3: conversation/responses.rs maps ConversationRequest;
+// sampler/client.rs adds store=false, encrypted replay and streaming.
+fn project_body(body: &mut Value) {
+    let Some(object) = body.as_object_mut() else {
+        return;
+    };
+    object.retain(|name, _| {
+        matches!(
+            name.as_str(),
+            "model"
+                | "input"
+                | "instructions"
+                | "stream"
+                | "max_output_tokens"
+                | "prompt_cache_key"
+                | "reasoning"
+                | "store"
+                | "include"
+                | "temperature"
+                | "top_p"
+                | "text"
+                | "tool_choice"
+                | "tools"
+        )
+    });
+    // Grok Build represents system instructions as an input message.
+    if let Some(Value::String(instructions)) = object.remove("instructions") {
+        let input = object
+            .entry("input")
+            .or_insert_with(|| Value::Array(Vec::new()));
+        if let Value::String(text) = input {
+            let text = std::mem::take(text);
+            *input = serde_json::json!([{"type":"message","role":"user","content":text}]);
+        }
+        if let Some(input) = input.as_array_mut() {
+            input.insert(
+                0,
+                serde_json::json!({
+                    "type":"message", "role":"system", "content":instructions
+                }),
+            );
+        }
+    }
+    object.entry("store").or_insert(Value::Bool(false));
+    if let Some(reasoning) = object.get_mut("reasoning").and_then(Value::as_object_mut) {
+        reasoning.retain(|name, _| matches!(name.as_str(), "effort" | "summary"));
+    }
+    if let Some(text) = object.get_mut("text").and_then(Value::as_object_mut) {
+        text.retain(|name, _| name == "format");
+    }
+    object.insert(
+        "include".into(),
+        serde_json::json!(["reasoning.encrypted_content"]),
+    );
+    if let Some(tools) = object.get_mut("tools").and_then(Value::as_array_mut) {
+        tools.retain(|tool| {
+            matches!(
+                tool.get("type").and_then(Value::as_str),
+                Some("function" | "web_search")
+            )
+        });
+        for tool in tools {
+            let Some(tool) = tool.as_object_mut() else {
+                continue;
+            };
+            match tool.get("type").and_then(Value::as_str) {
+                Some("function") => tool.retain(|name, _| {
+                    matches!(
+                        name.as_str(),
+                        "type" | "name" | "description" | "parameters"
+                    )
+                }),
+                Some("web_search") => {
+                    tool.retain(|name, _| matches!(name.as_str(), "type" | "filters"));
+                    if let Some(filters) = tool.get_mut("filters").and_then(Value::as_object_mut) {
+                        filters.retain(|name, _| {
+                            matches!(name.as_str(), "allowed_domains" | "excluded_domains")
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn apply_session_headers(
+    provider: &ProviderSnapshot,
+    model: &str,
+    headers: &mut Vec<(String, String)>,
+) {
+    // Session identity is host-derived. Downstream session/agent/turn headers
+    // and arbitrary provider options cannot become native routing authority.
+    let session = common::session_affinity(provider).unwrap_or_default();
+    headers.extend([
+        ("x-grok-conv-id".into(), session.to_owned()),
+        ("x-grok-session-id".into(), session.to_owned()),
+        ("x-grok-req-id".into(), uuid::Uuid::new_v4().to_string()),
+        ("x-grok-model-override".into(), model.to_owned()),
+        ("x-grok-agent-id".into(), String::new()),
+    ]);
 }
 
 fn apply_auth_headers(
@@ -758,3 +899,118 @@ impl VendorGuest for GrokVendor {
 
 #[cfg(target_arch = "wasm32")]
 stravia_vendor_sdk::export_vendor!(GrokVendor);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn native_session_headers_use_host_affinity_not_client_identity() {
+        let affinity = "0123456789abcdef".repeat(4);
+        let provider = ProviderSnapshot {
+            provider_id: VENDOR_ID.into(),
+            channel: CHANNEL_ID.into(),
+            base_url: "https://cli-chat-proxy.grok.com/v1".into(),
+            protocol: OPEN_RESPONSES_PROTOCOL.into(),
+            options: BTreeMap::from([("x-grok-conv-id".into(), json!("injected"))]),
+            credentials: BTreeMap::new(),
+            model: Some("grok".into()),
+            model_metadata: None,
+            client_headers: vec![("x-grok-session-id".into(), "injected".into())],
+            operation_metadata: BTreeMap::from([("session_affinity".into(), json!(affinity))]),
+        };
+        let mut first = Vec::new();
+        let mut second = Vec::new();
+        apply_session_headers(&provider, "grok", &mut first);
+        apply_session_headers(&provider, "grok", &mut second);
+        for name in ["x-grok-conv-id", "x-grok-session-id"] {
+            assert!(first.contains(&(name.into(), affinity.clone())));
+            assert!(second.contains(&(name.into(), affinity.clone())));
+        }
+        let request_id = |headers: &Vec<(String, String)>| {
+            headers
+                .iter()
+                .find(|(name, _)| name == "x-grok-req-id")
+                .unwrap()
+                .1
+                .clone()
+        };
+        assert_ne!(request_id(&first), request_id(&second));
+        assert!(first.iter().all(|(_, value)| value != "injected"));
+    }
+
+    #[test]
+    fn native_search_projects_domains_without_unsupported_controls() {
+        use stravia_runtime_contract::protocol::ir::{
+            CodeExecutionTool, NativeTool, WebSearchTool,
+        };
+        let tool = NativeTool::WebSearch(WebSearchTool {
+            allowed_domains: vec!["allowed.example".into()],
+            blocked_domains: vec!["blocked.example".into()],
+            max_uses: Some(3),
+            ..Default::default()
+        });
+        assert_eq!(
+            project_native_tool(tool),
+            Some(json!({
+                "type": "web_search",
+                "filters": {
+                    "allowed_domains": ["allowed.example"],
+                    "excluded_domains": ["blocked.example"]
+                }
+            }))
+        );
+        assert!(project_native_tool(NativeTool::CodeExecution(
+            CodeExecutionTool::default()
+        )).is_none());
+    }
+
+    #[test]
+    fn official_request_projection_is_closed_without_rewriting_function_schemas() {
+        let schema = json!({"type":"object","properties":{"metadata":{"type":"string"}}});
+        let mut body = json!({
+            "model":"grok","input":"hello","instructions":"be brief",
+            "stream":true,"temperature":0.3,"max_output_tokens":100,
+            "background":true,"metadata":{"future":true},"previous_response_id":"foreign",
+            "service_tier":"priority","arbitrary_control":true,
+            "reasoning":{"effort":"high","summary":"concise","future":true},
+            "text":{"format":{"type":"json_schema","name":"answer","schema":schema},"verbosity":"high"},
+            "include":["unknown.include"],
+            "tools":[{"type":"function","name":"read","parameters":schema,"future":true},
+                {"type":"web_search","filters":{"excluded_domains":["example.com"],"future":true},"future":true},
+                {"type":"x_search","from_date":"2026-01-01","future":true},
+                {"type":"mcp","server_url":"https://untrusted.example"}]
+        });
+        project_body(&mut body);
+        for name in [
+            "instructions",
+            "background",
+            "metadata",
+            "previous_response_id",
+            "service_tier",
+            "arbitrary_control",
+        ] {
+            assert!(body.get(name).is_none(), "{name}");
+        }
+        assert_eq!(
+            body["input"][0],
+            json!({"type":"message","role":"system","content":"be brief"})
+        );
+        assert_eq!(body["input"][1]["content"], "hello");
+        assert_eq!(body["store"], false);
+        assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
+        assert_eq!(
+            body["reasoning"],
+            json!({"effort":"high","summary":"concise"})
+        );
+        assert_eq!(body["tools"].as_array().unwrap().len(), 2);
+        assert_eq!(body["tools"][0]["parameters"], schema);
+        assert!(body["tools"][0].get("future").is_none());
+        assert_eq!(
+            body["tools"][1]["filters"],
+            json!({"excluded_domains":["example.com"]})
+        );
+        assert!(body["text"].get("verbosity").is_none());
+    }
+}

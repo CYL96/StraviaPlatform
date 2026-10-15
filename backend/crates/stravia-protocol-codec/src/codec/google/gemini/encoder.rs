@@ -6,6 +6,7 @@ use http::header::HeaderMap;
 use serde_json::Value;
 
 use stravia_runtime_contract::protocol::ir::AiRequest;
+use stravia_runtime_contract::protocol::ir::{Modality, ReasoningSummary, native_tool_to_gemini};
 use stravia_runtime_contract::protocol::ir::request::AiItem;
 use stravia_runtime_contract::protocol::ir::request::ContentBlock;
 use stravia_runtime_contract::protocol::ir::request::MediaSource;
@@ -18,6 +19,7 @@ pub struct GoogleEncoder;
 
 impl GoogleEncoder {
     pub(crate) fn encode_request(&self, mut req: AiRequest) -> Result<(Value, HeaderMap)> {
+        req.normalize_parameters();
         let ingress = &mut req.meta.vendor.ingress;
 
         // ── System instruction ────────────────────────────────────────────────
@@ -95,7 +97,8 @@ impl GoogleEncoder {
         }
 
         let system_val = raw_system.or_else(|| {
-            (!system_parts.is_empty()).then(|| object([("parts", Value::Array(system_parts))]))
+            (!system_parts.is_empty())
+                .then(|| object([("parts", Value::Array(system_parts))]))
         });
         let mut body = object([("contents", Value::Array(contents))]);
         let obj = body.as_object_mut().unwrap();
@@ -105,13 +108,40 @@ impl GoogleEncoder {
         }
 
         // ── generationConfig ──────────────────────────────────────────────────
-        let mut gen_config: serde_json::Map<String, Value> =
-            if let Some(Value::Object(m)) = ingress.remove("__google_generation_config") {
-                m
-            } else {
-                serde_json::Map::new()
-            };
-        gen_config.remove("thinkingConfig");
+        let mut gen_config = serde_json::Map::new();
+        if let Some(voice) = req.parameters.audio.take().and_then(|audio| audio.voice) {
+            gen_config.insert("speechConfig".into(), serde_json::json!({
+                "voiceConfig": {"prebuiltVoiceConfig": {"voiceName": voice}}
+            }));
+        }
+        for (key, value) in [
+            ("topK", req.parameters.top_k.map(Value::from)),
+            (
+                "candidateCount",
+                req.parameters.candidate_count.map(Value::from),
+            ),
+            ("responseLogprobs", req.parameters.logprobs.map(|_| Value::Bool(true))),
+            ("logprobs", req.parameters.logprobs.map(Value::from)),
+            (
+                "responseModalities",
+                req.parameters.modalities.take().map(|values| {
+                    Value::Array(
+                        values
+                            .into_iter()
+                            .map(|value| Value::String(match value {
+                                Modality::Text => "TEXT",
+                                Modality::Audio => "AUDIO",
+                                Modality::Image => "IMAGE",
+                            }.into()))
+                            .collect(),
+                    )
+                }),
+            ),
+        ] {
+            if let Some(value) = value {
+                gen_config.insert(key.into(), value);
+            }
+        }
 
         if let Some(t) = req.generation.temperature {
             gen_config.insert("temperature".into(), t.into());
@@ -150,14 +180,35 @@ impl GoogleEncoder {
                     Value::String("application/json".into()),
                 );
                 gen_config.remove("responseSchema");
-                gen_config.insert(
-                    "responseJsonSchema".into(),
-                    sanitize_response_json_schema(super::types::normalize_json_schema(schema)),
-                );
+                if !schema.is_null() {
+                    gen_config.insert("responseJsonSchema".into(), schema);
+                }
             }
-            Some(ResponseFormat::Text) | None => {}
+            Some(ResponseFormat::Text) => {
+                gen_config.insert("responseMimeType".into(), "text/plain".into());
+            }
+            None => {}
         }
         let mut thinking_config = serde_json::json!({});
+        if req.reasoning.mode.as_deref() == Some("auto") {
+            thinking_config["thinkingBudget"] = (-1).into();
+        } else if req.reasoning.mode.as_deref() == Some("disabled") {
+            thinking_config["thinkingBudget"] = 0.into();
+        } else if let Some(budget) = req.reasoning.budget_tokens {
+            thinking_config["thinkingBudget"] = budget.into();
+        } else if req.reasoning.mode.as_deref() == Some("enabled") {
+            thinking_config["thinkingBudget"] = (-1).into();
+        } else if let Some(level) = req.reasoning.level {
+            use stravia_runtime_contract::thinking::ThinkingLevel;
+            if level == ThinkingLevel::Off {
+                thinking_config["thinkingBudget"] = 0.into();
+            } else {
+                thinking_config["thinkingLevel"] = match level {
+                    ThinkingLevel::Xhigh | ThinkingLevel::Max => "HIGH".into(),
+                    _ => level.as_str().to_ascii_uppercase().into(),
+                };
+            }
+        }
         if let Some(control) = req.reasoning.target_control.as_ref() {
             thinking_config = match control {
                 stravia_runtime_contract::thinking::TargetThinkingControl::Budget { value } => {
@@ -170,18 +221,28 @@ impl GoogleEncoder {
                     serde_json::json!({"thinkingBudget": 0})
                 }
                 stravia_runtime_contract::thinking::TargetThinkingControl::Effort { value } => {
-                    serde_json::json!({"thinkingLevel": value.to_ascii_uppercase()})
+                    match stravia_runtime_contract::thinking::ThinkingLevel::from_wire(value)? {
+                        stravia_runtime_contract::thinking::ThinkingLevel::Off => {
+                            serde_json::json!({"thinkingBudget": 0})
+                        }
+                        stravia_runtime_contract::thinking::ThinkingLevel::Xhigh
+                        | stravia_runtime_contract::thinking::ThinkingLevel::Max => {
+                            serde_json::json!({"thinkingLevel": "HIGH"})
+                        }
+                        level => {
+                            serde_json::json!({"thinkingLevel": level.as_str().to_ascii_uppercase()})
+                        }
+                    }
                 }
                 stravia_runtime_contract::thinking::TargetThinkingControl::Hidden => anyhow::bail!(
                     "Google Gemini cannot represent Target Thinking Control {control:?}"
                 ),
             };
         }
-        let summary_disabled = matches!(
-            req.reasoning.display.as_deref(),
-            Some("omitted" | "none" | "disabled" | "hidden")
-        ) || req.reasoning.level
+        let summary_disabled = req.reasoning.summary == Some(ReasoningSummary::None)
+            || req.reasoning.level
             == Some(stravia_runtime_contract::thinking::ThinkingLevel::Off)
+            || req.reasoning.mode.as_deref() == Some("disabled")
             || matches!(
                 req.reasoning.target_control,
                 Some(stravia_runtime_contract::thinking::TargetThinkingControl::Disabled)
@@ -194,36 +255,25 @@ impl GoogleEncoder {
         }
 
         // ── Tools ─────────────────────────────────────────────────────────────
-        if let Some(raw) = ingress.remove("__google_raw_tools") {
-            obj.insert("tools".into(), raw);
-        } else if let Some(tools) = req.tools {
+        {
             let mut fn_decls: Vec<Value> = Vec::new();
-            let mut builtin_entries: Vec<Value> = Vec::new();
+            let builtin_entries: Vec<Value> = req
+                .parameters
+                .native_tools
+                .iter()
+                .filter_map(native_tool_to_gemini)
+                .collect();
 
-            for t in tools {
-                match t.name.as_str() {
-                    "__builtin__google_search" => {
-                        builtin_entries.push(serde_json::json!({"googleSearch": {}}));
-                    }
-                    "__builtin__code_execution" => {
-                        builtin_entries.push(serde_json::json!({"codeExecution": {}}));
-                    }
-                    "__builtin__google_search_retrieval" => {
-                        builtin_entries.push(serde_json::json!({"googleSearchRetrieval": {}}));
-                    }
-                    _ => {
-                        let mut decl = object([("name", Value::String(t.name))]);
-                        let d = decl.as_object_mut().unwrap();
-                        if let Some(desc) = t.description {
-                            d.insert("description".into(), Value::String(desc));
-                        }
-                        d.insert(
-                            "parametersJsonSchema".into(),
-                            super::types::normalize_json_schema(t.parameters),
-                        );
-                        fn_decls.push(decl);
-                    }
+            for t in req.tools.into_iter().flatten() {
+                let mut decl = object([("name", Value::String(t.name))]);
+                let d = decl.as_object_mut().unwrap();
+                if let Some(desc) = t.description {
+                    d.insert("description".into(), Value::String(desc));
                 }
+                if !t.parameters.is_null() {
+                    d.insert("parametersJsonSchema".into(), t.parameters);
+                }
+                fn_decls.push(decl);
             }
 
             let mut tool_array: Vec<Value> = Vec::new();
@@ -237,52 +287,32 @@ impl GoogleEncoder {
             }
         }
 
-        // ── Extra passthrough fields ───────────────────────────────────────────
-        let mut tool_config = ingress.remove("__google_tool_config");
-        let native_choice_matches = tool_config
-            .as_ref()
-            .and_then(super::decoder::decode_tool_choice)
-            .zip(req.tool_choice.as_ref())
-            .is_some_and(|(native, canonical)| match (&native, canonical) {
-                (ToolChoice::Auto, ToolChoice::Auto)
-                | (ToolChoice::None, ToolChoice::None)
-                | (ToolChoice::Required, ToolChoice::Required) => true,
-                (ToolChoice::Named { name: a }, ToolChoice::Named { name: b }) => a == b,
-                _ => false,
-            });
-        let calling_config = if native_choice_matches {
-            None
-        } else {
-            match req.tool_choice {
+        // ── Tool choice ───────────────────────────────────────────────────────
+        let calling_config = match req.tool_choice {
                 Some(ToolChoice::Auto) => Some(serde_json::json!({"mode": "AUTO"})),
                 Some(ToolChoice::None) => Some(serde_json::json!({"mode": "NONE"})),
                 Some(ToolChoice::Required) => Some(serde_json::json!({"mode": "ANY"})),
                 Some(ToolChoice::Named { name }) => {
                     Some(serde_json::json!({"mode": "ANY", "allowedFunctionNames": [name]}))
                 }
+                Some(ToolChoice::Allowed { names, required }) => {
+                    Some(serde_json::json!({
+                        "mode": if required { "ANY" } else { "AUTO" },
+                        "allowedFunctionNames": names,
+                    }))
+                }
                 _ => None,
-            }
         };
         if let Some(calling_config) = calling_config {
-            let config = tool_config.get_or_insert_with(|| serde_json::json!({}));
-            if !config.is_object() {
-                *config = serde_json::json!({});
-            }
-            config
-                .as_object_mut()
-                .unwrap()
-                .insert("functionCallingConfig".into(), calling_config);
-        }
-        if let Some(config) = tool_config {
-            obj.insert("toolConfig".into(), config);
-        }
-        if let Some(v) = ingress.remove("__google_safety_settings") {
-            obj.insert("safetySettings".into(), v);
-        }
-        if let Some(v) = ingress.remove("__google_cached_content") {
-            obj.insert("cachedContent".into(), v);
+            obj.insert("toolConfig".into(), serde_json::json!({
+                "functionCallingConfig": calling_config
+            }));
         }
 
+        crate::codec::control_projection::project_request(
+            &mut body,
+            crate::codec::control_projection::Family::Google,
+        );
         Ok((body, HeaderMap::new()))
     }
 
@@ -293,80 +323,6 @@ impl GoogleEncoder {
             format!("/v1beta/models/{}:generateContent", model)
         }
     }
-}
-
-// ── Schema sanitisation ───────────────────────────────────────────────────────
-
-fn sanitize_response_json_schema(value: Value) -> Value {
-    let Value::Object(map) = value else {
-        return value;
-    };
-    let has_ref = map.contains_key("$ref");
-    Value::Object(
-        map.into_iter()
-            .filter_map(|(key, value)| {
-                if !matches!(
-                    key.as_str(),
-                    "$id"
-                        | "$defs"
-                        | "$ref"
-                        | "$anchor"
-                        | "type"
-                        | "format"
-                        | "title"
-                        | "description"
-                        | "enum"
-                        | "items"
-                        | "prefixItems"
-                        | "minItems"
-                        | "maxItems"
-                        | "minimum"
-                        | "maximum"
-                        | "anyOf"
-                        | "oneOf"
-                        | "properties"
-                        | "additionalProperties"
-                        | "required"
-                        | "propertyOrdering"
-                ) || (has_ref && !key.starts_with('$'))
-                {
-                    return None;
-                }
-                if key == "enum"
-                    && !value.as_array().is_some_and(|values| {
-                        values
-                            .iter()
-                            .all(|value| value.is_string() || value.is_number())
-                    })
-                {
-                    return None;
-                }
-                let value = match key.as_str() {
-                    "properties" | "$defs" => match value {
-                        Value::Object(children) => Value::Object(
-                            children
-                                .into_iter()
-                                .map(|(name, schema)| (name, sanitize_response_json_schema(schema)))
-                                .collect(),
-                        ),
-                        other => other,
-                    },
-                    "items" | "additionalProperties" => sanitize_response_json_schema(value),
-                    "prefixItems" | "anyOf" | "oneOf" => match value {
-                        Value::Array(children) => Value::Array(
-                            children
-                                .into_iter()
-                                .map(sanitize_response_json_schema)
-                                .collect(),
-                        ),
-                        other => other,
-                    },
-                    _ => value,
-                };
-                Some((key, value))
-            })
-            .collect(),
-    )
 }
 
 // ── Content encoding ──────────────────────────────────────────────────────────

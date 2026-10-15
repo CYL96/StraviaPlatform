@@ -2,8 +2,8 @@
 //! 免费层契约——指纹头、Bearer public 兜底、占位工具注入与禁令、stream
 //! 强制，以及 discovery 只暴露免费模型。
 //!
-//! 运行：`task build:vendors:all` 后执行
-//! `cargo test -p stravia-vendor-opencode-free --test contract -- --ignored`。
+//! 先运行 `task build:vendors:all`。离线合同使用 `--ignored --skip live_`；
+//! 匿名真实调用须显式选择 `live_free_model_infer_against_real_zen -- --ignored --exact`。
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -12,7 +12,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use serde_json::{Value, json};
-use stravia_runtime_contract::protocol::ir::request::ToolSpec;
+use stravia_runtime_contract::protocol::ir::request::{ToolChoice, ToolSpec};
 use stravia_runtime_contract::protocol::ir::{AiItem, AiRequest, MessageContent, Role};
 use stravia_runtime_contract::{CancellationToken, Deadline};
 use stravia_vendor_runtime::{
@@ -21,7 +21,7 @@ use stravia_vendor_runtime::{
 };
 use stravia_vendor_sdk::{ErrorKind, OperationInput, OperationOutput, ProviderSnapshot};
 
-const UPSTREAM: &str = "https://opencode.ai/zen/v1";
+const UPSTREAM: &str = "https://opencode.ai/inference/v1";
 
 fn artifact() -> std::path::PathBuf {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -69,6 +69,7 @@ impl HostHttpResponse for MockResponse {
 #[derive(Default)]
 struct Recorded {
     requests: Mutex<Vec<HttpRequest>>,
+    private_state: Mutex<Option<Vec<u8>>>,
 }
 
 struct MockServices {
@@ -80,7 +81,20 @@ struct MockServices {
 #[async_trait]
 impl HostServices for MockServices {
     fn http_start(&self, request: HttpRequest) -> Result<Arc<dyn HostHttpResponse>, HostFailure> {
+        let rejects_tool_choice = request.method == "POST"
+            && serde_json::from_slice::<Value>(&request.body).is_ok_and(|body| {
+                let model = body["model"].as_str().unwrap_or_default();
+                (model == "big-pickle" || model.ends_with("-free")) && body["tool_choice"] != "auto"
+            });
         self.recorded.requests.lock().push(request);
+        if rejects_tool_choice {
+            return Ok(Arc::new(MockResponse {
+                status: 400,
+                body: Mutex::new(
+                    vec![br#"{"error":{"message":"Only auto tool choice is supported","type":"invalid_request_error"}}"#.to_vec()].into_iter(),
+                ),
+            }));
+        }
         Ok(Arc::new(MockResponse {
             status: self.upstream_status,
             body: Mutex::new(vec![self.upstream_body.as_bytes().to_vec()].into_iter()),
@@ -102,10 +116,11 @@ impl HostServices for MockServices {
     }
 
     async fn read_private_state(&self) -> Result<Option<Vec<u8>>, HostFailure> {
-        Ok(None)
+        Ok(self.recorded.private_state.lock().clone())
     }
 
-    async fn write_private_state(&self, _bytes: Vec<u8>) -> Result<(), HostFailure> {
+    async fn write_private_state(&self, bytes: Vec<u8>) -> Result<(), HostFailure> {
+        *self.recorded.private_state.lock() = Some(bytes);
         Ok(())
     }
 
@@ -158,8 +173,7 @@ fn client_tool(name: &str) -> ToolSpec {
         description: Some("client tool".into()),
         parameters: json!({"type": "object", "properties": {"q": {"type": "string"}}}),
         strict: None,
-        cache_control: None,
-        meta: None,
+        defer_loading: None,
     }
 }
 
@@ -228,65 +242,80 @@ fn sent_tool_names(body: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn assistant_text(items: &[AiItem]) -> String {
+    items
+        .iter()
+        .filter_map(|item| match &item.content {
+            MessageContent::Text(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires task build:vendors:all"]
-async fn free_model_request_carries_full_contract() {
+async fn required_choice_with_complete_tools_does_not_trigger_native_400() {
     let (runtime, plugin) = load_plugin().await;
     let recorded = Arc::new(Recorded::default());
+    let mut request = request("big-pickle");
+    request.tools = Some(vec![client_tool("bash"), client_tool("read")]);
+    request.tool_choice = Some(ToolChoice::Required);
     let output = infer_once(
         &runtime,
         &plugin,
         provider("big-pickle"),
-        request("big-pickle"),
+        request,
         &recorded,
     )
     .await
     .expect("inference succeeds");
 
-    let OperationOutput::Infer(_) = output else {
+    let OperationOutput::Infer(response) = output else {
         panic!("expected Infer output");
     };
+    assert!(response.error.is_none(), "{:?}", response.error);
+    assert_eq!(assistant_text(&response.items), "ok");
+}
 
-    // 指纹头
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires task build:vendors:all"]
+async fn separate_component_stores_reuse_the_persisted_session() {
+    let (runtime, plugin) = load_plugin().await;
+    let recorded = Arc::new(Recorded::default());
+    let mut provider = provider("big-pickle");
+    provider.operation_metadata.insert(
+        "session_affinity".into(),
+        Value::String("0123456789abcdef".repeat(4)),
+    );
+    for _ in 0..2 {
+        infer_once(
+            &runtime,
+            &plugin,
+            provider.clone(),
+            request("big-pickle"),
+            &recorded,
+        )
+        .await
+        .expect("inference succeeds");
+    }
+    let requests = recorded.requests.lock();
+    assert_eq!(requests.len(), 2);
+    let header = |index: usize, name: &str| {
+        requests[index]
+            .headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+            .expect("native identity header")
+    };
     assert_eq!(
-        sent_header(&recorded, "authorization").as_deref(),
-        Some("Bearer public")
+        header(0, "x-opencode-session"),
+        header(1, "x-opencode-session")
     );
-    assert!(
-        sent_header(&recorded, "user-agent")
-            .unwrap()
-            .starts_with("opencode/1.")
+    assert_ne!(
+        header(0, "x-opencode-request"),
+        header(1, "x-opencode-request")
     );
-    assert!(
-        sent_header(&recorded, "x-opencode-session")
-            .unwrap()
-            .starts_with("ses_")
-    );
-    assert!(
-        sent_header(&recorded, "x-opencode-request")
-            .unwrap()
-            .starts_with("msg_")
-    );
-    assert_eq!(
-        sent_header(&recorded, "x-opencode-client").as_deref(),
-        Some("cli")
-    );
-
-    // Body 契约
-    let body = sent_body(&recorded);
-    assert_eq!(body["stream"], json!(true));
-    assert_eq!(body["tool_choice"], json!("auto"));
-    let names = sent_tool_names(&body);
-    assert!(names.contains(&"bash".to_owned()) && names.contains(&"read".to_owned()));
-    // 禁令追加为 system 消息（instructions 并入 messages 头部）。
-    let system = body["messages"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|m| m["role"] == "system")
-        .expect("system message present");
-    let text = system["content"].as_str().unwrap_or_default();
-    assert!(text.contains("`bash`") && text.contains("`read`"));
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -386,11 +415,13 @@ async fn discovery_lists_only_free_models() {
 }
 
 // ── 真实上游 ────────────────────────────────────────────────────────────────
-// 用 reqwest 实现 HostServices，让真实组件打真实 opencode.ai。免费层匿名
-// 配额按公网 IP 计（约 ~200 请求/天），一次调用成本可忽略；上游门控或限流
-// 变更会让该测试失败——那正是它要捕捉的信号。
+// 用 reqwest 实现 HostServices，让真实组件调用 opencode.ai；匿名配额和门控
+// 由上游决定，仅显式 opt-in 才运行，不使用用户凭据、不自动重试。
 
-struct RealServices;
+#[derive(Default)]
+struct RealServices {
+    private_state: Mutex<Option<Vec<u8>>>,
+}
 
 type RealResponseData = (u16, Vec<(String, String)>, Vec<u8>);
 
@@ -412,6 +443,7 @@ impl RealResponse {
                     .ok_or_else(|| "request already consumed".to_owned())?;
                 let response = builder.send().await.map_err(|e| e.to_string())?;
                 let status = response.status().as_u16();
+                eprintln!("anonymous Zen live upstream_status={status}");
                 let headers = response
                     .headers()
                     .iter()
@@ -480,10 +512,11 @@ impl HostServices for RealServices {
     }
 
     async fn read_private_state(&self) -> Result<Option<Vec<u8>>, HostFailure> {
-        Ok(None)
+        Ok(self.private_state.lock().clone())
     }
 
-    async fn write_private_state(&self, _bytes: Vec<u8>) -> Result<(), HostFailure> {
+    async fn write_private_state(&self, bytes: Vec<u8>) -> Result<(), HostFailure> {
+        *self.private_state.lock() = Some(bytes);
         Ok(())
     }
 
@@ -504,23 +537,60 @@ impl HostServices for RealServices {
 #[ignore = "live upstream call; requires network and task build:vendors:all"]
 async fn live_free_model_infer_against_real_zen() {
     let (runtime, plugin) = load_plugin().await;
-    let services = Arc::new(RealServices);
+    let services: Arc<dyn HostServices> = Arc::new(RealServices::default());
+    let base_url = plugin
+        .descriptor()
+        .provider("opencode-free")
+        .expect("free provider")
+        .channels
+        .iter()
+        .find(|channel| channel.id == "default")
+        .and_then(|channel| channel.default_base_url.as_deref())
+        .expect("native default endpoint")
+        .to_owned();
     let scope = OperationScope::new(
         services,
         CancellationToken::new(),
         Deadline::from_now(Duration::from_secs(120)),
         0,
     );
+    let mut anonymous_provider = provider("big-pickle");
+    anonymous_provider.base_url = base_url.clone();
+    anonymous_provider.operation_metadata.insert(
+        "session_affinity".into(),
+        Value::String("abcdef0123456789".repeat(4)),
+    );
+    // 仅合成内容与公开的 Bearer public；错误诊断不得扩展到用户连接。
+    assert!(anonymous_provider.credentials.is_empty());
+    assert!(anonymous_provider.client_headers.is_empty());
+    let mut probe = request("big-pickle");
+    probe.items[0].content = MessageContent::Text(
+        "Reply with exactly STRAVIA_ZEN_PROBE_OK. Do not use tools."
+            .to_owned()
+            .into(),
+    );
+    probe.generation.max_tokens = Some(1024);
     let (operation, input) = OperationInput::Infer {
-        provider: provider("big-pickle"),
-        request: request("big-pickle"),
+        provider: anonymous_provider,
+        request: probe,
     }
     .encode_for_host()
     .expect("encode inference");
     let output = runtime
         .execute(&plugin, "default", operation, input, scope)
         .await
-        .expect("live infer completes");
+        .unwrap_or_else(|error| {
+            let diagnostic: String = error
+                .diagnostic_message()
+                .unwrap_or("no upstream diagnostic")
+                .chars()
+                .take(2048)
+                .collect();
+            panic!(
+                "anonymous Zen live infer failed at {base_url}: {error}; upstream_status={:?}; diagnostic={diagnostic}",
+                error.upstream_status()
+            );
+        });
     let OperationOutput::Infer(response) = output else {
         panic!("expected Infer output");
     };
@@ -529,17 +599,7 @@ async fn live_free_model_infer_against_real_zen() {
         "upstream error: {:?}",
         response.error
     );
-    let text: String = response
-        .items
-        .iter()
-        .filter_map(|item| match &item.content {
-            MessageContent::Text(text) => Some(text.as_str()),
-            _ => None,
-        })
-        .collect();
-    assert!(
-        !text.is_empty(),
-        "expected assistant text, got {:?}",
-        response.items
-    );
+    let text = assistant_text(&response.items);
+    assert_eq!(text.trim(), "STRAVIA_ZEN_PROBE_OK");
+    eprintln!("anonymous Zen {base_url}: {text}");
 }

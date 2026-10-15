@@ -3,6 +3,7 @@
 
 pub mod anthropic;
 pub mod compaction;
+mod control_projection;
 pub mod google;
 pub mod open_responses;
 pub mod openai;

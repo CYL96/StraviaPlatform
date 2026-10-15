@@ -72,12 +72,30 @@ impl ProtocolAdapter for GatewayLanguageModelV4 {
             .unwrap_or_default()
             .to_string();
         let mut request = AiRequest::new(model, decode_prompt(&body)?);
+        use stravia_runtime_contract::protocol::ir::ParameterReset;
+        for (field, reset) in [
+            ("maxOutputTokens", ParameterReset::MaxTokens),
+            ("temperature", ParameterReset::Temperature),
+            ("topP", ParameterReset::TopP),
+            ("presencePenalty", ParameterReset::PresencePenalty),
+            ("frequencyPenalty", ParameterReset::FrequencyPenalty),
+            ("responseFormat", ParameterReset::ResponseFormat),
+            ("reasoning", ParameterReset::Reasoning),
+        ] {
+            if body.get(field).is_some_and(Value::is_null) {
+                request.parameters.reset(reset);
+            }
+        }
         request.generation.max_tokens = body
             .get("maxOutputTokens")
             .and_then(Value::as_u64)
             .and_then(|value| u32::try_from(value).ok());
         request.generation.temperature = body.get("temperature").and_then(Value::as_f64);
         request.generation.top_p = body.get("topP").and_then(Value::as_f64);
+        request.parameters.top_k = body
+            .get("topK")
+            .and_then(Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok());
         request.generation.presence_penalty = body.get("presencePenalty").and_then(Value::as_f64);
         request.generation.frequency_penalty = body.get("frequencyPenalty").and_then(Value::as_f64);
         request.generation.seed = body.get("seed").and_then(Value::as_i64);
@@ -90,21 +108,37 @@ impl ProtocolAdapter for GatewayLanguageModelV4 {
                     .collect()
             })
         });
-        request.tools = body.get("tools").map(decode_gateway_tools).transpose()?;
+        request.tools = body
+            .get("tools")
+            .filter(|value| !value.is_null())
+            .map(decode_gateway_tools)
+            .transpose()?;
         request.tool_choice = body
             .get("toolChoice")
+            .filter(|value| !value.is_null())
             .map(decode_gateway_tool_choice)
             .transpose()?;
-        request.reasoning.enabled = body.get("reasoning").is_some();
+        if let Some(reasoning) = body.get("reasoning").and_then(Value::as_str) {
+            if reasoning == "none" {
+                request.reasoning.mode = Some("disabled".into());
+            } else if reasoning == "provider-default" {
+                request.reasoning.mode = Some("auto".into());
+            } else {
+                request.reasoning.level =
+                    Some(stravia_runtime_contract::thinking::ThinkingLevel::from_wire(reasoning)?);
+            }
+        }
         request.response_format = body
             .get("responseFormat")
+            .filter(|value| !value.is_null())
             .map(decode_gateway_response_format)
             .transpose()?;
         request.meta.source_protocol = Some(GATEWAY_LANGUAGE_MODEL_V4);
         Ok(request)
     }
 
-    fn encode_request(&self, request: AiRequest) -> anyhow::Result<(Value, HeaderMap)> {
+    fn encode_request(&self, mut request: AiRequest) -> anyhow::Result<(Value, HeaderMap)> {
+        request.normalize_parameters();
         let tool_names = tool_names(&request);
         let mut prompt = Vec::new();
         if let Some(instructions) = &request.instructions
@@ -125,6 +159,7 @@ impl ProtocolAdapter for GatewayLanguageModelV4 {
         insert_optional(&mut body, "maxOutputTokens", request.generation.max_tokens);
         insert_optional(&mut body, "temperature", request.generation.temperature);
         insert_optional(&mut body, "topP", request.generation.top_p);
+        insert_optional(&mut body, "topK", request.parameters.top_k);
         insert_optional(
             &mut body,
             "presencePenalty",
@@ -172,22 +207,33 @@ impl ProtocolAdapter for GatewayLanguageModelV4 {
                 ),
             );
         }
-        if let Some(choice) = &request.tool_choice {
-            body.insert("toolChoice".into(), encode_tool_choice(choice));
+        if let Some(choice) = request.tool_choice.as_ref().and_then(encode_tool_choice) {
+            body.insert("toolChoice".into(), choice);
         }
-        if request.reasoning.enabled {
+        if request.reasoning.is_enabled()
+            || request.reasoning.mode.as_deref() == Some("disabled")
+            || request.reasoning.level
+                == Some(stravia_runtime_contract::thinking::ThinkingLevel::Off)
+        {
             body.insert(
                 "reasoning".into(),
                 Value::String(
-                    request
-                        .reasoning
-                        .effort
-                        .as_ref()
-                        .and_then(
-                            stravia_runtime_contract::protocol::ir::ReasoningEffort::as_openai_str,
-                        )
-                        .unwrap_or("provider-default")
-                        .into(),
+                    if request.reasoning.mode.as_deref() == Some("disabled") {
+                        "none"
+                    } else {
+                        request
+                            .reasoning
+                            .level
+                            .map(|level| {
+                                if level == stravia_runtime_contract::thinking::ThinkingLevel::Off {
+                                    "none"
+                                } else {
+                                    level.as_str()
+                                }
+                            })
+                            .unwrap_or("provider-default")
+                    }
+                    .into(),
                 ),
             );
         }
@@ -485,8 +531,7 @@ fn decode_gateway_tools(value: &Value) -> anyhow::Result<Vec<ToolSpec>> {
                     .cloned()
                     .unwrap_or_else(|| json!({"type": "object"})),
                 strict: tool.get("strict").and_then(Value::as_bool),
-                cache_control: None,
-                meta: None,
+                defer_loading: None,
             })
         })
         .collect()
@@ -512,6 +557,7 @@ fn decode_gateway_response_format(
         Some("text") => Ok(stravia_runtime_contract::protocol::ir::ResponseFormat::Text),
         Some("json") if value.get("schema").is_some() => Ok(
             stravia_runtime_contract::protocol::ir::ResponseFormat::JsonSchema {
+                description: value.get("description").and_then(Value::as_str).map(str::to_owned),
                 schema: value.get("schema").cloned().unwrap_or(Value::Null),
                 name: value
                     .get("name")
@@ -724,26 +770,29 @@ fn encode_response_format(
             Ok(json!({"type": "json"}))
         }
         stravia_runtime_contract::protocol::ir::ResponseFormat::JsonSchema {
-            schema, name, ..
+            schema, name, description, ..
         } => {
             let mut result = Map::from_iter([
                 ("type".into(), Value::String("json".into())),
                 ("schema".into(), schema.clone()),
             ]);
             result.insert("name".into(), Value::String(name.clone()));
+            if let Some(description) = description {
+                result.insert("description".into(), Value::String(description.clone()));
+            }
             Ok(Value::Object(result))
         }
     }
 }
 
-fn encode_tool_choice(choice: &ToolChoice) -> Value {
-    match choice {
+fn encode_tool_choice(choice: &ToolChoice) -> Option<Value> {
+    Some(match choice {
         ToolChoice::Auto => json!({"type": "auto"}),
         ToolChoice::None => json!({"type": "none"}),
         ToolChoice::Required => json!({"type": "required"}),
         ToolChoice::Named { name } => json!({"type": "tool", "toolName": name}),
-        ToolChoice::Raw(value) => value.clone(),
-    }
+        ToolChoice::Allowed { .. } | ToolChoice::Native(_) => return None,
+    })
 }
 
 fn insert_optional<T: serde::Serialize>(map: &mut Map<String, Value>, key: &str, value: Option<T>) {

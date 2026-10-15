@@ -87,12 +87,15 @@ pub(super) fn generate(
         "stream":true,
         "include":[]
     });
-    codex::prepare_body(&mut body)?;
+    codex::prepare_operation_body(&mut body, codex::BodyOperation::Image)?;
+    let mut session = codex::NativeSession::new(provider, &Default::default());
+    session.resolve_identity(host, provider)?;
+    session.apply_body(&mut body);
     let mut headers = vec![
         ("content-type".into(), "application/json".into()),
         ("accept".into(), "text/event-stream".into()),
     ];
-    codex::append_runtime_headers(provider, &body, &mut headers)?;
+    codex::append_runtime_headers(provider, &body, &session, &mut headers)?;
     host.emit_started()?;
     let response = host.http_start(stravia_vendor_sdk::wit::types::HttpRequest {
         method: "POST".into(),

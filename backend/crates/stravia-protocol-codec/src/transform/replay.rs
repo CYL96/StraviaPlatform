@@ -2,16 +2,16 @@ use stravia_runtime_contract::protocol::ir::{
     AiItem, AiRequest, ContentBlock, MessageContent, Role,
 };
 
-/// Prepare a caller-owned request copy; canonical history and strict encoding stay untouched.
-/// The caller decides whether each item's protected payload may be replayed to this Target.
+/// 准备调用方持有的请求副本，不改写权威历史与严格编码行为。
+/// 调用方逐个决定条目中的受保护载荷能否回放到当前 Target。
 ///
 /// 宿主只负责来源约束：不可回放的签名、`encrypted_content` 与 redacted 块在此剥离。
 /// 明文思考保持为思考块，由出口 codec 决定原生承载还是降级为正文；受保护载荷
 /// 若出口协议无法承载，也由 codec 忽略。这里不按协议分支，插件协议同样适用。
-/// Untouched text blocks retain their shared payload; downgraded reasoning moves into new text.
+/// 未改写的正文继续共享载荷；降级的可读推理移入新正文块。
 pub fn prepare_thinking_replay(
     request: &mut AiRequest,
-    preserve_protected: impl Fn(&AiItem) -> bool,
+    preserve_protected: impl Fn(&AiItem, &ContentBlock) -> bool,
 ) -> bool {
     let mut changed = false;
     request.items.retain_mut(|item| {
@@ -22,26 +22,41 @@ pub fn prepare_thinking_replay(
             return true;
         }
         let assistant = item.role == Role::Assistant;
-        let preserve = assistant && preserve_protected(item);
-        if preserve {
+        // 判定时保留完整条目供宿主核对来源；只记录需要剥离的位置，不复制载荷。
+        let mut stripped = Vec::new();
+        let mut protected_retained = false;
+        if assistant {
+            for (index, block) in blocks
+                .iter()
+                .enumerate()
+                .filter(|(_, block)| is_protected(block))
+            {
+                if preserve_protected(item, block) {
+                    protected_retained = true;
+                } else {
+                    stripped.push(index);
+                }
+            }
+        }
+        if assistant && stripped.is_empty() {
             return true;
         }
         let thinking_only = blocks.iter().all(is_thinking)
             && item.tool_calls.as_ref().is_none_or(Vec::is_empty)
             && item.tool_call_id.is_none();
-        let native_fields = thinking_only
-            && item
-                .meta
-                .as_ref()
-                .is_some_and(|meta| meta.get(NATIVE_ITEM_FIELDS).is_some());
-        if assistant && !native_fields && !blocks.iter().any(is_protected) {
-            return true;
-        }
         let MessageContent::Blocks(blocks) = &mut item.content else {
             unreachable!();
         };
         let mut replay = Vec::with_capacity(blocks.len());
-        for block in blocks.drain(..) {
+        let mut stripped = stripped.into_iter().peekable();
+        for (index, block) in blocks.drain(..).enumerate() {
+            if assistant {
+                if stripped.peek() != Some(&index) {
+                    replay.push(block);
+                    continue;
+                }
+                stripped.next();
+            }
             match block {
                 // 没有协议承载非 assistant 角色的推理，只能作为普通文本保留。
                 ContentBlock::Thinking { thinking, .. } if !assistant => {
@@ -86,9 +101,12 @@ pub fn prepare_thinking_replay(
                     .expect("reasoning keys are not reserved");
             }
         }
-        // 原生条目字段（如 Responses reasoning id）指向来源上游保存的推理，与签名同样绑定来源。
-        // 混合条目可能携带普通内容/工具的硬字段：保持严格。
-        if thinking_only && let Some(meta) = item.meta.as_mut() {
+        // 原生条目字段可能仍服务于保留的本上游载荷，只有全部剥离后才移除。
+        // 混合普通内容/工具的条目可能携带硬字段：保持严格。
+        if thinking_only
+            && !protected_retained
+            && let Some(meta) = item.meta.as_mut()
+        {
             meta.remove_extension(NATIVE_ITEM_FIELDS)
                 .expect("native item fields key is not reserved");
         }

@@ -1,6 +1,74 @@
 use super::*;
 
 #[test]
+fn gateway_native_reasoning_keeps_activation_separate_from_intensity() {
+    for (value, mode, level) in [
+        ("none", Some("disabled"), None),
+        ("provider-default", Some("auto"), None),
+        (
+            "high",
+            None,
+            Some(stravia_runtime_contract::thinking::ThinkingLevel::High),
+        ),
+    ] {
+        let request = GatewayLanguageModelV4
+            .decode_request(json!({"prompt": [], "reasoning": value}))
+            .unwrap();
+        assert_eq!(request.reasoning.mode.as_deref(), mode);
+        assert_eq!(request.reasoning.level, level);
+        assert_eq!(request.reasoning.budget_tokens, None);
+        assert_eq!(
+            GatewayLanguageModelV4.encode_request(request).unwrap().0["reasoning"],
+            value
+        );
+    }
+}
+
+#[test]
+fn gateway_top_k_uses_platform_control_without_raw_parameter_echo() {
+    let mut request = AiRequest::new("model", vec![]);
+    request.parameters.top_k = Some(0);
+    request.parameters.min_p = Some(0.0);
+    request.parameters.logprobs = Some(0);
+
+    let (body, _) = GatewayLanguageModelV4.encode_request(request).unwrap();
+    assert_eq!(body["topK"], 0);
+    assert!(body.get("min_p").is_none());
+    assert!(body.get("logprobs").is_none());
+    let decoded = GatewayLanguageModelV4.decode_request(body).unwrap();
+    assert_eq!(decoded.parameters.top_k, Some(0));
+}
+
+#[test]
+fn gateway_skips_unrepresentable_choices_and_null_controls() {
+    let decoded = GatewayLanguageModelV4
+        .decode_request(json!({
+            "prompt": [], "tools": null, "toolChoice": null, "responseFormat": null,
+            "providerOptions": {"untrusted": {"control": true}}
+        }))
+        .unwrap();
+    assert!(decoded.parameters.resets(
+        stravia_runtime_contract::protocol::ir::ParameterReset::ResponseFormat
+    ));
+    let body = GatewayLanguageModelV4.encode_request(decoded).unwrap().0;
+    for field in ["tools", "toolChoice", "responseFormat", "providerOptions"] {
+        assert!(body.get(field).is_none(), "{field}");
+    }
+    for choice in [
+        ToolChoice::Allowed {
+            names: vec!["lookup".into()],
+            required: true,
+        },
+        ToolChoice::Native(stravia_runtime_contract::protocol::ir::NativeToolKind::WebSearch),
+    ] {
+        let mut request = AiRequest::new("model", vec![]);
+        request.tool_choice = Some(choice);
+        let body = GatewayLanguageModelV4.encode_request(request).unwrap().0;
+        assert!(body.get("toolChoice").is_none());
+    }
+}
+
+#[test]
 fn projects_nested_gateway_results_preserving_error_and_json_semantics() {
     use stravia_runtime_contract::protocol::ir::ToolResultContentKind;
     let mixed = json!([

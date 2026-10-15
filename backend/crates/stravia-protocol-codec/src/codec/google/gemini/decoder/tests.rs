@@ -1,7 +1,308 @@
 use super::*;
 
 #[test]
-fn decodes_both_official_schema_carriers_and_preserves_native_roundtrip() {
+fn explicit_null_controls_reset_inheritance_without_null_output() {
+    let request = GoogleDecoder.decode_request(serde_json::json!({
+        "contents": [], "systemInstruction": null, "tools": null,
+        "generationConfig": {
+            "temperature": null, "topP": null, "maxOutputTokens": null,
+            "presencePenalty": null, "frequencyPenalty": null,
+            "responseJsonSchema": null, "responseLogprobs": null,
+            "thinkingConfig": {"thinkingLevel": null, "includeThoughts": null}
+        }
+    })).unwrap();
+    for reset in [
+        ParameterReset::Instructions, ParameterReset::NativeTools,
+        ParameterReset::Temperature, ParameterReset::TopP, ParameterReset::MaxTokens,
+        ParameterReset::PresencePenalty, ParameterReset::FrequencyPenalty,
+        ParameterReset::ResponseFormat, ParameterReset::Logprobs,
+        ParameterReset::ReasoningLevel, ParameterReset::ReasoningSummary,
+    ] {
+        assert!(request.parameters.resets(reset));
+    }
+    assert!(request.response_format.is_none());
+    let (body, _) = crate::codec::google::gemini::encoder::GoogleEncoder.encode_request(request).unwrap();
+    assert!(!body.to_string().contains(":null"));
+    assert!(body.get("systemInstruction").is_none());
+    assert!(body.get("tools").is_none());
+    assert!(body["generationConfig"].get("responseJsonSchema").is_none());
+}
+
+#[test]
+fn allowed_function_names_preserve_the_complete_selection_and_mode() {
+    for (mode, required) in [("AUTO", false), ("ANY", true)] {
+        for names in [vec!["lookup"], vec!["lookup", "search"], vec![]] {
+            let request = GoogleDecoder.decode_request(serde_json::json!({
+                "contents": [],
+                "toolConfig": {"functionCallingConfig": {
+                    "mode": mode, "allowedFunctionNames": names,
+                    "streamFunctionCallArguments": true
+                }}
+            })).unwrap();
+            assert!(matches!(&request.tool_choice,
+                Some(ToolChoice::Allowed { names: actual, required: actual_required })
+                if actual.iter().map(String::as_str).collect::<Vec<_>>() == names && *actual_required == required
+            ));
+            let (body, _) = crate::codec::google::gemini::encoder::GoogleEncoder.encode_request(request).unwrap();
+            assert_eq!(body["toolConfig"], serde_json::json!({
+                "functionCallingConfig": {"mode": mode, "allowedFunctionNames": names}
+            }));
+        }
+    }
+}
+
+#[test]
+fn native_tools_normalize_supported_kinds_and_discard_unsupported_tools() {
+    let request = GoogleDecoder.decode_request(serde_json::json!({
+        "contents": [],
+        "safetySettings": {"unsupported": "shape"},
+        "cachedContent": {"unsupported": "shape"},
+        "tools": [
+            {"googleSearchRetrieval": {"dynamicRetrievalConfig": {"mode": "MODE_DYNAMIC"}}},
+            {"codeExecution": {"private": true}},
+            {"urlContext": {}}
+        ]
+    })).unwrap();
+    assert_eq!(request.parameters.native_tools.len(), 2);
+    let (body, _) = crate::codec::google::gemini::encoder::GoogleEncoder.encode_request(request).unwrap();
+    assert_eq!(body["tools"], serde_json::json!([{"googleSearch": {}}, {"codeExecution": {}}]));
+    assert!(body.get("safetySettings").is_none());
+    assert!(body.get("cachedContent").is_none());
+}
+
+#[test]
+fn mime_formats_and_logprobs_use_unified_controls() {
+    for (mime, expected) in [
+        ("application/json", Some(ResponseFormat::JsonObject)),
+        ("text/plain", Some(ResponseFormat::Text)),
+        ("image/png", None),
+    ] {
+        let request = GoogleDecoder.decode_request(serde_json::json!({
+            "contents": [], "generationConfig": {
+                "responseMimeType": mime, "responseLogprobs": true, "logprobs": 0,
+                "responseModalities": ["TEXT", "AUDIO", "IMAGE", "UNSUPPORTED"]
+            }
+        })).unwrap();
+        assert_eq!(
+            serde_json::to_value(&request.response_format).unwrap(),
+            serde_json::to_value(&expected).unwrap()
+        );
+        assert_eq!(request.parameters.logprobs, Some(0));
+        assert_eq!(request.parameters.modalities, Some(vec![Modality::Text, Modality::Audio, Modality::Image]));
+        let (body, _) = crate::codec::google::gemini::encoder::GoogleEncoder.encode_request(request).unwrap();
+        assert_eq!(body["generationConfig"]["responseLogprobs"], true);
+        assert_eq!(body["generationConfig"]["logprobs"], 0);
+        if expected.is_some() {
+            assert_eq!(body["generationConfig"]["responseMimeType"], mime);
+        } else {
+            assert!(body["generationConfig"].get("responseMimeType").is_none());
+        }
+    }
+}
+
+#[test]
+fn official_native_generation_controls_project_nested_keys() {
+    let request = GoogleDecoder.decode_request(serde_json::json!({
+        "contents": [], "generationConfig": {
+            "speechConfig": {"voiceConfig": {"prebuiltVoiceConfig": {"voiceName": "Kore", "private": true}, "private": true}, "private": true},
+            "imageConfig": {"aspectRatio": "1:1", "imageSize": "1K", "private": true},
+            "routingConfig": {"manualMode": {"modelName": "gemini", "private": true}, "private": true},
+            "modelSelectionConfig": {"featureSelectionPreference": "PRIORITIZE_QUALITY", "private": true}
+        },
+        "toolConfig": {"functionCallingConfig": {"mode": "AUTO", "private": true}, "private": true}
+    })).unwrap();
+    assert_eq!(request.parameters.audio.as_ref().and_then(|audio| audio.voice.as_deref()), Some("Kore"));
+    let (body, _) = crate::codec::google::gemini::encoder::GoogleEncoder
+        .encode_request(request)
+        .unwrap();
+    assert_eq!(
+        body["generationConfig"]["speechConfig"],
+        serde_json::json!({"voiceConfig": {"prebuiltVoiceConfig": {"voiceName": "Kore"}}})
+    );
+    for key in ["imageConfig", "routingConfig", "modelSelectionConfig"] {
+        assert!(body["generationConfig"].get(key).is_none());
+    }
+    assert_eq!(
+        body["toolConfig"],
+        serde_json::json!({"functionCallingConfig": {"mode": "AUTO"}})
+    );
+}
+
+#[test]
+fn source_effort_roundtrip_does_not_become_dynamic_budget() {
+    use crate::codec::google::gemini::encoder::GoogleEncoder;
+    let request = GoogleDecoder
+        .decode_request(serde_json::json!({
+            "contents": [],
+            "generationConfig": {"thinkingConfig": {"thinkingLevel": "HIGH"}}
+        }))
+        .unwrap();
+    assert_eq!(request.reasoning.mode, None);
+    assert!(request.reasoning.is_enabled());
+    let restored: stravia_runtime_contract::protocol::ir::AiRequest =
+        serde_json::from_value(serde_json::to_value(request).unwrap()).unwrap();
+    assert_eq!(restored.reasoning.mode, None);
+    let (wire, _) = GoogleEncoder.encode_request(restored).unwrap();
+    assert_eq!(
+        wire["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+        "HIGH"
+    );
+    assert!(
+        wire["generationConfig"]["thinkingConfig"]
+            .get("thinkingBudget")
+            .is_none()
+    );
+}
+
+#[test]
+fn roundtrips_canonical_controls_without_native_request_copies() {
+    use crate::codec::google::gemini::encoder::GoogleEncoder;
+    let request = GoogleDecoder
+        .decode_request(serde_json::json!({
+            "contents": [],
+            "cachedContent": "",
+            "generationConfig": {
+                "temperature": 0,
+                "topK": 0,
+                "candidateCount": 0,
+                "stopSequences": [],
+                "responseLogprobs": false,
+                "logprobs": 0,
+                "responseModalities": [],
+                "responseMimeType": "",
+                "audioTimestamp": false,
+                "mediaResolution": "",
+                "routingConfig": null,
+                "unknownGenerationControl": {"private": true}
+            },
+            "safetySettings": [],
+            "tools": [{"googleSearch": {"excludeDomains": []}}],
+            "unknownTopLevelControl": true
+        }))
+        .expect("canonical controls");
+    assert_eq!(request.parameters.top_k, Some(0));
+    assert_eq!(request.parameters.candidate_count, Some(0));
+    assert_eq!(request.parameters.logprobs, None);
+    assert!(request.parameters.resets(ParameterReset::Logprobs));
+    assert_eq!(request.parameters.modalities, Some(vec![]));
+    assert!(request.response_format.is_none());
+    assert_eq!(request.parameters.native_tools.len(), 1);
+
+    assert!(request.meta.vendor.ingress.is_empty());
+    let (body, _) = GoogleEncoder
+        .encode_request(request)
+        .expect("canonical roundtrip");
+    let config = &body["generationConfig"];
+    assert_eq!(config["temperature"], 0.0);
+    assert_eq!(config["topK"], 0);
+    assert_eq!(config["candidateCount"], 0);
+    assert_eq!(config["stopSequences"], serde_json::json!([]));
+    assert!(config.get("responseLogprobs").is_none());
+    assert!(config.get("logprobs").is_none());
+    assert_eq!(config["responseModalities"], serde_json::json!([]));
+    for key in ["responseMimeType", "audioTimestamp", "mediaResolution", "routingConfig"] {
+        assert!(config.get(key).is_none());
+    }
+    assert!(config.get("unknownGenerationControl").is_none());
+    assert!(body.get("unknownTopLevelControl").is_none());
+    assert!(body.get("cachedContent").is_none());
+    assert!(body.get("safetySettings").is_none());
+    assert!(body["tools"][0].get("googleSearch").is_some());
+}
+
+#[test]
+fn preserves_json_schema_literals_including_explicit_null() {
+    use crate::codec::google::gemini::encoder::GoogleEncoder;
+    {
+        let schema = serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": ["string", "null"], "enum": [null, "", false, 0],
+            "default": null, "examples": [null], "x-custom": {"nested": null}
+        });
+        let request = GoogleDecoder.decode_request(serde_json::json!({
+            "contents": [],
+            "generationConfig": {"responseJsonSchema": schema},
+            "tools": [{"functionDeclarations": [{"name": "lookup", "parametersJsonSchema": schema}]}]
+        })).expect("schema literals");
+        let Some(ResponseFormat::JsonSchema {
+            schema: canonical, ..
+        }) = &request.response_format
+        else {
+            panic!("canonical schema")
+        };
+        assert_eq!(canonical, &schema);
+        assert_eq!(request.tools.as_ref().unwrap()[0].parameters, schema);
+        let (body, _) = GoogleEncoder
+            .encode_request(request)
+            .expect("schema roundtrip");
+        assert_eq!(body["generationConfig"]["responseJsonSchema"], schema);
+        assert_eq!(
+            body["tools"][0]["functionDeclarations"][0]["parametersJsonSchema"],
+            schema
+        );
+    }
+}
+
+#[test]
+fn projects_canonical_thinking_mode_budget_and_level_without_target_control() {
+    use crate::codec::google::gemini::encoder::GoogleEncoder;
+    for (native, expected) in [
+        (
+            serde_json::json!({"thinkingBudget": -1, "includeThoughts": false}),
+            serde_json::json!({"thinkingBudget": -1, "includeThoughts": false}),
+        ),
+        (
+            serde_json::json!({"thinkingBudget": 0}),
+            serde_json::json!({"thinkingBudget": 0, "includeThoughts": false}),
+        ),
+        (
+            serde_json::json!({"thinkingBudget": 2048}),
+            serde_json::json!({"thinkingBudget": 2048, "includeThoughts": true}),
+        ),
+        (
+            serde_json::json!({"thinkingLevel": "LOW"}),
+            serde_json::json!({"thinkingLevel": "LOW", "includeThoughts": true}),
+        ),
+    ] {
+        let request = GoogleDecoder
+            .decode_request(serde_json::json!({
+                "contents": [], "generationConfig": {"thinkingConfig": native}
+            }))
+            .expect("thinking controls");
+        assert!(request.reasoning.target_control.is_none());
+        let (body, _) = GoogleEncoder
+            .encode_request(request)
+            .expect("thinking projection");
+        assert_eq!(body["generationConfig"]["thinkingConfig"], expected);
+    }
+}
+
+#[test]
+fn clears_native_tools_without_emitting_null_or_empty_controls() {
+    use crate::codec::google::gemini::encoder::GoogleEncoder;
+    for tools in [
+        serde_json::json!([]),
+        serde_json::json!([{"googleSearch": null}]),
+    ] {
+        let request = GoogleDecoder
+            .decode_request(serde_json::json!({
+                "contents": [], "tools": tools, "toolConfig": null
+            }))
+            .expect("present native options");
+        assert!(request.parameters.native_tools.is_empty());
+        if tools.as_array().unwrap().is_empty() {
+            assert!(request.parameters.resets(ParameterReset::NativeTools));
+        }
+        let (body, _) = GoogleEncoder
+            .encode_request(request)
+            .expect("native option presence");
+        assert!(body.get("tools").is_none());
+        assert!(body.get("toolConfig").is_none());
+    }
+}
+
+#[test]
+fn decodes_both_official_schema_carriers_into_canonical_format() {
     use crate::codec::google::gemini::encoder::GoogleEncoder;
     for (carrier, schema) in [
         (
@@ -24,10 +325,12 @@ fn decodes_both_official_schema_carriers_and_preserves_native_roundtrip() {
         let request = GoogleDecoder
             .decode_request(serde_json::json!({"contents": [], "generationConfig": config}))
             .expect("native schema");
-        let Some(ProtocolExt::Google(ext)) = &request.ext else {
-            panic!("Google extension")
+        let Some(ResponseFormat::JsonSchema {
+            schema: normalized, ..
+        }) = &request.response_format
+        else {
+            panic!("canonical response format")
         };
-        let normalized = ext.response_json_schema.as_ref().expect("canonical schema");
         if carrier == "responseSchema" {
             assert_eq!(normalized["type"], "object");
             assert_eq!(
@@ -43,10 +346,12 @@ fn decodes_both_official_schema_carriers_and_preserves_native_roundtrip() {
         } else {
             assert_eq!(normalized, &schema);
         }
+        let normalized = normalized.clone();
         let (body, _) = GoogleEncoder
             .encode_request(request)
             .expect("native roundtrip");
-        assert_eq!(body["generationConfig"][carrier], schema);
+        assert_eq!(body["generationConfig"]["responseJsonSchema"], normalized);
+        assert!(body["generationConfig"].get("responseSchema").is_none());
     }
 }
 
@@ -67,10 +372,11 @@ fn decodes_and_roundtrips_native_function_calling_modes() {
             "ANY"
                 if config["allowedFunctionNames"]
                     .as_array()
-                    .is_some_and(|names| names.len() == 1) =>
+                    .is_some() =>
             {
                 assert!(
-                    matches!(&request.tool_choice, Some(ToolChoice::Named { name }) if name == "lookup")
+                    matches!(&request.tool_choice, Some(ToolChoice::Allowed { names, required: true })
+                        if serde_json::json!(names) == config["allowedFunctionNames"])
                 )
             }
             _ => assert!(matches!(request.tool_choice, Some(ToolChoice::Required))),
@@ -188,8 +494,8 @@ fn missing_function_ids_are_compact_deterministic_and_skip_supplied_ids() {
 }
 
 #[test]
-fn include_thoughts_preserves_display_without_selecting_intensity() {
-    for (include, display) in [(true, "summarized"), (false, "omitted")] {
+fn include_thoughts_preserves_summary_without_selecting_intensity() {
+    for (include, summary) in [(true, ReasoningSummary::Auto), (false, ReasoningSummary::None)] {
         let request = GoogleDecoder
             .decode_request(serde_json::json!({
                 "contents": [{"role": "user", "parts": [{"text": "reason"}]}],
@@ -199,9 +505,9 @@ fn include_thoughts_preserves_display_without_selecting_intensity() {
             }))
             .expect("Gemini request");
 
-        assert_eq!(request.reasoning.display.as_deref(), Some(display));
+        assert_eq!(request.reasoning.summary, Some(summary));
         assert_eq!(request.reasoning.level, None);
-        assert!(!request.reasoning.enabled);
+        assert!(!request.reasoning.is_enabled());
     }
 }
 

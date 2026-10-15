@@ -1,20 +1,7 @@
 //! Wire-format types for the OpenAI Chat Completions API.
 //!
-//! PR-08 adds the full field set:
-//! - `stream_options` (include_usage)
-//! - `parallel_tool_calls`
-//! - `prediction` (output prediction / cache hinting)
-//! - `modalities`
-//! - `audio` (audio output config)
-//! - `response_format` (text / json_object / json_schema + strict)
-//! - `seed`
-//! - `stop`
-//! - `logit_bias`
-//! - `service_tier`
-//! - `max_completion_tokens` (alias for `max_tokens` for o-models)
-//! - `frequency_penalty`, `presence_penalty`
-//! - `n` (number of completions)
-//! - `user` (caller identifier for monitoring)
+//! Known source controls decode into the platform's canonical request fields.
+//! Unsupported source controls are ignored rather than passed upstream.
 
 use std::collections::HashMap;
 
@@ -44,6 +31,15 @@ pub struct OpenAIRequest {
     pub stop: Option<StopToken>,
     pub n: Option<u32>,
     pub logit_bias: Option<HashMap<String, f64>>,
+    pub logprobs: Option<bool>,
+    pub top_logprobs: Option<u32>,
+    pub store: Option<bool>,
+    pub metadata: Option<Value>,
+    pub safety_identifier: Option<String>,
+    pub prompt_cache_key: Option<String>,
+    pub prompt_cache_retention: Option<String>,
+    pub verbosity: Option<String>,
+    pub web_search_options: Option<Value>,
 
     // ── Tools ─────────────────────────────────────────────────────────────────
     pub tools: Option<Vec<Value>>,
@@ -60,8 +56,6 @@ pub struct OpenAIRequest {
     pub modalities: Option<Vec<String>>,
     /// Audio output configuration (requires `modalities: ["audio"]`).
     pub audio: Option<AudioConfig>,
-    /// Predicted output for speculative decoding / cache hinting.
-    pub prediction: Option<PredictionConfig>,
 
     // ── Reasoning (o-models) ──────────────────────────────────────────────────
     pub reasoning_effort: Option<String>,
@@ -70,9 +64,6 @@ pub struct OpenAIRequest {
     pub service_tier: Option<String>,
     /// Caller identifier surfaced in OpenAI usage dashboard.
     pub user: Option<String>,
-
-    #[serde(flatten)]
-    pub extra: HashMap<String, Value>,
 }
 
 // ── Stop token ────────────────────────────────────────────────────────────────
@@ -126,15 +117,6 @@ pub struct JsonSchemaConfig {
 pub struct AudioConfig {
     pub voice: Option<String>,
     pub format: Option<String>,
-}
-
-// ── Prediction ────────────────────────────────────────────────────────────────
-
-#[derive(Debug, Deserialize, Serialize)]
-pub struct PredictionConfig {
-    #[serde(rename = "type")]
-    pub pred_type: String,
-    pub content: Value,
 }
 
 // ── Messages ──────────────────────────────────────────────────────────────────

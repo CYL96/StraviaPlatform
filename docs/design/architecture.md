@@ -328,7 +328,7 @@ stravia-server::start_http_server() → 绑定 listener 并提供优雅关闭
 - **私有协议投影归属**：共享转换器负责标准协议的表达能力；Devin Connect-RPC、Command Code 等私有 wire 的请求准备与逐项省略由各自 Vendor Plugin 编解码器实现，不向共享转换器添加供应商专属能力表。统一省略政策不允许共享标准规则误删插件可以原生回放的思考项或工具历史。
 - **不透明插件身份与上下文权限**：私有上游仅使用 `ProtocolIdentity` 字符串，不进入共享协议枚举、endpoint 常量或宿主终态/媒体特判。未识别 endpoint 的媒体准备提供 canonical inline 字节；思考来源与客户端 endpoint 不匹配时按通用 Marker 契约保留。客户端额外头由已选 channel 的 `client_header_names` 精确声明，SDK 校验与执行筛选都拒绝凭据及 hop-by-hop 头，Core 不维护供应商私有头白名单，见 [插件请求头契约](vendor-plugins.md#客户端请求头读取声明)。
 - **Canonical-only 推理**：所有推理请求都经过 ingress decode、canonical IR、Vendor Plugin canonical execution 与 ingress encode；不提供以 wire raw request/response 绕过 HookRuntime 的路径。
-- **显式字段映射**：每个 codec 明确处理已知字段；允许的 vendor-specific 字段走 ExtensionBag，目标可表达时保留、不可表达时按转换政策省略，不把原始字节暴露给 hook。
+- **显式字段映射**：每个 codec 明确处理已知字段；请求控制归一到 canonical 字段，未分类控制按来源 namespace 保存，只有目标 codec／插件明确支持的字段才可投影。保留未知值不授予任意上游透传权限，不把原始字节暴露给 hook。
 - **唯一推理 seam**：`GatewayBuilder` 显式注入固定顺序的 `HookRuntime` hooks 与 `PlatformTool`，dispatcher 只通过 `HookRuntime` 处理推理扩展；`Gateway::execute_vendor` 是唯一供应商执行 seam，且只调用已安装的 Wasm Vendor Plugin，不保留 native adapter。
 - **固定事件面**：`Request`、`UpstreamResponse`、`ToolResult`、`ClientOutput` 四个规范化事件，以及每个 HookSession 内的 `StreamTransformer` 流式事件。
 
@@ -422,14 +422,31 @@ Inference Run 在 Request Hook 前验证 API Key、建立 Principal 并计一次
 - `AiStreamDelta`（`ir/stream.rs`）：流式增量事件，支持 reasoning delta、text、tool_call
 - `Usage`（`ir/usage.rs`）：prompt_tokens / completion_tokens / total_tokens / cache_read_tokens
 
-**vendor-specific 字段命名约定（存于 IR extra 字段）：**
+**唯一请求控制契约：**
 
-| 前缀 | 用途 |
-|---|---|
-| `__anthropic_raw_*` | Anthropic cache_control / exotic blocks / 工具 `strict` / `tool_result.is_error` 无损往返 |
-| `__google_raw_*` | Google systemInstruction / built-in tools / generationConfig |
-| `__emb_*` | Embeddings 已知字段（input / dimensions / encoding_format / user） |
-| `__vendor_ingress` | 未知 vendor 字段集合（由 VendorFieldPolicy 决定是否转发） |
+`AiRequest.parameters`（`ir/parameters.rs`）是 session、cache、continuation 及其余 optional controls 的唯一运行时语义归属。已有 `generation`、`reasoning`、`stream`、`tools`、`tool_choice`、`parallel_tool_calls` 与 `response_format` 保持各自 canonical 归属，不在协议扩展中再维护第二份权威值。源协议的 `ext`、原生字段名和历史 vendor bag 别名只在 ingress 或私有 legacy 读取 DTO 中消费并归一；普通 `AiRequest` 序列化不输出 `ext` 或 `disable_parallel_tool_calls`。
+
+字段集合以 [ADR-0081](../adr/0081-unify-request-controls-without-vendor-parameters.md) 为准：每个语义只有一个统一字段，不保留任何供应商专属控制，也不在同一协议里接受同一语义的两种拼写作为两个运行时值。入口 decoder 把各协议官方同义字段合并到同一字段，例如 `n`／`candidateCount` → `candidate_count`，`logprobs`＋`top_logprobs` → `logprobs: Option<u32>`，`safety_identifier`／`user`／Anthropic `metadata.user_id` → `end_user_id`（`safety_identifier` 优先），Anthropic `thinking.display`、Responses `reasoning.summary` 与 Gemini `includeThoughts` → `reasoning.summary`。安全过滤类控制（Gemini `safetySettings`、Bedrock guardrail、Cohere `safety_mode`）不建模，入口静默丢弃。
+
+- `parameters.cache.key` 是 prompt 分桶键，`retention` 只有 `default`／`extended` 两档；它们不是客户端会话身份，也不等同于 response continuation。内容块上的显式 breakpoint 属于内容 IR（`ContentBlock.cache_control`），不是请求参数；工具级 `cache_control` 不再建模。
+- `parameters.continuation` 是 `PreviousResponse(id)` 或 `Conversation(id)` 之一，前者是 Generation Chain／路由 continuation 的唯一父响应控制。同步执行会省略不支持的 background 控制，不承诺后台任务；`compaction.threshold_tokens` 是唯一服务端压缩触发控制。
+- `parameters.session` 只保存上游真正需要的身份：`id`（合并旧 affinity、thread、window 身份）、`request_id`、`parent_id`（合并 parent 与 parent thread）、`forked_from_id`、`context_window_id` 与 turn 系列 ID。Generation Chain 从 `session.id` 计算 session fingerprint；`request_id` 只是请求关联，不进入 retry 身份，也不能替代会话身份。
+- 原生工具只有 `parameters.native_tools` 中的 WebSearch、CodeExecution、ImageGeneration、ToolSearch、Custom 与 Namespace 六种；`tool_choice` 用 `Allowed{names, required}` 与 `Native(kind)` 表达受限选择，不保留原始 JSON 选择。统一变体之外的托管工具（如 `file_search`、`mcp`、`computer`、`web_fetch`）入口丢弃。
+- 各入口的原生搜索声明（包括 Gemini `googleSearch`）统一为 `WebSearch` 后，由平台搜索 Hook 接管并受联网搜索能力 Gate 约束；能力不可用时返回 `403 web_search_unavailable`，不因上游协议能表达原生搜索而绕过平台配置直接透传。业务工具 schema 与消息载体的保真不依赖启用搜索。
+- 显式 `false`、`0`、空数组／对象与省略不同，不能用 truthy/default 判断抹平。显式 null 或显式清空记为 `parameters.resets` 中的 `ParameterReset`，续接继承据此区分“沿用父请求”和“本轮清除”；出口从不发送显式 null。
+- `reasoning.level` 是唯一 canonical effort 档位，`budget_tokens`、`mode`、`summary` 与本次尝试的 `target_control` 各自独立。旧 `reasoning.effort`、`enabled`、`display` 仅在私有读取 DTO 中补充缺失的 canonical 控制；SDK format-1 序列化桥接可以生成旧拼写，供已安装插件读取，但它们不是第二个运行时字段。
+
+**入口 headers 与目标投影：**
+
+HTTP ingress 与内部 Model Turn 的 extra-header 入口都消费会话／关联 header 别名。`x-session-id`、`session-id`、`session_id` 等按固定优先级归一到 `session.id`；匹配的非空 header 可以覆盖 body 身份。`x-client-request-id`／`x-request-id` 只写 `session.request_id`。这些别名与 Codex 专有 headers 从通用转发集合移除，不能直接送到任意上游；认证、Cookie 和客户端网络身份仍由原有 header 安全策略隔离。
+
+Canonical 请求不保存供应商原生上下文。Model Turn 只把统一 session 身份按 Principal、Target 与根请求作用域派生为 `transport_affinity` 等 operation metadata，插件从这些宿主派生值生成原生会话标识，不读取客户端原始 ID。官方工具私有身份由插件自行维护：Codex `x-codex-installation-id` 是按凭据持久化在插件私有状态中的 UUID，`x-codex-turn-state` 只取自同一 turn 的上游响应头；客户端的 `x-codex-beta-features`、`x-openai-subagent` 与 `x-codex-turn-metadata` 不转发。
+
+目标 body、会话 headers 及其参数型嵌套对象采用正向白名单，由所属 codec／插件从 canonical 控制重新投影。标准 API 以对应官方协议为边界；OAuth／订阅插件以对应官方工具实际会产出的字段为边界，不能把公共 API 的字段全集当作私有端点支持范围。字段清单依据官方源码、schema 和实际请求核对，已确认的官方字段必须完整建模，新增支持须显式更新 canonical 字段及目标投影。白名单外参数透明丢弃，不转发、不报参数错误，也不触发额外重试；官方声明为任意业务映射的 metadata、工具 schema、工具入参与结果中的对象键不是请求控制，不能按参数清单递归删除。CLI 身份 metadata 等结构化控制不属于任意业务映射，其成员同样受白名单约束。
+
+平台不提供自定义请求参数袋、任意 extra-body 或泛化参数注入。既有已确认原生控制归入明确 typed 字段；未知控制不进入运行时参数模型。`meta.vendor.ingress` 等保真载荷只服务明确支持的内容回放，不是请求参数后门；`__anthropic_raw_*`、`__google_raw_*`、旧 `__emb_*` 及旧扩展数据只能由私有兼容读取逻辑提取已知语义，不能恢复任意透传权限。原始诊断与不可变历史不因目标投影被重写。白名单限定参数能力，不保证账号资格、额度、上下文容量或业务 schema 取值一定获上游接受；既有认证、安全校验与路由重试策略不变。
+
+控制摘要的编码变化同时更新 Generation prefix namespace 与 exclusion projection 版本。本轮使用 history namespace v5、projection v2；新节点记录控制证明版本，旧节点缺少版本时仍属于未知旧证明，重建索引不能把它追认为当前证明，也不改写不可变节点。旧控制摘要不保证匹配新版自动历史发现；客户端携带完整历史时可重新建链，显式父响应仍按既有权限与有效期完整物化，不以旧摘要省略未证明的历史。
 
 ### 3.4 Devin Connect 回放与工具说明
 
@@ -719,15 +736,19 @@ Request/response encode 和 stream delta encode 按目标协议的 per-value rep
 
 ### 5.4 Codec 主要字段映射
 
-**OpenAI Chat**：完整映射 logprobs、seed、response_format、parallel_tool_calls、audio 等 20+ 字段；reasoning 字段透传。
+各协议的入口合并与出口投影遵循 §3.3 的统一字段；下列只记录协议特有的取舍。入口无法映射的官方控制静默丢弃，出口不发送显式 null。
 
-**Open Responses 2026-04-24**：独立 decoder/encoder/parser/formatter；严格验证 dated request、ResponseResource 与 SSE lifecycle；Target 是否仅支持流式由 `ResolvedTargetCapabilities::stream_only` 声明。
+**OpenAI Chat**：`n`、`logprobs`＋`top_logprobs`、`audio`、`modalities`、`verbosity`、`metadata`、`service_tier`、`prompt_cache_key`／`prompt_cache_retention` 与 `web_search_options` 归一到 `parameters`；`safety_identifier` 优先于 `user` 写入 `end_user_id`，出口只写 `safety_identifier`。`prediction` 丢弃。seed 属于 `generation`，结构化输出与并行工具分别属于 `response_format` 和 `parallel_tool_calls`。reasoning 输入归一到 `reasoning`，目标端按已解析的 level／budget／Target control 编码，不原样透传 reasoning 对象。兼容服务的 `top_k`、`min_p`、`repetition_penalty` 只在非官方 OpenAI／Azure Chat 路径且 model `supported_parameters` 明确登记对应已知字段时补入；登记未知字段不授予转发权限。
 
-**Anthropic Messages**：cache_control、thinking config、context_management、exotic blocks（Document / InputAudio）、工具 `strict` 与 `tool_result.is_error` 保留 `__anthropic_raw_*` 做同协议无损往返（后两者不进入 IR，跨协议路由不受影响）；built-in tools（web_search_call）作为 sentinel ToolDef 处理。
+**Open Responses 2026-04-24**：独立 decoder/encoder/parser/formatter；严格验证 dated request、ResponseResource 与 SSE lifecycle；Target 是否仅支持流式由 `ResolvedTargetCapabilities::stream_only` 声明。客户端 `include` 不保存：出口在 `store=false` 且推理开启时派生 `reasoning.encrypted_content`，在 `logprobs` 有值时派生 `message.output_text.logprobs`。`previous_response_id` 与 `conversation` 是 `continuation` 的两个互斥分支；`context_management` 的 compaction 阈值映射 `compaction.threshold_tokens`。ImageGeneration、ToolSearch、Custom、Namespace 与 `ToolChoice::Native` 只有 Responses 能表达，其它出口跳过这些工具并移除依赖它们的选择。
 
-**Google GenerateContent**：完整 generationConfig（20+ fields）、safety_settings、built-in tools（googleSearch / codeExecution）；`__google_generation_config` 在 encoder 中被 model 参数 overlay。
+**Anthropic Messages**：thinking 配置归一到 `reasoning`，`thinking.display` 对应 `reasoning.summary`；`metadata.user_id` 对应 `end_user_id`，`service_tier` 的 `auto`／`standard_only` 对应 `Auto`／`Default`，顶层 `cache_control.ttl` 的 `5m`／`1h` 对应 `cache.retention` 的 `Default`／`Extended`，compact edit 的触发阈值对应 `compaction.threshold_tokens`。顶层 `container` 归入 `CodeExecution.container`，出口仍写回顶层而非工具声明。`speed`、`inference_geo`、非 compaction context edit，以及工具上的 `eager_input_streaming`、`allowed_callers`、`input_examples`、`cache_control` 均丢弃；Document／媒体与 tool-result error 仍按各自 typed IR 处理。
 
-**OpenAI Embeddings**：`VendorFieldPolicy::Drop`；`__emb_*` 明确解析；unknown fields 进 `__vendor_ingress` 但不转发。
+**Google GenerateContent**：generationConfig 的已知采样／输出控制拆入 `generation`、`parameters` 与 `response_format`，thinkingConfig 拆入 `reasoning`（`includeThoughts` 对应 `reasoning.summary`）；`candidateCount`、`responseLogprobs`＋`logprobs`、`responseModalities` 与 `speechConfig` 的 voiceName 分别归入统一字段，`allowedFunctionNames` 对应 `ToolChoice::Allowed`。编码时从这些 canonical 字段重建 generationConfig，不保存整份 raw generationConfig 再 overlay。`safetySettings`、`cachedContent`、`audioTimestamp`、`mediaResolution`、`routingConfig`、`imageConfig` 与 `urlContext` 等未统一工具丢弃。
+
+**Bedrock Converse**：`outputConfig.textFormat.structure.jsonSchema` 归一到 `response_format` 的 schema、name 与 description；出站从 canonical 重建官方结构，省略目标没有等价表达的 strict 或 JsonObject 控制。`requestMetadata` 对应 `metadata`，`serviceTier` 对应 `service_tier`；guardrail、performance、prompt variables 与 additional model response field paths 丢弃。
+
+**OpenAI Embeddings**：input、dimensions、encoding_format 明确解析到 typed `AiRequest.embedding`，`user` 归入 `end_user_id` 并在出口写回 embeddings 的 `user`；`VendorFieldPolicy::Drop`，unknown fields 保存在 ingress 的 `__vendor_ingress` 中但不转发，不以旧 `__emb_*` 作为运行时参数接口。
 
 ### 5.5 语义工具（codec/reasoning.rs & codec/tool_correlation.rs）
 
@@ -768,6 +789,8 @@ model_turn/                  ← 路由与尝试策略；只调用 Gateway::exec
 ### 6.1 Descriptor 与操作入口
 
 WIT 契约为 `stravia:vendor@0.5.0`。`VendorDescriptor` 声明稳定 `vendor_id`、版本、展示元数据、canonical format 版本、`kind`（fallback 或 dedicated）及 `providers`；每个 `ProviderDescriptor` 独立声明 `provider_id`、可选 `catalog_id`、展示元数据、channels、能力、配置字段、网络权限与数据兼容版本。fallback descriptor 的 Vendor 身份必须为 `base`；dedicated descriptor 只能有一个 profile，且其 `provider_id` 必须等于 `vendor_id`。管理面和执行面都从 `VendorPlugins` 当前已安装且已加载的 descriptor 读取，不再聚合协议 registry 伪造插件 inventory。
+
+请求 canonical format 仍为 1，WIT 仍为 0.5.0。新增有默认值的 optional 字段可由使用兼容读取契约的已安装 format-1 插件忽略；忽略不代表插件支持该新语义。SDK `request_compat.rs` 按目标 family 从唯一 canonical 状态生成旧 `ext`、已知标准字段和 `reasoning.effort` 的 wire 视图，以供旧组件读取，不把这些别名恢复成宿主运行时状态，也不把未知 passthrough 提升为上游 body 权限。新增必选语义、破坏读取契约或改变 WIT 仍须版本化，不能以 optional 兼容性绕过。独立插件中的 codec 固化在已安装 WASM 内，须重建并重新导入插件才能获得新 codec／目标投影行为；只升级宿主不会更新旧 WASM。
 
 这里的 `provider_id` 是供应商 profile 身份，不是已保存 Provider 连接的数据库 UUID。SDK 与 WIT 的 `ProviderSnapshot.provider_id` 为必填；准入、channel 校验、网络 origin 与 guest 分派都只使用当前 profile，不能合并其他 profile 的声明。基础 guest 按该身份分派，专属 guest 拒绝其他身份。
 
@@ -1309,7 +1332,7 @@ Request Records 使用 `/api/v1/observations/interactions`、`/interactions/{id}
 
 ### 12.1 Canonical inference path（当前实现）
 
-所有推理请求都经过 ingress decoder、canonical IR、HookRuntime、Vendor 编解码和 ingress formatter。不存在绕过 canonical pipeline、把原始 request/response/SSE 字节直接交给客户端或 hook 的路径；未知但允许的 vendor 字段必须通过协议定义的 ExtensionBag 往返，无法安全编码时明确失败。
+所有推理请求都经过 ingress decoder、canonical IR、HookRuntime、Vendor 编解码和 ingress formatter。不存在绕过 canonical pipeline、把原始 request/response/SSE 字节直接交给客户端或 hook 的路径；未知请求控制按来源 namespace 保留，仅明确支持的目标字段可由 codec／插件投影。不可表达部分按既有转换政策省略，非法源输入、安全／凭据校验与真实上游错误仍显式失败，不承诺未知字段往返或所有请求成功。
 
 ### 12.2 Principal admission boundary（当前实现）
 

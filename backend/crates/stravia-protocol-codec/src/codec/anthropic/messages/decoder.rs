@@ -1,9 +1,8 @@
 //! Anthropic Messages ingress decoder — produces `AiRequest` directly.
 //!
 //! Cache-control and exotic blocks (Document, InputAudio) are now carried
-//! natively in `ContentBlock`. Raw wire values are also preserved in
-//! `meta.vendor.ingress` so the old Anthropic encoder (pre-PR-3) can still
-//! round-trip them.
+//! natively in `ContentBlock`. Raw snapshots retain cache and exotic block
+//! metadata; request controls have canonical typed ownership.
 
 use anyhow::Result;
 use serde_json::Value;
@@ -11,21 +10,22 @@ use serde_json::Value;
 use stravia_runtime_contract::protocol::ids::ANTHROPIC_MESSAGES_2023_06_01;
 use stravia_runtime_contract::protocol::ir::AiItem;
 use stravia_runtime_contract::protocol::ir::AiRequest;
-use stravia_runtime_contract::protocol::ir::AnthropicExt;
 use stravia_runtime_contract::protocol::ir::CacheTtl;
 use stravia_runtime_contract::protocol::ir::ContentBlock;
 use stravia_runtime_contract::protocol::ir::DocumentSource as IrDocumentSource;
 use stravia_runtime_contract::protocol::ir::GenerationConfig;
 use stravia_runtime_contract::protocol::ir::MediaSource;
 use stravia_runtime_contract::protocol::ir::MessageContent;
-use stravia_runtime_contract::protocol::ir::ProtocolExt;
 use stravia_runtime_contract::protocol::ir::ReasoningConfig;
-use stravia_runtime_contract::protocol::ir::ReasoningEffort;
 use stravia_runtime_contract::protocol::ir::Role;
 use stravia_runtime_contract::protocol::ir::StreamConfig;
 use stravia_runtime_contract::protocol::ir::ToolCall;
 use stravia_runtime_contract::protocol::ir::ToolChoice;
 use stravia_runtime_contract::protocol::ir::ToolSpec;
+use stravia_runtime_contract::protocol::ir::{
+    CacheRetention, CompactionControl, NativeTool, NativeToolKind, ParameterReset, ReasoningSummary, ServiceTier,
+    native_tool_from_anthropic,
+};
 
 use super::types::{
     AnthropicContent, AnthropicContentBlock, AnthropicImageSource, AnthropicMessage,
@@ -37,6 +37,49 @@ pub struct AnthropicDecoder;
 
 impl AnthropicDecoder {
     pub(crate) fn decode_request(&self, body: Value) -> Result<AiRequest> {
+        let mut resets = Vec::new();
+        for (field, reset) in [
+            ("system", ParameterReset::Instructions),
+            ("tools", ParameterReset::NativeTools),
+            ("temperature", ParameterReset::Temperature),
+            ("top_p", ParameterReset::TopP),
+            ("max_tokens", ParameterReset::MaxTokens),
+            ("thinking", ParameterReset::Reasoning),
+            ("service_tier", ParameterReset::ServiceTier),
+            ("cache_control", ParameterReset::CacheRetention),
+        ] {
+            if body.get(field).is_some_and(Value::is_null) {
+                resets.push(reset);
+            }
+        }
+        if body.get("system").is_some_and(|v| v == "" || v.as_array().is_some_and(Vec::is_empty)) {
+            resets.push(ParameterReset::Instructions);
+        }
+        if body.get("tools").and_then(Value::as_array).is_some_and(Vec::is_empty) {
+            resets.push(ParameterReset::NativeTools);
+        }
+        if body.pointer("/thinking/display").is_some_and(Value::is_null) {
+            resets.push(ParameterReset::ReasoningSummary);
+        }
+        if body.pointer("/cache_control/ttl").is_some_and(Value::is_null) {
+            resets.push(ParameterReset::CacheRetention);
+        }
+        if body.pointer("/output_config/effort").is_some_and(Value::is_null) {
+            resets.push(ParameterReset::ReasoningLevel);
+        }
+        if body.get("output_config").is_some_and(Value::is_null)
+            || body.pointer("/output_config/format").is_some_and(Value::is_null)
+        {
+            resets.push(ParameterReset::ResponseFormat);
+        }
+        if body.get("metadata").is_some_and(Value::is_null)
+            || body.pointer("/metadata/user_id").is_some_and(|v| v.is_null() || v == "")
+        {
+            resets.push(ParameterReset::EndUser);
+        }
+        if body.pointer("/tool_choice/disable_parallel_tool_use").is_some_and(Value::is_null) {
+            resets.push(ParameterReset::ParallelToolCalls);
+        }
         let req: AnthropicRequest = serde_json::from_value(body)?;
 
         // ── Cache-control / exotic-block detection (for raw preservation) ──────
@@ -65,17 +108,6 @@ impl AnthropicDecoder {
             _ => false,
         };
 
-        // 原样快照保留 cache_control 和工具原生字段；strict 同时进入 IR，
-        // 以便跨协议保留官方严格工具调用约束。
-        let needs_raw_tools = req
-            .tools
-            .as_ref()
-            .map(|ts| {
-                ts.iter()
-                    .any(|t| t.cache_control.is_some() || t.strict.is_some())
-            })
-            .unwrap_or(false);
-
         // Snapshot raw wire values before consuming req.
         // Inline "system" role messages are filtered out of the snapshot so that
         // the Anthropic encoder's raw-passthrough path (used when cache_control is
@@ -97,14 +129,6 @@ impl AnthropicDecoder {
         } else {
             None
         };
-        let raw_tools: Option<Value> = if needs_raw_tools {
-            req.tools
-                .as_ref()
-                .and_then(|t| serde_json::to_value(t).ok())
-        } else {
-            None
-        };
-
         // ── System prompt ─────────────────────────────────────────────────────
         let instructions = req
             .system
@@ -133,38 +157,21 @@ impl AnthropicDecoder {
 
         // ── Tools ─────────────────────────────────────────────────────────────
         let mut user_tools: Vec<ToolSpec> = Vec::new();
-        let mut server_tools: Vec<Value> = Vec::new();
+        let mut native_tools = Vec::new();
 
         if let Some(tools) = req.tools {
             for t in tools {
-                if let Some(ref tool_type) = t.tool_type {
-                    // Built-in / server tool — preserve as raw Value in AnthropicExt.
-                    let mut raw = serde_json::Map::new();
-                    raw.insert("type".to_string(), Value::String(tool_type.clone()));
-                    if let Some(d) = &t.description {
-                        raw.insert("description".to_string(), Value::String(d.clone()));
+                if t.tool_type.as_deref().is_some_and(|kind| kind != "custom") {
+                    if let Some(tool) = native_tool_from_anthropic(&serde_json::to_value(t)?) {
+                        native_tools.push(tool);
                     }
-                    if let Some(s) = &t.input_schema {
-                        raw.insert("input_schema".to_string(), s.clone());
-                    }
-                    server_tools.push(Value::Object(raw));
-                    // Also keep sentinel ToolSpec so dispatcher knows about it.
-                    user_tools.push(ToolSpec {
-                        name: format!("__builtin__{}", tool_type),
-                        description: t.description,
-                        parameters: t.input_schema.unwrap_or(Value::Object(Default::default())),
-                        strict: t.strict,
-                        cache_control: t.cache_control.as_ref().map(map_cache_control),
-                        meta: None,
-                    });
                 } else if let Some(schema) = t.input_schema {
                     user_tools.push(ToolSpec {
                         name: t.name,
                         description: t.description,
                         parameters: schema,
                         strict: t.strict,
-                        cache_control: t.cache_control.as_ref().map(map_cache_control),
-                        meta: None,
+                        defer_loading: t.defer_loading,
                     });
                 }
             }
@@ -175,32 +182,52 @@ impl AnthropicDecoder {
             .tool_choice
             .as_ref()
             .and_then(|choice| choice.get("disable_parallel_tool_use"))
+            .filter(|value| !value.is_null())
             .map(|value| {
                 value.as_bool().ok_or_else(|| {
                     anyhow::anyhow!("Anthropic disable_parallel_tool_use must be a boolean")
                 })
             })
             .transpose()?;
-        let tool_choice = req.tool_choice.map(parse_tool_choice);
-        let response_format = parse_output_format(req.output_config.as_ref())?;
+        let tool_choice = req.tool_choice.and_then(parse_tool_choice).map(|choice| match choice {
+            ToolChoice::Named { ref name } if name == "web_search"
+                && native_tools.iter().any(|tool| matches!(tool, NativeTool::WebSearch(_))) =>
+                ToolChoice::Native(NativeToolKind::WebSearch),
+            ToolChoice::Named { ref name } if name == "code_execution"
+                && native_tools.iter().any(|tool| matches!(tool, NativeTool::CodeExecution(_))) =>
+                ToolChoice::Native(NativeToolKind::CodeExecution),
+            choice => choice,
+        });
+        let output_effort = parse_output_effort(req.output_config.as_ref())?;
+        let response_format = parse_output_format(req.output_config)?;
 
         // ── Reasoning config ──────────────────────────────────────────────────
-        let output_effort = parse_output_effort(req.output_config.as_ref())?;
         let reasoning = match req.thinking.as_ref() {
             Some(thinking) if output_effort.is_some() => {
                 if !matches!(thinking.kind.as_str(), "enabled" | "disabled" | "adaptive") {
                     anyhow::bail!("unsupported Anthropic thinking type: {}", thinking.kind);
                 }
-                // 显式档位优先于开关和预算，不能把冲突预算带到 Target 选择阶段。
-                reasoning_from_effort(
+                let mut reasoning = reasoning_from_effort(
                     output_effort.as_deref().expect("explicit effort"),
-                    thinking.display.clone(),
-                )?
+                    parse_summary(thinking.display.as_deref()),
+                )?;
+                reasoning.mode = Some(if thinking.kind == "adaptive" {
+                    "auto".into()
+                } else {
+                    thinking.kind.clone()
+                });
+                reasoning.budget_tokens = if thinking.kind == "enabled" {
+                    thinking.budget_tokens
+                } else {
+                    None
+                };
+                reasoning
             }
-            Some(thinking) if thinking.kind == "adaptive" => reasoning_from_effort(
-                output_effort.as_deref().unwrap_or("high"),
-                thinking.display.clone(),
-            )?,
+            Some(thinking) if thinking.kind == "adaptive" => ReasoningConfig {
+                mode: Some("auto".into()),
+                summary: parse_summary(thinking.display.as_deref()),
+                ..Default::default()
+            },
             Some(thinking) => {
                 let enabled = match thinking.kind.as_str() {
                     "enabled" => true,
@@ -208,9 +235,9 @@ impl AnthropicDecoder {
                     value => anyhow::bail!("unsupported Anthropic thinking type: {value}"),
                 };
                 ReasoningConfig {
-                    enabled,
+                    mode: Some(thinking.kind.clone()),
                     budget_tokens: thinking.budget_tokens,
-                    display: thinking.display.clone(),
+                    summary: parse_summary(thinking.display.as_deref()),
                     level: Some(if enabled {
                         thinking
                             .budget_tokens
@@ -229,21 +256,7 @@ impl AnthropicDecoder {
                 .unwrap_or_default(),
         };
 
-        // ── AnthropicExt ──────────────────────────────────────────────────────
-        let ant_ext = AnthropicExt {
-            output_config: req.output_config,
-            top_k: req.top_k,
-            container: req.container.as_ref().map(|c| Value::String(c.clone())),
-            service_tier: req.service_tier.clone(),
-            server_tools: if server_tools.is_empty() {
-                None
-            } else {
-                Some(server_tools)
-            },
-            ..Default::default()
-        };
-
-        // ── Vendor ingress bag — backward compat for old Anthropic encoder ────
+        // ── Raw snapshots, never request-control aliases ─────────────────────
         let mut ingress = std::collections::HashMap::new();
 
         if let Some(v) = raw_messages {
@@ -252,35 +265,6 @@ impl AnthropicDecoder {
         if let Some(v) = raw_system {
             ingress.insert("__anthropic_raw_system".into(), v);
         }
-        if let Some(v) = raw_tools {
-            ingress.insert("__anthropic_raw_tools".into(), v);
-        }
-        if let Some(ref thinking) = req.thinking
-            && let Ok(v) = serde_json::to_value(thinking)
-        {
-            ingress.insert("__anthropic_thinking".into(), v);
-        }
-        if let Some(ref cm) = req.context_management {
-            ingress.insert("__anthropic_context_management".into(), cm.clone());
-        }
-        if let Some(ref c) = req.container {
-            ingress.insert("__anthropic_container".into(), Value::String(c.clone()));
-        }
-        if let Some(ref st) = req.service_tier {
-            ingress.insert("__anthropic_service_tier".into(), Value::String(st.clone()));
-        }
-        if let Some(ref meta) = req.metadata {
-            ingress.insert("__anthropic_metadata".into(), meta.clone());
-        }
-        if let Some(ref stops) = req.stop_sequences
-            && let Ok(v) = serde_json::to_value(stops)
-        {
-            ingress.insert("__anthropic_stop_sequences".into(), v);
-        }
-        if let Some(k) = req.top_k {
-            ingress.insert("__anthropic_top_k".into(), Value::Number(k.into()));
-        }
-
         // ── Build AiRequest ───────────────────────────────────────────────────
         let tools_opt = if user_tools.is_empty() {
             None
@@ -292,7 +276,7 @@ impl AnthropicDecoder {
         ai_req.instructions = instructions;
         ai_req.generation = GenerationConfig {
             temperature: req.temperature,
-            max_tokens: Some(req.max_tokens),
+            max_tokens: req.max_tokens,
             top_p: req.top_p,
             stop: req.stop_sequences,
             ..Default::default()
@@ -303,13 +287,56 @@ impl AnthropicDecoder {
         };
         ai_req.tools = tools_opt;
         ai_req.tool_choice = tool_choice;
-        ai_req.disable_parallel_tool_calls = disable_parallel_tool_calls;
         ai_req.parallel_tool_calls = disable_parallel_tool_calls.map(|disabled| !disabled);
         ai_req.response_format = response_format;
         ai_req.reasoning = reasoning;
-        ai_req.ext = Some(ProtocolExt::Anthropic(ant_ext));
+        ai_req.parameters.top_k = req.top_k;
+        let container = req.container.as_ref().and_then(|value| {
+            value.as_str().or_else(|| value.get("id").and_then(Value::as_str))
+        });
+        for tool in &mut native_tools {
+            if let NativeTool::CodeExecution(tool) = tool {
+                tool.container = container.map(str::to_owned);
+            }
+        }
+        ai_req.parameters.compaction = req.context_management.as_ref()
+            .and_then(|value| value.get("edits"))
+            .and_then(Value::as_array)
+            .and_then(|edits| edits.iter().find(|edit| edit.get("type").and_then(Value::as_str) == Some("compact_20260112")))
+            .map(|edit| CompactionControl {
+                threshold_tokens: edit.get("trigger")
+                    .filter(|trigger| trigger.get("type").and_then(Value::as_str) == Some("input_tokens"))
+                    .and_then(|trigger| trigger.get("value"))
+                    .and_then(Value::as_u64)
+                    .and_then(|value| u32::try_from(value).ok()),
+            });
+        ai_req.parameters.cache.retention = req.cache_control.as_ref()
+            .filter(|control| control.get("type").and_then(Value::as_str) == Some("ephemeral"))
+            .and_then(|control| {
+            match control.get("ttl").and_then(Value::as_str) {
+                Some("1h") => Some(CacheRetention::Extended),
+                Some("5m") => Some(CacheRetention::Default),
+                None if control.get("ttl").is_none() => Some(CacheRetention::Default),
+                _ => None,
+            }
+        });
+        ai_req.parameters.end_user_id = req
+            .metadata
+            .and_then(|mut metadata| metadata.as_object_mut()?.remove("user_id"))
+            .and_then(|user_id| match user_id {
+                Value::String(user_id) if !user_id.is_empty() => Some(user_id),
+                _ => None,
+            });
+        ai_req.parameters.service_tier = req.service_tier.and_then(|tier| match tier.as_str() {
+            "auto" => Some(ServiceTier::Auto),
+            "standard_only" => Some(ServiceTier::Default),
+            _ => None,
+        });
+        ai_req.parameters.native_tools = native_tools;
+        ai_req.parameters.resets = resets;
         ai_req.meta.source_protocol = Some(ANTHROPIC_MESSAGES_2023_06_01);
         ai_req.meta.vendor.ingress = ingress;
+        ai_req.normalize_parameters();
 
         Ok(ai_req)
     }
@@ -645,11 +672,14 @@ fn decode_user_blocks(blocks: Vec<AnthropicContentBlock>) -> Result<Vec<AiItem>>
 // ── Type-mapping helpers ──────────────────────────────────────────────────────
 
 fn map_cache_control(
-    _cc: &WireCacheControl,
+    cc: &WireCacheControl,
 ) -> stravia_runtime_contract::protocol::ir::CacheControl {
-    // Anthropic only has "ephemeral" TTL.
     stravia_runtime_contract::protocol::ir::CacheControl {
-        ttl: CacheTtl::Ephemeral5m,
+        ttl: if cc.ttl.as_deref() == Some("1h") {
+            CacheTtl::Ephemeral1h
+        } else {
+            CacheTtl::Ephemeral5m
+        },
         breakpoint_priority: 0,
     }
 }
@@ -789,29 +819,23 @@ fn map_doc_source(src: WireDocumentSource) -> Result<IrDocumentSource> {
     })
 }
 
-fn parse_tool_choice(v: Value) -> ToolChoice {
+fn parse_tool_choice(v: Value) -> Option<ToolChoice> {
     match v.get("type").and_then(|t| t.as_str()) {
-        Some("auto") => ToolChoice::Auto,
-        Some("any") => ToolChoice::Required,
-        Some("none") => ToolChoice::None,
-        Some("tool") => {
-            if let Some(name) = v.get("name").and_then(|n| n.as_str()) {
-                ToolChoice::Named {
-                    name: name.to_string(),
-                }
-            } else {
-                ToolChoice::Raw(v)
-            }
-        }
-        _ => ToolChoice::Raw(v),
+        Some("auto") => Some(ToolChoice::Auto),
+        Some("any") => Some(ToolChoice::Required),
+        Some("none") => Some(ToolChoice::None),
+        Some("tool") => v.get("name").and_then(Value::as_str).map(|name| ToolChoice::Named {
+            name: name.to_string(),
+        }),
+        _ => None,
     }
 }
 
 fn parse_output_format(
-    output_config: Option<&Value>,
+    output_config: Option<Value>,
 ) -> Result<Option<stravia_runtime_contract::protocol::ir::ResponseFormat>> {
-    let Some(format) = output_config
-        .and_then(|config| config.get("format"))
+    let Some(mut format) = output_config
+        .and_then(|mut config| config.as_object_mut()?.remove("format"))
         .filter(|format| !format.is_null())
     else {
         return Ok(None);
@@ -820,7 +844,8 @@ fn parse_output_format(
         anyhow::bail!("unsupported Anthropic output_config.format type");
     }
     let schema = format
-        .get("schema")
+        .as_object_mut()
+        .and_then(|format| format.remove("schema"))
         .filter(|schema| schema.is_object())
         .ok_or_else(|| {
             anyhow::anyhow!("Anthropic output_config.format.schema must be an object")
@@ -828,7 +853,8 @@ fn parse_output_format(
     Ok(Some(
         stravia_runtime_contract::protocol::ir::ResponseFormat::JsonSchema {
             name: "response".into(),
-            schema: schema.clone(),
+            description: None,
+            schema,
             strict: Some(true),
         },
     ))
@@ -853,19 +879,18 @@ fn parse_output_effort(output_config: Option<&Value>) -> Result<Option<String>> 
         .transpose()
 }
 
-fn reasoning_from_effort(effort: &str, display: Option<String>) -> Result<ReasoningConfig> {
+fn parse_summary(display: Option<&str>) -> Option<ReasoningSummary> {
+    match display {
+        Some("summarized") => Some(ReasoningSummary::Auto),
+        Some("omitted") => Some(ReasoningSummary::None),
+        _ => None,
+    }
+}
+
+fn reasoning_from_effort(effort: &str, summary: Option<ReasoningSummary>) -> Result<ReasoningConfig> {
     let level = stravia_runtime_contract::thinking::ThinkingLevel::from_wire(effort)?;
-    let effort = ReasoningEffort::from_openai_str(
-        if level == stravia_runtime_contract::thinking::ThinkingLevel::Off {
-            "none"
-        } else {
-            level.as_str()
-        },
-    )?;
     Ok(ReasoningConfig {
-        enabled: level != stravia_runtime_contract::thinking::ThinkingLevel::Off,
-        effort: Some(effort),
-        display,
+        summary,
         level: Some(level),
         ..Default::default()
     })

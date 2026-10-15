@@ -224,33 +224,13 @@ pub(super) fn prepare_upstream(
     // Snapshot only after every continuation gate succeeds, immediately before
     // discarding history or replacing protocol controls.
     let mut fallback = Arc::clone(request);
-    if crate::router::parent_id_from_request(&fallback).is_some()
-        || fallback
-            .meta
-            .vendor
-            .ingress
-            .contains_key("previous_response_id")
-    {
+    if crate::router::parent_id_from_request(&fallback).is_some() {
         crate::router::clear_previous_response_id(Arc::make_mut(&mut fallback));
     }
     *full_fallback = Some(fallback);
     let request = Arc::make_mut(request);
     request.items = request.items.split_off(parent_state.context_messages);
-    match request.ext.as_mut() {
-        Some(ProtocolExt::OpenResponses(extension)) => {
-            extension.previous_response_id = Some(upstream_id.clone());
-        }
-        _ => {
-            request.ext = Some(ProtocolExt::OpenResponses(OpenResponsesExt {
-                previous_response_id: Some(upstream_id.clone()),
-                ..Default::default()
-            }));
-        }
-    }
-    request.meta.vendor.ingress.insert(
-        "previous_response_id".into(),
-        serde_json::Value::String(upstream_id.clone()),
-    );
+    crate::router::stamp_previous_response_id(request, upstream_id);
     true
 }
 

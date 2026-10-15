@@ -7,6 +7,8 @@ use serde_json::Value;
 pub struct CacheControl {
     #[serde(rename = "type")]
     pub kind: String, // "ephemeral"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ttl: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -25,7 +27,7 @@ pub struct ThinkingConfig {
 pub struct AnthropicRequest {
     pub model: String,
     pub messages: Vec<AnthropicMessage>,
-    pub max_tokens: u32,
+    pub max_tokens: Option<u32>,
     #[serde(default)]
     pub stream: bool,
     pub system: Option<AnthropicSystem>,
@@ -38,11 +40,21 @@ pub struct AnthropicRequest {
     // PR-10 additions ─────────────────────────────────────────────────────────
     pub thinking: Option<ThinkingConfig>,
     pub output_config: Option<Value>,
+    #[serde(default, deserialize_with = "present_value")]
+    pub cache_control: Option<Value>,
+    #[serde(default, deserialize_with = "present_value")]
     pub context_management: Option<Value>,
-    pub container: Option<String>,
+    #[serde(default, deserialize_with = "present_value")]
+    pub container: Option<Value>,
     pub service_tier: Option<String>,
     pub metadata: Option<Value>,
     pub stop_sequences: Option<Vec<String>>,
+}
+
+fn present_value<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Value>, D::Error> {
+    Value::deserialize(deserializer).map(Some)
 }
 
 // ── System ────────────────────────────────────────────────────────────────────
@@ -214,12 +226,16 @@ pub struct AnthropicToolDef {
     /// For function tools the schema goes here; built-in tools may omit it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input_schema: Option<Value>,
-    /// 只随 Anthropic 原样工具透传到同协议上游；不进入 IR，跨协议路由行为不变。
+    /// Canonical strict control, projected subject to aggregate compilation limits.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub strict: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub cache_control: Option<CacheControl>,
+    pub defer_loading: Option<bool>,
     /// Built-in tool type string e.g. "computer_20241022", "text_editor_20241022".
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
     pub tool_type: Option<String>,
+    /// Wire-only native fields are reduced by the shared typed tool decoder.
+    #[serde(flatten)]
+    pub options: serde_json::Map<String, Value>,
 }
+

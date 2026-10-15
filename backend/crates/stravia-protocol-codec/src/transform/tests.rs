@@ -212,7 +212,7 @@ fn historical_reasoning_replay_is_target_local_and_keeps_readable_parts() {
     })).unwrap();
     let before = serde_json::to_value(&original).unwrap();
     let mut compatible = original.clone();
-    assert!(!super::prepare_thinking_replay(&mut compatible, |_| true));
+    assert!(!super::prepare_thinking_replay(&mut compatible, |_, _| true));
     assert_eq!(
         native.encode_request(compatible).unwrap().body["input"][0]["encrypted_content"],
         "secret"
@@ -225,7 +225,7 @@ fn historical_reasoning_replay_is_target_local_and_keeps_readable_parts() {
         GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA,
     ] {
         let mut replay = original.clone();
-        assert!(super::prepare_thinking_replay(&mut replay, |_| { false }));
+        assert!(super::prepare_thinking_replay(&mut replay, |_, _| false));
         let pair = ProtocolTransform::global()
             .bind(OPEN_RESPONSES_2026_04_24, target)
             .unwrap();
@@ -275,7 +275,7 @@ fn thinking_replay_gemini_tool_signature_stays_on_function_call_part() {
     for original in [native, adjacent] {
         for preserve in [true, false] {
             let mut replay = original.clone();
-            super::prepare_thinking_replay(&mut replay, |_| preserve);
+            super::prepare_thinking_replay(&mut replay, |_, _| preserve);
             let body = pair.encode_request(replay).unwrap().body;
             assert_eq!(body["contents"][0]["role"], "model");
             assert_eq!(
@@ -426,7 +426,7 @@ fn thinking_replay_matrix_keeps_mixed_text_and_tool_associations() {
         for preserve in [false, true] {
             let mut replay = original.clone();
             assert_eq!(
-                super::prepare_thinking_replay(&mut replay, |_| preserve),
+                super::prepare_thinking_replay(&mut replay, |_, _| preserve),
                 !preserve
             );
             let body = pair.encode_request(replay).unwrap().body;
@@ -942,7 +942,7 @@ fn replay_drops_only_empty_thinking_and_retains_tools_and_hard_fields() {
         2,
         AiItem::function_call_output("call_1", json!("lookup result")),
     );
-    assert!(super::prepare_thinking_replay(&mut request, |_| false));
+    assert!(super::prepare_thinking_replay(&mut request, |_, _| false));
     assert_eq!(request.items.len(), 3);
     assert_eq!(
         request.items[0]
@@ -965,7 +965,7 @@ fn replay_drops_only_empty_thinking_and_retains_tools_and_hard_fields() {
     blocks.push(ContentBlock::Compaction {
         encrypted_content: "compaction-secret".into(),
     });
-    assert!(!super::prepare_thinking_replay(&mut request, |_| false));
+    assert!(!super::prepare_thinking_replay(&mut request, |_, _| false));
     let body = pair.encode_request(request).unwrap().body;
     assert!(
         !body.to_string().contains("compaction-secret"),
@@ -984,7 +984,7 @@ fn replay_retains_native_signed_thinking_but_not_foreign_signatures_or_redaction
         {"role":"user","content":"continue"}
     ]})).unwrap();
     let mut same = original.clone();
-    assert!(!super::prepare_thinking_replay(&mut same, |_| true));
+    assert!(!super::prepare_thinking_replay(&mut same, |_, _| true));
     let encoded = native.encode_request(same).unwrap().body;
     assert_eq!(
         encoded["messages"][0]["content"],
@@ -995,7 +995,7 @@ fn replay_retains_native_signed_thinking_but_not_foreign_signatures_or_redaction
         ])
     );
     let mut foreign = original.clone();
-    assert!(super::prepare_thinking_replay(&mut foreign, |_| false));
+    assert!(super::prepare_thinking_replay(&mut foreign, |_, _| false));
     let body = native.encode_request(foreign).unwrap().body;
     assert_eq!(
         body["messages"][0]["content"][0],
@@ -1015,7 +1015,7 @@ fn replay_retains_native_signed_thinking_but_not_foreign_signatures_or_redaction
     // 来源可证明时保留签名；Chat 承载不了签名与 redacted，由 codec 忽略，
     // 明文仍走原生 reasoning_content，不混入正文。
     let mut replay = original;
-    assert!(!super::prepare_thinking_replay(&mut replay, |_| true));
+    assert!(!super::prepare_thinking_replay(&mut replay, |_, _| true));
     let body = chat.encode_request(replay.clone()).unwrap().body;
     assert_eq!(body["messages"][0]["reasoning_content"], "visible");
     assert!(
@@ -1050,6 +1050,141 @@ fn replay_retains_native_signed_thinking_but_not_foreign_signatures_or_redaction
 }
 
 #[test]
+fn replay_selects_each_protected_payload_and_keeps_native_fields_until_all_are_stripped() {
+    let native = ProtocolTransform::global()
+        .bind(OPEN_RESPONSES_2026_04_24, OPEN_RESPONSES_2026_04_24)
+        .unwrap();
+    let mut original = native.decode_request(json!({"model":"model","input":[
+        {"type":"reasoning","id":"rs_local","native_hint":"retained","summary":[{"type":"summary_text","text":"local summary"}],"encrypted_content":"local encrypted"},
+        {"role":"user","content":"continue"}
+    ]})).unwrap();
+    let MessageContent::Blocks(blocks) = &mut original.items[0].content else {
+        panic!("blocks")
+    };
+    blocks.extend([
+        ContentBlock::Reasoning {
+            summary: vec!["foreign summary".into()],
+            content: vec!["foreign detail".into()],
+            encrypted_content: Some("foreign encrypted".into()),
+        },
+        ContentBlock::Thinking {
+            thinking: "local thought".into(),
+            signature: Some("local signature".into()),
+        },
+        ContentBlock::Thinking {
+            thinking: "foreign thought".into(),
+            signature: Some("foreign signature".into()),
+        },
+        ContentBlock::RedactedThinking {
+            data: "local redacted".into(),
+        },
+        ContentBlock::RedactedThinking {
+            data: "foreign redacted".into(),
+        },
+        // 未携带受保护载荷的空块不应因相邻载荷被剥离而消失。
+        ContentBlock::Thinking {
+            thinking: String::new(),
+            signature: None,
+        },
+    ]);
+    let before = serde_json::to_value(&original).unwrap();
+    let mut replay = original.clone();
+    assert!(super::prepare_thinking_replay(&mut replay, |item, block| {
+        assert_eq!(
+            item.meta.as_ref().unwrap().get("__open_responses_item_fields"),
+            original.items[0]
+                .meta
+                .as_ref()
+                .unwrap()
+                .get("__open_responses_item_fields")
+        );
+        match block {
+            ContentBlock::Thinking {
+                signature: Some(value),
+                ..
+            }
+            | ContentBlock::Reasoning {
+                encrypted_content: Some(value),
+                ..
+            }
+            | ContentBlock::RedactedThinking { data: value } => value.starts_with("local"),
+            _ => panic!("only protected payloads require an origin decision"),
+        }
+    }));
+    let MessageContent::Blocks(blocks) = &replay.items[0].content else {
+        panic!("blocks")
+    };
+    assert_eq!(
+        serde_json::to_value(blocks).unwrap(),
+        serde_json::to_value(vec![
+            ContentBlock::Reasoning {
+                summary: vec!["local summary".into()],
+                content: vec![],
+                encrypted_content: Some("local encrypted".into()),
+            },
+            ContentBlock::Reasoning {
+                summary: vec!["foreign summary".into()],
+                content: vec!["foreign detail".into()],
+                encrypted_content: None,
+            },
+            ContentBlock::Thinking {
+                thinking: "local thought".into(),
+                signature: Some("local signature".into()),
+            },
+            ContentBlock::Thinking {
+                thinking: "foreign thought".into(),
+                signature: None,
+            },
+            ContentBlock::RedactedThinking {
+                data: "local redacted".into(),
+            },
+            ContentBlock::Thinking {
+                thinking: String::new(),
+                signature: None,
+            },
+        ]).unwrap()
+    );
+    assert_eq!(replay.items[0].meta, original.items[0].meta);
+    let stable = serde_json::to_value(&replay).unwrap();
+    assert!(!super::prepare_thinking_replay(&mut replay, |_, _| true));
+    assert_eq!(serde_json::to_value(&replay).unwrap(), stable);
+
+    // 最后一批本上游载荷被显式剥离后，才允许移除该思考条目的原生字段。
+    assert!(super::prepare_thinking_replay(&mut replay, |_, _| false));
+    assert!(
+        replay.items[0]
+            .meta
+            .as_ref()
+            .unwrap()
+            .get("__open_responses_item_fields")
+            .is_none()
+    );
+    let body = native.encode_request(replay).unwrap().body.to_string();
+    for text in [
+        "local summary",
+        "foreign summary",
+        "foreign detail",
+        "local thought",
+        "foreign thought",
+    ] {
+        assert!(body.contains(text));
+    }
+    for stripped in [
+        "local encrypted",
+        "foreign encrypted",
+        "local signature",
+        "foreign signature",
+        "local redacted",
+        "foreign redacted",
+        "rs_local",
+        "native_hint",
+    ] {
+        assert!(!body.contains(stripped));
+    }
+    assert_eq!(serde_json::to_value(&original).unwrap(), before);
+}
+
+#[test]
 fn thinking_replay_native_reasoning_keeps_ciphertext_but_moves_content_before_tools() {
     let native = ProtocolTransform::global()
         .bind(OPEN_RESPONSES_2026_04_24, OPEN_RESPONSES_2026_04_24)
@@ -1064,7 +1199,7 @@ fn thinking_replay_native_reasoning_keeps_ciphertext_but_moves_content_before_to
         arguments: "{}".into(),
     }]);
     // 可证明来源的混合条目原样交给 codec；Responses encoder 自行拆出独立 reasoning item。
-    assert!(!super::prepare_thinking_replay(&mut request, |_| true));
+    assert!(!super::prepare_thinking_replay(&mut request, |_, _| true));
     let body = native.encode_request(request.clone()).unwrap().body;
     assert_eq!(body["input"][0]["encrypted_content"], "secret");
     assert_eq!(body["input"][0]["native_hint"], "reasoning-only");
@@ -1528,13 +1663,13 @@ fn responses_same_protocol_preserves_rolling_extensions() {
         .encode_request(request)
         .expect("same-protocol rolling extensions");
 
-    assert_eq!(encoded.body["client_metadata"]["session_id"], "session");
+    assert!(encoded.body.get("client_metadata").is_none());
     assert_eq!(encoded.body["tools"][0]["type"], "namespace");
     assert_eq!(encoded.body["tools"][1]["type"], "web_search");
 }
 
 #[test]
-fn responses_to_chat_drops_required_hosted_tools() {
+fn responses_to_chat_projects_search_without_required_function_choice() {
     let pair = ProtocolTransform::global()
         .bind(
             OPEN_RESPONSES_2026_04_24,
@@ -1552,11 +1687,15 @@ fn responses_to_chat_drops_required_hosted_tools() {
 
     let body = pair
         .encode_request(request)
-        .expect("hosted tools the target cannot run are dropped")
+        .expect("native search projects independently of function choice")
         .body;
 
     assert!(body.get("tool_choice").is_none());
-    assert!(body.get("tools").is_none());
+    assert_eq!(body["web_search_options"], json!({}));
+    assert!(
+        body.get("tools")
+            .is_none_or(|tools| tools.as_array().is_some_and(Vec::is_empty))
+    );
     assert_eq!(body["messages"][0]["content"], "hello");
 }
 
@@ -1616,6 +1755,34 @@ fn responses_converts_supported_tool_choices() {
 }
 
 #[test]
+fn responses_native_search_projects_to_anthropic_and_gemini() {
+    for target in [
+        ANTHROPIC_MESSAGES_2023_06_01,
+        GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA,
+    ] {
+        let pair = ProtocolTransform::global()
+            .bind(OPEN_RESPONSES_2026_04_24, target)
+            .unwrap();
+        let request = pair
+            .decode_request(json!({
+                "model": "model",
+                "input": "hello",
+                "tools": [{"type": "web_search", "filters": {"allowed_domains": ["example.com"]}}],
+                "tool_choice": {"type": "web_search"}
+            }))
+            .unwrap();
+        let body = pair.encode_request(request).unwrap().body;
+        assert!(body.get("tool_choice").is_none());
+        if target == ANTHROPIC_MESSAGES_2023_06_01 {
+            assert_eq!(body["tools"][0]["name"], "web_search");
+            assert_eq!(body["tools"][0]["allowed_domains"], json!(["example.com"]));
+        } else {
+            assert_eq!(body["tools"][0]["googleSearch"], json!({}));
+        }
+    }
+}
+
+#[test]
 fn gemini_auto_tool_config_translates_to_openai_tool_choice() {
     let pair = ProtocolTransform::global()
         .bind(
@@ -1650,7 +1817,7 @@ fn gemini_auto_tool_config_translates_to_openai_tool_choice() {
 }
 
 #[test]
-fn gemini_auto_tool_config_keeps_mode_when_unsupported_constraint_is_omitted() {
+fn gemini_allowed_function_selection_is_omitted_when_chat_cannot_express_it() {
     let pair = ProtocolTransform::global()
         .bind(
             GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA,
@@ -1680,10 +1847,10 @@ fn gemini_auto_tool_config_keeps_mode_when_unsupported_constraint_is_omitted() {
 
     let body = pair
         .encode_request(request)
-        .expect("supported auto mode is retained")
+        .expect("unsupported allowed selection is omitted")
         .body;
 
-    assert_eq!(body["tool_choice"], "auto");
+    assert!(body.get("tool_choice").is_none());
     assert_eq!(body["tools"].as_array().map(Vec::len), Some(2));
 }
 
@@ -1713,7 +1880,7 @@ fn target_native_continuation_survives_foreign_client_ingress() {
             "messages": [{"role": "user", "content": "continue"}]
         }))
         .unwrap();
-    request.ext = target_state.ext;
+    request.parameters.continuation = target_state.parameters.continuation;
     request.items.splice(0..0, target_state.items);
 
     let body = responses.encode_request(request.clone()).unwrap().body;
@@ -1758,8 +1925,17 @@ fn responses_cross_protocol_drops_controls_the_target_cannot_carry() {
             "include": ["reasoning.encrypted_content"]
         }))
         .expect("valid Responses request");
-    pair.encode_request(request)
-        .expect("advisory controls may stay local");
+    let encoded = pair
+        .encode_request(request)
+        .expect("shared controls project to Chat")
+        .body;
+    assert_eq!(encoded["prompt_cache_key"], "cache-key");
+    assert_eq!(encoded["service_tier"], "default");
+    assert_eq!(encoded["metadata"], json!({"tenant": "local"}));
+    assert_eq!(encoded["safety_identifier"], "local-user");
+    assert_eq!(encoded["store"], false);
+    assert_eq!(encoded["top_logprobs"], 3);
+    assert!(encoded.get("include").is_none());
 
     for (field, value) in [("max_tool_calls", json!(2)), ("truncation", json!("auto"))] {
         let mut body = json!({
@@ -2965,6 +3141,68 @@ fn cross_protocol_omits_advisory_text_and_stream_controls() {
     assert!(encoded.body.get("stream_options").is_none());
     assert!(encoded.body.get("text").is_none());
 }
+
+#[test]
+fn canonical_controls_project_across_chat_and_gemini_without_native_leaks() {
+    let pair = ProtocolTransform::global()
+        .bind(
+            OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+            GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA,
+        )
+        .expect("registered Chat to Gemini pair");
+    let mut request = pair
+        .decode_request(json!({
+            "model": "model", "messages": [{"role": "user", "content": "hello"}],
+            "n": 0, "logprobs": true, "top_logprobs": 0, "modalities": ["text", "audio"],
+            "service_tier": "priority", "unknown_provider_control": {"private": true}
+        }))
+        .expect("decode platform controls");
+    request.parameters.candidate_count = Some(2);
+    let encoded = pair
+        .encode_request(request)
+        .expect("project platform controls");
+    assert_eq!(encoded.body["generationConfig"]["candidateCount"], 2);
+    assert_eq!(encoded.body["generationConfig"]["responseLogprobs"], true);
+    assert_eq!(encoded.body["generationConfig"]["logprobs"], 0);
+    assert_eq!(
+        encoded.body["generationConfig"]["responseModalities"],
+        json!(["TEXT", "AUDIO"])
+    );
+    assert!(encoded.body.get("cachedContent").is_none());
+    assert!(encoded.body.get("service_tier").is_none());
+    assert!(encoded.body.get("unknown_provider_control").is_none());
+}
+
+#[test]
+fn responses_stream_and_text_controls_project_to_chat_canonical_fields() {
+    let pair = ProtocolTransform::global()
+        .bind(
+            OPEN_RESPONSES_2026_04_24,
+            OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+        )
+        .expect("registered Responses to Chat pair");
+    let request = pair
+        .decode_request(json!({
+            "model": "model", "input": "hello", "stream": true,
+            "stream_options": {"include_obfuscation": false},
+            "text": {"format": {"type": "text"}, "verbosity": "low"},
+            "prompt_cache_key": "", "prompt_cache_retention": "24h",
+            "background": false, "unknown_provider_control": true
+        }))
+        .expect("decode canonical stream controls");
+    let encoded = pair
+        .encode_request(request)
+        .expect("project shared controls")
+        .body;
+    assert!(encoded["stream_options"].get("include_obfuscation").is_none());
+    assert_eq!(encoded["verbosity"], "low");
+    assert_eq!(encoded["prompt_cache_key"], "");
+    assert_eq!(encoded["prompt_cache_retention"], "24h");
+    assert!(encoded.get("text").is_none());
+    assert!(encoded.get("background").is_none());
+    assert!(encoded.get("unknown_provider_control").is_none());
+}
+
 #[test]
 fn open_responses_client_omits_unknown_provider_output_items() {
     let pair = ProtocolTransform::global()

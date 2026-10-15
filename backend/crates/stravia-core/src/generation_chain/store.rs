@@ -430,12 +430,7 @@ pub(crate) async fn hydrate_response_artifact_references(
 }
 
 pub(crate) fn request_preserves_upstream_response(request: &AiRequest) -> bool {
-    match request.ext.as_ref() {
-        Some(stravia_runtime_contract::protocol::ir::ProtocolExt::OpenResponses(extension)) => {
-            extension.store.unwrap_or(true)
-        }
-        _ => true,
-    }
+    request.parameters.store.unwrap_or(true)
 }
 
 /// discover_prefix 一次调用内不变的核验输入：借用于调用方已算好的投影与
@@ -521,15 +516,18 @@ impl GenerationChainStore {
         principal: &Principal,
         request: &mut AiRequest,
     ) -> Result<ActiveGenerationChain, String> {
+        request.normalize_parameters();
         let not_found = if request_has_item_references(request) {
             "item_reference_not_found"
         } else {
             "previous_response_not_found"
         };
-        let previous_id = match request.ext.as_ref() {
-            Some(ProtocolExt::OpenResponses(extension)) => extension.previous_response_id.clone(),
-            _ => None,
-        };
+        let previous_id = request
+            .parameters
+            .continuation
+            .as_ref()
+            .and_then(|continuation| continuation.previous_response_id())
+            .map(str::to_owned);
         let Some(previous_id) = previous_id else {
             if !request_has_item_references(request) {
                 return Ok(ActiveGenerationChain::default());
@@ -980,17 +978,13 @@ impl GenerationChainStore {
         }
         request.items = materialized.effective_items.clone();
         request.items.extend(new_messages);
-        let instructions_present = matches!(
-            request.ext.as_ref(),
-            Some(ProtocolExt::OpenResponses(extension)) if extension.instructions_present
-        );
+        let instructions_present = request
+            .parameters
+            .resets(stravia_runtime_contract::protocol::ir::ParameterReset::Instructions);
         if request.instructions.is_none() && !instructions_present {
             request.instructions = materialized.effective_system.clone();
         }
-        if let Some(ProtocolExt::OpenResponses(extension)) = request.ext.as_mut() {
-            extension.previous_response_id = None;
-            request.meta.vendor.ingress.remove("previous_response_id");
-        }
+        crate::router::clear_previous_response_id(request);
         Ok(ActiveGenerationChain {
             root_id: Some(materialized.root_id.clone()),
             parent_id: Some(parent_id.to_owned()),

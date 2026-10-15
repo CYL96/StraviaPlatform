@@ -1,6 +1,33 @@
 use super::*;
 use stravia_runtime_contract::protocol::ir::AiRequest;
 use stravia_runtime_contract::protocol::ir::MessageContent;
+use stravia_runtime_contract::protocol::ir::ToolChoice;
+
+#[test]
+fn unknown_controls_cannot_change_the_native_envelope_or_tool_schema() {
+    let mut request = AiRequest::new("model", Vec::new());
+    request.parameters = serde_json::from_value(json!({
+        "extra_body":{"permissionMode":"bypass","params":{"future":true}},
+        "extensions":{"command-code":{"mode":"unrestricted"}},
+        "options":{"permissionMode":"bypass"}
+    }))
+    .unwrap();
+    request.tools = Some(vec![ToolSpec {
+        name: "read".into(),
+        description: None,
+        parameters: json!({"type":"object","properties":{"options":{"type":"object","additionalProperties":true}}}),
+        strict: None,
+        defer_loading: None,
+    }]);
+    let body = CommandCodeGenerateV1.encode_request(request).unwrap();
+    assert_eq!(body["permissionMode"], "standard");
+    assert_eq!(body["mode"], "agent");
+    assert!(body["params"].get("future").is_none());
+    assert_eq!(
+        body["params"]["tools"][0]["input_schema"]["properties"]["options"]["additionalProperties"],
+        true
+    );
+}
 
 #[test]
 fn encodes_generate_envelope() {
@@ -42,15 +69,29 @@ fn encodes_tools_without_type_and_aliases_names() {
         description: Some("read shell output".into()),
         parameters: json!({"type": "object", "properties": {"id": {"type": "string"}}}),
         strict: None,
-        cache_control: None,
-        meta: None,
+        defer_loading: None,
     }]);
     request.tool_choice = Some(ToolChoice::Required);
+    request.parallel_tool_calls = Some(false);
     let body = CommandCodeGenerateV1.encode_request(request).unwrap();
     assert_eq!(body["params"]["system"][0]["text"], "be brief");
     assert_eq!(body["params"]["tools"][0]["name"], "shell_output");
     assert!(body["params"]["tools"][0].get("type").is_none());
-    assert_eq!(body["params"]["tool_choice"], json!({"type": "any"}));
+    assert!(body["params"].get("tool_choice").is_none());
+    assert!(body["params"].get("parallel_tool_calls").is_none());
+    assert!(body.get("promptCache").is_none());
+}
+
+#[test]
+fn cache_retention_does_not_become_a_native_cache_disable_switch() {
+    use stravia_runtime_contract::protocol::ir::CacheRetention;
+
+    for retention in [CacheRetention::Default, CacheRetention::Extended] {
+        let mut request = AiRequest::new("model", Vec::new());
+        request.parameters.cache.retention = Some(retention);
+        let body = CommandCodeGenerateV1.encode_request(request).unwrap();
+        assert!(body.get("promptCache").is_none());
+    }
 }
 
 #[test]
@@ -253,7 +294,7 @@ fn thinking_replay_keeps_readable_reasoning_native_and_omits_protected_payloads(
 
     for preserve in [false, true] {
         let mut request = original.clone();
-        stravia_protocol_codec::transform::prepare_thinking_replay(&mut request, |_| preserve);
+        stravia_protocol_codec::transform::prepare_thinking_replay(&mut request, |_, _| preserve);
         let body = CommandCodeGenerateV1.encode_request(request).unwrap();
         let messages = body["params"]["messages"].as_array().unwrap();
         assert_eq!(

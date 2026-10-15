@@ -601,8 +601,7 @@ fn anthropic_encoder_maps_required_tool_choice_to_any() {
         description: Some("Execute command".to_string()),
         parameters: serde_json::json!({"type":"object","properties":{"command":{"type":"string"}}}),
         strict: None,
-        cache_control: None,
-        meta: None,
+        defer_loading: None,
     }]);
     let mut req = AiRequest::new("MiniMax-M2.7", messages);
     req.stream = StreamConfig {
@@ -611,9 +610,7 @@ fn anthropic_encoder_maps_required_tool_choice_to_any() {
     };
     req.generation.max_tokens = Some(256);
     req.tools = tools;
-    req.tool_choice = Some(stravia_runtime_contract::protocol::ir::ToolChoice::Raw(
-        serde_json::json!("required"),
-    ));
+    req.tool_choice = Some(stravia_runtime_contract::protocol::ir::ToolChoice::Required);
     req.meta.source_protocol = Some(OPEN_RESPONSES_2026_04_24);
 
     let (body, _) = AnthropicEncoder
@@ -640,8 +637,7 @@ fn anthropic_encoder_maps_function_tool_choice_to_tool_name() {
         description: Some("Execute command".to_string()),
         parameters: serde_json::json!({"type":"object","properties":{"command":{"type":"string"}}}),
         strict: None,
-        cache_control: None,
-        meta: None,
+        defer_loading: None,
     }]);
     let mut req = AiRequest::new("MiniMax-M2.7", messages);
     req.stream = StreamConfig {
@@ -650,12 +646,9 @@ fn anthropic_encoder_maps_function_tool_choice_to_tool_name() {
     };
     req.generation.max_tokens = Some(256);
     req.tools = tools;
-    req.tool_choice = Some(stravia_runtime_contract::protocol::ir::ToolChoice::Raw(
-        serde_json::json!({
-            "type":"function",
-            "function":{"name":"exec_command"}
-        }),
-    ));
+    req.tool_choice = Some(stravia_runtime_contract::protocol::ir::ToolChoice::Named {
+        name: "exec_command".into(),
+    });
     req.meta.source_protocol = Some(OPEN_RESPONSES_2026_04_24);
 
     let (body, _) = AnthropicEncoder
@@ -789,8 +782,7 @@ fn anthropic_encoder_preserves_correlated_external_tool_ids() {
         description: None,
         parameters: serde_json::json!({"type":"object","properties":{}}),
         strict: None,
-        cache_control: None,
-        meta: None,
+        defer_loading: None,
     }]);
     let mut req = AiRequest::new("MiniMax-M2.7", messages);
     req.stream = StreamConfig {
@@ -866,8 +858,7 @@ fn openai_encoder_remaps_reused_tool_result_id_with_synthetic_adjacent_call() {
         description: None,
         parameters: serde_json::json!({"type":"object","properties":{}}),
         strict: None,
-        cache_control: None,
-        meta: None,
+        defer_loading: None,
     }]);
     let mut req = AiRequest::new("gpt-4o-mini", messages);
     req.stream = StreamConfig {
@@ -938,8 +929,7 @@ fn openai_encoder_rewrites_multi_tool_call_history_to_adjacent_pairs() {
         description: None,
         parameters: serde_json::json!({"type":"object","properties":{}}),
         strict: None,
-        cache_control: None,
-        meta: None,
+        defer_loading: None,
     }]);
     let mut req = AiRequest::new("MiniMax-M2.7", messages);
     req.stream = StreamConfig {
@@ -1058,8 +1048,7 @@ fn openai_encoder_preserves_reasoning_content_across_parallel_tool_calls() {
         description: None,
         parameters: serde_json::json!({"type":"object","properties":{"location":{"type":"string"}}}),
         strict: None,
-        cache_control: None,
-        meta: None,
+        defer_loading: None,
     }]);
     let mut req = AiRequest::new("deepseek-v4-flash", messages);
     req.stream = StreamConfig {
@@ -1275,8 +1264,7 @@ fn openai_encoder_drops_orphan_assistant_tool_calls_without_results() {
         description: None,
         parameters: serde_json::json!({"type":"object","properties":{}}),
         strict: None,
-        cache_control: None,
-        meta: None,
+        defer_loading: None,
     }]);
     let mut req = AiRequest::new("MiniMax-M2.7", messages);
     req.stream = StreamConfig {

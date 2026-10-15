@@ -144,42 +144,6 @@ async fn catalog_provider_creation_resolves_runtime_fields_in_core() -> anyhow::
 }
 
 #[tokio::test]
-async fn custom_configuration_preview_ignores_inactive_chat_reasoning_fields() -> anyhow::Result<()>
-{
-    let (data_dir, gw) = build_gateway().await?;
-    let input = |protocol: &str| ProviderConfigurationPreviewInput {
-        provider_id: None,
-        vendor_id: "custom".into(),
-        channel: "default".into(),
-        protocol: Some(protocol.into()),
-        base_url: "http://127.0.0.1:9/v1".into(),
-        options: std::collections::BTreeMap::from([("reasoning_field".into(), "custom".into())]),
-        credentials: Default::default(),
-    };
-    let native = gw
-        .admin()
-        .preview_provider_configuration(input("anthropic-messages"))
-        .await?;
-    assert!(native.issues.is_empty(), "{:?}", native.issues);
-
-    let chat = gw
-        .admin()
-        .preview_provider_configuration(input("openai-compatible"))
-        .await?;
-    assert_eq!(
-        chat.issues
-            .iter()
-            .map(|issue| (issue.field.as_deref(), issue.code.as_str()))
-            .collect::<Vec<_>>(),
-        vec![(Some("custom_reasoning_field"), "required")]
-    );
-    gw.shutdown().await;
-    drop(gw);
-    data_dir.close()?;
-    Ok(())
-}
-
-#[tokio::test]
 async fn catalog_provider_creation_uses_declarative_cloud_configuration() -> anyhow::Result<()> {
     let (data_dir, gw) = build_gateway().await?;
     let groq = gw

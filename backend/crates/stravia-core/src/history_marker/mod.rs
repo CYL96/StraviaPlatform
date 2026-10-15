@@ -11,7 +11,7 @@ use stravia_runtime_contract::Principal;
 use stravia_runtime_contract::protocol::ir::ContentBlock;
 use stravia_runtime_contract::protocol::ir::ToolCall;
 
-pub(crate) use rejections::{ReasoningRejections, protected_payload_digests};
+pub(crate) use rejections::{ReasoningRejections, RejectedReasoning, protected_payload_digest};
 pub use sql::SqlHistoryMarkerStore;
 #[cfg(test)]
 pub(crate) use syntax::render_text_projection_span;
@@ -45,29 +45,17 @@ pub struct ThinkingSource {
     /// 旧记录没有该字段。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authority: Option<String>,
+    /// 本条目实际签发的载荷摘要；旧记录为空时沿用条目级来源。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub issued: Vec<String>,
 }
 
-/// 历史条目的受保护推理能否回放给当前 Target。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// 单个受保护载荷相对当前签发作用域的来源。
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ThinkingProvenance {
-    /// 来源记录证明由同一签发作用域产生。
-    Verified,
-    /// 无来源记录（客户端提供或记录已丢失），或同一出口协议下签发作用域不同：
-    /// 上游仍可能接受，乐观回放。
+    Own,
+    Foreign(String),
     Unknown,
-    /// 当前签发作用域已拒绝过、出口协议不同、协议绑定的模型不同，或私有记录已损坏。
-    Foreign,
-}
-
-/// 已知协议按协议族比较；插件自定义的协议标识按原字符串比较。
-fn same_protocol(
-    left: &stravia_runtime_contract::protocol::ids::ProtocolIdentity,
-    right: &stravia_runtime_contract::protocol::ids::ProtocolIdentity,
-) -> bool {
-    match (left.protocol(), right.protocol()) {
-        (Some(left), Some(right)) => left == right,
-        _ => left == right,
-    }
 }
 
 impl ThinkingSource {
@@ -77,50 +65,31 @@ impl ThinkingSource {
         serde_json::from_value(item.meta.as_ref()?.get(Self::ITEM_META_KEY)?.clone()).ok()
     }
 
-    /// 按兼容性判定（ADR-0075）：只有已被当前签发作用域拒绝过，或能确定上游必然拒绝
-    /// （出口协议不同、协议绑定的模型不同）时才判为 Foreign；签发作用域不同但仍可能
-    /// 被接受的载荷按来源不明处理，交给上游校验与拒绝恢复。
+    /// 来源跟随载荷而不是容器，插入已打标条目的其它载荷不能继承该条目的证明。
     pub(crate) fn provenance(
         &self,
         item: &stravia_runtime_contract::protocol::ir::AiItem,
-        rejections: &ReasoningRejections,
+        block: &ContentBlock,
     ) -> ThinkingProvenance {
-        if let Some(authority) = &self.authority
-            && rejections.rejected(authority, item)
-        {
-            return ThinkingProvenance::Foreign;
-        }
-        let Some(stamp) = item
-            .meta
-            .as_ref()
-            .and_then(|meta| meta.get(Self::ITEM_META_KEY))
-        else {
+        let Some(source) = Self::from_item(item) else {
             return ThinkingProvenance::Unknown;
         };
-        let Ok(source) = serde_json::from_value::<Self>(stamp.clone()) else {
-            return ThinkingProvenance::Foreign;
-        };
+        if !source.issued.is_empty()
+            && protected_payload_digest(block)
+                .is_none_or(|digest| !source.issued.contains(&rejections::digest_hex(&digest)))
+        {
+            return ThinkingProvenance::Unknown;
+        }
         let same_scope = match &source.authority {
             Some(authority) => self.authority.as_ref() == Some(authority),
             // 旧记录只有整体 namespace：相等仍可证明，不等时拆不出签发作用域。
             None => source.namespace == self.namespace,
         };
         if same_scope {
-            return ThinkingProvenance::Verified;
+            return ThinkingProvenance::Own;
         }
-        if let (Some(egress), Some(issuer)) = (&self.protocol, &source.protocol)
-            && !same_protocol(egress, issuer)
-        {
-            return ThinkingProvenance::Foreign;
-        }
-        if self
-            .protocol
-            .as_ref()
-            .and_then(|protocol| protocol.protocol())
-            .is_some_and(stravia_protocol_codec::transform::protected_thinking_binds_model)
-            && source.actual_model != self.actual_model
-        {
-            return ThinkingProvenance::Foreign;
+        if let Some(authority) = source.authority {
+            return ThinkingProvenance::Foreign(authority);
         }
         ThinkingProvenance::Unknown
     }
@@ -148,11 +117,20 @@ impl ThinkingSource {
     }
 
     pub(crate) fn stamp_item(&self, item: &mut stravia_runtime_contract::protocol::ir::AiItem) {
+        let mut source = self.clone();
+        source.issued = match &item.content {
+            stravia_runtime_contract::protocol::ir::MessageContent::Blocks(blocks) => blocks
+                .iter()
+                .filter_map(protected_payload_digest)
+                .map(|digest| rejections::digest_hex(&digest))
+                .collect(),
+            _ => Vec::new(),
+        };
         item.meta
             .get_or_insert_with(Default::default)
             .insert_graph_extension(
                 Self::ITEM_META_KEY,
-                serde_json::to_value(self).expect("thinking source is serializable"),
+                serde_json::to_value(source).expect("thinking source is serializable"),
             )
             .expect("thinking source key is not reserved");
     }

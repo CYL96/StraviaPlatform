@@ -1,4 +1,5 @@
-//! 显式 opt-in 的真实 Component 合同回归：在 HostServices stub 上验证
+//! 非忽略的 canonical/codec 合同与显式 opt-in 的真实 Component 回归：
+//! 在 HostServices stub 上验证
 //! Claude Code 线上形态（请求头顺序、计费头与 cch、工具名前缀往返）与
 //! OAuth 授权码交换 / 身份补全。
 //!
@@ -13,7 +14,9 @@ use async_trait::async_trait;
 use parking_lot::Mutex;
 use serde_json::{Value, json};
 use stravia_protocol_codec::transform::ProtocolTransform;
-use stravia_runtime_contract::protocol::ir::{AiRequest, AiStreamDelta};
+use stravia_runtime_contract::protocol::ir::{
+    AiRequest, AiStreamDelta, NativeTool, ReasoningSummary,
+};
 use stravia_runtime_contract::{CancellationToken, Deadline};
 use stravia_vendor_runtime::{
     HostFailure, HostHttpResponse, HostServices, HostWebSocket, HttpRequest, LoadedPlugin,
@@ -207,6 +210,51 @@ fn anthropic_client_request(body: Value) -> AiRequest {
         .expect("client request decodes")
 }
 
+#[test]
+fn unified_tools_and_summary_cross_the_anthropic_codec_boundary() {
+    let request = anthropic_client_request(json!({
+        "model":"claude-sonnet-4-5",
+        "max_tokens":4096,
+        "thinking":{"type":"enabled","budget_tokens":1024,"display":"omitted"},
+        "tools":[
+            {"name":"read","input_schema":{"type":"object","properties":{
+                "cache_control":{"type":"string"}}},
+             "strict":true,"defer_loading":false,"eager_input_streaming":true,
+             "cache_control":{"type":"ephemeral","ttl":"5m"},
+             "allowed_callers":["direct"],"input_examples":[{}],"citations":{"enabled":true}},
+            {"type":"web_search_20250305","name":"web_search","max_uses":8,
+             "allowed_domains":["example.com"],"user_location":{"type":"approximate","city":"Paris"},
+             "search_profile":"client-profile"}
+        ],
+        "metadata":{"user_id":"client-identity"},
+        "messages":[{"role":"user","content":"Read a."}]
+    }));
+    assert_eq!(request.reasoning.summary, Some(ReasoningSummary::None));
+    let tools = request.tools.as_ref().unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].strict, Some(true));
+    assert_eq!(tools[0].defer_loading, Some(false));
+    assert_eq!(tools[0].parameters["properties"]["cache_control"]["type"], "string");
+    let [NativeTool::WebSearch(search)] = request.parameters.native_tools.as_slice() else {
+        panic!("expected unified native web search");
+    };
+    assert_eq!(search.max_uses, Some(8));
+    assert_eq!(search.allowed_domains, ["example.com"]);
+    assert_eq!(search.user_location.as_ref().unwrap().city.as_deref(), Some("Paris"));
+    let encoded = stravia_vendor_common::common::encode_inference_request(
+        "anthropic-messages/messages/2023-06-01", request,
+    ).unwrap();
+    assert_eq!(encoded.body["tools"][0]["name"], "read");
+    assert_eq!(encoded.body["tools"][1]["type"], "web_search_20250305");
+    assert_eq!(encoded.body["tools"][1]["name"], "web_search");
+    for tool in encoded.body["tools"].as_array().unwrap() {
+        for field in ["eager_input_streaming", "cache_control", "allowed_callers",
+            "input_examples", "citations", "search_profile"] {
+            assert!(tool.get(field).is_none(), "{field}");
+        }
+    }
+}
+
 async fn load_plugin() -> (VendorRuntime, LoadedPlugin) {
     let bytes = std::fs::read(artifact()).unwrap();
     let runtime = VendorRuntime::new().expect("runtime");
@@ -380,12 +428,12 @@ async fn responses_auto_truncation_sends_complete_tool_continuation_history() {
 #[ignore = "requires task build:vendors:all"]
 async fn always_on_default_summary_preserves_explicit_omission_and_effort() {
     let (runtime, plugin) = load_plugin().await;
-    for (display, expected) in [
+    for (summary, expected) in [
         (None, "summarized"),
-        (Some("omitted"), "omitted"),
-        (Some("none"), "omitted"),
-        (Some("disabled"), "omitted"),
-        (Some("hidden"), "omitted"),
+        (Some(ReasoningSummary::None), "omitted"),
+        (Some(ReasoningSummary::Auto), "summarized"),
+        (Some(ReasoningSummary::Concise), "summarized"),
+        (Some(ReasoningSummary::Detailed), "summarized"),
     ] {
         let services = Arc::new(MockServices {
             routes: vec![(UPSTREAM, 200, "text/event-stream", SSE_TOOL_USE.into())],
@@ -396,7 +444,7 @@ async fn always_on_default_summary_preserves_explicit_omission_and_effort() {
             "max_tokens": 1024,
             "messages": [{"role": "user", "content": "Read a."}]
         }));
-        request.reasoning.display = display.map(str::to_owned);
+        request.reasoning.summary = summary;
         let mut provider = signed_in();
         provider.model = Some("claude-opus-5-5".into());
         run(
@@ -427,15 +475,24 @@ async fn inference_is_sent_in_claude_code_shape_and_tool_names_round_trip() {
         "model": "claude-sonnet-4-5",
         "max_tokens": 1024,
         "system": "You are a helpful agent.",
-        "tools": [{"name": "read", "description": "Read a file", "input_schema": {"type": "object"}}],
+        "tools": [
+            {"name": "read", "description": "Read a file", "input_schema": {"type": "object"},
+             "eager_input_streaming":true,"cache_control":{"type":"ephemeral","ttl":"5m"}},
+            {"type":"web_search_20250305","name":"web_search","max_uses":8}
+        ],
+        "metadata":{"user_id":"{\"session_id\":\"client-session\",\"parent_session_id\":\"client-parent\"}"},
         "messages": [{"role": "user", "content": "Read a."}]
     }));
+    let mut provider = signed_in();
+    provider.operation_metadata.insert("transport_affinity".into(), json!("host-session"));
+    provider.operation_metadata.insert("parent_transport_affinity".into(), json!("host-parent"));
+    provider.client_headers.push(("x-claude-code-session-id".into(), "client-session".into()));
     let output = run(
         &runtime,
         &plugin,
         &services,
         OperationInput::Infer {
-            provider: signed_in(),
+            provider,
             request,
         },
     )
@@ -480,7 +537,7 @@ async fn inference_is_sent_in_claude_code_shape_and_tool_names_round_trip() {
     assert_eq!(header("authorization"), Some("Bearer sk-ant-oat01-test"));
     let client_version = header("user-agent")
         .and_then(|value| value.strip_prefix("claude-cli/"))
-        .and_then(|value| value.strip_suffix(" (external, cli)"))
+        .and_then(|value| value.strip_suffix(" (external, sdk-cli)"))
         .expect("Claude CLI identity");
     assert!(
         header("anthropic-beta")
@@ -501,11 +558,19 @@ async fn inference_is_sent_in_claude_code_shape_and_tool_names_round_trip() {
     );
     assert_eq!(body["system"][2]["text"], "You are a helpful agent.");
     assert_eq!(body["tools"][0]["name"], "_read");
+    assert!(body["tools"][0].get("eager_input_streaming").is_none());
+    assert!(body["tools"][0].get("cache_control").is_none());
+    assert_eq!(body["tools"][1]["type"], "web_search_20250305");
+    assert_eq!(body["tools"][1]["name"], "web_search");
+    assert_eq!(body["tools"][1]["cache_control"], json!({"type":"ephemeral","ttl":"1h"}));
     assert_eq!(body["stream"], json!(true));
     let user_id: Value =
         serde_json::from_str(body["metadata"]["user_id"].as_str().unwrap()).unwrap();
     assert_eq!(user_id["account_uuid"], ACCOUNT_UUID);
     assert_eq!(user_id["device_id"], DEVICE_ID);
+    assert_ne!(user_id["session_id"], "client-session");
+    assert_ne!(user_id["parent_session_id"], "client-parent");
+    assert!(uuid::Uuid::parse_str(user_id["parent_session_id"].as_str().unwrap()).is_ok());
     assert_eq!(
         user_id["session_id"].as_str(),
         header("x-claude-code-session-id")

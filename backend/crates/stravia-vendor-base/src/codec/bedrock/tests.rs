@@ -1,6 +1,370 @@
 use super::*;
 
 #[test]
+fn claude_native_thinking_has_model_and_output_cap_gates() {
+    let mut request = BedrockConverseV1.decode_request(json!({
+        "modelId": "anthropic.claude-3-7-sonnet-20250219-v1:0",
+        "messages": [],
+        "inferenceConfig": {"maxTokens": 4096, "temperature": 0, "topP": 0.5},
+        "additionalModelRequestFields": {"thinking": {"type": "enabled", "budget_tokens": 1024}, "top_k": 0, "unconfirmed": true}
+    })).unwrap();
+    assert_eq!(request.reasoning.mode.as_deref(), Some("enabled"));
+    let (body, _) = BedrockConverseV1.encode_request(request.clone()).unwrap();
+    assert_eq!(
+        body["additionalModelRequestFields"]["thinking"],
+        json!({"type": "enabled", "budget_tokens": 1024})
+    );
+    assert!(
+        body["additionalModelRequestFields"]
+            .get("unconfirmed")
+            .is_none()
+    );
+    assert!(body["additionalModelRequestFields"].get("top_k").is_none());
+    assert!(body["inferenceConfig"].get("temperature").is_none());
+    assert!(body["inferenceConfig"].get("topP").is_none());
+    request.generation.max_tokens = Some(1024);
+    assert!(BedrockConverseV1.encode_request(request.clone()).is_err());
+    request.model = "amazon.nova-pro-v1:0".into();
+    assert!(
+        BedrockConverseV1
+            .encode_request(request)
+            .unwrap()
+            .0
+            .get("additionalModelRequestFields")
+            .is_none()
+    );
+}
+
+#[test]
+fn bedrock_native_activation_keeps_explicit_mode_without_budget_inference() {
+    for kind in ["adaptive", "disabled"] {
+        let mut request = BedrockConverseV1
+            .decode_request(json!({
+                "modelId": "anthropic.claude-sonnet",
+                "messages": [],
+                "additionalModelRequestFields": {"thinking": {"type": kind}}
+            }))
+            .unwrap();
+        assert_eq!(request.reasoning.mode.as_deref(), Some(kind));
+        assert_eq!(request.reasoning.budget_tokens, None);
+        request.reasoning.target_control = None;
+        assert_eq!(
+            BedrockConverseV1.encode_request(request).unwrap().0["additionalModelRequestFields"]["thinking"],
+            json!({"type": kind})
+        );
+    }
+}
+
+#[test]
+fn bedrock_cache_points_keep_canonical_breakpoints_and_ttl() {
+    let request = BedrockConverseV1
+        .decode_request(json!({
+            "modelId": "model",
+            "system": [{"text": "system"}, {"cachePoint": {"type": "default", "ttl": "1h"}}],
+            "messages": [{"role": "user", "content": [
+                {"text": "hello"}, {"cachePoint": {"type": "default", "ttl": "5m"}}
+            ]}]
+        }))
+        .unwrap();
+    assert!(request.instructions.is_none());
+    let (body, _) = BedrockConverseV1.encode_request(request).unwrap();
+    assert_eq!(
+        body["system"][1]["cachePoint"],
+        json!({"type": "default", "ttl": "1h"})
+    );
+    assert_eq!(
+        body["messages"][0]["content"][1]["cachePoint"],
+        json!({"type": "default", "ttl": "5m"})
+    );
+    assert!(
+        BedrockConverseV1
+            .decode_request(json!({
+                "messages": [{"role": "user", "content": [
+                    {"text": "hello"}, {"cachePoint": {"type": "default", "ttl": "unknown"}}
+                ]}]
+            }))
+            .is_err()
+    );
+}
+
+#[test]
+fn bedrock_tools_retain_schema_null_and_choice_but_drop_tool_cache() {
+    let request = BedrockConverseV1.decode_request(json!({
+        "modelId": "model", "messages": [],
+        "toolConfig": {
+            "tools": [
+                {"toolSpec": {"name": "lookup", "inputSchema": {"json": {"type": "object", "properties": {"value": {"type": ["string", "null"]}}}}}},
+                {"cachePoint": {"type": "default", "ttl": "1h"}}
+            ],
+            "toolChoice": {"tool": {"name": "lookup"}}
+        }
+    })).unwrap();
+    let (body, _) = BedrockConverseV1.encode_request(request).unwrap();
+    assert_eq!(
+        body["toolConfig"]["toolChoice"],
+        json!({"tool": {"name": "lookup"}})
+    );
+    assert_eq!(
+        body["toolConfig"]["tools"][0]["toolSpec"]["inputSchema"]["json"]["properties"]["value"]["type"],
+        json!(["string", "null"])
+    );
+    assert_eq!(body["toolConfig"]["tools"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn bedrock_metadata_is_string_only_and_unsupported_controls_are_dropped() {
+    let mut request = BedrockConverseV1.decode_request(json!({
+        "modelId": "model", "messages": [],
+        "requestMetadata": {"caller": "test", "number": 1, "flag": true, "null": null, "nested": {"secret": "drop"}},
+        "guardrailConfig": {"guardrailIdentifier": "guard", "guardrailVersion": "1", "trace": "enabled", "unknown": true, "streamProcessingMode": "async"},
+        "performanceConfig": {"latency": "optimized", "unknown": true},
+        "serviceTier": {"type": "priority", "unknown": true},
+        "promptVariables": {"user": {"text": "hello", "unknown": true}},
+        "outputConfig": {"textFormat": {"type": "json_schema", "structure": {"jsonSchema": {
+            "schema": "{\"type\":\"object\",\"properties\":{\"unknown\":{\"type\":\"string\"}}}",
+            "name": "response", "unknown": true
+        }, "unknown": true}, "unknown": true}, "unknown": true},
+        "additionalModelResponseFieldPaths": [],
+        "additionalModelRequestFields": {"unconfirmed": true}
+    })).unwrap();
+    assert_eq!(
+        request.parameters.metadata,
+        Some(BTreeMap::from([("caller".into(), "test".into())]))
+    );
+    request.parameters.top_k = Some(0);
+    request.parameters.store = Some(false);
+    let (body, _) = BedrockConverseV1.encode_request(request).unwrap();
+    assert_eq!(body["requestMetadata"], json!({"caller": "test"}));
+    for field in [
+        "guardrailConfig",
+        "performanceConfig",
+        "promptVariables",
+        "additionalModelResponseFieldPaths",
+    ] {
+        assert!(body.get(field).is_none(), "{field} must not be forwarded");
+    }
+    assert_eq!(body["serviceTier"], json!({"type": "priority"}));
+    let definition = &body["outputConfig"]["textFormat"]["structure"]["jsonSchema"];
+    assert_eq!(definition["name"], "response");
+    assert_eq!(definition.as_object().unwrap().len(), 2);
+    assert_eq!(
+        serde_json::from_str::<Value>(definition["schema"].as_str().unwrap()).unwrap(),
+        json!({"type": "object", "properties": {"unknown": {"type": "string"}}})
+    );
+    assert!(body.get("additionalModelRequestFields").is_none());
+    assert!(body.get("top_k").is_none());
+    assert!(body.get("store").is_none());
+}
+
+#[test]
+fn bedrock_null_optional_controls_are_treated_as_absent() {
+    for body in [
+        json!({
+            "messages": [], "system": null,
+            "outputConfig": null, "requestMetadata": null,
+            "serviceTier": null, "toolConfig": null,
+            "additionalModelRequestFields": null
+        }),
+        json!({
+            "messages": [],
+            "outputConfig": {"textFormat": null},
+            "toolConfig": {"tools": null, "toolChoice": null},
+            "additionalModelRequestFields": {"thinking": null}
+        }),
+    ] {
+        let request = BedrockConverseV1.decode_request(body).unwrap();
+        assert!(request.items.is_empty());
+        assert!(request.tools.is_none());
+        assert!(request.tool_choice.is_none());
+        assert!(request.response_format.is_none());
+        assert!(request.parameters.metadata.is_none());
+        assert!(request.parameters.service_tier.is_none());
+        assert!(request.reasoning.mode.is_none());
+        let (body, _) = BedrockConverseV1.encode_request(request).unwrap();
+        for field in [
+            "system",
+            "outputConfig",
+            "requestMetadata",
+            "serviceTier",
+            "toolConfig",
+            "additionalModelRequestFields",
+        ] {
+            assert!(body.get(field).is_none(), "{field} must remain absent");
+        }
+    }
+}
+
+#[test]
+fn bedrock_explicit_null_resets_only_the_matching_inherited_controls() {
+    let request = BedrockConverseV1
+        .decode_request(json!({
+            "messages": [],
+            "outputConfig": null,
+            "serviceTier": null,
+            "inferenceConfig": {"temperature": null, "topP": null, "maxTokens": null},
+            "additionalModelRequestFields": {"thinking": null}
+        }))
+        .unwrap();
+    for reset in [
+        ParameterReset::ResponseFormat,
+        ParameterReset::ServiceTier,
+        ParameterReset::Temperature,
+        ParameterReset::TopP,
+        ParameterReset::MaxTokens,
+        ParameterReset::Reasoning,
+    ] {
+        assert!(request.parameters.resets(reset));
+    }
+    let absent = BedrockConverseV1
+        .decode_request(json!({"messages": []}))
+        .unwrap();
+    assert!(absent.parameters.resets.is_empty());
+    let (body, _) = BedrockConverseV1.encode_request(request).unwrap();
+    assert_eq!(body, json!({"messages": []}));
+}
+
+#[test]
+fn bedrock_service_tiers_only_map_shared_official_values() {
+    for (wire, tier) in [
+        ("default", ServiceTier::Default),
+        ("flex", ServiceTier::Flex),
+        ("priority", ServiceTier::Priority),
+    ] {
+        let request = BedrockConverseV1
+            .decode_request(json!({
+                "messages": [], "serviceTier": {"type": wire, "unknown": true}
+            }))
+            .unwrap();
+        assert_eq!(request.parameters.service_tier, Some(tier));
+        let (body, _) = BedrockConverseV1.encode_request(request).unwrap();
+        assert_eq!(body["serviceTier"], json!({"type": wire}));
+    }
+    for wire in ["auto", "reserved", "unknown"] {
+        let request = BedrockConverseV1
+            .decode_request(json!({"messages": [], "serviceTier": {"type": wire}}))
+            .unwrap();
+        assert!(request.parameters.service_tier.is_none());
+        let (body, _) = BedrockConverseV1.encode_request(request).unwrap();
+        assert!(body.get("serviceTier").is_none());
+    }
+    let mut request = AiRequest::new("model", vec![]);
+    request.parameters.service_tier = Some(ServiceTier::Auto);
+    let (body, _) = BedrockConverseV1.encode_request(request).unwrap();
+    assert!(body.get("serviceTier").is_none());
+}
+
+#[test]
+fn bedrock_projects_unified_metadata_without_vendor_specific_state() {
+    let mut request = AiRequest::new("model", vec![]);
+    request.parameters.metadata = Some(BTreeMap::from([("caller".into(), "canonical".into())]));
+    let (body, _) = BedrockConverseV1.encode_request(request).unwrap();
+    assert_eq!(body["requestMetadata"], json!({"caller": "canonical"}));
+}
+
+#[test]
+fn bedrock_omits_unrepresentable_tool_choices_and_native_tools() {
+    use stravia_runtime_contract::protocol::ir::{
+        NativeTool, NativeToolKind, WebSearchTool,
+    };
+
+    for choice in [
+        ToolChoice::Allowed {
+            names: vec!["lookup".into()],
+            required: true,
+        },
+        ToolChoice::Native(NativeToolKind::WebSearch),
+    ] {
+        let mut request = BedrockConverseV1
+            .decode_request(json!({
+                "messages": [],
+                "toolConfig": {"tools": [
+                    {"toolSpec": {"name": "lookup", "inputSchema": {"json": {"type": "object"}}}}
+                ]}
+            }))
+            .unwrap();
+        request.tool_choice = Some(choice);
+        request.parameters.native_tools = vec![NativeTool::WebSearch(WebSearchTool {
+            max_uses: None,
+            allowed_domains: vec![],
+            blocked_domains: vec![],
+            user_location: None,
+            context_size: None,
+        })];
+        let (body, _) = BedrockConverseV1.encode_request(request).unwrap();
+        assert!(body["toolConfig"].get("toolChoice").is_none());
+        assert_eq!(body["toolConfig"]["tools"].as_array().unwrap().len(), 1);
+        assert_eq!(body["toolConfig"]["tools"][0]["toolSpec"]["name"], "lookup");
+    }
+}
+
+#[test]
+fn bedrock_native_structured_output_normalizes_to_one_canonical_format() {
+    let schema = json!({
+        "type": "object",
+        "properties": {"business": {"type": "object", "properties": {"unknown": {"type": "string"}}}}
+    });
+    let request = BedrockConverseV1.decode_request(json!({
+        "modelId": "model", "messages": [],
+        "outputConfig": {"unknown": true, "textFormat": {
+            "type": "json_schema", "unknown": true,
+            "structure": {"unknown": true, "jsonSchema": {
+                "name": "native", "description": "native description",
+                "schema": serde_json::to_string(&schema).unwrap(), "unknown": true, "strict": true
+            }}
+        }}
+    })).unwrap();
+    let Some(ResponseFormat::JsonSchema {
+        name,
+        description,
+        schema: decoded_schema,
+        strict,
+    }) = &request.response_format
+    else {
+        panic!("native output schema must normalize to canonical JSON schema");
+    };
+    assert_eq!(name, "native");
+    assert_eq!(decoded_schema, &schema);
+    assert!(strict.is_none());
+    assert_eq!(
+        description.as_deref(),
+        Some("native description")
+    );
+}
+
+#[test]
+fn bedrock_projects_cross_protocol_canonical_schema_without_native_output_config() {
+    let schema =
+        json!({"type": "object", "properties": {"preserve": {"type": ["string", "null"]}}});
+    let mut request = AiRequest::new("model", vec![]);
+    request.response_format = Some(ResponseFormat::JsonSchema {
+        name: "canonical".into(),
+        description: Some("canonical description".into()),
+        schema: schema.clone(),
+        strict: Some(true),
+    });
+    let (body, _) = BedrockConverseV1.encode_request(request).unwrap();
+    let definition = &body["outputConfig"]["textFormat"]["structure"]["jsonSchema"];
+    assert_eq!(body["outputConfig"]["textFormat"]["type"], "json_schema");
+    assert_eq!(definition["name"], "canonical");
+    assert_eq!(definition["description"], "canonical description");
+    assert!(definition.get("strict").is_none());
+    assert_eq!(
+        serde_json::from_str::<Value>(definition["schema"].as_str().unwrap()).unwrap(),
+        schema
+    );
+}
+
+#[test]
+fn bedrock_omits_output_formats_without_a_native_equivalent() {
+    for format in [ResponseFormat::Text, ResponseFormat::JsonObject] {
+        let mut request = AiRequest::new("model", vec![]);
+        request.response_format = Some(format);
+        let (body, _) = BedrockConverseV1.encode_request(request).unwrap();
+        assert!(body.get("outputConfig").is_none());
+    }
+}
+
+#[test]
 fn projects_nested_tool_results_to_native_carriers() {
     use stravia_runtime_contract::protocol::ir::ToolResultContentKind;
     let mixed = json!([
@@ -297,8 +661,7 @@ fn encodes_converse_tool_config_not_chat_completions() {
         description: None,
         parameters: json!({"type":"object"}),
         strict: None,
-        cache_control: None,
-        meta: None,
+        defer_loading: None,
     }]);
     let (body, _) = BedrockConverseV1.encode_request(request).unwrap();
     assert_eq!(
@@ -480,7 +843,7 @@ fn omits_unsupported_controls_roles_and_noninline_images() {
     request.generation.frequency_penalty = Some(0.5);
     request.generation.presence_penalty = Some(0.5);
     request.generation.seed = Some(1);
-    request.reasoning.enabled = true;
+    request.reasoning.mode = Some("enabled".into());
     request.response_format =
         Some(stravia_runtime_contract::protocol::ir::ResponseFormat::JsonObject);
     request.tools = Some(vec![ToolSpec {
@@ -488,10 +851,11 @@ fn omits_unsupported_controls_roles_and_noninline_images() {
         description: None,
         parameters: json!({"type": "object"}),
         strict: None,
-        cache_control: None,
-        meta: None,
+        defer_loading: None,
     }]);
-    request.tool_choice = Some(ToolChoice::Raw(json!({"unsupported": true})));
+    request.tool_choice = Some(ToolChoice::Native(
+        stravia_runtime_contract::protocol::ir::NativeToolKind::WebSearch,
+    ));
     let (body, _) = BedrockConverseV1.encode_request(request).unwrap();
     assert_eq!(
         body["messages"],

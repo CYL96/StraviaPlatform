@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn generic_anthropic_does_not_invent_summary_controls_for_compatible_targets() {
+fn anthropic_projects_only_explicit_summary_controls() {
     use stravia_runtime_contract::thinking::TargetThinkingControl;
     let mut request = crate::codec::anthropic::messages::decoder::AnthropicDecoder
         .decode_request(serde_json::json!({
@@ -12,17 +12,20 @@ fn generic_anthropic_does_not_invent_summary_controls_for_compatible_targets() {
         .unwrap();
     let (body, _) = AnthropicEncoder.encode_request(request.clone()).unwrap();
     assert!(body.get("thinking").is_none());
-    for display in [None, Some("omitted"), Some("concise")] {
-        request.reasoning.display = display.map(str::to_owned);
+    for summary in [None, Some(ReasoningSummary::None), Some(ReasoningSummary::Concise)] {
+        request.reasoning.summary = summary;
         request.reasoning.target_control = Some(TargetThinkingControl::Budget { value: 2048 });
         let (body, _) = AnthropicEncoder.encode_request(request.clone()).unwrap();
         assert_eq!(body["thinking"]["budget_tokens"], 2048);
-        assert!(body["thinking"].get("display").is_none());
+        assert_eq!(
+            body["thinking"].get("display").and_then(Value::as_str),
+            summary.map(|value| if value == ReasoningSummary::None { "omitted" } else { "summarized" })
+        );
     }
     request.reasoning.target_control = Some(TargetThinkingControl::Disabled);
     let (body, _) = AnthropicEncoder.encode_request(request).unwrap();
     assert_eq!(body["thinking"]["type"], "disabled");
-    assert!(body["thinking"].get("display").is_none());
+    assert_eq!(body["thinking"]["display"], "summarized");
 }
 
 #[test]
@@ -577,8 +580,8 @@ fn cross_protocol_controls_reach_anthropic_and_return_to_openai() {
 }
 
 #[test]
-fn native_output_config_preserves_format_effort_and_control_roundtrip() {
-    use stravia_runtime_contract::protocol::ir::{ProtocolExt, ResponseFormat};
+fn canonical_output_controls_replace_native_values() {
+    use stravia_runtime_contract::protocol::ir::ResponseFormat;
     let native_format = serde_json::json!({"type": "json_schema", "schema": {
         "type": "object", "properties": {}, "additionalProperties": false
     }});
@@ -595,13 +598,10 @@ fn native_output_config_preserves_format_effort_and_control_roundtrip() {
         request.response_format,
         Some(ResponseFormat::JsonSchema { .. })
     ));
-    assert_eq!(request.disable_parallel_tool_calls, Some(false));
     assert_eq!(request.parallel_tool_calls, Some(true));
-    assert!(
-        matches!(&request.ext, Some(ProtocolExt::Anthropic(ext)) if ext.output_config.as_ref().unwrap()["format"] == native_format)
-    );
     request.response_format = Some(ResponseFormat::JsonSchema {
         name: "canonical".into(),
+        description: None,
         schema: serde_json::json!({"type": "string"}),
         strict: None,
     });
@@ -613,7 +613,7 @@ fn native_output_config_preserves_format_effort_and_control_roundtrip() {
     let (body, _) = AnthropicEncoder.encode_request(request).unwrap();
     assert_eq!(
         body["output_config"],
-        serde_json::json!({"format": native_format, "effort": "high"})
+        serde_json::json!({"format": {"type": "json_schema", "schema": {"type": "string"}}, "effort": "low"})
     );
     assert_eq!(body["tool_choice"]["disable_parallel_tool_use"], false);
     assert_eq!(body["stop_sequences"], serde_json::json!(["END"]));
@@ -641,6 +641,7 @@ fn canonical_schema_and_effort_merge_without_inventing_json_object_schema() {
         serde_json::json!({"type": "object", "properties": {}, "additionalProperties": false});
     request.response_format = Some(ResponseFormat::JsonSchema {
         name: "answer".into(),
+        description: None,
         schema: schema.clone(),
         strict: Some(true),
     });
@@ -669,6 +670,7 @@ fn raw_output_config_fallback_merges_and_invalid_native_format_still_errors() {
     );
     request.response_format = Some(ResponseFormat::JsonSchema {
         name: "answer".into(),
+        description: None,
         schema: serde_json::json!({"type": "string"}),
         strict: None,
     });
@@ -694,110 +696,317 @@ fn raw_output_config_fallback_merges_and_invalid_native_format_still_errors() {
     }
 }
 
-#[test]
-fn schema_omission_retains_supported_constraints_and_property_names() {
-    let mut schema = serde_json::json!({
-        "type": "object", "additionalProperties": false,
-        "required": ["minimum"],
-        "properties": {
-            "minimum": {"type": "integer", "minimum": 1, "maximum": 9, "enum": [1, 2]},
-            "label": {"type": "string", "minLength": 2, "format": "email", "pattern": "^[a-z]+$"},
-            "list": {"type": "array", "minItems": 1, "maxItems": 10, "items": {"type": "string", "maxLength": 3}},
-            "external": {"$ref": "https://example.test/schema"},
-            "local": {"$ref": "#/$defs/local"}
-        },
-        "$defs": {"local": {"type": "number", "multipleOf": 2}},
-        "default": {"minimum": 7}
-    });
-    omit_unsupported_schema_constraints(&mut schema);
-    assert_eq!(
-        schema["properties"]["minimum"],
-        serde_json::json!({"type": "integer", "enum": [1, 2]})
-    );
-    assert_eq!(
-        schema["properties"]["label"],
-        serde_json::json!({"type": "string", "format": "email", "pattern": "^[a-z]+$"})
-    );
-    assert_eq!(
-        schema["properties"]["list"],
-        serde_json::json!({"type": "array", "minItems": 1, "items": {"type": "string"}})
-    );
-    assert_eq!(schema["properties"]["external"], serde_json::json!({}));
-    assert_eq!(schema["properties"]["local"]["$ref"], "#/$defs/local");
-    assert_eq!(
-        schema["$defs"]["local"],
-        serde_json::json!({"type": "number"})
-    );
-    assert_eq!(schema["default"], serde_json::json!({"minimum": 7}));
-    assert_eq!(schema["additionalProperties"], false);
-    assert_eq!(schema["required"], serde_json::json!(["minimum"]));
+fn canonical_tool(
+    name: impl Into<String>,
+    schema: Value,
+    strict: Option<bool>,
+) -> stravia_runtime_contract::protocol::ir::ToolSpec {
+    stravia_runtime_contract::protocol::ir::ToolSpec {
+        name: name.into(),
+        description: None,
+        parameters: schema,
+        strict,
+        defer_loading: None,
+    }
+}
+
+fn parameter_request() -> AiRequest {
+    AiRequest::new(
+        "claude",
+        vec![AiItem {
+            role: Role::User,
+            content: MessageContent::Text("hello".to_owned().into()),
+            tool_calls: None,
+            tool_call_id: None,
+            meta: None,
+        }],
+    )
 }
 
 #[test]
-fn open_schema_omits_format_and_strict_but_keeps_tool_contract() {
-    use stravia_runtime_contract::protocol::ir::{ResponseFormat, ToolSpec};
-    for additional in [
-        None,
-        Some(serde_json::json!(true)),
-        Some(serde_json::json!({"type": "string"})),
-    ] {
-        let mut schema = serde_json::json!({"type": "object", "properties": {"value": {"type": "number", "minimum": 3}}});
-        if let Some(additional) = additional {
-            schema["additionalProperties"] = additional;
-        }
-        let mut request = AiRequest::new(
-            "claude",
-            vec![AiItem {
-                role: Role::User,
-                content: MessageContent::Text("hello".to_owned().into()),
-                tool_calls: None,
-                tool_call_id: None,
-                meta: None,
-            }],
-        );
-        request.response_format = Some(ResponseFormat::JsonSchema {
-            name: "answer".into(),
-            schema: schema.clone(),
-            strict: Some(true),
-        });
-        request.tools = Some(vec![ToolSpec {
+fn strict39_keeps_nullable_schema_and_relaxes_only_true_strict() {
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "value": {"anyOf": [{"type": "string", "minLength": 2}, {"type": "null"}]},
+            "extra": {"$ref": "https://example.test/schema"}
+        },
+        "required": ["value", "extra"],
+        "additionalProperties": false,
+        "$defs": {"recursive": {"$ref": "#/$defs/recursive"}},
+        "default": {"minimum": 7}
+    });
+    let mut request = parameter_request();
+    request.tools = Some(
+        (0..39)
+            .map(|index| canonical_tool(format!("tool_{index}"), schema.clone(), Some(index != 0)))
+            .collect(),
+    );
+    request.response_format = Some(
+        stravia_runtime_contract::protocol::ir::ResponseFormat::JsonSchema {
             name: "answer".into(),
             description: None,
-            parameters: schema.clone(),
+            schema: schema.clone(),
             strict: Some(true),
-            cache_control: None,
-            meta: None,
-        }]);
+        },
+    );
+    let (body, _) = AnthropicEncoder.encode_request(request).unwrap();
+    assert_eq!(body["tools"].as_array().unwrap().len(), 39);
+    assert_eq!(body["tools"][0]["strict"], false);
+    for tool in body["tools"].as_array().unwrap() {
+        assert_eq!(tool["input_schema"], schema);
+        assert_ne!(tool.get("strict"), Some(&Value::Bool(true)));
+    }
+    assert_eq!(body["output_config"]["format"]["schema"], schema);
+}
+
+#[test]
+fn strict_budget_uses_aggregate_optional_parameters_and_union_branches() {
+    for (optional, branches, expected_strict) in
+        [(24, 0, true), (25, 0, false), (0, 16, true), (0, 17, false)]
+    {
+        let properties: serde_json::Map<String, Value> = (0..optional)
+            .map(|index| {
+                (
+                    format!("optional_{index}"),
+                    serde_json::json!({"type": ["string", "null"]}),
+                )
+            })
+            .collect();
+        let mut schema = serde_json::json!({"type": "object", "properties": properties});
+        if branches > 0 {
+            schema["anyOf"] = Value::Array(
+                (0..branches)
+                    .map(|_| serde_json::json!({"type": "string"}))
+                    .collect(),
+            );
+        }
+        let mut request = parameter_request();
+        request.tools = Some(vec![
+            canonical_tool(
+                "a",
+                serde_json::json!({"type": "object", "properties": {}}),
+                Some(true),
+            ),
+            canonical_tool("b", schema.clone(), Some(true)),
+        ]);
         let (body, _) = AnthropicEncoder.encode_request(request).unwrap();
-        assert!(body.get("output_config").is_none());
-        assert_eq!(body["tools"][0]["name"], "answer");
-        assert_eq!(body["tools"][0]["input_schema"], schema);
-        assert!(body["tools"][0].get("strict").is_none());
+        assert_eq!(
+            body["tools"][0].get("strict").and_then(Value::as_bool),
+            expected_strict.then_some(true)
+        );
+        assert_eq!(
+            body["tools"][1].get("strict").and_then(Value::as_bool),
+            expected_strict.then_some(true)
+        );
+        assert_eq!(body["tools"][1]["input_schema"], schema);
+    }
+    // Neither schema individually exceeds 24 optional parameters.
+    let mut request = parameter_request();
+    let properties: serde_json::Map<String, Value> = (0..13)
+        .map(|index| {
+            (
+                format!("optional_{index}"),
+                serde_json::json!({"type": "string"}),
+            )
+        })
+        .collect();
+    let schema = serde_json::json!({"type": "object", "properties": properties});
+    request.tools = Some(vec![canonical_tool("a", schema.clone(), Some(true))]);
+    request.response_format = Some(
+        stravia_runtime_contract::protocol::ir::ResponseFormat::JsonSchema {
+            name: "answer".into(),
+            description: None,
+            schema: schema.clone(),
+            strict: None,
+        },
+    );
+    let (body, _) = AnthropicEncoder.encode_request(request).unwrap();
+    assert!(body["tools"][0].get("strict").is_none());
+    assert_eq!(body["output_config"]["format"]["schema"], schema);
+}
+
+#[test]
+fn strict_tool_count_limit_includes_only_supported_native_tools() {
+    use stravia_runtime_contract::protocol::ir::{ImageGenerationTool, WebSearchTool};
+    for (function_count, strict) in [(19, true), (20, false)] {
+        let mut request = parameter_request();
+        request.tools = Some(
+            (0..function_count)
+                .map(|index| {
+                    canonical_tool(
+                        format!("tool_{index}"),
+                        serde_json::json!({"type": "object"}),
+                        Some(true),
+                    )
+                })
+                .collect(),
+        );
+        request.parameters.native_tools = vec![
+            NativeTool::WebSearch(WebSearchTool::default()),
+            NativeTool::ImageGeneration(ImageGenerationTool::default()),
+        ];
+        let (body, _) = AnthropicEncoder.encode_request(request).unwrap();
+        assert_eq!(body["tools"].as_array().unwrap().len(), function_count + 1);
+        assert_eq!(
+            body["tools"][0].get("strict").and_then(Value::as_bool),
+            strict.then_some(true)
+        );
     }
 }
 
 #[test]
-fn recursive_schema_and_unsupported_patterns_drop_only_constraints() {
-    let mut schema = serde_json::json!({
-        "type": "object", "additionalProperties": false,
-        "properties": {"child": {"$ref": "#"}, "label": {"type": "string", "pattern": "(?=a)a"}},
-        "allOf": [{"$ref": "#/$defs/leaf", "description": "keep"}],
-        "$defs": {"leaf": {"type": "string"}}
-    });
-    omit_unsupported_schema_constraints(&mut schema);
-    assert_eq!(schema["properties"]["child"], serde_json::json!({}));
+fn canonical_tools_and_controls_win_over_raw_tools_and_aliases() {
+    let schema = serde_json::json!({"type": "object", "properties": {
+        "minimum": {"type": ["integer", "null"], "minimum": 3}
+    }});
+    let mut request = parameter_request();
+    request.tools = crate::codec::anthropic::messages::decoder::AnthropicDecoder
+        .decode_request(serde_json::json!({
+            "model": "model", "max_tokens": 1024,
+            "messages": [{"role": "user", "content": "read"}],
+            "tools": [{
+                "type": "custom", "name": "read", "input_schema": schema,
+                "strict": false, "defer_loading": false, "eager_input_streaming": false,
+                "citations": {"enabled": false},
+                "cache_control": {"type": "ephemeral", "ttl": "5m"},
+                "allowed_callers": ["direct"],
+                "input_examples": [{"minimum": 3, "private_parameter": "business"}]
+            }]
+        }))
+        .unwrap()
+        .tools;
+    request.parallel_tool_calls = Some(true);
+    request.generation.stop = Some(vec![]);
+    request.parameters.top_k = Some(0);
+    request.parameters.end_user_id = Some(String::new());
+    request.parameters.service_tier = Some(ServiceTier::Default);
+    request.meta.vendor.ingress.extend([
+        (
+            "__anthropic_raw_tools".into(),
+            serde_json::json!([
+                {"name": "read", "description": "stale", "strict": true,
+                 "defer_loading": true, "eager_input_streaming": true,
+                 "citations": {"enabled": true}, "allowed_callers": ["code_execution_20260120"],
+                 "input_examples": [{"minimum": 99}],
+                 "input_schema": {"type": "string"},
+                 "cache_control": {"type": "ephemeral", "ttl": "1h"}},
+                {"name": "deleted", "input_schema": {}}
+            ]),
+        ),
+        ("__anthropic_top_k".into(), serde_json::json!(80)),
+        ("__anthropic_container".into(), serde_json::json!("bag")),
+        (
+            "__anthropic_context_management".into(),
+            serde_json::json!({"edits": []}),
+        ),
+        ("__anthropic_service_tier".into(), serde_json::json!("auto")),
+        (
+            "__anthropic_stop_sequences".into(),
+            serde_json::json!(["stale"]),
+        ),
+        (
+            "__anthropic_metadata".into(),
+            serde_json::json!({"user_id": "stale", "unknown": true}),
+        ),
+    ]);
+    let (body, _) = AnthropicEncoder.encode_request(request).unwrap();
+    assert_eq!(body["tools"].as_array().unwrap().len(), 1);
+    assert_eq!(body["tools"][0]["input_schema"], schema);
+    assert_eq!(body["tools"][0]["strict"], false);
+    assert_eq!(body["tools"][0]["defer_loading"], false);
+    for field in ["eager_input_streaming", "citations", "allowed_callers", "input_examples", "cache_control", "description"] {
+        assert!(body["tools"][0].get(field).is_none(), "{field}");
+    }
+    assert_eq!(body["top_k"], 0);
+    assert!(body.get("context_management").is_none());
+    assert!(body.get("container").is_none());
+    assert!(body.get("inference_geo").is_none());
+    assert_eq!(body["metadata"], serde_json::json!({"user_id": ""}));
+    assert_eq!(body["service_tier"], "standard_only");
+    assert_eq!(body["tool_choice"]["disable_parallel_tool_use"], false);
+    assert_eq!(body["stop_sequences"], serde_json::json!([]));
+}
+
+#[test]
+fn unsupported_native_variants_and_service_tiers_are_omitted() {
+    use stravia_runtime_contract::protocol::ir::{ImageGenerationTool, WebSearchTool};
+    let mut request = parameter_request();
+    request.parameters.service_tier = Some(ServiceTier::Priority);
+    request.parameters.native_tools = vec![
+        NativeTool::WebSearch(WebSearchTool { max_uses: Some(0), ..Default::default() }),
+        NativeTool::ImageGeneration(ImageGenerationTool::default()),
+    ];
+
+    request.parameters.metadata = Some(std::collections::BTreeMap::from([
+        ("user_id".into(), "not-an-anthropic-user".into()),
+    ]));
+    let (body, _) = AnthropicEncoder.encode_request(request).unwrap();
+    assert!(body.get("service_tier").is_none());
+    assert!(body.get("unknown").is_none());
+    assert!(body.get("metadata").is_none());
     assert_eq!(
-        schema["properties"]["label"],
-        serde_json::json!({"type": "string"})
+        body["tools"],
+        serde_json::json!([{
+            "type": "web_search_20250305", "name": "web_search", "max_uses": 0
+        }])
     );
-    assert_eq!(
-        schema["allOf"][0],
-        serde_json::json!({"description": "keep"})
-    );
-    assert_eq!(
-        schema["$defs"]["leaf"],
-        serde_json::json!({"type": "string"})
-    );
+}
+
+#[test]
+fn canonical_reasoning_modes_and_levels_project_without_target_controls() {
+    use stravia_runtime_contract::thinking::{TargetThinkingControl, ThinkingLevel};
+    for (source, mode, expected) in [
+        (
+            serde_json::json!({"type": "adaptive"}),
+            "auto",
+            serde_json::json!({"type": "adaptive"}),
+        ),
+        (
+            serde_json::json!({"type": "enabled", "budget_tokens": 2048}),
+            "enabled",
+            serde_json::json!({"type": "enabled", "budget_tokens": 2048}),
+        ),
+        (
+            serde_json::json!({"type": "disabled"}),
+            "disabled",
+            serde_json::json!({"type": "disabled"}),
+        ),
+    ] {
+        let request = super::super::decoder::AnthropicDecoder
+            .decode_request(serde_json::json!({
+                "model": "claude", "max_tokens": 4096,
+                "messages": [{"role": "user", "content": "hello"}], "thinking": source
+            }))
+            .unwrap();
+        assert_eq!(request.reasoning.mode.as_deref(), Some(mode));
+        let (body, _) = AnthropicEncoder.encode_request(request).unwrap();
+        assert_eq!(body["thinking"], expected);
+    }
+    let mut request = parameter_request();
+    request.reasoning.level = Some(ThinkingLevel::Medium);
+    let (body, _) = AnthropicEncoder.encode_request(request.clone()).unwrap();
+    assert_eq!(body["thinking"]["type"], "adaptive");
+    assert_eq!(body["output_config"]["effort"], "medium");
+    request.generation.max_tokens = Some(2048);
+    request.reasoning.mode = Some("enabled".into());
+    request.reasoning.budget_tokens = Some(50_000);
+    let (body, _) = AnthropicEncoder.encode_request(request.clone()).unwrap();
+    assert_eq!(body["thinking"]["budget_tokens"], 2047);
+    request.reasoning.budget_tokens = Some(0);
+    let (body, _) = AnthropicEncoder.encode_request(request.clone()).unwrap();
+    assert_eq!(body["thinking"]["budget_tokens"], 1024);
+    request.reasoning.target_control = Some(TargetThinkingControl::Disabled);
+    let (body, _) = AnthropicEncoder.encode_request(request).unwrap();
+    assert_eq!(body["thinking"], serde_json::json!({"type": "disabled"}));
+}
+
+#[test]
+fn enabled_thinking_rejects_an_impossible_generation_budget() {
+    let mut request = parameter_request();
+    request.generation.max_tokens = Some(1024);
+    request.reasoning.mode = Some("enabled".into());
+    assert!(AnthropicEncoder.encode_request(request).is_err());
 }
 
 fn assistant_blocks_request(blocks: Vec<ContentBlock>) -> AiRequest {
@@ -1077,7 +1286,7 @@ fn owned_normalization_merges_text_and_blocks_without_changing_shared_history() 
 }
 
 #[test]
-fn owned_raw_system_messages_and_tools_keep_precedence_and_cache_controls() {
+fn owned_raw_system_messages_keep_cache_controls_but_raw_tools_are_not_authoritative() {
     let mut request = AiRequest::new("model", vec![AiItem::output_text("ignored")]);
     request.instructions = Some("ignored instructions".into());
     let system = serde_json::json!([
@@ -1112,7 +1321,7 @@ fn owned_raw_system_messages_and_tools_keep_precedence_and_cache_controls() {
 
     assert_eq!(body["system"], system);
     assert_eq!(body["messages"], messages);
-    assert_eq!(body["tools"], tools);
+    assert!(body.get("tools").is_none());
 }
 
 #[test]

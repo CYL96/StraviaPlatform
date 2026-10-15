@@ -6,7 +6,8 @@ use serde_json::Value;
 use super::{RedactionError, marker, store::Mapping};
 use stravia_runtime_contract::protocol::ir::{
     AiItem, AiRequest, AiResponse, ContentBlock, DocumentSource, EmbeddingInput, MessageContent,
-    ProtocolExt, ResponseFormat, TOOL_RESULT_CONTENT_KIND_META, ToolResultContentKind,
+    CustomTool, NamespaceMember, NativeTool, ResponseFormat, TOOL_RESULT_CONTENT_KIND_META,
+    ToolResultContentKind, ToolSpec,
 };
 
 pub(super) fn active(mapping: &Mapping) -> bool {
@@ -431,6 +432,7 @@ pub(super) fn wire_text(value: & $($qualifier)* Value, location: &'static str, v
                     "format" | "json_schema" | "parts" | "functionDeclarations" | "executableCode" | "codeExecutionResult" | "citations" => wire_text(value, location, visit)?,
                     "content" | "summary" | "results" | "context" => if let Value::String(text) = value { visit(text, Some(key), location)?; } else { wire_text(value, location, visit)?; },
                     "schema" | "parameters" | "input_schema" | "responseSchema" | "responseJsonSchema" => schema(value, location, visit)?,
+                    "input_examples" => json_values(value, None, location, visit)?,
                     _ => {}
                 }
             }
@@ -518,8 +520,11 @@ pub(super) fn request(request: & $($qualifier)* AiRequest, reject_ambiguous: boo
     if let Some(text) = & $($qualifier)* request.instructions { visit(text, None, "system_or_history")?; }
     for item in & $($qualifier)* request.items { item_text(item, reject_ambiguous, location, visit)?; }
     if let Some(embedding) = & $($qualifier)* request.embedding { match & $($qualifier)* embedding.input { EmbeddingInput::Text(text) => visit(text, None, location)?, EmbeddingInput::Texts(texts) => for text in texts { visit(text, None, location)?; }, _ => {} } }
-    if let Some(tools) = & $($qualifier)* request.tools { for tool in tools { if let Some(text) = & $($qualifier)* tool.description { visit(text, None, location)?; } schema(& $($qualifier)* tool.parameters, location, visit)?; } }
-    if let Some(ResponseFormat::JsonSchema { schema: value, .. }) = & $($qualifier)* request.response_format { schema(value, location, visit)?; }
+    if let Some(tools) = & $($qualifier)* request.tools { for tool in tools { function_tool(tool, location, visit)?; } }
+    if let Some(ResponseFormat::JsonSchema { schema: value, description, .. }) = & $($qualifier)* request.response_format {
+        schema(value, location, visit)?;
+        if let Some(description) = description { visit(description, None, location)?; }
+    }
     // Encoders prefer these fidelity-preserving copies over canonical fields.
     // Select only model-readable carriers, never the arbitrary vendor bag:
     // authentication, identities, media and opaque signatures must stay intact.
@@ -532,24 +537,41 @@ pub(super) fn request(request: & $($qualifier)* AiRequest, reject_ambiguous: boo
             _ => {}
         }
     }
-    if let Some(ext) = & $($qualifier)* request.ext {
-        match ext {
-            ProtocolExt::OpenAiChat(ext) => if let Some(value) = & $($qualifier)* ext.prediction { wire_text(value, location, visit)?; },
-            ProtocolExt::OpenResponses(ext) => {
-                if let Some(value) = & $($qualifier)* ext.text { wire_text(value, location, visit)?; }
-                for value in & $($qualifier)* ext.passthrough_tools { wire_text(value, location, visit)?; }
-                for (key, value) in & $($qualifier)* ext.passthrough_body { if matches!(key.as_str(), "prompt" | "context") { wire_text(value, location, visit)?; } }
+    if let Some(metadata) = & $($qualifier)* request.parameters.metadata {
+        for (key, text) in metadata { visit(text, Some(key), location)?; }
+    }
+    for tool in & $($qualifier)* request.parameters.native_tools {
+        match tool {
+            NativeTool::ToolSearch(tool) => {
+                if let Some(text) = & $($qualifier)* tool.description { visit(text, None, location)?; }
+                if let Some(parameters) = & $($qualifier)* tool.parameters { schema(parameters, location, visit)?; }
             }
-            ProtocolExt::Anthropic(ext) => {
-                if let Some(value) = & $($qualifier)* ext.output_config { if let Some(format) = value.$get("format") { wire_text(format, location, visit)?; } }
-                if let Some(tools) = & $($qualifier)* ext.server_tools { for tool in tools { wire_text(tool, location, visit)?; } }
+            NativeTool::Custom(tool) => custom_tool(tool, location, visit)?,
+            NativeTool::Namespace(namespace) => {
+                if let Some(text) = & $($qualifier)* namespace.description { visit(text, None, location)?; }
+                for member in & $($qualifier)* namespace.tools {
+                    match member {
+                        NamespaceMember::Function(tool) => function_tool(tool, location, visit)?,
+                        NamespaceMember::Custom(tool) => custom_tool(tool, location, visit)?,
+                    }
+                }
             }
-            ProtocolExt::Google(ext) => if let Some(value) = & $($qualifier)* ext.response_json_schema { schema(value, location, visit)?; },
+            NativeTool::WebSearch(_) | NativeTool::CodeExecution(_) | NativeTool::ImageGeneration(_) => {}
         }
     }
     Ok(())
 }
 
+fn function_tool(tool: & $($qualifier)* ToolSpec, location: &'static str, visit: &mut Visitor<'_>) -> Result<(), RedactionError> {
+    if let Some(text) = & $($qualifier)* tool.description { visit(text, None, location)?; }
+    schema(& $($qualifier)* tool.parameters, location, visit)
+}
+
+fn custom_tool(tool: & $($qualifier)* CustomTool, location: &'static str, visit: &mut Visitor<'_>) -> Result<(), RedactionError> {
+    if let Some(text) = & $($qualifier)* tool.description { visit(text, None, location)?; }
+    if let Some(grammar) = & $($qualifier)* tool.grammar { visit(& $($qualifier)* grammar.definition, None, location)?; }
+    Ok(())
+}
 
         }
     };
@@ -1103,6 +1125,58 @@ mod tests {
             malformed,
             "restored secret must be re-escaped as JSON string content"
         );
+    }
+
+    #[test]
+    fn typed_native_prompt_carriers_protect_text_without_mutating_identities() {
+        let mapping = Mapping {
+            reference: format!("{PREFIX}{}{SUFFIX}", "d".repeat(IDENTIFIER_LEN)),
+            secret: "sk-native-prompt-secret".into(),
+            expires_at: i64::MAX,
+        };
+        let mut request = AiRequest::new("model", Vec::new());
+        request.parameters.session.id = Some(mapping.secret.clone());
+        request.parameters.metadata = Some(
+            [(mapping.secret.clone(), mapping.secret.clone())].into(),
+        );
+        request.parameters.native_tools = serde_json::from_value(serde_json::json!([
+            {"type": "tool_search", "description": mapping.secret,
+                "parameters": {"type": "object", "description": mapping.secret}},
+            {"type": "custom", "name": mapping.secret, "description": mapping.secret,
+                "grammar": {"syntax": "lark", "definition": mapping.secret}},
+            {"type": "namespace", "name": mapping.secret, "description": mapping.secret,
+                "tools": [
+                    {"type": "function", "name": mapping.secret,
+                        "description": mapping.secret,
+                        "parameters": {"type": "object", "description": mapping.secret}},
+                    {"type": "custom", "name": mapping.secret,
+                        "grammar": {"syntax": "regex", "definition": mapping.secret}}
+                ]}
+        ])).unwrap();
+        let (texts, _) = request_texts(&request, true).unwrap();
+        assert_eq!(
+            texts
+                .iter()
+                .filter(|text| text.contains(&mapping.secret))
+                .count(),
+            9
+        );
+        redact_request(&mut request, std::slice::from_ref(&mapping)).unwrap();
+        assert_eq!(request.parameters.session.id.as_deref(), Some(mapping.secret.as_str()));
+        assert_eq!(request.parameters.metadata.as_ref().unwrap()[&mapping.secret], mapping.reference);
+        let tools = serde_json::to_value(&request.parameters.native_tools).unwrap();
+        assert_eq!(tools[0]["description"], mapping.reference);
+        assert_eq!(tools[0]["parameters"]["description"], mapping.reference);
+        assert_eq!(tools[1]["name"], mapping.secret);
+        assert_eq!(tools[1]["grammar"]["definition"], mapping.reference);
+        assert_eq!(tools[2]["name"], mapping.secret);
+        assert_eq!(tools[2]["tools"][0]["name"], mapping.secret);
+        assert_eq!(tools[2]["tools"][0]["parameters"]["description"], mapping.reference);
+        assert_eq!(tools[2]["tools"][1]["grammar"]["definition"], mapping.reference);
+        read_surface::request(&request, true, "request", &mut |text, _, _| {
+            assert!(!text.contains(&mapping.secret));
+            Ok(())
+        }).unwrap();
     }
 
     #[test]

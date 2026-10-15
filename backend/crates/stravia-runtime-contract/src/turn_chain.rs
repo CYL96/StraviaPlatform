@@ -342,7 +342,7 @@ pub struct TurnCommit {
 }
 /// Version of the optional controls/client-context exclusion proof. Unknown
 /// versions must remain eligible for the authoritative history matcher.
-pub const REUSABLE_PREFIX_PROJECTION_VERSION: u32 = 1;
+pub const REUSABLE_PREFIX_PROJECTION_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReusablePrefixProjection {

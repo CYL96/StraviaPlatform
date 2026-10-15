@@ -65,9 +65,7 @@ async fn delivered_hidden_round_continuation_prefers_the_final_model_legs_target
         .await
         .expect("Principal");
     let mut request = AiRequest::new("changing-target-route", Vec::new());
-    request.ext = Some(
-        stravia_runtime_contract::protocol::ir::ProtocolExt::OpenResponses(Default::default()),
-    );
+    request.meta.source_protocol = Some(OPEN_RESPONSES_2026_04_24);
     let response = execute(RunInput {
         gateway: gateway.clone(),
         executor: Arc::new(ChangingTargetExecutor(AtomicUsize::new(0))),
@@ -93,14 +91,10 @@ async fn delivered_hidden_round_continuation_prefers_the_final_model_legs_target
     let response: serde_json::Value = serde_json::from_slice(&body).expect("response");
     assert!(String::from_utf8_lossy(&body).contains("final Target answer"));
     let mut continuation = AiRequest::new("changing-target-route", Vec::new());
-    continuation.ext = Some(
-        stravia_runtime_contract::protocol::ir::ProtocolExt::OpenResponses(
-            stravia_runtime_contract::protocol::ir::OpenResponsesExt {
-                previous_response_id: Some(
-                    response["id"].as_str().expect("response identity").into(),
-                ),
-                ..Default::default()
-            },
+    continuation.meta.source_protocol = Some(OPEN_RESPONSES_2026_04_24);
+    continuation.parameters.continuation = Some(
+        stravia_runtime_contract::protocol::ir::Continuation::PreviousResponse(
+            response["id"].as_str().expect("response identity").into(),
         ),
     );
     assert_eq!(
@@ -909,11 +903,7 @@ async fn chat_full_history_uses_upstream_websocket_and_longest_reusable_prefix()
             third_user,
         ],
     );
-    third_request.ext = Some(
-        stravia_runtime_contract::protocol::ir::ProtocolExt::Anthropic(
-            stravia_runtime_contract::protocol::ir::AnthropicExt::default(),
-        ),
-    );
+    third_request.meta.source_protocol = Some(ANTHROPIC_MESSAGES_2023_06_01);
     let third_response = execute_request_with_headers(
         gateway,
         headers,
@@ -1065,14 +1055,8 @@ async fn store_false_chat_chain_generates_a_stable_prompt_cache_key() {
     let mut first_user = stravia_runtime_contract::protocol::ir::AiItem::output_text("first");
     first_user.role = stravia_runtime_contract::protocol::ir::Role::User;
     let mut first_request = AiRequest::new("store-false-cache-key", vec![first_user.clone()]);
-    first_request.ext = Some(
-        stravia_runtime_contract::protocol::ir::ProtocolExt::OpenResponses(
-            stravia_runtime_contract::protocol::ir::OpenResponsesExt {
-                store: Some(false),
-                ..Default::default()
-            },
-        ),
-    );
+    first_request.meta.source_protocol = Some(OPEN_RESPONSES_2026_04_24);
+    first_request.parameters.store = Some(false);
     let first_response =
         execute_non_stream_request_with_headers(gateway.clone(), headers.clone(), first_request)
             .await;
@@ -1091,14 +1075,8 @@ async fn store_false_chat_chain_generates_a_stable_prompt_cache_key() {
             second_user,
         ],
     );
-    second_request.ext = Some(
-        stravia_runtime_contract::protocol::ir::ProtocolExt::OpenResponses(
-            stravia_runtime_contract::protocol::ir::OpenResponsesExt {
-                store: Some(false),
-                ..Default::default()
-            },
-        ),
-    );
+    second_request.meta.source_protocol = Some(OPEN_RESPONSES_2026_04_24);
+    second_request.parameters.store = Some(false);
     let second_response =
         execute_non_stream_request_with_headers(gateway, headers, second_request).await;
     assert_eq!(second_response.status(), StatusCode::OK);
@@ -1119,7 +1097,7 @@ async fn store_false_chat_chain_generates_a_stable_prompt_cache_key() {
 }
 
 #[tokio::test]
-async fn upstream_session_id_follows_the_local_generation_chain() {
+async fn openrouter_session_id_follows_the_local_generation_chain() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind provider");
@@ -1145,7 +1123,7 @@ async fn upstream_session_id_follows_the_local_generation_chain() {
         &gateway,
         "session-affinity",
         &[format!("http://{address}/v1")],
-        "custom",
+        "openrouter",
         "openai-compatible",
     )
     .await;

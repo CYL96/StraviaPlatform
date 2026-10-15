@@ -430,18 +430,15 @@ async fn custom_compatible_connection_can_call_an_explicit_local_upstream_withou
     )
     .await?;
     install_distributed_vendor_plugin(&gateway, "openai-codex").await?;
-    let profiles = gateway.admin().list_vendor_metadata().await?;
-    let declared = &profiles
-        .iter()
-        .find(|profile| profile.provider_id == "openai-codex")
-        .expect("installed Codex profile")
-        .channels
-        .iter()
-        .find(|channel| channel.id == "codex")
-        .expect("Codex channel")
-        .client_header_names;
-    assert_eq!(declared.len(), 5);
-    let mut client_headers: Vec<_> = declared
+    let codex_headers = [
+        "x-codex-beta-features",
+        "x-codex-installation-id",
+        "x-codex-turn-metadata",
+        "x-codex-turn-state",
+        "x-codex-window-id",
+        "x-openai-subagent",
+    ];
+    let mut client_headers: Vec<_> = codex_headers
         .iter()
         .map(|name| (name.to_ascii_uppercase(), "other-channel-context".into()))
         .collect();
@@ -458,10 +455,10 @@ async fn custom_compatible_connection_can_call_an_explicit_local_upstream_withou
     let requests = server.await??;
     assert!(!requests[0].headers.contains_key("authorization"));
     assert!(!requests[0].headers.contains_key("cookie"));
-    for name in declared {
+    for name in codex_headers {
         assert!(
             !requests[0].headers.contains_key(name),
-            "undeclared target read {name}"
+            "custom target forwarded {name}"
         );
     }
     Ok(())
@@ -2721,7 +2718,9 @@ fn devin_chat_fixture() -> Vec<u8> {
 #[tokio::test]
 async fn manually_installed_devin_discovers_families_assigns_a_router_and_streams_real_protobuf()
 -> anyhow::Result<()> {
-    let (base_url, server) = local_upstream(5, |request| {
+    // These independent requests have no scoped transport affinity: each needs
+    // its own cascade-bound assignment, even when the user text is identical.
+    let (base_url, server) = local_upstream(7, |request| {
         if request.path.ends_with("/GetCliModelConfigs") {
             MockResponse::bytes("application/proto", devin_catalog_fixture())
         } else if request.path.ends_with("/AssignModel") {
@@ -2933,6 +2932,52 @@ async fn manually_installed_devin_discovers_families_assigns_a_router_and_stream
     assert_eq!(body["output"][0]["content"][0]["text"], "devin answer");
 
     let requests = server.await??;
+    assert_eq!(
+        requests
+            .iter()
+            .map(|request| request.path.rsplit('/').next().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "GetCliModelConfigs",
+            "AssignModel",
+            "GetChatMessage",
+            "AssignModel",
+            "GetChatMessage",
+            "AssignModel",
+            "GetChatMessage",
+        ]
+    );
+    let mut cascades = Vec::new();
+    let (pairs, rest) = requests[1..].as_chunks::<2>();
+    assert!(rest.is_empty(), "unpaired Devin request");
+    for [assignment, inference] in pairs {
+        // AssignModel ends with field #3 (a 36-byte cascade UUID); the same
+        // identity must be carried in GetChatMessage field #16.
+        assert!(assignment.body.len() >= 38, "missing AssignModel cascade");
+        let cascade = std::str::from_utf8(&assignment.body[assignment.body.len() - 36..])?;
+        assert!(assignment.body.ends_with(&proto_string(3, cascade)));
+        assert!(
+            !cascades.contains(&cascade),
+            "independent requests must not reuse a native cascade"
+        );
+        cascades.push(cascade);
+        let cascade_field = proto_string(16, cascade);
+        assert!(
+            inference
+                .body
+                .windows(cascade_field.len())
+                .any(|window| window == cascade_field),
+            "each inference must use its own AssignModel cascade"
+        );
+        let jwt_field = proto_string(26, "assignment-jwt");
+        assert!(
+            inference
+                .body
+                .windows(jwt_field.len())
+                .any(|window| window == jwt_field),
+            "each inference must carry the assignment JWT"
+        );
+    }
     for request in requests
         .iter()
         .filter(|request| request.path.ends_with("/GetChatMessage"))

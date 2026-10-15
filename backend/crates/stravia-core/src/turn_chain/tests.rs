@@ -1849,7 +1849,7 @@ async fn sqlite_0007_upgrade_and_generation_v3_rebuild_find_existing_history() {
     use crate::generation_chain::{GenerationChain, GenerationSource};
     use stravia_runtime_contract::protocol::ids::OPEN_RESPONSES_2026_04_24;
     use stravia_runtime_contract::protocol::ir::{
-        AiItem, AiRequest, AiResponse, MessageContent, OpenResponsesExt, ProtocolExt, Role,
+        AiItem, AiRequest, AiResponse, MessageContent, Role,
     };
 
     let owner = principal("upgraded-generation");
@@ -1862,7 +1862,7 @@ async fn sqlite_0007_upgrade_and_generation_v3_rebuild_find_existing_history() {
     };
     let request = |items| {
         let mut request = AiRequest::new("model", items);
-        request.ext = Some(ProtocolExt::OpenResponses(OpenResponsesExt::default()));
+        request.meta.source_protocol = Some(OPEN_RESPONSES_2026_04_24);
         request
     };
     // Obtain a real persisted generation payload through the write interface,
@@ -1886,30 +1886,32 @@ async fn sqlite_0007_upgrade_and_generation_v3_rebuild_find_existing_history() {
         actual_model: "model".into(),
         target_id: "provider:model".into(),
         authority: Some("provider:model".into()),
+        issued: Vec::new(),
     });
     assert!(write.stage(&mut response, &source, None));
     write.persist().await.unwrap();
     let id = TurnNodeId::new(write.id());
-    let nodes = seed_store
+    let mut nodes = seed_store
         .materialize(&owner, TurnNodeKind::Response, &id)
         .await
         .unwrap();
+    // 升级前的不可变节点没有控制摘要版本，重建不能把它追认为当前版本的证明。
+    nodes[0].payload["client_history"]
+        .as_object_mut()
+        .unwrap()
+        .remove("projection_version");
     let mut rebuild = crate::generation_chain::PrefixRebuild::default();
     let mut expected = None;
     for node in nodes.clone() {
         expected = rebuild.decode(node, Some(123)).unwrap();
     }
     let expected = expected.unwrap();
-    assert!(
-        expected
-            .namespace
-            .starts_with("stravia-generation-history-v3:")
-    );
 
     let data_dir = tempfile::tempdir().unwrap();
     let pool = crate::db::init_pool(data_dir.path()).await.unwrap();
     let migrator = sqlx::migrate!("./migrations/sqlite");
     migrator.run_to(7, &pool).await.unwrap();
+    assert!(expected.namespace.starts_with("stravia-generation-history-v5:"));
     let mut encoded = content::encode(nodes[0].payload.clone()).unwrap();
     let now = chrono::Utc::now().timestamp_millis();
     let mut transaction = pool.begin().await.unwrap();

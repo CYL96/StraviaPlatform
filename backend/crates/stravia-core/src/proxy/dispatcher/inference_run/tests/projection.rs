@@ -171,7 +171,7 @@ async fn custom_provider_can_require_reasoning_content_on_every_assistant_turn()
 }
 
 #[tokio::test]
-async fn custom_provider_round_trip_maps_the_selected_reasoning_field() {
+async fn custom_provider_round_trip_maps_the_supported_reasoning_field() {
     use axum::Json;
     use axum::response::IntoResponse;
     use axum::routing::post;
@@ -186,7 +186,7 @@ async fn custom_provider_round_trip_maps_the_selected_reasoning_field() {
                 let messages = body["messages"].as_array().unwrap();
                 let valid = messages.iter().all(|message| {
                     message["role"] != "assistant"
-                        || (message["analysis_text"].is_string()
+                        || (message["reasoning"].is_string()
                             && message.get("reasoning_content").is_none())
                 });
                 let final_turn = messages
@@ -198,15 +198,17 @@ async fn custom_provider_round_trip_maps_the_selected_reasoning_field() {
                         StatusCode::BAD_REQUEST,
                         Json(json!({"error": {
                             "type": "invalid_request_error",
-                            "message": "Assistant history requires analysis_text, not reasoning_content"
+                            "message": "Assistant history requires reasoning, not reasoning_content"
                         }})),
                     )
                         .into_response();
                 }
-                let mut response =
-                    openai_response(if final_turn { "finished" } else { "calling" });
-                response["choices"][0]["message"]["analysis_text"] =
-                    json!(if final_turn { "done thinking" } else { "  custom thought\n" });
+                let mut response = openai_response(if final_turn { "finished" } else { "calling" });
+                response["choices"][0]["message"]["reasoning"] = json!(if final_turn {
+                    "done thinking"
+                } else {
+                    "  mapped thought\n"
+                });
                 if !final_turn {
                     response["choices"][0]["message"]["tool_calls"] = json!([{
                         "id": "call_echo",
@@ -232,42 +234,13 @@ async fn custom_provider_round_trip_maps_the_selected_reasoning_field() {
     let model = "custom-reasoning-field";
     configure_route(&gateway, model, &[format!("http://{address}/v1")]).await;
     let provider = gateway.admin().list_providers().await.unwrap().remove(0);
-    let rejected = gateway
-        .admin()
-        .update_provider(
-            &provider.id,
-            crate::db::models::UpdateProvider {
-                vendor_options: Some(serde_json::Map::from_iter([
-                    ("reasoning_field".into(), json!("custom")),
-                    ("custom_reasoning_field".into(), json!("content")),
-                ])),
-                ..Default::default()
-            },
-        )
-        .await;
-    assert!(
-        rejected.is_err(),
-        "a reasoning field must not overwrite visible content"
-    );
-    assert_eq!(
-        gateway
-            .admin()
-            .list_providers()
-            .await
-            .unwrap()
-            .remove(0)
-            .vendor_options,
-        provider.vendor_options,
-        "rejected configuration must not change the saved provider"
-    );
     gateway
         .admin()
         .update_provider(
             &provider.id,
             crate::db::models::UpdateProvider {
                 vendor_options: Some(serde_json::Map::from_iter([
-                    ("reasoning_field".into(), json!("custom")),
-                    ("custom_reasoning_field".into(), json!("analysis_text")),
+                    ("reasoning_field".into(), json!("reasoning")),
                     ("ensure_reasoning_field".into(), json!(true)),
                 ])),
                 ..Default::default()
@@ -313,7 +286,7 @@ async fn custom_provider_round_trip_maps_the_selected_reasoning_field() {
     assert!(assistant["content"].as_str().unwrap().contains("calling"));
     assert_eq!(assistant["tool_calls"][0]["id"], "call_echo");
     let first = captured_rx.recv().await.unwrap();
-    assert_eq!(first["messages"][1]["analysis_text"], "");
+    assert_eq!(first["messages"][1]["reasoning"], "");
 
     let messages = history.as_array_mut().unwrap();
     messages.push(assistant);
@@ -338,13 +311,13 @@ async fn custom_provider_round_trip_maps_the_selected_reasoning_field() {
     let replayed = captured_rx.recv().await.unwrap();
     let messages = replayed["messages"].as_array().unwrap();
     assert!(messages.iter().any(|message| {
-        message["role"] == "assistant" && message["analysis_text"] == "  custom thought\n"
+        message["role"] == "assistant" && message["reasoning"] == "  mapped thought\n"
     }));
     assert!(
         messages
             .iter()
             .filter(|message| message["role"] == "assistant")
-            .all(|message| message["analysis_text"].is_string()
+            .all(|message| message["reasoning"].is_string()
                 && message.get("reasoning_content").is_none())
     );
     assert!(messages.iter().any(|message| {

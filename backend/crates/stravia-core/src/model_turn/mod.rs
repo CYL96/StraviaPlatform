@@ -133,10 +133,12 @@ pub struct TurnInput {
 
 impl TurnInput {
     pub fn new(principal: Principal, request: impl Into<Arc<AiRequest>>) -> Self {
+        let mut request = request.into();
+        Arc::make_mut(&mut request).normalize_parameters();
         Self {
             purpose: ModelTurnPurpose::Generation,
             principal,
-            request: request.into(),
+            request,
             authorization: ModelTurnAuthorization::RouteBinding,
             extra_headers: reqwest::header::HeaderMap::new(),
             cancellation: CancellationToken::new(),
@@ -157,7 +159,15 @@ impl TurnInput {
         self
     }
 
-    pub fn with_extra_headers(mut self, extra_headers: reqwest::header::HeaderMap) -> Self {
+    pub fn with_extra_headers(mut self, mut extra_headers: reqwest::header::HeaderMap) -> Self {
+        normalize_request_headers(Arc::make_mut(&mut self.request), |name| {
+            extra_headers
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+        });
+        for name in PARAMETER_HEADERS {
+            extra_headers.remove(*name);
+        }
         self.extra_headers = extra_headers;
         self
     }
@@ -172,6 +182,48 @@ impl TurnInput {
         self.observer = Some(observer);
         self
     }
+}
+
+pub(crate) const PARAMETER_HEADERS: &[&str] = &[
+    "x-session-id",
+    "session-id",
+    "session_id",
+    "conversation_id",
+    "x-session-affinity",
+    "x-opencode-session",
+    "x-conversation-id",
+    "x-claude-code-session-id",
+    "x-client-request-id",
+    "x-request-id",
+    "thread-id",
+    "parent-thread-id",
+    "x-codex-thread-id",
+    "x-codex-parent-thread-id",
+    "x-parent-session-id",
+    "forked-from-thread-id",
+    "x-codex-forked-from-thread-id",
+    "x-context-window-id",
+    "x-codex-context-window-id",
+    "x-turn-id",
+    "x-codex-turn-id",
+    "x-parent-turn-id",
+    "x-codex-parent-turn-id",
+    "x-root-turn-id",
+    "x-codex-root-turn-id",
+    "x-codex-installation-id",
+    "x-codex-window-id",
+    "x-codex-turn-state",
+    "x-codex-turn-metadata",
+    "x-codex-routing-hint",
+    "x-codex-beta-features",
+    "x-openai-subagent",
+];
+
+pub(crate) fn normalize_request_headers<'a>(
+    request: &mut AiRequest,
+    get: impl Fn(&str) -> Option<&'a str>,
+) {
+    request.parameters.normalize_headers(&get);
 }
 
 use stravia_runtime_contract::model_turn::{CanonicalEvent, CanonicalEventStream, ModelTurnError};
@@ -272,6 +324,7 @@ impl TargetIdentity {
             actual_model: self.actual_model.clone(),
             target_id: self.target_id.clone(),
             authority: Some(self.thinking_authority.clone()),
+            issued: Vec::new(),
         }
     }
 }

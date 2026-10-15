@@ -19,13 +19,8 @@ pub struct ResponsesEncoder;
 // Open Responses fields are emitted only from the canonical IR and dated extension.
 impl ResponsesEncoder {
     pub fn encode_request(&self, mut req: AiRequest) -> Result<(Value, HeaderMap)> {
+        req.normalize_parameters();
         validate_target_thinking_control(&req)?;
-        let extension = match req.ext.as_ref() {
-            Some(stravia_runtime_contract::protocol::ir::ProtocolExt::OpenResponses(extension)) => {
-                Some(extension)
-            }
-            _ => None,
-        };
         let mut input: Vec<Value> = Vec::new();
 
         for mut item in std::mem::take(&mut req.items) {
@@ -165,7 +160,7 @@ impl ResponsesEncoder {
         }
 
         if input.is_empty()
-            && !extension.is_some_and(|extension| extension.previous_response_id.is_some())
+            && req.parameters.continuation.is_none()
         {
             anyhow::bail!("responses request requires input or previous_response_id");
         }
@@ -184,6 +179,10 @@ impl ResponsesEncoder {
             req,
         );
 
+        crate::codec::control_projection::project_request(
+            &mut body,
+            crate::codec::control_projection::Family::Responses,
+        );
         Ok((body, HeaderMap::new()))
     }
 
@@ -193,34 +192,19 @@ impl ResponsesEncoder {
 }
 
 pub fn response_profile_from_request(req: &AiRequest) -> Value {
-    let extension = match req.ext.as_ref() {
-        Some(stravia_runtime_contract::protocol::ir::ProtocolExt::OpenResponses(extension)) => {
-            Some(extension)
-        }
-        _ => None,
-    };
     let mut profile = serde_json::Map::new();
-    insert_request_control_fields(&mut profile, req, extension);
+    insert_request_control_fields(&mut profile, req);
     profile.remove("include");
     profile.remove("stream_options");
-    if let Some(extension) = extension {
-        profile.insert(
-            "metadata".into(),
-            extension
-                .metadata
-                .clone()
-                .unwrap_or_else(|| serde_json::json!({})),
-        );
-        profile.insert(
-            "safety_identifier".into(),
-            extension
-                .safety_identifier
-                .clone()
-                .map(Value::String)
-                .unwrap_or(Value::Null),
-        );
-    }
-    Value::Object(profile)
+    profile
+        .entry("metadata")
+        .or_insert_with(|| serde_json::json!({}));
+    let mut profile = Value::Object(profile);
+    crate::codec::control_projection::project_request(
+        &mut profile,
+        crate::codec::control_projection::Family::Responses,
+    );
+    profile
 }
 pub fn effective_response_profile_from_request(req: &AiRequest) -> Value {
     let Value::Object(mut profile) = response_profile_from_request(req) else {
@@ -257,52 +241,33 @@ fn insert_owned_request_control_fields(
     let tools = req.tools.take();
     let format = req.response_format.take();
     let tool_choice = req.tool_choice.take();
-    let mut extension = match req.ext.take() {
-        Some(stravia_runtime_contract::protocol::ir::ProtocolExt::OpenResponses(extension)) => {
-            Some(extension)
-        }
-        _ => None,
-    };
-    let (stream_options, text, passthrough_tools, passthrough_body) =
-        if let Some(extension) = extension.as_mut() {
-            (
-                extension.stream_options.take(),
-                extension.text.take(),
-                std::mem::take(&mut extension.passthrough_tools),
-                std::mem::take(&mut extension.passthrough_body),
-            )
-        } else {
-            (None, None, Vec::new(), Default::default())
-        };
-    insert_request_control_fields(obj, &req, extension.as_ref());
+    let native_tools = std::mem::take(&mut req.parameters.native_tools);
+    insert_request_control_fields(obj, &req);
     if let Some(tools) = tools {
         let encoded = tools
             .into_iter()
             .map(|tool| {
-                if tool.name.starts_with("__builtin__") {
-                    tool.parameters
-                } else {
                     let mut encoded = serde_json::json!({"type": "function"});
                     encoded["name"] = Value::String(tool.name);
-                    encoded["description"] =
-                        tool.description.map(Value::String).unwrap_or(Value::Null);
+                    if let Some(description) = tool.description {
+                        encoded["description"] = Value::String(description);
+                    }
                     encoded["parameters"] = tool.parameters;
                     // Preserve foreign ingress's non-strict default: Responses
                     // otherwise makes an omitted strict flag strict-by-default.
                     if let Some(strict) = tool.strict.or(foreign_ingress.then_some(false)) {
                         encoded["strict"] = Value::Bool(strict);
                     }
+                    if let Some(defer_loading) = tool.defer_loading {
+                        encoded["defer_loading"] = Value::Bool(defer_loading);
+                    }
                     encoded
-                }
             })
             .collect();
         obj.insert("tools".into(), Value::Array(encoded));
     }
     if let Some(choice) = tool_choice {
-        let encoded = match choice {
-            ToolChoice::Raw(value) => value,
-            other => tool_choice_to_value(&other),
-        };
+        let encoded = tool_choice_to_value(&choice, &native_tools);
         obj.insert("tool_choice".into(), encoded);
     }
     if let Some(format) = format {
@@ -310,12 +275,16 @@ fn insert_owned_request_control_fields(
             ResponseFormat::Text => serde_json::json!({"type": "text"}),
             ResponseFormat::JsonSchema {
                 name,
+                description,
                 schema,
                 strict,
             } => {
                 let mut format = serde_json::json!({"type": "json_schema"});
                 format["name"] = Value::String(name);
                 format["schema"] = schema;
+                if let Some(description) = description {
+                    format["description"] = Value::String(description);
+                }
                 if let Some(strict) = strict {
                     format["strict"] = Value::Bool(strict);
                 }
@@ -324,45 +293,25 @@ fn insert_owned_request_control_fields(
             ResponseFormat::JsonObject => Value::Null,
         };
         if !format.is_null() {
-            let mut text = serde_json::Map::new();
-            text.insert("format".into(), format);
-            obj.insert("text".into(), Value::Object(text));
+            if obj.get("text").is_some_and(Value::is_null) {
+                obj.remove("text");
+            }
+            obj.entry("text").or_insert_with(|| serde_json::json!({}))["format"] = format;
         }
     }
-    if let Some(value) = stream_options {
-        obj.insert("stream_options".into(), value);
-    }
-    if let Some(value) = text {
-        obj.insert("text".into(), value);
-    }
-    if !passthrough_tools.is_empty() {
+    for tool in native_tools.iter().filter_map(stravia_runtime_contract::protocol::ir::native_tool_to_responses) {
         obj.entry("tools")
             .or_insert_with(|| Value::Array(Vec::new()))
             .as_array_mut()
             .expect("encoded tools are an array")
-            .extend(passthrough_tools);
-    }
-    for (key, value) in passthrough_body {
-        obj.entry(key).or_insert(value);
+            .push(tool);
     }
 }
 
-fn insert_request_control_fields(
-    obj: &mut serde_json::Map<String, Value>,
-    req: &AiRequest,
-    extension: Option<&stravia_runtime_contract::protocol::ir::OpenResponsesExt>,
-) {
-    obj.insert(
-        "store".into(),
-        extension
-            .and_then(|extension| extension.store)
-            .unwrap_or(true)
-            .into(),
-    );
+fn insert_request_control_fields(obj: &mut serde_json::Map<String, Value>, req: &AiRequest) {
+    obj.insert("store".into(), req.parameters.store.unwrap_or(true).into());
     if let Some(instructions) = &req.instructions {
         obj.insert("instructions".into(), Value::String(instructions.clone()));
-    } else if extension.is_some_and(|extension| extension.instructions_present) {
-        obj.insert("instructions".into(), Value::Null);
     }
     if let Some(value) = req.generation.temperature {
         obj.insert("temperature".into(), value.into());
@@ -394,24 +343,34 @@ fn insert_request_control_fields(
         if !effort.is_empty() {
             reasoning.insert("effort".into(), Value::String(effort.into()));
         }
+    } else if let Some(level) = req.reasoning.level {
+        reasoning.insert(
+            "effort".into(),
+            Value::String(
+                if level == stravia_runtime_contract::thinking::ThinkingLevel::Off {
+                    "none"
+                } else {
+                    level.as_str()
+                }
+                .into(),
+            ),
+        );
+    } else if req.reasoning.mode.as_deref() == Some("disabled") {
+        reasoning.insert("effort".into(), Value::String("none".into()));
     }
-    let summary = match req.reasoning.display.as_deref() {
-        Some("omitted" | "none" | "disabled" | "hidden") => None,
-        Some("summarized") => Some("auto"),
-        Some(value) => Some(value),
-        None if req.reasoning.level
-            == Some(stravia_runtime_contract::thinking::ThinkingLevel::Off)
-            || matches!(
-                req.reasoning.target_control,
-                Some(stravia_runtime_contract::thinking::TargetThinkingControl::Disabled)
-            ) =>
-        {
-            None
-        }
-        None => Some("auto"),
+    use stravia_runtime_contract::protocol::ir::ReasoningSummary;
+    let summary = match req.reasoning.summary.as_ref() {
+        Some(ReasoningSummary::None) => None,
+        Some(summary) => Some(summary),
+        None if req.reasoning.mode.as_deref() == Some("disabled")
+            || req.reasoning.level == Some(stravia_runtime_contract::thinking::ThinkingLevel::Off)
+            || matches!(req.reasoning.target_control, Some(stravia_runtime_contract::thinking::TargetThinkingControl::Disabled))
+            || req.parameters.resets(stravia_runtime_contract::protocol::ir::ParameterReset::Reasoning)
+            || req.parameters.resets(stravia_runtime_contract::protocol::ir::ParameterReset::ReasoningSummary) => None,
+        None => Some(&ReasoningSummary::Auto),
     };
     if let Some(summary) = summary {
-        reasoning.insert("summary".into(), Value::String(summary.into()));
+        reasoning.insert("summary".into(), serde_json::to_value(summary).expect("summary serializes"));
     }
     if !reasoning.is_empty() {
         obj.insert("reasoning".into(), Value::Object(reasoning));
@@ -423,34 +382,36 @@ fn insert_request_control_fields(
         let tools = tools
             .iter()
             .map(|tool| {
-                if tool.name.starts_with("__builtin__") {
-                    tool.parameters.clone()
-                } else {
                     let mut encoded = serde_json::json!({
                         "type": "function",
                         "name": tool.name,
-                        "description": tool.description,
                         "parameters": tool.parameters,
                     });
+                    if let Some(description) = &tool.description {
+                        encoded["description"] = Value::String(description.clone());
+                    }
                     // Chat、Anthropic 等协议省略 `strict` 即非严格；Responses 省略时上游会自动
                     // 严格化并把可选参数改成必填，所以非 Responses 入口必须显式写出 false。
                     if let Some(strict) = tool.strict.or(foreign_ingress.then_some(false)) {
                         encoded["strict"] = Value::Bool(strict);
                     }
+                    if let Some(defer_loading) = tool.defer_loading {
+                        encoded["defer_loading"] = Value::Bool(defer_loading);
+                    }
                     encoded
-                }
             })
             .collect();
         obj.insert("tools".into(), Value::Array(tools));
     }
     if let Some(tool_choice) = &req.tool_choice {
-        obj.insert("tool_choice".into(), tool_choice_to_value(tool_choice));
+        obj.insert("tool_choice".into(), tool_choice_to_value(tool_choice, &req.parameters.native_tools));
     }
     if let Some(format) = req.response_format.as_ref() {
         let format = match format {
             ResponseFormat::Text => serde_json::json!({"type": "text"}),
             ResponseFormat::JsonSchema {
                 name,
+                description,
                 schema,
                 strict,
             } => {
@@ -459,6 +420,9 @@ fn insert_request_control_fields(
                     "name": name,
                     "schema": schema,
                 });
+                if let Some(description) = description {
+                    format["description"] = Value::String(description.clone());
+                }
                 if let Some(strict) = strict {
                     format["strict"] = Value::Bool(*strict);
                 }
@@ -470,52 +434,87 @@ fn insert_request_control_fields(
             obj.insert("text".into(), serde_json::json!({"format": format}));
         }
     }
-    let Some(extension) = extension else {
-        return;
-    };
-    if let Some(value) = extension.background {
+    let parameters = &req.parameters;
+    if let Some(value) = parameters.generate {
+        obj.insert("generate".into(), value.into());
+    }
+    if let Some(value) = parameters.background {
         obj.insert("background".into(), value.into());
     }
-    if let Some(value) = &extension.previous_response_id {
-        obj.insert("previous_response_id".into(), Value::String(value.clone()));
+    if let Some(continuation) = &parameters.continuation {
+        use stravia_runtime_contract::protocol::ir::Continuation;
+        let (key, id) = match continuation {
+            Continuation::PreviousResponse(id) => ("previous_response_id", id),
+            Continuation::Conversation(id) => ("conversation", id),
+        };
+        obj.insert(key.into(), Value::String(id.clone()));
     }
-    if let Some(value) = &extension.include {
-        obj.insert(
-            "include".into(),
-            Value::Array(value.iter().cloned().map(Value::String).collect()),
-        );
+    let reasoning_enabled = req.reasoning.mode.as_deref() != Some("disabled")
+        && req.reasoning.level != Some(stravia_runtime_contract::thinking::ThinkingLevel::Off)
+        && !matches!(req.reasoning.target_control, Some(stravia_runtime_contract::thinking::TargetThinkingControl::Disabled))
+        && (req.reasoning.mode.as_deref().is_some_and(|mode| matches!(mode, "enabled" | "auto"))
+            || req.reasoning.level.is_some() || req.reasoning.target_control.is_some()
+            || req.reasoning.budget_tokens.is_some());
+    let mut include = Vec::new();
+    if parameters.store == Some(false) && reasoning_enabled {
+        include.push(Value::String("reasoning.encrypted_content".into()));
     }
-    if let Some(value) = &extension.stream_options {
-        obj.insert("stream_options".into(), value.clone());
+    if parameters.logprobs.is_some() {
+        include.push(Value::String("message.output_text.logprobs".into()));
     }
-    if let Some(value) = extension.max_tool_calls {
+    if !include.is_empty() {
+        obj.insert("include".into(), Value::Array(include));
+    }
+    if let Some(value) = parameters.max_tool_calls {
         obj.insert("max_tool_calls".into(), value.into());
     }
-    if let Some(value) = &extension.prompt_cache_key {
+    if let Some(value) = &parameters.cache.key {
         obj.insert("prompt_cache_key".into(), Value::String(value.clone()));
     }
-    if let Some(value) = extension.top_logprobs {
+    if let Some(value) = &parameters.cache.retention {
+        use stravia_runtime_contract::protocol::ir::CacheRetention;
+        obj.insert(
+            "prompt_cache_retention".into(),
+            Value::String(match value {
+                CacheRetention::Default => "in_memory",
+                CacheRetention::Extended => "24h",
+            }.into()),
+        );
+    }
+    if let Some(value) = parameters.logprobs {
         obj.insert("top_logprobs".into(), value.into());
     }
-    if let Some(value) = &extension.truncation {
-        obj.insert("truncation".into(), Value::String(value.clone()));
+    if let Some(value) = &parameters.truncation {
+        obj.insert("truncation".into(), serde_json::to_value(value).expect("truncation serializes"));
     }
-    if let Some(value) = &extension.text {
-        obj.insert("text".into(), value.clone());
+    if let Some(value) = &parameters.verbosity {
+        obj.entry("text").or_insert_with(|| serde_json::json!({}))["verbosity"] =
+            serde_json::to_value(value).expect("verbosity serializes");
     }
-    if let Some(value) = &extension.service_tier {
-        obj.insert("service_tier".into(), Value::String(value.clone()));
+    if let Some(value) = &parameters.service_tier {
+        obj.insert("service_tier".into(), serde_json::to_value(value).expect("service tier serializes"));
     }
-    if !extension.passthrough_tools.is_empty() {
+    if let Some(value) = &parameters.metadata {
+        obj.insert("metadata".into(), serde_json::to_value(value).expect("string metadata serializes"));
+    }
+    if let Some(value) = &parameters.end_user_id {
+        obj.insert("safety_identifier".into(), Value::String(value.clone()));
+    }
+    for tool in parameters.native_tools.iter()
+        .filter_map(stravia_runtime_contract::protocol::ir::native_tool_to_responses) {
         let tools = obj
             .entry("tools")
             .or_insert_with(|| Value::Array(Vec::new()))
             .as_array_mut()
             .expect("encoded tools are an array");
-        tools.extend(extension.passthrough_tools.iter().cloned());
+        tools.push(tool);
     }
-    for (key, value) in &extension.passthrough_body {
-        obj.entry(key.clone()).or_insert_with(|| value.clone());
+    if let Some(value) = &parameters.compaction {
+        let mut control = serde_json::json!({"type": "compaction"});
+        if let Some(threshold) = value.threshold_tokens {
+            control["compact_threshold"] = threshold.into();
+        }
+        obj.insert("context_management".into(), Value::Array(vec![control]));
     }
 }
 
@@ -1244,16 +1243,33 @@ fn encode_responses_content_block(block: ContentBlock, text_type: &str) -> Optio
     }
 }
 
-fn tool_choice_to_value(tc: &ToolChoice) -> Value {
+fn tool_choice_to_value(
+    tc: &ToolChoice,
+    native_tools: &[stravia_runtime_contract::protocol::ir::NativeTool],
+) -> Value {
+    use stravia_runtime_contract::protocol::ir::{NativeTool, NativeToolKind};
+    let named = |name: &str| {
+        let custom = native_tools.iter().any(|tool| matches!(tool, NativeTool::Custom(tool) if tool.name == name));
+        serde_json::json!({"type": if custom { "custom" } else { "function" }, "name": name})
+    };
     match tc {
         ToolChoice::Auto => Value::String("auto".into()),
         ToolChoice::None => Value::String("none".into()),
         ToolChoice::Required => Value::String("required".into()),
-        ToolChoice::Named { name } => serde_json::json!({
-            "type": "function",
-            "name": name
+        ToolChoice::Named { name } => named(name),
+        ToolChoice::Allowed { names, required } => serde_json::json!({
+            "type": "allowed_tools",
+            "mode": if *required { "required" } else { "auto" },
+            "tools": names.iter().map(|name| named(name)).collect::<Vec<_>>(),
         }),
-        ToolChoice::Raw(v) => v.clone(),
+        ToolChoice::Native(kind) => serde_json::json!({
+            "type": match kind {
+                NativeToolKind::WebSearch => "web_search",
+                NativeToolKind::CodeExecution => "code_interpreter",
+                NativeToolKind::ImageGeneration => "image_generation",
+                NativeToolKind::ToolSearch => "tool_search",
+            }
+        }),
     }
 }
 

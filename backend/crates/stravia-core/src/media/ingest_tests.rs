@@ -177,7 +177,7 @@ async fn opaque_media_uses_inline_bytes_and_standard_media_keeps_signed_download
 }
 
 #[tokio::test]
-async fn shared_text_normalization_scrubs_extension_keys_and_keeps_sql_errors() {
+async fn shared_text_normalization_scrubs_parameter_keys_and_keeps_sql_errors() {
     use stravia_runtime_contract::protocol::ir::{AiItem, AiRequest};
     let directory = tempfile::tempdir().unwrap();
     let gateway = crate::Gateway::new(crate::config::GatewayConfig {
@@ -193,19 +193,21 @@ async fn shared_text_normalization_scrubs_extension_keys_and_keeps_sql_errors() 
     item.role = stravia_runtime_contract::protocol::ir::Role::User;
     let mut input = AiRequest::new("model", vec![item]);
     input.instructions = Some("existing instructions".into());
-    input.ext = Some(
-        serde_json::from_value(serde_json::json!({
-            "OpenAiChat": {"prediction": {"unknown": {(grant): grant}}}
-        }))
-        .unwrap(),
-    );
+    input.parameters.session.id = Some(grant.into());
+    input.parameters.metadata = Some(std::collections::BTreeMap::from([
+        (grant.to_owned(), grant.to_owned()),
+    ]));
     let mut input = Arc::new(input);
     ingest::normalize_shared_request(&gateway, &owner, &mut input, &cancellation)
         .await
         .unwrap();
-    let extension = serde_json::to_value(&input.ext).unwrap();
+    let parameters = serde_json::to_value(&input.parameters).unwrap();
     assert_eq!(
-        extension["OpenAiChat"]["prediction"]["unknown"]["<stravia-upload-key>"],
+        parameters["session"]["id"],
+        "<stravia-upload-key>"
+    );
+    assert_eq!(
+        parameters["metadata"]["<stravia-upload-key>"],
         "<stravia-upload-key>"
     );
     assert_eq!(input.instructions.as_deref(), Some("existing instructions"));
@@ -394,7 +396,7 @@ async fn public_model_input_snapshots_media_without_scanning_text() {
         .upload_grants
         .issue(&Principal::new(key.id.clone()))
         .unwrap();
-    let body = serde_json::json!({"model":"vision","prediction":{"type":"content","content":upload_grant.key},"tools":[{"type":"function","function":{"name":"client_action","description":"ordinary description","parameters":{"type":"object","properties":{(upload_grant.key.clone()):{"type":"string","description":"ordinary-value"}}}}}],"messages":[{"role":"user","content":[{"type":"text","text":ordinary},{"type":"image_url","image_url":{"url":format!("data:image/png;base64,{encoded}")}}]}]});
+    let body = serde_json::json!({"model":"vision","safety_identifier":upload_grant.key,"tools":[{"type":"function","function":{"name":"client_action","description":"ordinary description","parameters":{"type":"object","properties":{(upload_grant.key.clone()):{"type":"string","description":"ordinary-value"}}}}}],"messages":[{"role":"user","content":[{"type":"text","text":ordinary},{"type":"image_url","image_url":{"url":format!("data:image/png;base64,{encoded}")}}]}]});
     let response = router
         .clone()
         .oneshot(
@@ -415,7 +417,7 @@ async fn public_model_input_snapshots_media_without_scanning_text() {
         String::from_utf8_lossy(&response_body)
     );
     let wire = received.lock().await;
-    assert_eq!(wire[0]["prediction"]["content"], "<stravia-upload-key>");
+    assert_eq!(wire[0]["safety_identifier"], "<stravia-upload-key>");
     assert_eq!(
         wire[0]["tools"][0]["function"]["parameters"]["properties"]["<stravia-upload-key>"]["description"],
         "ordinary-value"

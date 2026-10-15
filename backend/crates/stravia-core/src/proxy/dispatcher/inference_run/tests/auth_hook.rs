@@ -314,14 +314,8 @@ async fn automatic_parent_materializes_rewritten_history_before_the_current_hook
     let mut first_user = stravia_runtime_contract::protocol::ir::AiItem::output_text("first");
     first_user.role = stravia_runtime_contract::protocol::ir::Role::User;
     let mut first_request = AiRequest::new(model, vec![first_user.clone()]);
-    first_request.ext = Some(
-        stravia_runtime_contract::protocol::ir::ProtocolExt::OpenResponses(
-            stravia_runtime_contract::protocol::ir::OpenResponsesExt {
-                store: Some(true),
-                ..Default::default()
-            },
-        ),
-    );
+    first_request.meta.source_protocol = Some(OPEN_RESPONSES_2026_04_24);
+    first_request.parameters.store = Some(true);
     let first_response = execute_request_with_headers(
         gateway.clone(),
         headers.clone(),
@@ -345,14 +339,8 @@ async fn automatic_parent_materializes_rewritten_history_before_the_current_hook
             second_user,
         ],
     );
-    second_request.ext = Some(
-        stravia_runtime_contract::protocol::ir::ProtocolExt::OpenResponses(
-            stravia_runtime_contract::protocol::ir::OpenResponsesExt {
-                store: Some(true),
-                ..Default::default()
-            },
-        ),
-    );
+    second_request.meta.source_protocol = Some(OPEN_RESPONSES_2026_04_24);
+    second_request.parameters.store = Some(true);
     let second_response = execute_request_with_headers(
         gateway.clone(),
         headers.clone(),
@@ -375,15 +363,11 @@ async fn automatic_parent_materializes_rewritten_history_before_the_current_hook
     let mut third_user = stravia_runtime_contract::protocol::ir::AiItem::output_text("third");
     third_user.role = stravia_runtime_contract::protocol::ir::Role::User;
     let mut third_request = AiRequest::new(model, vec![third_user]);
-    third_request.ext = Some(
-        stravia_runtime_contract::protocol::ir::ProtocolExt::OpenResponses(
-            stravia_runtime_contract::protocol::ir::OpenResponsesExt {
-                previous_response_id: Some(second_response_id),
-                store: Some(true),
-                ..Default::default()
-            },
-        ),
+    third_request.meta.source_protocol = Some(OPEN_RESPONSES_2026_04_24);
+    third_request.parameters.continuation = Some(
+        stravia_runtime_contract::protocol::ir::Continuation::PreviousResponse(second_response_id),
     );
+    third_request.parameters.store = Some(true);
     let third_response = execute_request_with_headers(
         gateway.clone(),
         headers,

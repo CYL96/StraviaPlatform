@@ -8146,6 +8146,25 @@ dependencies = [
  "stravia-vendor-sdk",
  "url",
  "urlencoding",
+ "uuid",
+]
+
+[[package]]
+name = "stravia-vendor-kilo"
+version = "0.4.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "parking_lot",
+ "semver",
+ "serde",
+ "serde_json",
+ "stravia-protocol-codec",
+ "stravia-runtime-contract",
+ "stravia-vendor-common",
+ "stravia-vendor-runtime",
+ "stravia-vendor-sdk",
+ "tokio",
 ]
 
 [[package]]
@@ -8169,10 +8188,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "stravia-vendor-muse-code"
+version = "0.4.0"
+dependencies = [
+ "async-trait",
+ "parking_lot",
+ "semver",
+ "serde",
+ "serde_json",
+ "stravia-protocol-codec",
+ "stravia-runtime-contract",
+ "stravia-vendor-common",
+ "stravia-vendor-runtime",
+ "stravia-vendor-sdk",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "stravia-vendor-opencode-free"
 version = "0.4.0"
 dependencies = [
  "async-trait",
+ "jsonschema",
  "parking_lot",
  "reqwest",
  "semver",

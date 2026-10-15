@@ -85,34 +85,6 @@ pub(super) fn attachment_ingest_error_response(
     )
 }
 
-pub(super) fn parameter_error_response(
-    status: StatusCode,
-    code: &str,
-    param: &str,
-    message: &str,
-) -> Response {
-    let mut response = (
-        status,
-        axum::Json(serde_json::json!({
-            "error": {
-                "type": "invalid_request",
-                "code": code,
-                "param": param,
-                "message": message,
-            }
-        })),
-    )
-        .into_response();
-    response
-        .extensions_mut()
-        .insert(crate::interaction_observation::FailureDiagnostic::platform(
-            code,
-            message,
-            status.as_u16(),
-        ));
-    response
-}
-
 pub(super) fn inference_access_error_response(error: GatewayError) -> Response {
     match error {
         GatewayError::Unauthorized {

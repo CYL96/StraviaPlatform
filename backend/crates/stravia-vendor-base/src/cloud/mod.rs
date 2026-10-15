@@ -138,7 +138,7 @@ fn infer_azure(
         ));
     }
     let protocol = protocol.to_string();
-    let encoded = crate::encode_inference_request(&protocol, request)?;
+    let encoded = crate::parameters::encode(provider, &protocol, request)?;
     let endpoint = common::endpoint_url(&provider.base_url, &encoded.path)?;
     let mut url = Url::parse(&endpoint)
         .map_err(|_| common::plugin_error(ErrorKind::Invalid, "Azure base URL is invalid"))?;
@@ -146,7 +146,6 @@ fn infer_azure(
     url.query_pairs_mut().append_pair("api-version", &version);
     let api_key = required_string(provider, "apiKey", "Azure API key is required")?;
     let mut headers = common::header_pairs(&encoded.headers)?;
-    crate::apply_session_affinity(provider, &mut headers);
     set_header(&mut headers, "api-key", api_key);
     send_inference(
         host,
@@ -164,11 +163,10 @@ fn infer_bedrock(
     mut request: stravia_runtime_contract::protocol::ir::AiRequest,
 ) -> Result<OperationOutput, PluginError> {
     apply_snapshot_model(provider, &mut request)?;
-    let encoded = crate::encode_inference_request("bedrock-converse", request)?;
+    let encoded = crate::parameters::encode(provider, "bedrock-converse", request)?;
     let url = common::endpoint_url(&provider.base_url, &encoded.path)?;
     let body = json_body(encoded.body)?;
     let mut headers = common::header_pairs(&encoded.headers)?;
-    crate::apply_session_affinity(provider, &mut headers);
     set_header(&mut headers, "content-type", "application/json");
     if let Some(api_key) = string_value(provider, "apiKey") {
         set_header(&mut headers, "authorization", format!("Bearer {api_key}"));
@@ -190,7 +188,7 @@ fn infer_vertex(
     } else {
         "openai-chat-completions"
     };
-    let encoded = crate::encode_inference_request(protocol, request)?;
+    let encoded = crate::parameters::encode(provider, protocol, request)?;
     let base = vertex_base_url(provider)?;
     let url = if channel == "native" {
         vertex_google_url(&base, &encoded.path)
@@ -199,7 +197,6 @@ fn infer_vertex(
     };
     let token = vertex_access_token(host, provider)?;
     let mut headers = common::header_pairs(&encoded.headers)?;
-    crate::apply_session_affinity(provider, &mut headers);
     set_header(&mut headers, "authorization", format!("Bearer {token}"));
     send_inference(
         host,
@@ -218,7 +215,7 @@ fn infer_vertex_anthropic(
 ) -> Result<OperationOutput, PluginError> {
     apply_snapshot_model(provider, &mut request)?;
     let stream = request.stream.enabled;
-    let encoded = crate::encode_inference_request("anthropic-messages", request)?;
+    let encoded = crate::parameters::encode(provider, "anthropic-messages", request)?;
     let model = provider
         .model
         .as_deref()
@@ -237,7 +234,6 @@ fn infer_vertex_anthropic(
     );
     let token = vertex_access_token(host, provider)?;
     let mut headers = common::header_pairs(&encoded.headers)?;
-    crate::apply_session_affinity(provider, &mut headers);
     set_header(&mut headers, "authorization", format!("Bearer {token}"));
     send_inference(
         host,
@@ -255,12 +251,11 @@ fn infer_sap(
     mut request: stravia_runtime_contract::protocol::ir::AiRequest,
 ) -> Result<OperationOutput, PluginError> {
     apply_snapshot_model(provider, &mut request)?;
-    let encoded = crate::encode_inference_request("openai-chat-completions", request)?;
+    let encoded = crate::parameters::encode(provider, "openai-chat-completions", request)?;
     let path = encoded.path.strip_prefix("/v1").unwrap_or(&encoded.path);
     let url = common::endpoint_url(&provider.base_url, path)?;
     let token = sap_access_token(host, provider)?;
     let mut headers = common::header_pairs(&encoded.headers)?;
-    crate::apply_session_affinity(provider, &mut headers);
     set_header(&mut headers, "authorization", format!("Bearer {token}"));
     if let Some(group) = string_value(provider, "resourceGroup") {
         set_header(&mut headers, "AI-Resource-Group", group);
@@ -281,11 +276,10 @@ fn infer_gitlab(
     mut request: stravia_runtime_contract::protocol::ir::AiRequest,
 ) -> Result<OperationOutput, PluginError> {
     apply_snapshot_model(provider, &mut request)?;
-    let encoded = crate::encode_inference_request("openai-chat-completions", request)?;
+    let encoded = crate::parameters::encode(provider, "openai-chat-completions", request)?;
     let url = common::endpoint_url(&provider.base_url, &encoded.path)?;
     let body = json_body(encoded.body)?;
-    let mut base_headers = common::header_pairs(&encoded.headers)?;
-    crate::apply_session_affinity(provider, &mut base_headers);
+    let base_headers = common::header_pairs(&encoded.headers)?;
 
     let access = gitlab_direct_access(host, provider, false)?;
     host.emit_started()?;
@@ -311,7 +305,7 @@ fn infer_watsonx(
 ) -> Result<OperationOutput, PluginError> {
     apply_snapshot_model(provider, &mut request)?;
     let stream = request.stream.enabled;
-    let encoded = crate::encode_inference_request("watsonx-text-chat", request)?;
+    let encoded = crate::parameters::encode(provider, "watsonx-text-chat", request)?;
     let Value::Object(mut object) = encoded.body else {
         return Err(common::plugin_error(
             ErrorKind::Invalid,
@@ -326,14 +320,7 @@ fn infer_watsonx(
             "watsonx project ID is required",
         )?),
     );
-    object.remove("stream");
-    if let Some(choice) = object.remove("tool_choice") {
-        if matches!(choice.as_str(), Some("auto" | "none" | "required")) {
-            object.insert("tool_choice_option".into(), choice);
-        } else {
-            object.insert("tool_choice".into(), choice);
-        }
-    }
+
     let endpoint = if stream { "chat_stream" } else { "chat" };
     let version = string_value(provider, "apiVersion").unwrap_or_else(|| "2026-04-20".into());
     let base = provider.base_url.trim_end_matches('/').to_string();
@@ -348,7 +335,6 @@ fn infer_watsonx(
     url.query_pairs_mut().append_pair("version", &version);
     let token = ibm_access_token(host, provider)?;
     let mut headers = common::header_pairs(&encoded.headers)?;
-    crate::apply_session_affinity(provider, &mut headers);
     set_header(&mut headers, "authorization", format!("Bearer {token}"));
     send_inference(
         host,

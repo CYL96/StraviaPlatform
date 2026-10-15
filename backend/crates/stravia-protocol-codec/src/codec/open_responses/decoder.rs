@@ -15,8 +15,6 @@ use stravia_runtime_contract::protocol::ir::ContentBlock;
 use stravia_runtime_contract::protocol::ir::GenerationConfig;
 use stravia_runtime_contract::protocol::ir::MediaSource;
 use stravia_runtime_contract::protocol::ir::MessageContent;
-use stravia_runtime_contract::protocol::ir::OpenResponsesExt;
-use stravia_runtime_contract::protocol::ir::ProtocolExt;
 use stravia_runtime_contract::protocol::ir::ReasoningConfig;
 use stravia_runtime_contract::protocol::ir::ResponseFormat;
 use stravia_runtime_contract::protocol::ir::Role;
@@ -24,38 +22,12 @@ use stravia_runtime_contract::protocol::ir::StreamConfig;
 use stravia_runtime_contract::protocol::ir::ToolCall;
 use stravia_runtime_contract::protocol::ir::ToolChoice;
 use stravia_runtime_contract::protocol::ir::ToolSpec;
+use stravia_runtime_contract::protocol::ir::{
+    native_tool_from_responses, CacheRetention, CompactionControl, Continuation, NativeTool,
+    NativeToolKind, ParameterReset, ReasoningSummary,
+};
 
 pub struct ResponsesDecoder;
-
-// Fields decoded into named IR fields (not ingress bag).
-const KNOWN_FIELDS: &[&str] = &[
-    "model",
-    "input",
-    "previous_response_id",
-    "include",
-    "tools",
-    "tool_choice",
-    "metadata",
-    "text",
-    "temperature",
-    "top_p",
-    "presence_penalty",
-    "frequency_penalty",
-    "parallel_tool_calls",
-    "stream",
-    "stream_options",
-    "background",
-    "max_output_tokens",
-    "max_tool_calls",
-    "reasoning",
-    "safety_identifier",
-    "prompt_cache_key",
-    "truncation",
-    "instructions",
-    "store",
-    "service_tier",
-    "top_logprobs",
-];
 
 impl ResponsesDecoder {
     pub fn decode_request(&self, mut body: Value) -> Result<AiRequest> {
@@ -63,11 +35,6 @@ impl ResponsesDecoder {
             .as_object_mut()
             .ok_or_else(|| anyhow::anyhow!("request body must be a JSON object"))?;
         validate_field_types(obj)?;
-        let passthrough_body = obj
-            .iter()
-            .filter(|(field, _)| !KNOWN_FIELDS.contains(&field.as_str()))
-            .map(|(field, value)| (field.clone(), value.clone()))
-            .collect();
 
         let previous_response_id = match obj.get("previous_response_id") {
             Some(Value::String(id)) if !id.is_empty() => Some(id.clone()),
@@ -157,29 +124,19 @@ impl ResponsesDecoder {
         // ── Tools ─────────────────────────────────────────────────────────────
         let ParsedTools {
             tools,
-            passthrough_tools,
+            native_tools,
         } = parse_tools(obj.get("tools"))?;
         let tool_choice = obj
             .get("tool_choice")
-            .cloned()
-            .map(parse_tool_choice)
-            .transpose()?;
+            .and_then(parse_tool_choice);
 
         // ── Reasoning ─────────────────────────────────────────────────────────
         let reasoning = if let Some(reasoning) = obj.get("reasoning") {
-            let effort = reasoning
-                .get("effort")
-                .and_then(Value::as_str)
-                .map(stravia_runtime_contract::protocol::ir::ReasoningEffort::from_openai_str)
-                .transpose()?;
             let summary = reasoning
                 .get("summary")
-                .and_then(Value::as_str)
-                .map(String::from);
+                .and_then(|value| serde_json::from_value(value.clone()).ok());
             ReasoningConfig {
-                enabled: true,
-                effort,
-                display: summary,
+                summary,
                 level: reasoning
                     .get("effort")
                     .and_then(Value::as_str)
@@ -191,46 +148,6 @@ impl ResponsesDecoder {
             ReasoningConfig::default()
         };
         let response_format = parse_response_format(obj.get("text"))?;
-
-        // ── ProtocolExt ───────────────────────────────────────────────────────
-        let resp_ext = OpenResponsesExt {
-            instructions_present: obj.contains_key("instructions"),
-            passthrough_body,
-            passthrough_tools,
-            background: obj.get("background").and_then(Value::as_bool),
-            previous_response_id,
-            include: obj.get("include").and_then(Value::as_array).map(|items| {
-                items
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(String::from)
-                    .collect()
-            }),
-            stream_options: obj.get("stream_options").cloned(),
-            max_tool_calls: optional_u32(obj, "max_tool_calls")?,
-            safety_identifier: obj
-                .get("safety_identifier")
-                .and_then(Value::as_str)
-                .map(String::from),
-            prompt_cache_key: obj
-                .get("prompt_cache_key")
-                .and_then(Value::as_str)
-                .map(String::from),
-            top_logprobs: optional_u32(obj, "top_logprobs")?,
-            truncation: obj
-                .get("truncation")
-                .and_then(Value::as_str)
-                .map(String::from),
-            store: obj.get("store").and_then(Value::as_bool),
-            metadata: obj.get("metadata").cloned(),
-            text: obj.get("text").cloned(),
-            service_tier: obj
-                .get("service_tier")
-                .and_then(Value::as_str)
-                .map(String::from),
-            native_web_search: None,
-            tool_choice_ext: None,
-        };
 
         // ── Build AiRequest ───────────────────────────────────────────────────
         let mut ai_req = AiRequest::new(model, messages);
@@ -252,9 +169,109 @@ impl ResponsesDecoder {
         ai_req.parallel_tool_calls = parallel_tool_calls;
         ai_req.reasoning = reasoning;
         ai_req.response_format = response_format;
-        ai_req.ext = Some(ProtocolExt::OpenResponses(resp_ext));
         ai_req.meta.source_protocol = Some(OPEN_RESPONSES_2026_04_24);
         ai_req.meta.vendor.ingress = Default::default();
+        ai_req.normalize_parameters();
+        let parameters = &mut ai_req.parameters;
+        parameters.background = obj.get("background").and_then(Value::as_bool);
+        parameters.continuation = previous_response_id.map(Continuation::PreviousResponse)
+            .or_else(|| obj.get("conversation").and_then(|value| {
+                value.as_str().or_else(|| value.get("id").and_then(Value::as_str))
+                    .map(|id| Continuation::Conversation(id.to_owned()))
+            }));
+        parameters.max_tool_calls = optional_u32(obj, "max_tool_calls")?;
+        parameters.logprobs = optional_u32(obj, "top_logprobs")?;
+        parameters.store = obj.get("store").and_then(Value::as_bool);
+        parameters.metadata = obj.get("metadata").and_then(Value::as_object).map(|metadata| {
+            metadata.iter().filter_map(|(key, value)| {
+                value.as_str().map(|value| (key.clone(), value.to_owned()))
+            }).collect()
+        });
+        parameters.end_user_id = obj
+            .get("safety_identifier")
+            .and_then(Value::as_str)
+            .or_else(|| obj.get("user").and_then(Value::as_str))
+            .map(str::to_owned);
+        parameters.cache.key = obj
+            .get("prompt_cache_key")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        parameters.truncation = obj
+            .get("truncation")
+            .and_then(|value| serde_json::from_value(value.clone()).ok());
+        parameters.service_tier =
+            obj.get("service_tier")
+                .and_then(|value| serde_json::from_value(value.clone()).ok());
+        parameters.native_tools = native_tools;
+        parameters.compaction = obj.get("context_management").and_then(Value::as_array)
+            .and_then(|controls| controls.iter().find(|control| control["type"] == "compaction"))
+            .map(|control| CompactionControl {
+                threshold_tokens: control.get("compact_threshold").and_then(Value::as_u64)
+                    .and_then(|value| u32::try_from(value).ok()),
+            });
+        if let Some(metadata) = obj.get("client_metadata") {
+            parameters.import_client_metadata(metadata.clone());
+        }
+        parameters.generate = obj.get("generate").and_then(Value::as_bool);
+        if ai_req.reasoning.summary.is_none() {
+            ai_req.reasoning.summary = obj.get("stream_options").and_then(|value| value.get("reasoning_summary_delivery"))
+                .and_then(|value| serde_json::from_value::<ReasoningSummary>(value.clone()).ok());
+        }
+        parameters.verbosity = obj
+            .get("text")
+            .and_then(|text| text.get("verbosity"))
+            .and_then(|value| serde_json::from_value(value.clone()).ok());
+        parameters.cache.retention = obj
+            .get("prompt_cache_retention")
+            .and_then(Value::as_str)
+            .and_then(|value| match value {
+                "in_memory" => Some(CacheRetention::Default),
+                "24h" => Some(CacheRetention::Extended),
+                _ => None,
+            });
+        for (field, reset) in [
+            ("instructions", ParameterReset::Instructions),
+            ("tools", ParameterReset::NativeTools),
+            ("temperature", ParameterReset::Temperature),
+            ("top_p", ParameterReset::TopP),
+            ("presence_penalty", ParameterReset::PresencePenalty),
+            ("frequency_penalty", ParameterReset::FrequencyPenalty),
+            ("max_output_tokens", ParameterReset::MaxTokens),
+            ("parallel_tool_calls", ParameterReset::ParallelToolCalls),
+            ("background", ParameterReset::Background),
+            ("max_tool_calls", ParameterReset::MaxToolCalls),
+            ("previous_response_id", ParameterReset::Continuation),
+            ("conversation", ParameterReset::Continuation),
+            ("prompt_cache_key", ParameterReset::CacheKey),
+            ("prompt_cache_retention", ParameterReset::CacheRetention),
+            ("top_logprobs", ParameterReset::Logprobs),
+            ("truncation", ParameterReset::Truncation),
+            ("store", ParameterReset::Store),
+            ("service_tier", ParameterReset::ServiceTier),
+            ("reasoning", ParameterReset::Reasoning),
+            ("safety_identifier", ParameterReset::EndUser),
+            ("user", ParameterReset::EndUser),
+        ] {
+            if obj.get(field).is_some_and(|value| value.is_null()
+                || value.as_str().is_some_and(str::is_empty)
+                || value.as_array().is_some_and(Vec::is_empty)) {
+                parameters.reset(reset);
+            }
+        }
+        for (parent, field, reset) in [
+            ("reasoning", "effort", ParameterReset::ReasoningLevel),
+            ("reasoning", "summary", ParameterReset::ReasoningSummary),
+            ("text", "format", ParameterReset::ResponseFormat),
+            ("text", "verbosity", ParameterReset::Verbosity),
+        ] {
+            if obj.get(parent).is_some_and(Value::is_null)
+                || obj.get(parent).and_then(|value| value.get(field)).is_some_and(Value::is_null) {
+                parameters.reset(reset);
+            }
+        }
+        if obj.get("text").and_then(|value| value.pointer("/format/strict")).is_some_and(Value::is_null) {
+            parameters.reset(ParameterReset::ResponseFormatStrict);
+        }
 
         Ok(ai_req)
     }
@@ -405,13 +422,7 @@ fn validate_field_types(obj: &serde_json::Map<String, Value>) -> Result<()> {
             anyhow::bail!("'reasoning.summary' must be a string or null");
         }
     }
-    if let Some(stream_options) = obj.get("stream_options").and_then(Value::as_object)
-        && stream_options
-            .get("include_obfuscation")
-            .is_some_and(|value| !value.is_boolean())
-    {
-        anyhow::bail!("'stream_options.include_obfuscation' must be a boolean");
-    }
+
     if let Some(text) = obj.get("text").and_then(Value::as_object) {
         if let Some(verbosity) = text.get("verbosity")
             && !verbosity.is_null()
@@ -491,6 +502,7 @@ fn parse_response_format(text: Option<&Value>) -> Result<Option<ResponseFormat>>
                 .and_then(Value::as_str)
                 .expect("validated text.format.name")
                 .to_owned(),
+            description: object.get("description").and_then(Value::as_str).map(str::to_owned),
             schema: object
                 .get("schema")
                 .expect("validated text.format.schema")
@@ -910,19 +922,19 @@ fn decode_message_item(item: &Value, allow_video: bool) -> Result<Option<AiItem>
 #[derive(Debug)]
 struct ParsedTools {
     tools: Option<Vec<ToolSpec>>,
-    passthrough_tools: Vec<Value>,
+    native_tools: Vec<NativeTool>,
 }
 
 fn parse_tools(raw_tools: Option<&Value>) -> Result<ParsedTools> {
     let Some(Value::Array(items)) = raw_tools else {
         return Ok(ParsedTools {
             tools: None,
-            passthrough_tools: Vec::new(),
+            native_tools: Vec::new(),
         });
     };
 
     let mut tools = Vec::new();
-    let mut passthrough_tools = Vec::new();
+    let mut native_tools = Vec::new();
     for item in items {
         let tool_type = item
             .get("type")
@@ -957,6 +969,7 @@ fn parse_tools(raw_tools: Option<&Value>) -> Result<ParsedTools> {
                     .map(String::from);
                 let parameters = item
                     .get("parameters")
+                    .filter(|value| !value.is_null())
                     .cloned()
                     .unwrap_or(Value::Object(Default::default()));
                 let strict = match item.get("strict") {
@@ -964,48 +977,69 @@ fn parse_tools(raw_tools: Option<&Value>) -> Result<ParsedTools> {
                     Some(Value::Null) | None => None,
                     Some(_) => anyhow::bail!("function tool 'strict' must be a boolean or null"),
                 };
+                let defer_loading = match item.get("defer_loading") {
+                    Some(Value::Bool(value)) => Some(*value),
+                    Some(Value::Null) | None => None,
+                    Some(_) => {
+                        anyhow::bail!("function tool 'defer_loading' must be a boolean or null")
+                    }
+                };
                 tools.push(ToolSpec {
                     name,
                     description,
                     parameters,
                     strict,
-                    cache_control: None,
-                    meta: None,
+                    defer_loading,
                 });
             }
-            other if super::is_namespaced_extension(other) => {
-                anyhow::bail!("unregistered Open Responses tool extension: {other}");
+            _ => {
+                if let Some(tool) = native_tool_from_responses(item) {
+                    native_tools.push(tool);
+                }
             }
-            _ => passthrough_tools.push(item.clone()),
         }
     }
 
     Ok(ParsedTools {
         tools: Some(tools),
-        passthrough_tools,
+        native_tools,
     })
 }
 
-fn parse_tool_choice(v: Value) -> Result<ToolChoice> {
-    match &v {
+fn parse_tool_choice(v: &Value) -> Option<ToolChoice> {
+    match v {
         Value::String(s) => match s.as_str() {
-            "none" => Ok(ToolChoice::None),
-            "auto" => Ok(ToolChoice::Auto),
-            "required" => Ok(ToolChoice::Required),
-            _ => Ok(ToolChoice::Raw(v)),
+            "none" => Some(ToolChoice::None),
+            "auto" => Some(ToolChoice::Auto),
+            "required" => Some(ToolChoice::Required),
+            _ => None,
         },
         Value::Object(obj) if obj.get("type").and_then(Value::as_str) == Some("function") => {
             let name = obj
                 .get("name")
                 .and_then(Value::as_str)
                 .filter(|name| !name.is_empty())
-                .ok_or_else(|| anyhow::anyhow!("function tool_choice missing 'name'"))?;
-            Ok(ToolChoice::Named {
+                ?;
+            Some(ToolChoice::Named {
                 name: name.to_owned(),
             })
         }
-        Value::Object(_) => Ok(ToolChoice::Raw(v)),
-        _ => anyhow::bail!("unsupported 'tool_choice' value"),
+        Value::Object(obj) => match obj.get("type").and_then(Value::as_str)? {
+            "custom" => Some(ToolChoice::Named { name: obj.get("name")?.as_str()?.to_owned() }),
+            "allowed_tools" => Some(ToolChoice::Allowed {
+                names: obj.get("tools")?.as_array()?.iter()
+                    .filter(|tool| matches!(tool.get("type").and_then(Value::as_str), Some("function" | "custom")))
+                    .filter_map(|tool| tool.get("name").and_then(Value::as_str).map(str::to_owned)).collect(),
+                required: obj.get("mode").and_then(Value::as_str) == Some("required"),
+            }),
+            "web_search" | "web_search_preview" | "web_search_2025_08_26"
+                | "web_search_preview_2025_03_11" => Some(ToolChoice::Native(NativeToolKind::WebSearch)),
+            "code_interpreter" => Some(ToolChoice::Native(NativeToolKind::CodeExecution)),
+            "image_generation" => Some(ToolChoice::Native(NativeToolKind::ImageGeneration)),
+            "tool_search" => Some(ToolChoice::Native(NativeToolKind::ToolSearch)),
+            _ => None,
+        },
+        _ => None,
     }
 }
 

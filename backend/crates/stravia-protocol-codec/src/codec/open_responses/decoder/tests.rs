@@ -44,6 +44,12 @@ fn accepts_codex_rolling_request_extensions() {
         Some(stravia_runtime_contract::thinking::ThinkingLevel::High)
     );
     assert_eq!(
+        request.parameters.session.id.as_deref(),
+        Some("session")
+    );
+    assert_eq!(request.parameters.session.turn_id.as_deref(), Some("turn"));
+    assert_eq!(request.parameters.native_tools.len(), 2);
+    assert_eq!(
         request
             .tools
             .as_ref()
@@ -60,14 +66,14 @@ fn rolling_tools_are_preserved_and_client_function_names_remain_independent() {
     for tool_type in ["web_search", "web_search_2025_08_26", "web_search_preview"] {
         let parsed = parse_tools(Some(&serde_json::json!([{"type": tool_type}])))
             .expect("rolling hosted tool");
-        assert_eq!(parsed.passthrough_tools[0]["type"], tool_type);
+        assert!(matches!(parsed.native_tools[0], NativeTool::WebSearch(_)));
     }
-    parse_tools(Some(&serde_json::json!([{"type": "vendor:unknown"}])))
-        .expect_err("unregistered namespaced extension must fail");
+    assert!(parse_tools(Some(&serde_json::json!([{"type": "vendor:unknown"}])))
+        .expect("unsupported tools are dropped").native_tools.is_empty());
 
     let ParsedTools {
         tools,
-        passthrough_tools,
+        native_tools,
     } = parse_tools(Some(&serde_json::json!([
         { "type": "web_search" },
         {
@@ -78,7 +84,7 @@ fn rolling_tools_are_preserved_and_client_function_names_remain_independent() {
     ])))
     .expect("client function and Provider-native tool");
     assert_eq!(tools.expect("function tools")[0].name, "web_search");
-    assert_eq!(passthrough_tools[0]["type"], "web_search");
+    assert!(matches!(native_tools[0], NativeTool::WebSearch(_)));
 }
 
 #[test]
@@ -166,11 +172,12 @@ fn continuation_may_omit_model_and_input() {
 
     assert!(request.model.is_empty());
     assert!(request.items.is_empty());
-    let Some(ProtocolExt::OpenResponses(extension)) = request.ext else {
-        panic!("Open Responses extension");
-    };
     assert_eq!(
-        extension.previous_response_id.as_deref(),
+        request
+            .parameters
+            .continuation
+            .as_ref()
+            .and_then(Continuation::previous_response_id),
         Some("resp_parent")
     );
 }
@@ -207,10 +214,10 @@ fn preserves_fields_added_after_the_dated_protocol() {
         }))
         .expect("rolling provider field");
 
-    let Some(ProtocolExt::OpenResponses(extension)) = request.ext else {
-        panic!("Open Responses extension");
-    };
-    assert_eq!(extension.passthrough_body["conversation"], "conv_123");
+    assert_eq!(
+        request.parameters.continuation,
+        Some(Continuation::Conversation("conv_123".into()))
+    );
 }
 
 #[test]
@@ -251,11 +258,31 @@ fn accepts_nullable_dated_integer_controls() {
         .expect("nullable integer controls");
 
     assert_eq!(request.generation.max_tokens, None);
-    let Some(ProtocolExt::OpenResponses(extension)) = request.ext else {
-        unreachable!();
-    };
-    assert_eq!(extension.max_tool_calls, None);
-    assert_eq!(extension.top_logprobs, None);
+    assert_eq!(request.parameters.max_tool_calls, None);
+    assert_eq!(request.parameters.logprobs, None);
+    for reset in [ParameterReset::MaxTokens, ParameterReset::MaxToolCalls, ParameterReset::Logprobs] {
+        assert!(request.parameters.resets(reset));
+    }
+}
+
+#[test]
+fn unsupported_controls_are_dropped_without_rejecting_supported_intent() {
+    let request = ResponsesDecoder.decode_request(serde_json::json!({
+        "model": "gpt", "input": "hello",
+        "service_tier": "scale",
+        "prompt_cache_retention": "vendor-specific",
+        "truncation": "vendor-specific",
+        "include": ["file_search_call.results"],
+        "tools": [{"type": "file_search"}, {"type": "mcp"}, {"type": "computer"}],
+        "tool_choice": {"type": "file_search"},
+        "metadata": {"tenant": "acme", "nested": {"private": true}},
+    })).unwrap();
+    assert!(request.parameters.service_tier.is_none());
+    assert!(request.parameters.cache.retention.is_none());
+    assert!(request.parameters.truncation.is_none());
+    assert!(request.parameters.native_tools.is_empty());
+    assert!(request.tool_choice.is_none());
+    assert_eq!(request.parameters.metadata, Some([("tenant".into(), "acme".into())].into()));
 }
 
 #[test]
@@ -287,6 +314,7 @@ fn explicit_empty_tools_remains_an_override() {
         .expect("request with explicit empty tools");
 
     assert_eq!(request.tools, Some(Vec::new()));
+    assert!(request.parameters.resets(ParameterReset::NativeTools));
 }
 
 #[test]
@@ -317,7 +345,7 @@ fn decodes_dated_named_and_allowed_tool_choices() {
         .expect("dated allowed_tools choice");
     assert!(matches!(
         allowed.tool_choice,
-        Some(ToolChoice::Raw(ref value)) if value == &allowed_value
+        Some(ToolChoice::Allowed { ref names, required: true }) if names == &["lookup".to_owned()]
     ));
 
     ResponsesDecoder
@@ -326,7 +354,7 @@ fn decodes_dated_named_and_allowed_tool_choices() {
             "input": "hello",
             "tool_choice": {"type": "function", "function": {"name": "lookup"}},
         }))
-        .expect_err("rolling nested function shape must fail");
+        .expect("unsupported choice shape is dropped");
 }
 
 #[test]

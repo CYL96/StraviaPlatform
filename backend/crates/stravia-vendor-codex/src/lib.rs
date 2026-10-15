@@ -26,14 +26,6 @@ use stravia_vendor_sdk::{
 const VENDOR_ID: &str = "openai-codex";
 const CATALOG_ID: &str = "openai";
 const CHANNEL: &str = "codex";
-/// Non-credential client metadata requested by this channel and forwarded upstream.
-const CODEX_CLIENT_HEADER_NAMES: [&str; 5] = [
-    "x-codex-beta-features",
-    "x-codex-installation-id",
-    "x-codex-turn-metadata",
-    "x-codex-turn-state",
-    "x-codex-window-id",
-];
 /// Spoofed Codex CLI version sent on every request. The backend version-gates
 /// model availability for `/models` and `/responses` by exact client version
 /// rather than the catalog's `minimal_client_version`; an older pin silently
@@ -108,10 +100,8 @@ pub fn descriptor() -> VendorDescriptor {
                 default_models_source: None,
                 consumes_catalog_models: false,
                 capabilities: capabilities.clone(),
-                client_header_names: CODEX_CLIENT_HEADER_NAMES
-                    .into_iter()
-                    .map(str::to_owned)
-                    .collect(),
+                // 会话头已由宿主归一为统一 session 字段，安装与 turn 身份由插件私有状态生成。
+                client_header_names: BTreeSet::new(),
                 model_capabilities: BTreeSet::new(),
             }],
             capabilities,
@@ -248,42 +238,45 @@ fn infer(
             item.role = stravia_runtime_contract::protocol::ir::Role::Developer;
         }
     }
-    let extension = request.ext.get_or_insert_with(|| {
-        stravia_runtime_contract::protocol::ir::ProtocolExt::OpenResponses(Default::default())
-    });
-    if let stravia_runtime_contract::protocol::ir::ProtocolExt::OpenResponses(ext) = extension {
-        ext.store = Some(false);
-    }
+    request.parameters.store = Some(false);
+    let mut session = codex::NativeSession::new(&provider, &request.parameters.session);
+    session.resolve_identity(host, &provider)?;
 
     let protocol = OPEN_RESPONSES_2026_04_24;
     let preserve_upstream_errors = operation == Operation::Infer
         && stravia_protocol_codec::codec::compaction::native_compaction_requested(&request);
-    let compact_fields = if operation == Operation::Compact {
-        request
-            .meta
-            .vendor
-            .ingress
-            .get("__stravia_compact_fields")
-            .cloned()
-    } else {
-        None
-    };
+    let websocket = operation == Operation::Infer
+        && provider.transport_preference() != TransportPreference::HttpOnly
+        && codex::websocket_available(&provider);
+    if operation == Operation::Infer {
+        require_native_continuation_transport(&request, websocket)?;
+    }
+    let native_tools = codex::encode_tools(&request, codex::BodyOperation::Http);
+    let include = codex::inference_include(&request);
+    // 原生工具只编码一次；通用 codec 仍负责历史与统一控制的协议投影。
+    request.tools = None;
+    request.parameters.native_tools.clear();
     let encoded = common::encode_inference_request(&protocol.to_string(), request)?;
     let mut body = encoded.body;
+    body["tools"] = native_tools.into();
+    body["include"] = include.into();
     let codec_headers = encoded.headers;
     let egress_path = encoded.path;
-    codex::prepare_body(&mut body)?;
     prepare_responses_body(&provider, &mut body)?;
-    if operation == Operation::Infer
-        && provider.transport_preference() != TransportPreference::HttpOnly
-        && codex::websocket_available(&provider)
-    {
-        return codex::infer_websocket(host, &provider, &body, preserve_upstream_errors)
+    if operation == Operation::Compact {
+        codex::prepare_operation_body(&mut body, codex::BodyOperation::Compact)?;
+    } else if websocket {
+        codex::prepare_operation_body(&mut body, codex::BodyOperation::WebSocket)?;
+    } else {
+        codex::prepare_body(&mut body)?;
+    }
+    if operation != Operation::Compact {
+        session.apply_body(&mut body);
+    }
+    if websocket {
+        return codex::infer_websocket(host, &provider, &body, &session, preserve_upstream_errors)
             .map(Box::new)
             .map(OperationOutput::Infer);
-    }
-    if operation == Operation::Compact {
-        retain_compact_fields(compact_fields.as_ref(), &mut body)?;
     }
     let path = if operation == Operation::Compact {
         "/responses/compact".to_owned()
@@ -299,7 +292,7 @@ fn infer(
         "accept".into(),
         "text/event-stream, application/json".into(),
     ));
-    codex::append_runtime_headers(&provider, &body, &mut headers)?;
+    codex::append_runtime_headers(&provider, &body, &session, &mut headers)?;
     host.emit_started()?;
     let response = host.http_start(stravia_vendor_sdk::wit::types::HttpRequest {
         method: "POST".into(),
@@ -308,6 +301,9 @@ fn infer(
         body: serde_json::to_vec(&body)
             .map_err(|_| invalid("Codex request could not be encoded"))?,
     })?;
+    if operation == Operation::Infer && (200..300).contains(&response.status()?) {
+        session.capture_turn_state(host, &provider, &response.headers()?)?;
+    }
     match operation {
         Operation::Infer => {
             // Codex 流式请求的成功响应按 SSE 解码，不依赖上游是否返回 Content-Type。
@@ -344,6 +340,29 @@ fn infer(
     }
 }
 
+fn require_native_continuation_transport(
+    request: &AiRequest,
+    websocket: bool,
+) -> Result<(), PluginError> {
+    if !websocket
+        && request
+            .parameters
+            .continuation
+            .as_ref()
+            .and_then(|continuation| continuation.previous_response_id())
+            .is_some_and(|id| !id.trim().is_empty())
+    {
+        // The host may have replaced full history with a continuation delta.
+        // Reject before dispatch so its existing seam restores retained history.
+        return Err(PluginError {
+            kind: ErrorKind::ContinuationUnavailable,
+            message: "Codex HTTP requires the host's full-history request".into(),
+            upstream_status: None,
+        });
+    }
+    Ok(())
+}
+
 fn prepare_responses_body(
     provider: &ProviderSnapshot,
     body: &mut Value,
@@ -360,12 +379,8 @@ fn prepare_responses_body(
     let include = include
         .as_array_mut()
         .ok_or_else(|| invalid("Codex Responses include must be an array"))?;
-    if !include
-        .iter()
-        .any(|value| value.as_str() == Some("reasoning.encrypted_content"))
-    {
-        include.push(Value::String("reasoning.encrypted_content".into()));
-    }
+    include.retain(|value| matches!(value.as_str(),
+        Some("reasoning.encrypted_content" | "message.output_text.logprobs")));
     if !object.contains_key("prompt_cache_key")
         && let Some(affinity) = provider
             .operation_metadata
@@ -379,22 +394,6 @@ fn prepare_responses_body(
             Value::String(affinity.to_owned()),
         );
     }
-    Ok(())
-}
-
-fn retain_compact_fields(fields: Option<&Value>, body: &mut Value) -> Result<(), PluginError> {
-    let object = body
-        .as_object_mut()
-        .ok_or_else(|| invalid("Open Responses compact request must be an object"))?;
-    let explicit = fields.and_then(Value::as_array);
-    object.retain(|key, _| {
-        matches!(key.as_str(), "model" | "input" | "instructions")
-            || explicit.is_some_and(|fields| {
-                fields
-                    .iter()
-                    .any(|field| field.as_str() == Some(key.as_str()))
-            })
-    });
     Ok(())
 }
 
@@ -829,6 +828,164 @@ stravia_vendor_sdk::export_vendor!(CodexVendor);
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn http_continuation_requires_host_full_history_before_dispatch() {
+        let mut request = AiRequest::new("gpt-5.4", Vec::new());
+        request.parameters.continuation = Some(stravia_runtime_contract::protocol::ir::Continuation::PreviousResponse("resp_previous".into()));
+        let error = require_native_continuation_transport(&request, false).unwrap_err();
+        assert!(matches!(error.kind, ErrorKind::ContinuationUnavailable));
+        assert!(require_native_continuation_transport(&request, true).is_ok());
+        request.parameters.continuation = None;
+        assert!(require_native_continuation_transport(&request, false).is_ok());
+    }
+
+    #[test]
+    fn native_projection_keeps_supported_controls_and_canonical_history() {
+        let mut request = AiRequest::new("gpt-6-astra", Vec::new());
+        request.stream.enabled = false;
+        request.generation.temperature = Some(0.2);
+        request.generation.top_p = Some(0.9);
+        request.generation.max_tokens = Some(256);
+        request.parallel_tool_calls = Some(false);
+        request.parameters.metadata = Some(BTreeMap::from([("verification".into(), "canonical-final".into())]));
+        request.parameters.cache.key = Some("canonical-final-smoke".into());
+        request.parameters.cache.retention = Some(stravia_runtime_contract::protocol::ir::CacheRetention::Extended);
+        request.parameters.generate = Some(false);
+        request.parameters.continuation = Some(stravia_runtime_contract::protocol::ir::Continuation::PreviousResponse("resp_previous".into()));
+        let original = request.clone();
+        let mut body = common::encode_inference_request(
+            &OPEN_RESPONSES_2026_04_24.to_string(),
+            request.clone(),
+        )
+        .unwrap()
+        .body;
+        assert_eq!(body["metadata"], json!({"verification":"canonical-final"}));
+        assert_eq!(body["prompt_cache_retention"], "24h");
+        codex::prepare_body(&mut body).unwrap();
+        for unsupported in [
+            "metadata",
+            "prompt_cache_retention",
+            "temperature",
+            "top_p",
+            "max_output_tokens",
+        ] {
+            assert!(
+                body.get(unsupported).is_none(),
+                "unsupported native control: {unsupported}"
+            );
+        }
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["parallel_tool_calls"], false);
+        assert_eq!(body["prompt_cache_key"], "canonical-final-smoke");
+        assert!(body.get("previous_response_id").is_none());
+        assert_eq!(body["store"], false);
+        assert!(
+            body.get("generate").is_none(),
+            "generate is a WS-only control"
+        );
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            serde_json::to_value(original).unwrap()
+        );
+    }
+
+    #[test]
+    fn native_tool_projection_keeps_cli_definitions_and_omits_api_only_controls() {
+        let schema = json!({
+            "type":"object","properties":{"unregistered_parameter":{"type":"string"}}
+        });
+        let request = stravia_protocol_codec::codec::open_responses::decoder::ResponsesDecoder
+            .decode_request(json!({
+                "model":"gpt-6-astra","input":"hello",
+                "tool_choice":{"type":"function","name":"business"},
+                "tools":[
+                    {"type":"function","name":"business","description":"business input",
+                        "strict":false,"defer_loading":true,"parameters":schema},
+                    {"type":"namespace","name":"business_namespace","description":"business tools",
+                        "tools":[
+                            {"type":"function","name":"nested","parameters":schema,"strict":false},
+                            {"type":"custom","name":"grammar","description":"grammar tool",
+                                "defer_loading":false,"format":{"type":"grammar","syntax":"lark",
+                                    "definition":"start: /.+/","unregistered_parameter":true}},
+                            {"type":"web_search"}
+                        ]},
+                    {"type":"tool_search","execution":"client","description":"find tools",
+                        "parameters":schema,"unregistered_parameter":true},
+                    {"type":"web_search","external_web_access":false,"indexed_web_access":true,
+                        "search_content_types":["text","image"],
+                        "filters":{"allowed_domains":["example.test"],"unregistered_parameter":true},
+                        "user_location":{"type":"approximate","city":"Paris","unregistered_parameter":true},
+                        "unregistered_parameter":true},
+                    {"type":"mcp","server_label":"public-api-only","server_url":"https://example.test/mcp"}
+                ]
+            }))
+            .unwrap();
+        let tools = codex::encode_tools(&request, codex::BodyOperation::Http);
+        let mut body =
+            common::encode_inference_request(&OPEN_RESPONSES_2026_04_24.to_string(), request)
+                .unwrap()
+                .body;
+        body["tools"] = tools.into();
+        codex::prepare_body(&mut body).unwrap();
+        assert!(
+            body.get("tool_choice").is_none(),
+            "CLI inference uses string tool choices"
+        );
+        let tools = body["tools"].as_array().unwrap();
+        assert!(!tools.iter().any(|tool| tool["type"] == "mcp"));
+        let function = tools
+            .iter()
+            .find(|tool| tool["name"] == "business")
+            .unwrap();
+        assert_eq!(function["parameters"], schema);
+        assert_eq!(function["defer_loading"], true);
+        assert_eq!(function["strict"], false);
+        let namespace = tools
+            .iter()
+            .find(|tool| tool["type"] == "namespace")
+            .unwrap();
+        let children = namespace["tools"].as_array().unwrap();
+        assert!(!children.iter().any(|tool| tool["type"] == "web_search"));
+        assert_eq!(children[0]["parameters"], schema);
+        assert_eq!(children[1]["defer_loading"], false);
+        assert_eq!(
+            children[1]["format"],
+            json!({
+                "type":"grammar","syntax":"lark","definition":"start: /.+/"
+            })
+        );
+        let search = tools
+            .iter()
+            .find(|tool| tool["type"] == "tool_search")
+            .unwrap();
+        assert_eq!(search["execution"], "client");
+        assert_eq!(search["parameters"], schema);
+        assert!(search.get("unregistered_parameter").is_none());
+        let web = tools
+            .iter()
+            .find(|tool| tool["type"] == "web_search")
+            .unwrap();
+        assert_eq!(web["filters"], json!({"allowed_domains":["example.test"]}));
+        assert_eq!(
+            web["user_location"],
+            json!({"type":"approximate","city":"Paris"})
+        );
+        assert!(web.get("unregistered_parameter").is_none());
+        for tools in [
+            json!([{"type":"mcp","server_label":"API-only","server_url":"https://example.test"}]),
+            json!([{"type":"namespace","name":"empty_after_projection","tools":[{"type":"web_search"}]}]),
+        ] {
+            let mut body = json!({
+                "model":"gpt-6-astra", "input":"hello", "tools":tools, "tool_choice":"required"
+            });
+            codex::prepare_body(&mut body).unwrap();
+            assert_eq!(body["input"], "hello");
+            assert_eq!(body["tools"], json!([]));
+            assert!(body.get("tool_choice").is_none());
+        }
+    }
+
 
     #[test]
     fn discovered_model_translates_declared_specifications() {

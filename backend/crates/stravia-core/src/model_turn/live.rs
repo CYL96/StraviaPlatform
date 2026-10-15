@@ -36,7 +36,7 @@ use stravia_runtime_contract::protocol::ir::AiError;
 use stravia_runtime_contract::protocol::ir::AiRequest;
 use stravia_runtime_contract::protocol::ir::AiStreamDelta;
 use stravia_runtime_contract::protocol::ir::request::MediaRoutingMode;
-use stravia_runtime_contract::protocol::ir::{ContentBlock, MessageContent};
+use stravia_runtime_contract::protocol::ir::{ContentBlock, MessageContent, ReasoningSummary};
 use stravia_runtime_contract::thinking::ThinkingLevel;
 use stravia_vendor_runtime::RuntimeError;
 use stravia_vendor_sdk::{
@@ -1227,19 +1227,18 @@ async fn prepare_attempt(
 
     // 每次尝试都从原请求解析，避免前一个 Target 的钳制结果污染 failover。
     let mut provider_request = input.request.clone();
-    // Preserve the client's original off intent across the existing upward mapping.
-    // This only suppresses automatic summaries; it does not change intensity resolution.
+    // 向上映射强度时保留客户端关闭摘要的意图，不改变既有强度解析。
     if provider_request.reasoning.level == Some(ThinkingLevel::Off)
-        && provider_request.reasoning.display.is_none()
+        && provider_request.reasoning.summary.is_none()
     {
-        Arc::make_mut(&mut provider_request).reasoning.display = Some("omitted".into());
+        Arc::make_mut(&mut provider_request).reasoning.summary = Some(ReasoningSummary::None);
     }
     // 与 generation_chain 的继承判定一致：任何显式推理指令都阻止默认档介入。
-    if !provider_request.reasoning.enabled
-        && provider_request.reasoning.level.is_none()
-        && provider_request.reasoning.effort.is_none()
+    if provider_request.reasoning.level.is_none()
+        && provider_request.reasoning.mode.is_none()
         && provider_request.reasoning.budget_tokens.is_none()
-        && provider_request.reasoning.display.is_none()
+        && provider_request.reasoning.summary.is_none()
+        && provider_request.reasoning.target_control.is_none()
         && let Some(value) = route.default_thinking_level.as_deref()
     {
         match ThinkingLevel::from_wire(value) {
@@ -1255,7 +1254,7 @@ async fn prepare_attempt(
             }
         }
     }
-    if provider_request.reasoning.level.is_some() || provider_request.reasoning.effort.is_some() {
+    if provider_request.reasoning.level.is_some() {
         let mut supported = ThinkingLevel::ALL;
         let mut count = 0;
         for level in ThinkingLevel::ALL {
@@ -1272,10 +1271,6 @@ async fn prepare_attempt(
             .and_then(|requested| requested.clamp(&supported[..count]));
         if level != provider_request.reasoning.level {
             Arc::make_mut(&mut provider_request).reasoning.level = level;
-        }
-        // 未配置可用档位时交给上游默认行为，不让客户端 effort 改变 Target 选择。
-        if count == 0 && provider_request.reasoning.effort.is_some() {
-            Arc::make_mut(&mut provider_request).reasoning.effort = None;
         }
     }
 
@@ -1319,8 +1314,9 @@ async fn prepare_attempt(
             execution.oauth_connection_id(),
             &actual_model,
         )),
+        issued: Vec::new(),
     };
-    // 来源不明的受保护载荷乐观回放：上游拒绝时由 `protected_reasoning_rejected` 恢复分级剥离。
+    // 外来与未知来源都先尝试回放；只有命中已确认的拒绝记忆才首发剥离。
     // Plain text requests need no replay mutation or private history copy.
     let has_thinking = provider_request.items.iter().any(|item| {
         matches!(&item.content, MessageContent::Blocks(blocks) if blocks.iter().any(|block| {
@@ -1335,9 +1331,12 @@ async fn prepare_attempt(
     let thinking_replayed = has_thinking
         && stravia_protocol_codec::transform::prepare_thinking_replay(
             Arc::make_mut(&mut provider_request),
-            |item| {
-                thinking_source.provenance(item, &gateway.reasoning_rejections)
-                    != crate::history_marker::ThinkingProvenance::Foreign
+            |item, block| {
+                !gateway.reasoning_rejections.rejected(
+                    thinking_source.authority.as_deref().expect("thinking authority"),
+                    thinking_source.provenance(item, block),
+                    block,
+                )
             },
         );
     let native_compaction_requested =
@@ -1442,13 +1441,7 @@ async fn prepare_attempt(
     let require_affinity = request_requires_affinity(&provider_request);
     let mut continuation_fallback = None;
     if compact || thinking_replayed {
-        if crate::router::parent_id_from_request(&provider_request).is_some()
-            || provider_request
-                .meta
-                .vendor
-                .ingress
-                .contains_key("previous_response_id")
-        {
+        if crate::router::parent_id_from_request(&provider_request).is_some() {
             crate::router::clear_previous_response_id(Arc::make_mut(&mut provider_request));
         }
     } else {
@@ -1472,12 +1465,63 @@ async fn prepare_attempt(
     }
 
     let session_affinity = crate::generation_chain::generation_session_fingerprint(&input.request);
+    // A client session can span independent Generation Chain roots. Prefer its
+    // canonical fingerprint for transport reuse; a new root or request
+    // correlation must not discard an otherwise matching socket. This key is
+    // still namespaced by Principal and Target, and the pool separately checks
+    // credentials, plugin identity, effective proxy, and handshake identity.
     let websocket_affinity = namespace_fingerprint(&(
         input.principal.continuation_key(),
         target_key.as_str(),
-        session_affinity.as_deref(),
+        session_affinity
+            .as_deref()
+            .or(input.generation_root_id.as_deref())
+            .unwrap_or(model_turn_id),
     ));
     let mut metadata = BTreeMap::new();
+    metadata.insert(
+        "transport_affinity".into(),
+        serde_json::Value::String(websocket_affinity.clone()),
+    );
+    for (key, identifier) in [
+        (
+            "parent_transport_affinity",
+            input.request.parameters.session.parent_id.as_deref(),
+        ),
+        (
+            "parent_thread_transport_affinity",
+            input.request.parameters.session.parent_id.as_deref(),
+        ),
+        (
+            "forked_from_thread_transport_affinity",
+            input
+                .request
+                .parameters
+                .session
+                .forked_from_id
+                .as_deref(),
+        ),
+        (
+            "context_window_transport_affinity",
+            input
+                .request
+                .parameters
+                .session
+                .context_window_id
+                .as_deref(),
+        ),
+    ] {
+        if let Some(identifier) = identifier.filter(|value| !value.is_empty()) {
+            metadata.insert(
+                key.into(),
+                serde_json::Value::String(scoped_session_transport_affinity(
+                    &input.principal,
+                    target_key.as_str(),
+                    identifier,
+                )),
+            );
+        }
+    }
     metadata.insert(
         TRANSPORT_PREFERENCE_METADATA_KEY.into(),
         serde_json::Value::String(transport_preference.as_metadata_value().into()),
@@ -1489,8 +1533,8 @@ async fn prepare_attempt(
         );
     }
     // 上游会话亲和键只由本地链路根派生，不取客户端自报的 session：同一链路
-    // 各轮与压缩共享同一键，上游据此把前缀缓存留在同一节点。按主体与 Target
-    // 命名空间隔离，与 websocket_affinity 一致。
+    // 各轮与压缩共享同一键，上游据此把前缀缓存留在同一节点。与传输复用键
+    // 分开：后者可跨同一客户端会话的多个链路根；两者均按主体与 Target 隔离。
     if let Some(root_id) = input.generation_root_id.as_deref() {
         metadata.insert(
             "session_affinity".into(),
@@ -1834,6 +1878,8 @@ async fn begin_attempt(
     let parent_cancellation = input.cancellation.clone();
     let deadline = input.deadline.clone();
     let observer = input.observer.clone();
+    let first_token_window = Arc::new(tokio::sync::Notify::new());
+    let driver_first_token_window = first_token_window.clone();
     use tracing::Instrument as _;
     let parent = tracing::Span::current();
     let join = tokio::spawn(
@@ -1853,6 +1899,7 @@ async fn begin_attempt(
                 output_tx,
                 terminal_output,
                 ready_tx,
+                driver_first_token_window,
             )
             .await;
         }
@@ -1868,33 +1915,43 @@ async fn begin_attempt(
     let ready_result = if first_token_timeout_ms == 0 {
         ready_rx.await
     } else {
-        tokio::select! {
-            result = &mut ready_rx => result,
-            _ = tokio::time::sleep(Duration::from_millis(first_token_timeout_ms as u64)) => {
-                if let Some(signal) = timeout_signal {
-                    signal.store(true, Ordering::Release);
+        let window = Duration::from_millis(first_token_timeout_ms as u64);
+        let expiry = tokio::time::sleep(window);
+        tokio::pin!(expiry);
+        loop {
+            tokio::select! {
+                result = &mut ready_rx => break result,
+                // 剥离受保护推理后的重放是一次新的上游请求，获得完整首 token 窗口；
+                // 被拒请求的耗时不应挤占它。
+                _ = first_token_window.notified() => {
+                    expiry.as_mut().reset(tokio::time::Instant::now() + window);
                 }
-                let upstream_timed_out = upstream_state.load(Ordering::Acquire)
-                    & UPSTREAM_FAILURE_MASK
-                    == UPSTREAM_STARTED;
-                driver.cancellation.cancel();
-                drop(output_rx);
-                driver.wait().await;
-                deadline_guard.disarm();
-                return Err(if upstream_timed_out {
-                    AttemptFailure::upstream(
-                        stravia_runtime_contract::protocol::ir::AiErrorKind::Timeout,
-                        None,
-                        "first_token_timeout",
-                        "Target did not produce a First Token before its timeout",
-                        None,
-                    )
-                } else {
-                    AttemptFailure::terminal(
-                        "first_token_timeout",
-                        "Local Provider preparation exceeded the First Token timeout",
-                    )
-                });
+                _ = &mut expiry => {
+                    if let Some(signal) = timeout_signal {
+                        signal.store(true, Ordering::Release);
+                    }
+                    let upstream_timed_out = upstream_state.load(Ordering::Acquire)
+                        & UPSTREAM_FAILURE_MASK
+                        == UPSTREAM_STARTED;
+                    driver.cancellation.cancel();
+                    drop(output_rx);
+                    driver.wait().await;
+                    deadline_guard.disarm();
+                    return Err(if upstream_timed_out {
+                        AttemptFailure::upstream(
+                            stravia_runtime_contract::protocol::ir::AiErrorKind::Timeout,
+                            None,
+                            "first_token_timeout",
+                            "Target did not produce a First Token before its timeout",
+                            None,
+                        )
+                    } else {
+                        AttemptFailure::terminal(
+                            "first_token_timeout",
+                            "Local Provider preparation exceeded the First Token timeout",
+                        )
+                    });
+                }
             }
         }
     };
@@ -1944,6 +2001,7 @@ async fn drive_vendor_attempt(
     output: tokio::sync::mpsc::Sender<VendorPublishedResult>,
     terminal_output: tokio::sync::mpsc::OwnedPermit<VendorPublishedResult>,
     ready: tokio::sync::oneshot::Sender<Result<VendorDriverReady, AttemptFailure>>,
+    first_token_window: Arc<tokio::sync::Notify>,
 ) {
     let mut lifecycle = OutputLifecycle::new(
         &gateway,
@@ -1958,10 +2016,11 @@ async fn drive_vendor_attempt(
     );
     let mut continuation_fallback = prepared.continuation_fallback.take();
     let mut auth_recovered = false;
-    // 分级见 `strip_rejected_protected_reasoning`。
+    // 最多剥离非本上游载荷后重放一次。
     let mut protected_reasoning_recovery = 0u8;
-    // 最近一级剥离掉的受保护载荷摘要，等待该级重放的结果。
-    let mut stripped_protected_reasoning: Option<Vec<[u8; 32]>> = None;
+    // 剥离掉的来源或未知载荷摘要，等待重放结果后才记忆拒绝。
+    let mut stripped_protected_reasoning: Option<Vec<crate::history_marker::RejectedReasoning>> =
+        None;
 
     loop {
         if parent_cancellation.is_cancelled() || operation_cancellation.is_cancelled() {
@@ -1979,15 +2038,17 @@ async fn drive_vendor_attempt(
             prepared.egress_base_url.clone(),
             prepared.first_token_timed_out.clone(),
         );
+        // 每次派发都从实际请求重建事实；恢复、续传回退与凭据恢复不能沿用旧声明。
+        update_protected_reasoning_metadata(
+            &mut prepared.metadata,
+            &prepared.request,
+            &prepared.thinking_source,
+        );
         let mut first_token_ms = None;
         let outcome = lifecycle
             .run(&mut prepared, &attempt, &mut first_token_ms)
             .instrument(attempt.span())
             .await;
-        if parent_cancellation.is_cancelled() || operation_cancellation.is_cancelled() {
-            operation_cancellation.cancel();
-            return;
-        }
         let outcome = if let Some(error) = prepared.send_failure.lock().take() {
             let error = error.model_error();
             let mut failure = AttemptFailure::terminal(&error.code, &error.message);
@@ -1997,8 +2058,10 @@ async fn drive_vendor_attempt(
             outcome
         };
 
-        // 剥离后的重放没有再被判为推理拒绝（无论成功还是因其它原因失败），就记住该级
-        // 剥离掉的全部载荷。这是保守的过度近似：同一级中可能只有部分载荷是被拒原因。
+        // 剥离后的重放没有再被判为推理拒绝（无论成功、因其它原因失败，还是被首 token
+        // 超时等取消），就记住该级剥离掉的全部载荷。必须先于取消返回：否则外层 Target
+        // 重试会再次首发外来载荷、重复同一次拒绝。这是保守的过度近似：同一级中可能只有
+        // 部分载荷是被拒原因。
         if let Some(stripped) = stripped_protected_reasoning.take()
             && !matches!(
                 &outcome,
@@ -2008,9 +2071,12 @@ async fn drive_vendor_attempt(
             remember_rejected_protected_reasoning(
                 &gateway.reasoning_rejections,
                 &prepared,
-                protected_reasoning_recovery,
                 stripped,
             );
+        }
+        if parent_cancellation.is_cancelled() || operation_cancellation.is_cancelled() {
+            operation_cancellation.cancel();
+            return;
         }
 
         match outcome {
@@ -2104,21 +2170,20 @@ async fn drive_vendor_attempt(
                 if !lifecycle.committed()
                     && failure.error.code == "protected_reasoning_rejected"
                     && prepared.allow_recovery
-                    && protected_reasoning_recovery < 2 =>
+                    && protected_reasoning_recovery < 1 =>
             {
                 // 上游因载荷拒绝说明 Target 本身健康：不计入连续失败，也不受 Target
-                // 重试预算约束；只受两级剥离上限约束，且每级必须实际移除载荷。
+                // 重试预算约束；只允许剥离非本上游载荷后重放一次。
                 if let Some(fallback) = continuation_fallback.take() {
                     prepared.request = fallback;
                 }
                 crate::router::clear_previous_response_id(Arc::make_mut(&mut prepared.request));
-                let before =
-                    crate::history_marker::protected_payload_digests(&prepared.request.items);
+                let rejected =
+                    rejected_protected_reasoning(&prepared.request, &prepared.thinking_source);
                 if strip_rejected_protected_reasoning(
                     Arc::make_mut(&mut prepared.request),
                     &mut protected_reasoning_recovery,
                     &prepared.thinking_source,
-                    &gateway.reasoning_rejections,
                 ) {
                     attempt.finish(
                         "failed",
@@ -2127,10 +2192,9 @@ async fn drive_vendor_attempt(
                         None,
                         Some(&failure.diagnostic),
                     );
-                    let after =
-                        crate::history_marker::protected_payload_digests(&prepared.request.items);
-                    stripped_protected_reasoning =
-                        Some(before.difference(&after).copied().collect());
+                    stripped_protected_reasoning = Some(rejected);
+                    // notify_one 在无等待者时保留许可，计时方不会错过重启。
+                    first_token_window.notify_one();
                     continue;
                 }
                 finish_vendor_failure(
@@ -2611,35 +2675,67 @@ fn target_namespace(
     ))
 }
 
-/// 上游拒绝受保护推理后的分级剥离。`stage` 0：首发；1：已剥离来源未证实的载荷；
-/// 2：已剥离全部载荷。先保住同一签发作用域的推理链；没有可剥离的未证实载荷，
-/// 或剥离后再次被拒，才剥离全部。返回是否改动了请求。
+/// 上游拒绝后只剥离外来与未知来源载荷一次，绝不剥离本上游签发的载荷。
 fn strip_rejected_protected_reasoning(
     request: &mut AiRequest,
     stage: &mut u8,
     source: &crate::history_marker::ThinkingSource,
-    rejections: &crate::history_marker::ReasoningRejections,
 ) -> bool {
-    if *stage == 0 {
-        *stage = 1;
-        if stravia_protocol_codec::transform::prepare_thinking_replay(request, |item| {
-            source.provenance(item, rejections)
-                == crate::history_marker::ThinkingProvenance::Verified
-        }) {
-            return true;
-        }
+    if *stage != 0 || !has_untrusted_protected_reasoning(request, source) {
+        return false;
     }
-    *stage = 2;
-    stravia_protocol_codec::transform::prepare_thinking_replay(request, |_| false)
+    *stage = 1;
+    stravia_protocol_codec::transform::prepare_thinking_replay(request, |item, block| {
+        source.provenance(item, block) == crate::history_marker::ThinkingProvenance::Own
+    })
 }
 
-/// 把某一级剥离掉的载荷记入当前签发作用域的拒绝记忆（ADR-0075）。第二级包含来源
-/// 已证实的载荷，说明签发作用域判定与上游行为不符，需要运维可见。
+fn rejected_protected_reasoning(
+    request: &AiRequest,
+    source: &crate::history_marker::ThinkingSource,
+) -> Vec<crate::history_marker::RejectedReasoning> {
+    request.items.iter().flat_map(|item| {
+        let blocks = match &item.content {
+            MessageContent::Blocks(blocks) => blocks.as_slice(),
+            _ => &[],
+        };
+        blocks.iter().filter_map(|block| {
+            crate::history_marker::protected_payload_digest(block)?;
+            crate::history_marker::RejectedReasoning::for_payload(source.provenance(item, block), block)
+        })
+    }).collect()
+}
+
+fn update_protected_reasoning_metadata(
+    metadata: &mut BTreeMap<String, serde_json::Value>,
+    request: &AiRequest,
+    source: &crate::history_marker::ThinkingSource,
+) {
+    const KEY: &str = "protected_reasoning_untrusted";
+    if !has_untrusted_protected_reasoning(request, source) {
+        metadata.remove(KEY);
+    } else {
+        metadata.insert(KEY.into(), serde_json::Value::Bool(true));
+    }
+}
+
+fn has_untrusted_protected_reasoning(
+    request: &AiRequest,
+    source: &crate::history_marker::ThinkingSource,
+) -> bool {
+    request.items.iter().any(|item| {
+        matches!(&item.content, MessageContent::Blocks(blocks) if blocks.iter().any(|block| {
+            crate::history_marker::protected_payload_digest(block).is_some()
+                && source.provenance(item, block) != crate::history_marker::ThinkingProvenance::Own
+        }))
+    })
+}
+
+/// 重放没有再次被判为推理拒绝后，记住当前上游拒绝的来源或未知载荷。
 fn remember_rejected_protected_reasoning(
     rejections: &crate::history_marker::ReasoningRejections,
     prepared: &PreparedAttempt,
-    stage: u8,
-    stripped: Vec<[u8; 32]>,
+    stripped: Vec<crate::history_marker::RejectedReasoning>,
 ) {
     if stripped.is_empty() {
         return;
@@ -2649,14 +2745,6 @@ fn remember_rejected_protected_reasoning(
         .authority
         .as_deref()
         .expect("prepared Target always has a thinking authority");
-    if stage == 2 {
-        tracing::warn!(
-            target_id = %prepared.route.target_id,
-            protocol = %prepared.protocol_hint,
-            payloads = stripped.len(),
-            "upstream rejected protected reasoning from its own signing scope"
-        );
-    }
     rejections.record(authority, stripped);
 }
 
@@ -2686,11 +2774,7 @@ fn thinking_authority(
 }
 
 fn request_requires_affinity(request: &AiRequest) -> bool {
-    matches!(
-        request.ext.as_ref(),
-        Some(stravia_runtime_contract::protocol::ir::ProtocolExt::OpenResponses(extension))
-            if extension.store == Some(false)
-    )
+    request.parameters.store == Some(false)
 }
 
 fn header_pairs(headers: &reqwest::header::HeaderMap) -> Vec<(String, String)> {
@@ -2710,6 +2794,19 @@ fn namespace_fingerprint<T: serde::Serialize>(value: &T) -> String {
     stravia_runtime_contract::protocol::ir::canonical::hash_hex(
         &stravia_runtime_contract::protocol::ir::canonical::hash_bytes(&bytes),
     )
+}
+
+fn scoped_session_transport_affinity(
+    principal: &stravia_runtime_contract::Principal,
+    target_key: &str,
+    identifier: &str,
+) -> String {
+    let fingerprint = crate::generation_chain::generation_session_id_fingerprint(identifier);
+    namespace_fingerprint(&(
+        principal.continuation_key(),
+        target_key,
+        fingerprint.as_str(),
+    ))
 }
 
 fn request_contains_video(request: &AiRequest) -> bool {
