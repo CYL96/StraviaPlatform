@@ -716,13 +716,17 @@ CREATE INDEX inference_runs_generation_idx ON inference_run_observations(generat
 
 CREATE INDEX inference_runs_interaction_idx ON inference_run_observations(interaction_id, started_at, id);
 
+CREATE INDEX inference_runs_parent_idx ON inference_run_observations(parent_run_id);
+
 CREATE INDEX inference_runs_status_idx ON inference_run_observations(status, last_active_at);
 
-CREATE INDEX interaction_observations_expiry_idx ON interaction_observations(expires_at);
+CREATE INDEX interaction_observations_expiry_idx ON interaction_observations(expires_at, id);
 
 CREATE INDEX interaction_observations_filter_idx ON interaction_observations(status, api_key_name, last_active_at DESC);
 
 CREATE INDEX interaction_observations_generation_idx ON interaction_observations(generation_root_id, last_active_at);
+
+CREATE INDEX interaction_observations_parent_idx ON interaction_observations(parent_interaction_id);
 
 CREATE INDEX interaction_observations_window_idx ON interaction_observations(root_id, last_active_at DESC, id);
 
@@ -751,8 +755,12 @@ CREATE INDEX observation_events_tool_idx ON observation_events(tool_id,sequence)
 CREATE INDEX observation_pending_tools_expiry_idx
     ON observation_pending_tools(expires_at);
 
+CREATE INDEX observation_pending_tools_interaction_idx ON observation_pending_tools(interaction_id);
+
 CREATE INDEX observation_pending_tools_lookup_idx
     ON observation_pending_tools(principal, tool_id);
+
+CREATE INDEX observation_pending_tools_run_idx ON observation_pending_tools(run_id);
 
 CREATE INDEX observation_tail_sources_expiry_idx
     ON observation_tail_sources(expires_at);
@@ -760,7 +768,9 @@ CREATE INDEX observation_tail_sources_expiry_idx
 CREATE INDEX observation_tail_sources_hash_idx
     ON observation_tail_sources(principal, last_unit_hash);
 
-CREATE INDEX rejected_requests_expiry_idx ON rejected_request_observations(expires_at);
+CREATE INDEX observation_tail_sources_interaction_idx ON observation_tail_sources(interaction_id);
+
+CREATE INDEX rejected_requests_expiry_idx ON rejected_request_observations(expires_at, id);
 
 CREATE INDEX rejected_requests_started_idx
     ON rejected_request_observations(started_at DESC, id);
@@ -770,6 +780,8 @@ CREATE INDEX rejected_requests_window_idx ON rejected_request_observations(occur
 CREATE INDEX stats_usage_window_idx ON stats_usage_buckets (scope, bucket_start);
 
 CREATE INDEX target_attempts_analytics_idx ON target_attempt_observations(started_at, provider_id, upstream_model, target_id, status);
+
+CREATE INDEX target_attempts_interaction_idx ON target_attempt_observations(interaction_id);
 
 CREATE INDEX target_attempts_run_status_idx ON target_attempt_observations(run_id, status);
 

@@ -3053,6 +3053,13 @@ CREATE INDEX inference_runs_interaction_idx ON public.inference_run_observations
 
 
 --
+-- Name: inference_runs_parent_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX inference_runs_parent_idx ON public.inference_run_observations USING btree (parent_run_id);
+
+
+--
 -- Name: inference_runs_status_idx; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -3063,7 +3070,7 @@ CREATE INDEX inference_runs_status_idx ON public.inference_run_observations USIN
 -- Name: interaction_observations_expiry_idx; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX interaction_observations_expiry_idx ON public.interaction_observations USING btree (expires_at);
+CREATE INDEX interaction_observations_expiry_idx ON public.interaction_observations USING btree (expires_at, id);
 
 
 --
@@ -3078,6 +3085,13 @@ CREATE INDEX interaction_observations_filter_idx ON public.interaction_observati
 --
 
 CREATE INDEX interaction_observations_generation_idx ON public.interaction_observations USING btree (generation_root_id, last_active_at);
+
+
+--
+-- Name: interaction_observations_parent_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX interaction_observations_parent_idx ON public.interaction_observations USING btree (parent_interaction_id);
 
 
 --
@@ -3172,10 +3186,24 @@ CREATE INDEX observation_pending_tools_expiry_idx ON public.observation_pending_
 
 
 --
+-- Name: observation_pending_tools_interaction_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX observation_pending_tools_interaction_idx ON public.observation_pending_tools USING btree (interaction_id);
+
+
+--
 -- Name: observation_pending_tools_lookup_idx; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX observation_pending_tools_lookup_idx ON public.observation_pending_tools USING btree (principal, tool_id);
+
+
+--
+-- Name: observation_pending_tools_run_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX observation_pending_tools_run_idx ON public.observation_pending_tools USING btree (run_id);
 
 
 --
@@ -3193,10 +3221,17 @@ CREATE INDEX observation_tail_sources_hash_idx ON public.observation_tail_source
 
 
 --
+-- Name: observation_tail_sources_interaction_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX observation_tail_sources_interaction_idx ON public.observation_tail_sources USING btree (interaction_id);
+
+
+--
 -- Name: rejected_requests_expiry_idx; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX rejected_requests_expiry_idx ON public.rejected_request_observations USING btree (expires_at);
+CREATE INDEX rejected_requests_expiry_idx ON public.rejected_request_observations USING btree (expires_at, id);
 
 
 --
@@ -3225,6 +3260,13 @@ CREATE INDEX stats_usage_window_idx ON public.stats_usage_buckets USING btree (s
 --
 
 CREATE INDEX target_attempts_analytics_idx ON public.target_attempt_observations USING btree (started_at, provider_id, upstream_model, target_id, status);
+
+
+--
+-- Name: target_attempts_interaction_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX target_attempts_interaction_idx ON public.target_attempt_observations USING btree (interaction_id);
 
 
 --

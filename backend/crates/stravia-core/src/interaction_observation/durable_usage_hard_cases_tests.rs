@@ -212,13 +212,14 @@ async fn retention_and_failed_clear(
     db.execute("UPDATE interaction_observations SET status='running' WHERE id='long'; UPDATE inference_run_observations SET status='running',finished_at=NULL WHERE id='long'").await?;
     observation.update_retention(7).await?;
     let cutoff = START + 3 * QUARTER + 7 * 86_400_000;
-    assert!(
-        observation
-            .purge_expired_rows(cutoff - 2 * QUARTER)
-            .await?
-            .is_empty()
-    );
-    let mut removed = observation.purge_expired_rows(cutoff).await?;
+    let batch = observation
+        .purge_expired_batch(cutoff - 2 * QUARTER)
+        .await?;
+    assert!(batch.removed_interactions.is_empty());
+    assert!(!batch.has_more);
+    let batch = observation.purge_expired_batch(cutoff).await?;
+    assert!(!batch.has_more);
+    let mut removed = batch.removed_interactions;
     removed.sort();
     assert_eq!(removed, vec!["cross", "short"]);
     assert_eq!(
@@ -250,7 +251,9 @@ async fn retention_and_failed_clear(
         Some(60)
     );
     assert_eq!(stats.stats_by_provider(selected).await?[0].request_count, 3);
-    assert!(observation.purge_expired_rows(cutoff).await?.is_empty());
+    let batch = observation.purge_expired_batch(cutoff).await?;
+    assert!(batch.removed_interactions.is_empty());
+    assert!(!batch.has_more);
     observation.update_retention(30).await?;
     assert_eq!(
         stats.stats_overview(selected).await?.total_output_tokens,
@@ -315,6 +318,75 @@ async fn retention_and_failed_clear(
     Ok(())
 }
 
+async fn retention_across_batches(
+    db: &Database,
+    stats: &dyn UsageStatsStore,
+    observation: &ObservationStore,
+) -> anyhow::Result<()> {
+    // 同时覆盖两种批次上限，以及 interaction 耗尽后仅剩 rejection 的续批。
+    for index in 0..205 {
+        db.seed(&format!("batch-{index:04}"), START, START, 1000, 2, 0)
+            .await?;
+    }
+    for id in ["batch-running", "batch-fresh", "batch-waiting"] {
+        db.seed(id, START, START, 1000, 2, 0).await?;
+    }
+    db.execute(
+        "UPDATE interaction_observations SET expires_at=1 WHERE id LIKE 'batch-%';
+UPDATE interaction_observations SET status='running' WHERE id='batch-running';
+UPDATE interaction_observations SET status='waiting_client' WHERE id='batch-waiting';
+UPDATE interaction_observations SET expires_at=2 WHERE id='batch-fresh';",
+    )
+    .await?;
+    for index in 0..305 {
+        db.execute(format!("INSERT INTO rejected_request_observations (id,occurred_at,method,path,ingress_protocol,stage,code,status_code,debug_enabled,last_event_sequence,expires_at) VALUES ('batch-rejected-{index:04}',{START},'POST','/v1/responses','responses','admission','rejected',400,false,0,1)"))
+            .await?;
+    }
+    let before = stats.stats_overview(StatsWindow::default()).await?;
+    let mut removed = Vec::new();
+    for (expected_removed, expected_more, expected_rejected) in [
+        (100, true, 205),
+        (100, true, 105),
+        (6, true, 5),
+        (0, false, 0),
+    ] {
+        let batch = observation.purge_expired_batch(1).await?;
+        assert_eq!(batch.removed_interactions.len(), expected_removed);
+        assert_eq!(batch.has_more, expected_more);
+        removed.extend(batch.removed_interactions);
+        assert_eq!(
+            db.scalar("SELECT COUNT(*) FROM rejected_request_observations WHERE id LIKE 'batch-rejected-%'")
+                .await?,
+            expected_rejected
+        );
+        let after = stats.stats_overview(StatsWindow::default()).await?;
+        assert_eq!(after.total_requests, before.total_requests);
+        assert_eq!(after.total_output_tokens, before.total_output_tokens);
+    }
+    removed.sort();
+    let mut expected: Vec<_> = (0..205).map(|index| format!("batch-{index:04}")).collect();
+    expected.push("batch-waiting".to_owned());
+    assert_eq!(removed, expected);
+    assert_eq!(
+        db.scalar("SELECT COUNT(*) FROM interaction_observations WHERE id LIKE 'batch-%'")
+            .await?,
+        2
+    );
+    assert_eq!(
+        db.scalar("SELECT COUNT(*) FROM interaction_observations WHERE id IN ('batch-running','batch-fresh')")
+            .await?,
+        2
+    );
+    for sql in [
+        "SELECT COUNT(*) FROM inference_run_observations WHERE id LIKE 'batch-%'",
+        "SELECT COUNT(*) FROM model_turn_observations WHERE id LIKE 'batch-%'",
+        "SELECT COUNT(*) FROM target_attempt_observations WHERE id LIKE 'batch-%'",
+    ] {
+        assert_eq!(db.scalar(sql).await?, 2);
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn sqlite_durable_usage_hard_cases() -> anyhow::Result<()> {
     let directory = tempfile::tempdir()?;
@@ -324,7 +396,8 @@ async fn sqlite_durable_usage_hard_cases() -> anyhow::Result<()> {
     let observation = db.observation(directory.path())?;
     let result = async {
         cross_quarter_and_weighted_metrics(&db, storage.usage_stats()).await?;
-        retention_and_failed_clear(&db, storage.usage_stats(), &observation).await
+        retention_and_failed_clear(&db, storage.usage_stats(), &observation).await?;
+        retention_across_batches(&db, storage.usage_stats(), &observation).await
     }
     .await;
     pool.close().await;
@@ -374,7 +447,8 @@ async fn postgres_durable_usage_hard_cases() -> anyhow::Result<()> {
             let db = Database::Postgres(pool.clone());
             let observation = db.observation(directory.path())?;
             cross_quarter_and_weighted_metrics(&db, storage.usage_stats()).await?;
-            retention_and_failed_clear(&db, storage.usage_stats(), &observation).await
+            retention_and_failed_clear(&db, storage.usage_stats(), &observation).await?;
+            retention_across_batches(&db, storage.usage_stats(), &observation).await
         }
         .await;
         pool.close().await;
