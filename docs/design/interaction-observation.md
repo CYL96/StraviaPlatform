@@ -439,6 +439,10 @@ Observation、Rejected Request、Debug manifest 与 Trace 文件跟随 `log_rete
 
 清理不再依赖数据库 manifest 或 tombstone：按 manifest 的 `expires_at` 回收目录；删除先 rename 为 `.deleting-*`，随后幂等删除，启动补完中断的删除并回收无 manifest 的孤儿目录。关系数据清理后另删 owner 已不存在的 Trace 目录。
 
+周期到期回收在 SQLite 与 PostgreSQL 上均按 `(expires_at, id)` 分批：每批最多删除 100 条过期 Rejected Request 和 100 条过期、非 `running` 的 Interaction，子记录仍由外键级联回收。每批使用独立事务；SQLite 的共享写协调器仅覆盖单批，不跨批持有。迁移 `0020_observation_retention_indexes` 补齐自引用及子表外键索引，并使到期索引覆盖批次排序，避免删除每条父记录时全表扫描或每批重复排序同期限记录。批次数量不构成固定耗时保证，单个 Interaction 的级联规模仍影响该批耗时。
+
+writer 在每批提交后立即失效对应的实时状态和归属索引；后续批次失败时明确返回错误，已提交批次不回滚，下一次清理继续处理剩余记录，不自动重试。全部批次成功后统一移除 owner 已不存在的 manifest，避免每批扫描全部 owner。清理前的用量持久化屏障、长期统计不随详情删除的语义，以及手动清除的事务边界保持不变。
+
 “清除历史记录”只删除非活动 Interaction 与 Rejected Request；`running` 和 `waiting_client` 保留，并在结果中报告跳过数量。清理不取消 Inference Run。
 
 “清除 Debug 数据”关闭活动 writer 后删除全部受管目录并清空进程内索引。活动 Run 的 Trace 停止并标记 `debug_data_cleared` partial；请求记录、Rejected Request 与 Debug 开关状态不变，后续准入的 Run 继续正常捕获。

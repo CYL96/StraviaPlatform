@@ -416,27 +416,41 @@ pub(super) fn spawn(
                         let _ = done.send(Err(error));
                         continue;
                     }
-                    // Delete and invalidate grouping in the same writer turn, before another admission.
-                    let result = match expired_before {
-                        Some(at) => store.purge_expired_rows(at).await,
-                        None => store.purge_clear_rows().await,
+                    let result = async {
+                        loop {
+                            let (removed, has_more) = match expired_before {
+                                Some(at) => {
+                                    let batch = store.purge_expired_batch(at).await?;
+                                    (batch.removed_interactions, batch.has_more)
+                                }
+                                None => (store.purge_clear_rows().await?, false),
+                            };
+                            // 每批提交后立即失效；后批失败不能遗失已提交批次的内存进度。
+                            live.invalidate(&removed);
+                            if !removed.is_empty() || expired_before.is_none() {
+                                let _ = updates.send(ObservationUpdate::ResetRequired {
+                                    snapshot_sequence: trace_sequence.load(Ordering::Acquire),
+                                });
+                            }
+                            attribution.forget_interactions(&removed);
+                            pending_gaps.retain(|interaction, _| !removed.contains(interaction));
+                            pending_text
+                                .retain(|run| attribution.interaction_for_run(run).is_some());
+                            persisted_manifests
+                                .retain(|run, _| attribution.interaction_for_run(run).is_some());
+                            if expired_before.is_none() {
+                                attribution.clear_tail();
+                            }
+                            if !has_more {
+                                break;
+                            }
+                        }
+                        if expired_before.is_some() {
+                            store.remove_orphan_manifests().await?;
+                        }
+                        Ok::<_, anyhow::Error>(())
                     }
-                    .map(|removed| {
-                        live.invalidate(&removed);
-                        if !removed.is_empty() || expired_before.is_none() {
-                            let _ = updates.send(ObservationUpdate::ResetRequired {
-                                snapshot_sequence: trace_sequence.load(Ordering::Acquire),
-                            });
-                        }
-                        attribution.forget_interactions(&removed);
-                        pending_gaps.retain(|interaction, _| !removed.contains(interaction));
-                        pending_text.retain(|run| attribution.interaction_for_run(run).is_some());
-                        persisted_manifests
-                            .retain(|run, _| attribution.interaction_for_run(run).is_some());
-                        if expired_before.is_none() {
-                            attribution.clear_tail();
-                        }
-                    });
+                    .await;
                     let _ = done.send(result);
                 }
                 Some(WriterCommand::ClientCompletion {

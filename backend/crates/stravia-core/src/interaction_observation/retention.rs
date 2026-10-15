@@ -1,6 +1,13 @@
 use super::{store::ObservationStore, types::ClearHistoryResult};
 use std::collections::HashSet;
 
+const RETENTION_BATCH_SIZE: i64 = 100;
+
+pub(super) struct RetentionBatch {
+    pub(super) removed_interactions: Vec<String>,
+    pub(super) has_more: bool,
+}
+
 impl ObservationStore {
     #[tracing::instrument(
         target = "stravia::perf",
@@ -45,33 +52,50 @@ impl ObservationStore {
         name = "observation.maintenance.purge_expired",
         skip_all
     )]
-    pub async fn purge_expired_rows(&self, now: i64) -> anyhow::Result<Vec<String>> {
+    pub(super) async fn purge_expired_batch(&self, now: i64) -> anyhow::Result<RetentionBatch> {
         match self {
             Self::Sqlite(p, _, write_gate) => {
-                let deleted = {
-                    let _write_gate = write_gate.lock().await;
-                    let mut tx = p.begin().await?;
-                    sqlx::query("DELETE FROM rejected_request_observations WHERE expires_at<=?")
-                        .bind(now)
-                        .execute(&mut *tx)
-                        .await?;
-                    let deleted = sqlx::query_scalar("DELETE FROM interaction_observations WHERE expires_at<=? AND status<>'running' RETURNING id").bind(now).fetch_all(&mut *tx).await?;
-                    tx.commit().await?;
-                    deleted
-                };
-                self.remove_orphan_manifests().await?;
-                Ok(deleted)
+                // 每批单独持有协调器与事务，避免一次清理长期阻塞其他写入。
+                let _write_gate = write_gate.lock().await;
+                let mut tx = p.begin().await?;
+                let rejected = sqlx::query("DELETE FROM rejected_request_observations WHERE expires_at<=?1 AND id IN (SELECT id FROM rejected_request_observations WHERE expires_at<=?1 ORDER BY expires_at,id LIMIT ?2)")
+                    .bind(now)
+                    .bind(RETENTION_BATCH_SIZE)
+                    .execute(&mut *tx)
+                    .await?
+                    .rows_affected();
+                let removed_interactions: Vec<String> = sqlx::query_scalar("DELETE FROM interaction_observations WHERE expires_at<=?1 AND status<>'running' AND id IN (SELECT id FROM interaction_observations WHERE expires_at<=?1 AND status<>'running' ORDER BY expires_at,id LIMIT ?2) RETURNING id")
+                    .bind(now)
+                    .bind(RETENTION_BATCH_SIZE)
+                    .fetch_all(&mut *tx)
+                    .await?;
+                tx.commit().await?;
+                Ok(RetentionBatch {
+                    has_more: rejected == RETENTION_BATCH_SIZE as u64
+                        || removed_interactions.len() == RETENTION_BATCH_SIZE as usize,
+                    removed_interactions,
+                })
             }
             Self::Postgres(p, _) => {
                 let mut tx = p.begin().await?;
-                sqlx::query("DELETE FROM rejected_request_observations WHERE expires_at<=$1")
+                let rejected = sqlx::query("DELETE FROM rejected_request_observations WHERE expires_at<=$1 AND id IN (SELECT id FROM rejected_request_observations WHERE expires_at<=$1 ORDER BY expires_at,id LIMIT $2)")
                     .bind(now)
+                    .bind(RETENTION_BATCH_SIZE)
                     .execute(&mut *tx)
+                    .await?
+                    .rows_affected();
+                // PostgreSQL 等待行锁后仍须重查资格，不能删除已被续接恢复为 running 的记录。
+                let removed_interactions: Vec<String> = sqlx::query_scalar("DELETE FROM interaction_observations WHERE expires_at<=$1 AND status<>'running' AND id IN (SELECT id FROM interaction_observations WHERE expires_at<=$1 AND status<>'running' ORDER BY expires_at,id LIMIT $2) RETURNING id")
+                    .bind(now)
+                    .bind(RETENTION_BATCH_SIZE)
+                    .fetch_all(&mut *tx)
                     .await?;
-                let deleted = sqlx::query_scalar("DELETE FROM interaction_observations WHERE expires_at<=$1 AND status<>'running' RETURNING id").bind(now).fetch_all(&mut *tx).await?;
                 tx.commit().await?;
-                self.remove_orphan_manifests().await?;
-                Ok(deleted)
+                Ok(RetentionBatch {
+                    has_more: rejected == RETENTION_BATCH_SIZE as u64
+                        || removed_interactions.len() == RETENTION_BATCH_SIZE as usize,
+                    removed_interactions,
+                })
             }
         }
     }
@@ -169,7 +193,7 @@ impl ObservationStore {
             }
         }
     }
-    async fn remove_orphan_manifests(&self) -> anyhow::Result<()> {
+    pub(super) async fn remove_orphan_manifests(&self) -> anyhow::Result<()> {
         let runs: Vec<String> = match self {
             Self::Sqlite(pool, _, _) => {
                 sqlx::query_scalar("SELECT id FROM inference_run_observations")

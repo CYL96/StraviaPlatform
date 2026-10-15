@@ -1856,6 +1856,67 @@ mod snapshot_tests {
         }
     }
 
+    #[tokio::test]
+    async fn retention_failure_preserves_committed_progress_and_can_resume() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let pool = crate::test_support::migrated_sqlite_pool().await?;
+        let observation = test_observation(&pool, directory.path(), false).await;
+        let cutoff = chrono::Utc::now().timestamp_millis() - 10_000;
+        sqlx::query(
+            "WITH RECURSIVE seeds(n) AS (
+                 VALUES(0) UNION ALL SELECT n+1 FROM seeds WHERE n<1024
+             )
+             INSERT INTO interaction_observations
+                 (id,principal,root_id,root_run_id,first_route_id,status,
+                  started_at,last_active_at,expires_at)
+             SELECT printf('retention-%04d',n),'owner',printf('retention-%04d',n),
+                    printf('run-%04d',n),'route','completed',0,0,?+n FROM seeds",
+        )
+        .bind(cutoff)
+        .execute(&pool)
+        .await?;
+        sqlx::raw_sql(
+            "INSERT INTO interaction_observations
+                 (id,principal,root_id,root_run_id,first_route_id,status,
+                  started_at,last_active_at,expires_at)
+             VALUES ('retention-running','owner','running','running','route','running',0,0,0),
+                    ('retention-fresh','owner','fresh','fresh','route','completed',0,0,9223372036854775807);
+             CREATE TRIGGER retention_delete_fault BEFORE DELETE ON interaction_observations
+             WHEN OLD.id='retention-1024'
+             BEGIN SELECT RAISE(ABORT,'retention fixture delete fault'); END;",
+        )
+        .execute(&pool)
+        .await?;
+
+        let error = observation.sweep_retention().await.unwrap_err();
+        assert!(format!("{error:#}").contains("retention fixture delete fault"));
+        // 后续批次失败不能回滚已提交的清理，也不能删除未完成的当前批次。
+        let retained: Vec<String> = sqlx::query_scalar(
+            "SELECT id FROM interaction_observations
+             WHERE id IN ('retention-0000','retention-1024','retention-running','retention-fresh')
+             ORDER BY id",
+        )
+        .fetch_all(&pool)
+        .await?;
+        assert_eq!(
+            retained,
+            vec!["retention-1024", "retention-fresh", "retention-running"]
+        );
+
+        sqlx::query("DROP TRIGGER retention_delete_fault")
+            .execute(&pool)
+            .await?;
+        observation.sweep_retention().await?;
+        let retained: Vec<String> =
+            sqlx::query_scalar("SELECT id FROM interaction_observations ORDER BY id")
+                .fetch_all(&pool)
+                .await?;
+        assert_eq!(retained, vec!["retention-fresh", "retention-running"]);
+        observation.shutdown().await;
+        pool.close().await;
+        Ok(())
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn asynchronous_usage_failure_blocks_public_clear_but_diagnostic_gap_does_not()
     -> anyhow::Result<()> {

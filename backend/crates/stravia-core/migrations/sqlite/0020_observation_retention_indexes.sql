@@ -1,0 +1,13 @@
+-- 过期观测删除会触发外键置空或级联清理；为子键建索引，避免逐条全表扫描而长时间持有写锁。
+CREATE INDEX interaction_observations_parent_idx ON interaction_observations(parent_interaction_id);
+CREATE INDEX inference_runs_parent_idx ON inference_run_observations(parent_run_id);
+CREATE INDEX observation_pending_tools_interaction_idx ON observation_pending_tools(interaction_id);
+CREATE INDEX observation_pending_tools_run_idx ON observation_pending_tools(run_id);
+CREATE INDEX observation_tail_sources_interaction_idx ON observation_tail_sources(interaction_id);
+CREATE INDEX target_attempts_interaction_idx ON target_attempt_observations(interaction_id);
+
+-- 批次按到期时间与身份稳定取号，避免每一批重新排序全部同期限记录。
+DROP INDEX interaction_observations_expiry_idx;
+CREATE INDEX interaction_observations_expiry_idx ON interaction_observations(expires_at, id);
+DROP INDEX rejected_requests_expiry_idx;
+CREATE INDEX rejected_requests_expiry_idx ON rejected_request_observations(expires_at, id);
