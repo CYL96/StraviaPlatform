@@ -59,6 +59,8 @@ let navigationPanel = $state<HTMLElement | null>(null)
 let navigationTrigger = $state<HTMLButtonElement | null>(null)
 let isDesktopNavigation = $state(false)
 let sidebarCollapsed = $state(false)
+let conversationGroupHovered = $state(false)
+let conversationGroupFocused = $state(false)
 let isWindowMaximized = $state(false)
 let translucentChrome = $state(false)
 
@@ -74,7 +76,12 @@ const gatewayTone = $derived(
   gatewayRunning ? ('healthy' as const) : statusQuery.isError ? ('error' as const) : ('neutral' as const),
 )
 const currentPath = $derived(page.url.pathname)
-const showRecentConversations = $derived(!sidebarCollapsed || !isDesktopNavigation)
+const conversationRouteActive = $derived(currentPath === '/' || currentPath === '/conversations')
+const recentConversationsId = $props.id()
+const showRecentConversations = $derived(
+  !isDesktopNavigation ||
+    (!sidebarCollapsed && (conversationRouteActive || conversationGroupHovered || conversationGroupFocused)),
+)
 const RECENT_CONVERSATION_LIMIT = 3
 const recentConversations = $derived(chat.snapshot.conversations.slice(0, RECENT_CONVERSATION_LIMIT))
 const showAllConversations = $derived(chat.snapshot.conversations.length > RECENT_CONVERSATION_LIMIT)
@@ -291,7 +298,16 @@ onMount(() => {
     class={sidebarCollapsed && isDesktopNavigation ? 'navigation-scrollbar-compact' : 'navigation-scrollbar'}>
     <nav aria-label={m.app_shell_primary_navigation()}>
       <Sidebar.Group>
-        <Sidebar.GroupContent>
+        <Sidebar.GroupContent
+          role="group"
+          aria-label={m.console_chat_chat()}
+          onmouseenter={() => (conversationGroupHovered = true)}
+          onmouseleave={() => (conversationGroupHovered = false)}
+          onfocusin={() => (conversationGroupFocused = true)}
+          onfocusout={(event: FocusEvent & { currentTarget: HTMLDivElement }) => {
+            conversationGroupFocused =
+              event.relatedTarget instanceof Node && event.currentTarget.contains(event.relatedTarget)
+          }}>
           <Sidebar.Menu>
             <Sidebar.MenuItem>
               <Sidebar.MenuButton isActive={chatNavigationActive} tooltipContent={m.console_chat_chat()}>
@@ -300,6 +316,8 @@ onMount(() => {
                     {...props}
                     href={resolve('/')}
                     aria-label={m.console_chat_chat()}
+                    aria-expanded={isDesktopNavigation && !sidebarCollapsed ? showRecentConversations : undefined}
+                    aria-controls={isDesktopNavigation && !sidebarCollapsed ? recentConversationsId : undefined}
                     aria-current={chatNavigationActive ? 'page' : undefined}
                     onclick={() => (navigationOpen = false)}>
                     <MessageSquareIcon /><span>{m.console_chat_chat()}</span>
@@ -309,7 +327,7 @@ onMount(() => {
             </Sidebar.MenuItem>
           </Sidebar.Menu>
           {#if showRecentConversations}
-            <ul class="mt-1 flex flex-col gap-1 ps-3">
+            <ul id={recentConversationsId} class="mt-1 flex flex-col gap-1 ps-3">
               {#each recentConversations as conversation (conversation.id)}
                 <li>
                   <a
