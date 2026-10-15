@@ -252,14 +252,12 @@ fn infer(
         require_native_continuation_transport(&request, websocket)?;
     }
     let native_tools = codex::encode_tools(&request, codex::BodyOperation::Http);
-    let include = codex::inference_include(&request);
     // 原生工具只编码一次；通用 codec 仍负责历史与统一控制的协议投影。
     request.tools = None;
     request.parameters.native_tools.clear();
     let encoded = common::encode_inference_request(&protocol.to_string(), request)?;
     let mut body = encoded.body;
     body["tools"] = native_tools.into();
-    body["include"] = include.into();
     let codec_headers = encoded.headers;
     let egress_path = encoded.path;
     prepare_responses_body(&provider, &mut body)?;
@@ -379,8 +377,8 @@ fn prepare_responses_body(
     let include = include
         .as_array_mut()
         .ok_or_else(|| invalid("Codex Responses include must be an array"))?;
-    include.retain(|value| matches!(value.as_str(),
-        Some("reasoning.encrypted_content" | "message.output_text.logprobs")));
+    // Codex CLI 不请求 logprobs；订阅推理端点会拒绝公共 Responses 派生的该项。
+    include.retain(|value| value.as_str() == Some("reasoning.encrypted_content"));
     if !object.contains_key("prompt_cache_key")
         && let Some(affinity) = provider
             .operation_metadata

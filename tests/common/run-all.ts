@@ -165,6 +165,8 @@ const localIgnored: Record<string, true> = {
   large_reasoning_signature_completes: true,
   http_sse_without_content_type_emits_before_eof: true,
   http_sse_with_content_type_emits_before_eof: true,
+  http_reasoning_ignores_unsupported_logprobs: true,
+  websocket_ignores_chat_logprobs_without_disabling_reasoning: true,
   http_unary_json_remains_unary: true,
   http_malformed_and_truncated_sse_fail: true,
   http_non_success_json_keeps_status: true,
