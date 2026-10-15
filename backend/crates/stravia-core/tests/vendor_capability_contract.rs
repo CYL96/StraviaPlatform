@@ -3419,3 +3419,325 @@ async fn manually_installed_codex_component_reuses_one_connection_for_search_and
     assert_eq!(edit_images, [format!("data:image/png;base64,{PNG_BASE64}")]);
     Ok(())
 }
+
+struct CodexContinuationUpstream {
+    url: String,
+    state: Arc<CodexContinuationState>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+struct CodexContinuationState {
+    handshakes: Mutex<Vec<HeaderMap>>,
+    frames: Mutex<Vec<(usize, Value)>>,
+    shutdown: tokio::sync::watch::Sender<bool>,
+}
+
+impl Drop for CodexContinuationUpstream {
+    fn drop(&mut self) {
+        self.state.shutdown.send_replace(true);
+        self.task.abort();
+    }
+}
+
+impl CodexContinuationUpstream {
+    async fn start() -> anyhow::Result<Self> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let (shutdown, _) = tokio::sync::watch::channel(false);
+        let state = Arc::new(CodexContinuationState {
+            handshakes: Mutex::new(Vec::new()),
+            frames: Mutex::new(Vec::new()),
+            shutdown,
+        });
+        let app = Router::new()
+            .route(
+                "/responses",
+                axum::routing::get(codex_continuation_websocket),
+            )
+            .with_state(Arc::clone(&state));
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve local Codex continuation upstream");
+        });
+        Ok(Self {
+            url: format!("http://{address}"),
+            state,
+            task,
+        })
+    }
+}
+
+async fn codex_continuation_websocket(
+    State(state): State<Arc<CodexContinuationState>>,
+    headers: HeaderMap,
+    upgrade: axum::extract::ws::WebSocketUpgrade,
+) -> impl IntoResponse {
+    let socket = {
+        let mut handshakes = state.handshakes.lock().await;
+        let socket = handshakes.len();
+        handshakes.push(headers);
+        socket
+    };
+    let mut shutdown = state.shutdown.subscribe();
+    upgrade.on_upgrade(move |mut websocket| async move {
+        loop {
+            let message = tokio::select! {
+                _ = shutdown.changed() => break,
+                message = websocket.recv() => message,
+            };
+            let Some(Ok(axum::extract::ws::Message::Text(text))) = message else {
+                break;
+            };
+            let frame: Value = serde_json::from_str(&text).expect("Codex response.create JSON");
+            let ordinal = {
+                let mut frames = state.frames.lock().await;
+                let ordinal = frames.len();
+                frames.push((socket, frame));
+                ordinal
+            };
+            // Accept full replays too: the regression must detect lost reuse even when
+            // the host's fallback still produces a successful public response.
+            let output = if ordinal < 2 {
+                json!({
+                    "id":format!("fc_codex_{ordinal}"), "type":"function_call",
+                    "status":"completed", "call_id":format!("call_codex_{ordinal}"),
+                    "name":"lookup", "arguments":format!("{{\"step\":{ordinal}}}")
+                })
+            } else {
+                json!({
+                    "id":"msg_codex_final", "type":"message", "role":"assistant",
+                    "status":"completed", "content":[{
+                        "type":"output_text", "text":"Both tool results received", "annotations":[]
+                    }]
+                })
+            };
+            let completed =
+                stravia_protocol_codec::codec::open_responses::formatter::response_resource_snapshot(
+                    &format!("resp_codex_{ordinal}"), "gpt-5.4", "completed",
+                    vec![output.clone()], Value::Null, Value::Null,
+                    json!({"input_tokens":2,"output_tokens":3,"total_tokens":5,
+                        "input_tokens_details":{"cached_tokens":0},
+                        "output_tokens_details":{"reasoning_tokens":0}}),
+                );
+            let mut created = completed.clone();
+            created["status"] = json!("in_progress");
+            created["output"] = json!([]);
+            created["usage"] = Value::Null;
+            let mut added = output.clone();
+            added["status"] = json!("in_progress");
+            let mut events = vec![json!({"type":"response.created","response":created})];
+            if output["type"] == "function_call" {
+                added["arguments"] = json!("");
+                events.push(json!({"type":"response.output_item.added","output_index":0,"item":added}));
+                events.push(json!({"type":"response.function_call_arguments.delta",
+                    "output_index":0,"item_id":output["id"],"delta":output["arguments"]}));
+                events.push(json!({"type":"response.function_call_arguments.done",
+                    "output_index":0,"item_id":output["id"],"arguments":output["arguments"]}));
+            } else {
+                added["content"] = json!([]);
+                events.push(json!({"type":"response.output_item.added","output_index":0,"item":added}));
+                let part = &output["content"][0];
+                let mut empty_part = part.clone();
+                empty_part["text"] = json!("");
+                events.push(json!({"type":"response.content_part.added","output_index":0,
+                    "content_index":0,"item_id":output["id"],"part":empty_part}));
+                events.push(json!({"type":"response.output_text.delta","output_index":0,
+                    "content_index":0,"item_id":output["id"],"delta":part["text"]}));
+                events.push(json!({"type":"response.output_text.done","output_index":0,
+                    "content_index":0,"item_id":output["id"],"text":part["text"]}));
+                events.push(json!({"type":"response.content_part.done","output_index":0,
+                    "content_index":0,"item_id":output["id"],"part":part}));
+            }
+            events.push(json!({"type":"response.output_item.done","output_index":0,"item":output}));
+            events.push(json!({"type":"response.completed","response":completed}));
+            for (sequence, mut event) in events.into_iter().enumerate() {
+                event["sequence_number"] = sequence.into();
+                if websocket.send(axum::extract::ws::Message::Text(event.to_string().into())).await.is_err() {
+                    return;
+                }
+            }
+        }
+    })
+}
+
+#[tokio::test]
+async fn manually_installed_codex_component_continues_client_tool_results_on_one_websocket()
+-> anyhow::Result<()> {
+    let harness = TestHarness::new().await?;
+    install_distributed_vendor_plugin(&harness.gateway, "openai-codex").await?;
+    let upstream = CodexContinuationUpstream::start().await?;
+    let provider = harness.gateway.storage.providers().create(CreateProviderRecord {
+        name: "Local Codex tool continuation".into(),
+        vendor: Some("openai-codex".into()),
+        protocol: "open-responses".into(),
+        base_url: upstream.url.clone(),
+        preset_key: Some("openai".into()),
+        channel: Some("codex".into()),
+        models_source: None,
+        static_models: Some("gpt-5.4".into()),
+        api_key: String::new(),
+        adapter_credentials: "{}".into(),
+        vendor_options: json!({
+            "websocket_url":format!("{}/responses", upstream.url.replacen("http://", "ws://", 1))
+        }).to_string(),
+        auth_mode: "oauth".into(),
+        use_proxy: false,
+    }).await?;
+    harness
+        .gateway
+        .storage
+        .oauth_credentials()
+        .upsert(
+            &provider.id,
+            UpsertOAuthCredential {
+                driver_key: "openai-codex".into(),
+                scheme: "oauth_auth_code_pkce".into(),
+                access_token: "controlled-codex-continuation-token".into(),
+                resource_url: Some(upstream.url.clone()),
+                ..UpsertOAuthCredential::default()
+            },
+        )
+        .await?;
+    seed_provider_scope(
+        &harness.gateway.config.data_dir,
+        "openai",
+        br#"{
+        "gpt-5.4": {
+            "id":"gpt-5.4", "name":"GPT-5.4", "tool_call":true,
+            "modalities":{"input":["text"],"output":["text"]},
+            "limit":{"context":272000,"output":128000},
+            "cost":{"input":2.5,"output":15.0}
+        }
+    }"#,
+    )?;
+    harness
+        .gateway
+        .admin()
+        .sync_provider_models(&provider.id)
+        .await?;
+    let route = create_route(
+        &harness.gateway,
+        "codex-client-tool-continuation",
+        vec![(&provider, "gpt-5.4", 10)],
+        0,
+    )
+    .await?;
+    harness
+        .gateway
+        .admin()
+        .update_api_key(
+            &harness.key_id,
+            serde_json::from_value(json!({"model_ids":[route.id.clone()]}))?,
+        )
+        .await?;
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()?;
+    let mut history = vec![json!({"role":"user","content":"Look up both steps, then summarize."})];
+    let mut tool_results = Vec::new();
+    for turn in 0..3 {
+        let response = client
+            .post(harness.endpoint.trim_end_matches("/mcp").to_owned() + "/v1/responses")
+            .bearer_auth(&harness.token)
+            .header("x-session-id", "codex-client-tool-session")
+            .header("x-client-request-id", format!("codex-tool-request-{turn}"))
+            .header(
+                "x-codex-turn-metadata",
+                json!({"turn_id":format!("client-turn-{turn}")}).to_string(),
+            )
+            .json(&json!({
+                "model":route.model_id, "store":false,
+                "prompt_cache_key":"codex-client-tool-session", "input":history,
+                "tools":[{"type":"function","name":"lookup","description":"Look up one step",
+                    "parameters":{"type":"object","properties":{"step":{"type":"integer"}},
+                        "required":["step"],"additionalProperties":false},"strict":true}]
+            }))
+            .send()
+            .await?;
+        let status = response.status();
+        let body: Value = response.json().await?;
+        assert_eq!(status, StatusCode::OK, "turn {turn}: {body}");
+        let output = body["output"].as_array().expect("Responses output");
+        if turn < 2 {
+            let call = output
+                .iter()
+                .find(|item| item["type"] == "function_call")
+                .expect("client tool call");
+            assert_eq!(call["name"], "lookup");
+            assert_eq!(call["call_id"], format!("call_codex_{turn}"));
+            assert_eq!(
+                serde_json::from_str::<Value>(call["arguments"].as_str().expect("tool arguments"))?,
+                json!({"step":turn})
+            );
+            history.extend(output.iter().cloned());
+            let result = json!({"type":"function_call_output","call_id":call["call_id"],
+                "output":format!("step {turn} result")});
+            history.push(result.clone());
+            tool_results.push(result);
+        } else {
+            assert_eq!(
+                output[0]["content"][0]["text"],
+                "Both tool results received"
+            );
+        }
+    }
+
+    let frames = upstream.state.frames.lock().await;
+    let handshakes = upstream.state.handshakes.lock().await;
+    assert_eq!(
+        frames.len(),
+        3,
+        "one response.create per public turn: {frames:?}"
+    );
+    assert_eq!(
+        handshakes.len(),
+        1,
+        "all client tool turns reuse one socket: {handshakes:?}"
+    );
+    assert_eq!(
+        handshakes[0]["authorization"],
+        "Bearer controlled-codex-continuation-token"
+    );
+    for (turn, (socket, frame)) in frames.iter().enumerate() {
+        assert_eq!(*socket, 0);
+        assert_eq!(frame["type"], "response.create");
+        let metadata = &frame["client_metadata"];
+        let context: Value = serde_json::from_str(
+            metadata["x-codex-turn-metadata"]
+                .as_str()
+                .expect("per-frame Codex turn context"),
+        )?;
+        assert!(
+            metadata["turn_id"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty())
+        );
+        assert_eq!(context["turn_id"], metadata["turn_id"]);
+        assert_eq!(
+            metadata["session_id"],
+            frames[0].1["client_metadata"]["session_id"]
+        );
+        for (_, earlier) in &frames[..turn] {
+            assert_ne!(
+                metadata["turn_id"], earlier["client_metadata"]["turn_id"],
+                "turn metadata must not freeze at the socket handshake"
+            );
+        }
+        if turn == 0 {
+            assert!(frame.get("previous_response_id").is_none_or(Value::is_null));
+        } else {
+            assert_eq!(
+                frame["previous_response_id"],
+                format!("resp_codex_{}", turn - 1)
+            );
+            assert_eq!(
+                frame["input"],
+                json!([tool_results[turn - 1]]),
+                "only the new client tool result is sent, never full history"
+            );
+        }
+    }
+    Ok(())
+}

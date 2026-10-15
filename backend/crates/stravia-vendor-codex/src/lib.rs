@@ -290,7 +290,13 @@ fn infer(
         "accept".into(),
         "text/event-stream, application/json".into(),
     ));
-    codex::append_runtime_headers(&provider, &body, &session, &mut headers)?;
+    codex::append_runtime_headers(
+        &provider,
+        &body,
+        &session,
+        codex::BodyOperation::Http,
+        &mut headers,
+    )?;
     host.emit_started()?;
     let response = host.http_start(stravia_vendor_sdk::wit::types::HttpRequest {
         method: "POST".into(),

@@ -492,6 +492,7 @@ pub(super) fn append_runtime_headers(
     provider: &ProviderSnapshot,
     body: &Value,
     session: &NativeSession,
+    operation: BodyOperation,
     headers: &mut Vec<(String, String)>,
 ) -> Result<(), stravia_vendor_sdk::PluginError> {
     // Codec/ingress headers are not native identity authority. Build this
@@ -500,10 +501,28 @@ pub(super) fn append_runtime_headers(
         name.eq_ignore_ascii_case("content-type") || name.eq_ignore_ascii_case("accept")
     });
     append_identity_headers(provider, headers)?;
+    let websocket = matches!(operation, BodyOperation::WebSocket);
     for (name, value) in &session.headers {
+        // 连接跨 turn 复用；动态快照和 sticky state 只随每帧 client_metadata 发送。
+        if websocket
+            && matches!(
+                name.as_str(),
+                "x-codex-turn-metadata" | "x-codex-turn-state"
+            )
+        {
+            continue;
+        }
         set_header(headers, name, value.clone());
     }
-    set_header(headers, "x-client-request-id", session.request_id.clone());
+    let request_id = if websocket {
+        // 官方 WS 握手以 thread 关联连接，不使用每次 HTTP 请求的 correlation ID。
+        session.metadata["thread_id"]
+            .as_str()
+            .expect("native thread ID")
+    } else {
+        &session.request_id
+    };
+    set_header(headers, "x-client-request-id", request_id.to_owned());
     set_header(headers, "x-codex-routing-hint", routing_hint(body)?);
     Ok(())
 }
@@ -578,7 +597,13 @@ pub(super) fn infer_websocket(
     preserve_upstream_errors: bool,
 ) -> Result<AiResponse, stravia_vendor_sdk::PluginError> {
     let mut headers = Vec::new();
-    append_runtime_headers(provider, body, session, &mut headers)?;
+    append_runtime_headers(
+        provider,
+        body,
+        session,
+        BodyOperation::WebSocket,
+        &mut headers,
+    )?;
     set_header(
         &mut headers,
         "openai-beta",
@@ -695,7 +720,13 @@ pub(super) fn search(
         ("content-type".into(), "application/json".into()),
         ("accept".into(), "text/event-stream".into()),
     ];
-    append_runtime_headers(provider, &body, &session, &mut headers)?;
+    append_runtime_headers(
+        provider,
+        &body,
+        &session,
+        BodyOperation::Search,
+        &mut headers,
+    )?;
     host.emit_started()?;
     let response = host.http_start(stravia_vendor_sdk::wit::types::HttpRequest {
         method: "POST".into(),
@@ -1211,7 +1242,14 @@ mod tests {
             ("conversation_id".into(), "codec-raw-conversation".into()),
             ("x-unapproved".into(), "not-native".into()),
         ];
-        append_runtime_headers(&provider, &body, &session, &mut headers).unwrap();
+        append_runtime_headers(
+            &provider,
+            &body,
+            &session,
+            BodyOperation::Http,
+            &mut headers,
+        )
+        .unwrap();
         let headers: BTreeMap<_, _> = headers.into_iter().collect();
         for (header, key) in [
             ("session-id", "session_id"),

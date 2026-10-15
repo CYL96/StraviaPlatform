@@ -911,16 +911,6 @@ async fn affinity_and_account_headers_follow_actual_codex_frames() {
             );
             assert_eq!(connections[0].headers.get(header), Some(value));
         }
-        assert_ne!(
-            connections[index].headers.get("x-client-request-id"),
-            connections[index].headers.get("thread-id")
-        );
-        if index > 0 {
-            assert_ne!(
-                connections[index].headers.get("x-client-request-id"),
-                connections[index - 1].headers.get("x-client-request-id")
-            );
-        }
     }
     assert!(
         sent[0]["client_metadata"]["turn_id"]

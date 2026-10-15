@@ -299,7 +299,7 @@ WebSocket 不在 `response.create` body 中重复传 token。所谓“每轮重�
 
 连接池按精确 Target namespace、affinity、URL、认证与握手参数隔离，并保存每条空闲连接最新成功完成的 upstream response ID；每个连接同一时刻只执行一个 response。连接 60 分钟后不再复用，宿主最多保留 64 条空闲连接，满时淘汰最早归池的连接；该限制不是 in-flight 连接上限。`store=false` 只有在原子取得匹配 tip 的可用 socket 后才能发送续接 ID。sibling 占用、tip 前移、重启、断线、淘汰或 max-age 导致匹配失败时，在任何增量请求发出前切换为完整 Effective Model Request，不消耗上游恢复预算。取消关闭所属 socket。
 
-Codex 的连接级 session/thread/window ID 由 `transport_affinity` 派生，turn ID 每轮变化且放在消息中；省略的默认服务级别与上游补全的 `default` 使用同一路由提示。不会通过忽略认证、账号或其他握手差异来强行复用连接。
+Codex 的连接级 session/thread/window ID 由 `transport_affinity` 派生；WebSocket 握手的 `x-client-request-id` 使用同一稳定 thread ID，不沿用 HTTP 的逐请求 correlation ID。turn ID 每轮变化，`x-codex-turn-metadata` 与同 turn 的 `x-codex-turn-state` 仅随各帧 `response.create.client_metadata` 发送，不进入握手。HTTP 的逐请求关联头及 turn 投影不变。省略的默认服务级别与上游补全的 `default` 使用同一路由提示。宿主仍精确比较握手参数，不通过忽略认证、账号或其他握手差异来强行复用连接。已安装的 `openai-codex` 组件需要重新构建并导入才能获得该行为。
 
 握手不支持或可恢复的传输失败沿现有 Target 重试与 cooldown 策略，在安全边界内回退同 Target HTTP/SSE；401/403/429 保持 typed Provider rejection。发送后接受状态不明、malformed/binary event 不因本地续接优化而获得重放许可。对于实际携带续接 ID 的请求，`previous_response_not_found`，以及 Codex 无 code 的明确 ``Invalid `previous_response_id`.`` 错误，只在尚无模型响应事件且既有恢复预算允许时清除旧 tip、最多回放一次完整历史。连接仍可用时可以复用，但不再携带旧 ID；普通 400、再次失败或响应已经开始时不走该回退。
 

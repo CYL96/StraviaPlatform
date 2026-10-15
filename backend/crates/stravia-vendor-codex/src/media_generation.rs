@@ -95,7 +95,13 @@ pub(super) fn generate(
         ("content-type".into(), "application/json".into()),
         ("accept".into(), "text/event-stream".into()),
     ];
-    codex::append_runtime_headers(provider, &body, &session, &mut headers)?;
+    codex::append_runtime_headers(
+        provider,
+        &body,
+        &session,
+        codex::BodyOperation::Image,
+        &mut headers,
+    )?;
     host.emit_started()?;
     let response = host.http_start(stravia_vendor_sdk::wit::types::HttpRequest {
         method: "POST".into(),
