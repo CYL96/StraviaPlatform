@@ -1,4 +1,4 @@
-use crate::{auth_error, credential, headers, invalid};
+use crate::{CLIENT_USER_AGENT, auth_error, credential, headers, invalid};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -61,6 +61,7 @@ fn post(
         vec![
             ("accept".into(), "application/json".into()),
             ("x-api-version".into(), "1.0.0".into()),
+            ("user-agent".into(), CLIENT_USER_AGENT.into()),
         ]
     });
     request_headers.push((
@@ -96,26 +97,6 @@ pub(super) fn execute(
     provider: &ProviderSnapshot,
     request: AuthRequest,
 ) -> Result<AuthResponse, PluginError> {
-    if provider.channel == "api-key" {
-        return match request.step {
-            AuthStep::ManualInput { value }
-                if !value.trim().is_empty() && !value.contains(['\r', '\n']) =>
-            {
-                Ok(credentials(BTreeMap::from([(
-                    "apiKey".into(),
-                    json!(value.trim()),
-                )])))
-            }
-            AuthStep::ManualInput { .. } => {
-                Err(auth_error("Meta API key must be nonempty and single-line"))
-            }
-            _ => Err(crate::common::unsupported(
-                "auth step",
-                crate::ID,
-                &provider.channel,
-            )),
-        };
-    }
     match request.step {
         AuthStep::Start { .. } => start(host),
         AuthStep::Poll => {

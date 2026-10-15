@@ -312,7 +312,7 @@ pub(super) fn infer(
         .filter(|model| !model.trim().is_empty())
         .ok_or_else(|| fail(ErrorKind::Invalid, "Kilo inference requires a model"))?
         .into();
-    authorize_model(provider, &request.model)?;
+    token(provider)?;
     let (protocol, body) = prepare(provider, request)?;
     let path = if protocol == RESPONSES {
         "/api/openrouter/responses"
@@ -330,26 +330,4 @@ pub(super) fn infer(
     stream::decode(host, &protocol, response)
         .map(Box::new)
         .map(OperationOutput::Infer)
-}
-pub(super) fn authorize_model(
-    provider: &ProviderSnapshot,
-    requested: &str,
-) -> Result<(), PluginError> {
-    if key(provider)?.is_some() {
-        return Ok(());
-    }
-    let model = metadata(provider);
-    if provider
-        .model_metadata
-        .as_ref()
-        .and_then(|model| model.id.as_deref())
-        != Some(requested)
-        || !models::free(requested, model.and_then(|model| model.get("pricing")))
-    {
-        return Err(fail(
-            ErrorKind::Auth,
-            "Anonymous Kilo inference requires a verified free model",
-        ));
-    }
-    Ok(())
 }

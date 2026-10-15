@@ -1,4 +1,4 @@
-//! First-party Meta Responses transport for Muse Code subscriptions and manual keys.
+//! First-party Meta Responses transport for Muse Code subscriptions.
 //! Contract: oh-my-pi v18.10.4 muse-code/meta provider and auth rules.
 mod auth;
 mod messages {
@@ -14,6 +14,9 @@ use stravia_vendor_sdk::*;
 const ID: &str = "muse-code";
 const BASE: &str = "https://api.meta.ai/v1";
 const PROTOCOL: &str = "open-responses/responses/2026-04-24";
+// 对齐契约客户端 OMP 18.10.4 所在 Bun 1.4.3 运行时的 fetch 默认 UA。Meta 会把无 UA 的
+// 设备登录请求 302 到 facebook.com/unsupportedbrowser，宿主按未授权 origin 拒绝该跳转。
+const CLIENT_USER_AGENT: &str = "Bun/1.4.3";
 
 fn invalid(message: &str) -> PluginError {
     common::plugin_error(ErrorKind::Invalid, message)
@@ -32,13 +35,10 @@ fn credential<'a>(provider: &'a ProviderSnapshot, key: &str) -> Option<&'a str> 
 fn key(provider: &ProviderSnapshot) -> Result<&str, PluginError> {
     credential(provider, "apiKey")
         .filter(|key| !key.contains(['\r', '\n']))
-        .ok_or_else(|| auth_error("Muse Code API key is missing or invalid; authenticate again"))
+        .ok_or_else(|| auth_error("Muse Code inference key is missing or invalid; sign in again"))
 }
 fn route(channel: &str, provider: &ProviderSnapshot) -> Result<(), PluginError> {
-    if provider.provider_id != ID
-        || !matches!(channel, "subscription" | "api-key")
-        || provider.channel != channel
-    {
+    if provider.provider_id != ID || channel != "subscription" || provider.channel != channel {
         return Err(common::unsupported("route", ID, channel));
     }
     if provider.base_url.trim_end_matches('/') != BASE {
@@ -51,10 +51,11 @@ fn headers(token: &str) -> Vec<(String, String)> {
         ("authorization".into(), format!("Bearer {token}")),
         ("x-api-version".into(), "1.0.0".into()),
         ("accept".into(), "application/json".into()),
+        ("user-agent".into(), CLIENT_USER_AGENT.into()),
     ]
 }
 
-fn seed(id: &str, channel: &str) -> Option<(&'static str, bool)> {
+fn seed(id: &str) -> Option<(&'static str, bool)> {
     Some(match id {
         "muse-spark-1.1" => ("Muse Spark 1.1", false),
         "muse-spark-1.2" => ("Muse Spark 1.2", false),
@@ -62,11 +63,9 @@ fn seed(id: &str, channel: &str) -> Option<(&'static str, bool)> {
         "muse-spark-1.3" => ("Muse Spark 1.3", true),
         "muse-spark-1.3-contributor" => ("Muse Spark 1.3 (C)", false),
         "muse-wonder-1.0" => ("Muse Wonder", true),
-        "muse-wonder-1.0-contributor" if channel == "subscription" => ("Muse Wonder (C)", true),
-        "muse-wonder-full-1.0" if channel == "subscription" => ("Muse Wonder Full", true),
-        "muse-wonder-full-1.0-contributor" if channel == "subscription" => {
-            ("Muse Wonder Full (C)", true)
-        }
+        "muse-wonder-1.0-contributor" => ("Muse Wonder (C)", true),
+        "muse-wonder-full-1.0" => ("Muse Wonder Full", true),
+        "muse-wonder-full-1.0-contributor" => ("Muse Wonder Full (C)", true),
         _ => return None,
     })
 }
@@ -101,7 +100,7 @@ fn discover(host: &GuestHost, provider: &ProviderSnapshot) -> Result<OperationOu
             metadata.insert("created".into(), created.clone());
         }
         let mut capabilities = Vec::new();
-        let name = if let Some((name, max)) = seed(id, &provider.channel) {
+        let name = if let Some((name, max)) = seed(id) {
             capabilities.extend(["reasoning".into(), "tool_call".into(), "image_input".into()]);
             metadata.insert("limit".into(), json!({"context":1048576,"output":131072}));
             metadata.insert("input_modalities".into(), json!(["text", "image"]));
@@ -136,7 +135,7 @@ fn discover(host: &GuestHost, provider: &ProviderSnapshot) -> Result<OperationOu
 // Meta's CreateResponse schema is not the complete OpenAI Responses surface.
 // https://dev.meta.ai/docs/api-reference/responses/schemas#create-response
 // https://dev.meta.ai/docs/protocols/responses#openai-compatibility
-fn project_body(body: &mut Value, model: &str, channel: &str) -> Result<(), PluginError> {
+fn project_body(body: &mut Value, model: &str) -> Result<(), PluginError> {
     let object = body
         .as_object_mut()
         .ok_or_else(|| invalid("Responses body must be an object"))?;
@@ -187,7 +186,7 @@ fn project_body(body: &mut Value, model: &str, channel: &str) -> Result<(), Plug
             }
         }
     }
-    let known = seed(model, channel);
+    let known = seed(model);
     if let Some(reasoning) = object.get_mut("reasoning").and_then(Value::as_object_mut) {
         reasoning.retain(|name, _| matches!(name.as_str(), "effort" | "summary"));
         let supports_max = known.is_some_and(|(_, max)| max);
@@ -310,7 +309,6 @@ fn infer(
     project_body(
         &mut encoded.body,
         provider.model.as_deref().unwrap_or_default(),
-        &provider.channel,
     )?;
     let mut headers = headers(key(provider)?);
     headers.push(("content-type".into(), "application/json".into()));
@@ -367,35 +365,14 @@ pub fn descriptor() -> VendorDescriptor {
         Capability::ModelDiscovery,
         Capability::AuthOauth,
     ]);
-    let channel = |id: &str, subscription: bool| ChannelDescriptor {
-        id: id.into(),
-        name: if subscription {
-            messages::subscription()
-        } else {
-            messages::api_key_channel()
-        },
-        description: Some(if subscription {
-            messages::subscription_description()
-        } else {
-            messages::api_key_description()
-        }),
+    let channel = ChannelDescriptor {
+        id: "subscription".into(),
+        name: messages::subscription(),
+        description: Some(messages::subscription_description()),
         auth: Some(AuthDescriptor {
-            flow: if subscription {
-                AuthFlow::DeviceCode
-            } else {
-                AuthFlow::Manual
-            },
+            flow: AuthFlow::DeviceCode,
             callback: None,
-            manual_input: if subscription {
-                None
-            } else {
-                Some(AuthManualInput {
-                    input_type: AuthManualInputType::Text,
-                    label: messages::api_key(),
-                    description: Some(messages::api_key_description()),
-                    secret: true,
-                })
-            },
+            manual_input: None,
         }),
         protocol: Some("open-responses".into()),
         protocols: Vec::new(),
@@ -408,14 +385,13 @@ pub fn descriptor() -> VendorDescriptor {
     };
     VendorDescriptor {
         vendor_id: ID.into(), version: semver::Version::parse(env!("CARGO_PKG_VERSION")).expect("package semver"), display_name: "Muse Code".into(),
-        description: Some("Meta Muse Code subscription device login and manual Model API keys; automatic tool selection only.".into()), authors: vec!["Stravia".into()],
+        description: Some("Meta Muse Code subscription device login; automatic tool selection only.".into()), authors: vec!["Stravia".into()],
         canonical_format_version: CANONICAL_FORMAT_VERSION, kind: VendorKind::Dedicated,
         providers: vec![ProviderDescriptor { provider_id: ID.into(), catalog_id: Some("meta".into()), icon_svg: stravia_vendor_common::icons::provider_svg("meta").map(str::to_owned),
-            display_name: "Muse Code".into(), description: Some(messages::compatibility().english_text().to_owned()), channels: vec![channel("subscription", true), channel("api-key", false)], capabilities,
+            display_name: "Muse Code".into(), description: Some(messages::compatibility().english_text().to_owned()), channels: vec![channel], capabilities,
             website: Some("https://dev.meta.ai/docs/muse-code/auth".into()), implementation: None,
-            config_groups: vec![ConfigGroup { id: "credentials".into(), label: messages::credentials() }],
-            config_fields: vec![ConfigField { key: "apiKey".into(), label: messages::api_key(), description: Some(messages::api_key_description()), kind: ConfigFieldKind::String { multiline: false }, required: false,
-                default_json: None, group: Some("credentials".into()), secret: true, min: None, max: None, max_length: Some(16384), pattern: None, visible_when: None }],
+            config_groups: Vec::new(),
+            config_fields: Vec::new(),
             network: NetworkDeclaration { base_url_field: None, extra_origins: vec![OriginDeclaration { scheme: "https".into(), host: "api.meta.ai".into(), port: None }, OriginDeclaration { scheme: "https".into(), host: "auth.meta.com".into(), port: None }], field_origins: Vec::new() }, data_compat: DataCompatibility::default() }],
     }
 }

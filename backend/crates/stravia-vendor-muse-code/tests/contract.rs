@@ -233,6 +233,14 @@ async fn device_flow_mints_once_and_keeps_account_token_out_of_inference() {
         String::from_utf8(requests[0].body.clone()).unwrap(),
         "client_id=1031625952748946"
     );
+    // Meta 把无 UA 的设备登录重定向到浏览器不支持页；每一步认证请求都必须带 UA。
+    for request in requests.iter() {
+        assert!(
+            request
+                .headers
+                .contains(&("user-agent".into(), "Bun/1.4.3".into()))
+        );
+    }
     let form: BTreeMap<_, _> = url::form_urlencoded::parse(&requests[1].body)
         .into_owned()
         .collect();
@@ -308,29 +316,26 @@ async fn pending_slowdown_denial_expiry_and_entitlement_are_explicit_and_redacte
 
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires task build:vendors:all"]
-async fn manual_key_and_discovery_do_not_mint_or_claim_unknown_model_capabilities() {
+async fn manual_key_is_rejected_and_discovery_does_not_claim_unknown_model_capabilities() {
     let (runtime, plugin) = load().await;
     let services = Arc::new(Services::default());
-    let output = run(
-        &runtime,
-        &plugin,
-        &services,
-        OperationInput::Auth {
-            provider: provider("api-key", false),
-            request: AuthRequest {
-                step: AuthStep::ManualInput {
-                    value: "manual-key".into(),
+    assert!(
+        run(
+            &runtime,
+            &plugin,
+            &services,
+            OperationInput::Auth {
+                provider: provider("subscription", false),
+                request: AuthRequest {
+                    step: AuthStep::ManualInput {
+                        value: "manual-key".into(),
+                    },
                 },
             },
-        },
-    )
-    .await
-    .unwrap();
-    let OperationOutput::Auth(AuthResponse::Credentials { values, .. }) = output else {
-        panic!("manual credentials")
-    };
-    assert_eq!(values.len(), 1);
-    assert_eq!(values["apiKey"], "manual-key");
+        )
+        .await
+        .is_err()
+    );
     assert!(services.requests.lock().is_empty());
     services.reply(
         200,
@@ -341,7 +346,7 @@ async fn manual_key_and_discovery_do_not_mint_or_claim_unknown_model_capabilitie
         &plugin,
         &services,
         OperationInput::Discover {
-            provider: provider("api-key", true),
+            provider: provider("subscription", true),
             request: DiscoverRequest::default(),
         },
     )
@@ -518,7 +523,7 @@ async fn responses_stream_preserves_tools_results_and_real_encrypted_reasoning()
 async fn invalid_origins_credentials_refresh_and_upstream_errors_never_fallback() {
     let (runtime, plugin) = load().await;
     let services = Arc::new(Services::default());
-    let mut p = provider("api-key", true);
+    let mut p = provider("subscription", true);
     p.base_url = "https://untrusted.example/v1".into();
     assert!(
         run(
@@ -533,7 +538,7 @@ async fn invalid_origins_credentials_refresh_and_upstream_errors_never_fallback(
         .await
         .is_err()
     );
-    let mut p = provider("api-key", false);
+    let mut p = provider("subscription", false);
     p.options.insert("apiKey".into(), json!("option-key"));
     assert!(
         run(
@@ -751,7 +756,7 @@ async fn meta_projection_omits_foreign_controls_and_keeps_supported_native_value
     );
     assert!(sent.headers.iter().all(|(name, _)| matches!(
         name.as_str(),
-        "authorization" | "x-api-version" | "content-type" | "accept"
+        "authorization" | "x-api-version" | "content-type" | "accept" | "user-agent"
     )));
     let serialized = serde_json::to_string(&body).unwrap();
     for private in [

@@ -1,22 +1,6 @@
 use super::*;
 
-pub(super) fn free(id: &str, pricing: Option<&Value>) -> bool {
-    let zero = |name: &str| {
-        pricing
-            .and_then(|v| v.get(name))
-            .and_then(Value::as_str)
-            .and_then(|v| v.parse::<f64>().ok())
-            == Some(0.0)
-    };
-    zero("prompt")
-        && zero("completion")
-        && (id == "kilo-auto/free"
-            || id.contains(":free")
-            || !id.contains('/')
-            || id.starts_with("kilo/")
-            || id.starts_with("openrouter/"))
-}
-pub(super) fn parse(mut value: Value, anonymous: bool) -> Result<DiscoverResponse, PluginError> {
+pub(super) fn parse(mut value: Value) -> Result<DiscoverResponse, PluginError> {
     let data = value.get_mut("data").map(Value::take).ok_or_else(|| {
         fail(
             ErrorKind::Invalid,
@@ -37,9 +21,6 @@ pub(super) fn parse(mut value: Value, anonymous: bool) -> Result<DiscoverRespons
             .filter(|v| !v.is_empty())
             .ok_or_else(|| fail(ErrorKind::Invalid, "Kilo model ID missing"))?
             .to_owned();
-        if anonymous && !free(&id, model.get("pricing")) {
-            continue;
-        }
         let has = |field: &str, value: &str| {
             model
                 .pointer(field)
@@ -109,8 +90,6 @@ pub(super) fn discover(
         || "/api/gateway/models".into(),
         |org| format!("/api/organizations/{}/models", escape(org)),
     );
-    parse(
-        http_json(host, provider, "GET", &path)?,
-        key(provider)?.is_none(),
-    )
+    token(provider)?;
+    parse(http_json(host, provider, "GET", &path)?)
 }

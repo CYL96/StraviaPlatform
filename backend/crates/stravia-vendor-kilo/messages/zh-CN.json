@@ -1,1 +1,1 @@
-{"default_channel":"Kilo 登录","api_key_channel":"API 密钥","anonymous_channel":"匿名免费模型","credentials_group":"认证","api_key":"API 密钥","api_key_description":"输入 Kilo API 密钥。认证资料用于验证账号及组织访问权限。","organization_id":"组织 ID","organization_description":"可选，必须属于已认证账号。留空使用个人账号。"}
+{"default_channel":"Kilo 登录","organization_group":"组织","organization_id":"组织 ID","organization_description":"可选，必须属于已登录账号。留空使用个人账号；修改后需重新登录。"}

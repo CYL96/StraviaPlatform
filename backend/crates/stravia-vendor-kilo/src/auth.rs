@@ -83,27 +83,13 @@ pub(super) fn execute(
     provider: &ProviderSnapshot,
     step: AuthStep,
 ) -> Result<AuthResponse, PluginError> {
-    if provider.channel == "anonymous" {
-        return Err(fail(
-            ErrorKind::Unsupported,
-            "Anonymous Kilo does not use authentication",
-        ));
-    }
-    if provider.channel == "api-key" {
-        return match step {
-            AuthStep::ManualInput { value } => approved(host, provider, &value, None),
-            _ => Err(fail(
-                ErrorKind::Unsupported,
-                "Kilo API-key authentication requires manual input",
-            )),
-        };
-    }
     match step {
         AuthStep::Start { .. } => {
-            let mut anonymous = provider.clone();
-            anonymous.credentials.clear();
-            anonymous.options.remove("organizationId");
-            let value = http_json(host, &anonymous, "POST", "/api/device-auth/codes")?;
+            // 设备码签发早于登录，必须不带旧令牌和组织头。
+            let mut unauthenticated = provider.clone();
+            unauthenticated.credentials.clear();
+            unauthenticated.options.remove("organizationId");
+            let value = http_json(host, &unauthenticated, "POST", "/api/device-auth/codes")?;
             let code = value
                 .get("code")
                 .and_then(Value::as_str)
@@ -204,10 +190,8 @@ pub(super) fn execute(
             host.write_private_state(b"null")?;
             Ok(result)
         }
-        AuthStep::ManualInput { value } => approved(host, provider, &value, None),
         AuthStep::Refresh => {
-            let token = key(provider)?
-                .ok_or_else(|| fail(ErrorKind::Auth, "Kilo credentials missing; sign in again"))?;
+            let token = token(provider)?;
             approved(
                 host,
                 provider,
@@ -220,7 +204,7 @@ pub(super) fn execute(
         }
         _ => Err(fail(
             ErrorKind::Unsupported,
-            "Kilo has no refresh grant, revoke or callback exchange endpoint",
+            "Kilo has no manual input, refresh grant, revoke or callback exchange endpoint",
         )),
     }
 }

@@ -23,10 +23,7 @@ fn fail(kind: ErrorKind, message: impl Into<String>) -> PluginError {
     common::plugin_error(kind, message)
 }
 fn check(channel: &str, provider: &ProviderSnapshot) -> Result<(), PluginError> {
-    if provider.provider_id != "kilo"
-        || !matches!(channel, "default" | "api-key" | "anonymous")
-        || provider.channel != channel
-    {
+    if provider.provider_id != "kilo" || channel != "default" || provider.channel != channel {
         return Err(fail(ErrorKind::Invalid, "Kilo provider/channel mismatch"));
     }
     if provider.base_url.trim_end_matches('/') != BASE {
@@ -52,6 +49,9 @@ fn key(provider: &ProviderSnapshot) -> Result<Option<&str>, PluginError> {
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|v| !v.is_empty()))
+}
+fn token(provider: &ProviderSnapshot) -> Result<&str, PluginError> {
+    key(provider)?.ok_or_else(|| fail(ErrorKind::Auth, "Kilo credentials missing; sign in again"))
 }
 fn organization(provider: &ProviderSnapshot) -> Option<&str> {
     provider
@@ -133,23 +133,6 @@ fn http_json(
     serde_json::from_slice(&bytes)
         .map_err(|e| fail(ErrorKind::Invalid, format!("Invalid Kilo JSON: {e}")))
 }
-fn field(key: &str, label: LocalizedText, description: LocalizedText, secret: bool) -> ConfigField {
-    ConfigField {
-        key: key.into(),
-        label,
-        description: Some(description),
-        kind: ConfigFieldKind::String { multiline: false },
-        required: false,
-        default_json: None,
-        group: Some("credentials".into()),
-        secret,
-        min: None,
-        max: None,
-        max_length: Some(16384),
-        pattern: None,
-        visible_when: None,
-    }
-}
 pub fn descriptor() -> VendorDescriptor {
     let capabilities = BTreeSet::from([
         Capability::Infer,
@@ -157,53 +140,31 @@ pub fn descriptor() -> VendorDescriptor {
         Capability::AuthOauth,
         Capability::Allowance,
     ]);
-    let channel = |id: &str| {
-        let anonymous = id == "anonymous";
-        ChannelDescriptor {
-            id: id.into(),
-            name: match id {
-                "api-key" => messages::api_key_channel(),
-                "anonymous" => messages::anonymous_channel(),
-                _ => messages::default_channel(),
-            },
-            description: None,
-            auth: if anonymous {
-                None
-            } else {
-                Some(AuthDescriptor {
-                    flow: if id == "api-key" {
-                        AuthFlow::Manual
-                    } else {
-                        AuthFlow::DeviceCode
-                    },
-                    callback: None,
-                    manual_input: (id == "api-key").then(|| AuthManualInput {
-                        input_type: AuthManualInputType::Text,
-                        label: messages::api_key(),
-                        description: Some(messages::api_key_description()),
-                        secret: true,
-                    }),
-                })
-            },
-            protocol: Some("openai-compatible".into()),
-            protocols: Vec::new(),
-            default_base_url: Some(BASE.into()),
-            default_models_source: None,
-            consumes_catalog_models: false,
-            capabilities: if anonymous {
-                BTreeSet::from([Capability::Infer, Capability::ModelDiscovery])
-            } else {
-                capabilities.clone()
-            },
-            client_header_names: BTreeSet::new(),
-            model_capabilities: BTreeSet::new(),
-        }
+    let channel = ChannelDescriptor {
+        id: "default".into(),
+        name: messages::default_channel(),
+        description: None,
+        auth: Some(AuthDescriptor {
+            flow: AuthFlow::DeviceCode,
+            callback: None,
+            manual_input: None,
+        }),
+        protocol: Some("openai-compatible".into()),
+        protocols: Vec::new(),
+        default_base_url: Some(BASE.into()),
+        default_models_source: None,
+        consumes_catalog_models: false,
+        capabilities: capabilities.clone(),
+        client_header_names: BTreeSet::new(),
+        model_capabilities: BTreeSet::new(),
     };
     VendorDescriptor {
         vendor_id: "kilo".into(),
         version: semver::Version::parse(env!("CARGO_PKG_VERSION")).expect("valid version"),
         display_name: "Kilo".into(),
-        description: Some("Kilo Gateway: personal, organization and anonymous free models".into()),
+        description: Some(
+            "Kilo Gateway: personal and organization accounts via device sign-in".into(),
+        ),
         authors: vec!["Stravia".into()],
         canonical_format_version: CANONICAL_FORMAT_VERSION,
         kind: VendorKind::Dedicated,
@@ -213,28 +174,29 @@ pub fn descriptor() -> VendorDescriptor {
             icon_svg: None,
             display_name: "Kilo".into(),
             description: None,
-            channels: vec![channel("default"), channel("api-key"), channel("anonymous")],
+            channels: vec![channel],
             capabilities,
             website: Some("https://kilo.ai".into()),
             implementation: None,
             config_groups: vec![ConfigGroup {
-                id: "credentials".into(),
-                label: messages::credentials_group(),
+                id: "organization".into(),
+                label: messages::organization_group(),
             }],
-            config_fields: vec![
-                field(
-                    "apiKey",
-                    messages::api_key(),
-                    messages::api_key_description(),
-                    true,
-                ),
-                field(
-                    "organizationId",
-                    messages::organization_id(),
-                    messages::organization_description(),
-                    false,
-                ),
-            ],
+            config_fields: vec![ConfigField {
+                key: "organizationId".into(),
+                label: messages::organization_id(),
+                description: Some(messages::organization_description()),
+                kind: ConfigFieldKind::String { multiline: false },
+                required: false,
+                default_json: None,
+                group: Some("organization".into()),
+                secret: false,
+                min: None,
+                max: None,
+                max_length: Some(16384),
+                pattern: None,
+                visible_when: None,
+            }],
             network: NetworkDeclaration {
                 base_url_field: None,
                 extra_origins: vec![OriginDeclaration {

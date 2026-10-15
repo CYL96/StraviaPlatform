@@ -13,7 +13,7 @@ use stravia_vendor_runtime::{
     LogLevel, OperationScope, RuntimeError, RuntimeEvent, VendorRuntime,
 };
 use stravia_vendor_sdk::{
-    AuthRequest, AuthResponse, AuthStep, ErrorKind, ModelMetadata, OperationInput, OperationOutput,
+    AuthRequest, AuthResponse, AuthStep, ErrorKind, OperationInput, OperationOutput,
     ProviderSnapshot,
 };
 
@@ -240,7 +240,7 @@ async fn device_pending_approval_profile_and_expiry() {
 }
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires built Kilo Wasm component"]
-async fn device_denied_expired_and_manual_org_membership() {
+async fn device_denied_expired_and_unverified_org_membership() {
     let (runtime, plugin) = load().await;
     for status in [403, 410] {
         let s = Arc::new(Services::default());
@@ -259,6 +259,18 @@ async fn device_denied_expired_and_manual_org_membership() {
         );
     }
     let s = Arc::new(Services::default());
+    *s.state.lock() = Some(
+        format!(
+            "{{\"code\":\"code\",\"deadline_ms\":{}}}",
+            chrono::Utc::now().timestamp_millis() + 60000
+        )
+        .into_bytes(),
+    );
+    s.add(
+        200,
+        "application/json",
+        r#"{"status":"approved","token":"secret"}"#,
+    );
     s.add(
         200,
         "application/json",
@@ -268,32 +280,55 @@ async fn device_denied_expired_and_manual_org_membership() {
     p.options
         .insert("organizationId".into(), json!("unauthorized"));
     assert!(
+        run(&runtime, &plugin, auth(p, AuthStep::Poll), s.clone())
+            .await
+            .is_err()
+    );
+    let count = s.requests.lock().len();
+    assert!(
         run(
             &runtime,
             &plugin,
             auth(
-                p,
+                provider(),
                 AuthStep::ManualInput {
                     value: "key".into()
                 }
             ),
-            s
+            s.clone()
         )
         .await
         .is_err()
     );
+    assert_eq!(s.requests.lock().len(), count);
 }
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires built Kilo Wasm component"]
-async fn anonymous_catalog_and_organization_usage_units() {
+async fn signed_in_catalog_and_organization_balance() {
     let (runtime, plugin) = load().await;
     let s = Arc::new(Services::default());
-    s.add(200,"application/json",r#"{"data":[{"id":"vendor/paid","pricing":{"prompt":"0","completion":"0"}},{"id":"vendor/free:free","pricing":{"prompt":"0","completion":"0"}}]}"#);
+    assert!(
+        run(
+            &runtime,
+            &plugin,
+            OperationInput::Discover {
+                provider: provider(),
+                request: Default::default(),
+            },
+            s.clone(),
+        )
+        .await
+        .is_err()
+    );
+    assert!(s.requests.lock().is_empty());
+    s.add(200,"application/json",r#"{"data":[{"id":"vendor/paid","pricing":{"prompt":"1","completion":"1"}},{"id":"vendor/free:free","pricing":{"prompt":"0","completion":"0"}}]}"#);
+    let mut p = provider();
+    p.credentials.insert("apiKey".into(), json!("key"));
     let out = run(
         &runtime,
         &plugin,
         OperationInput::Discover {
-            provider: provider(),
+            provider: p.clone(),
             request: Default::default(),
         },
         s.clone(),
@@ -303,24 +338,16 @@ async fn anonymous_catalog_and_organization_usage_units() {
     let OperationOutput::Discover(out) = out else {
         panic!("discover")
     };
-    assert_eq!(out.models.len(), 1);
-    assert_eq!(out.models[0].id, "vendor/free:free");
+    assert_eq!(out.models.len(), 2);
     assert!(
         s.requests.lock()[0]
             .headers
-            .iter()
-            .all(|(n, _)| !n.eq_ignore_ascii_case("authorization"))
+            .contains(&("authorization".into(), "Bearer key".into()))
     );
-    let mut p = provider();
-    p.credentials.insert("apiKey".into(), json!("key"));
     p.credentials
         .insert("organizations".into(), json!([{"id":"org/id"}]));
     p.options.insert("organizationId".into(), json!("org/id"));
-    s.add(
-        200,
-        "application/json",
-        r#"{"usage":[{"date":"2026-10-01","model":"vendor/model","total_cost":1000001}]}"#,
-    );
+    s.add(200, "application/json", r#"{"balance":7.5}"#);
     let out = run(
         &runtime,
         &plugin,
@@ -335,9 +362,15 @@ async fn anonymous_catalog_and_organization_usage_units() {
     let OperationOutput::Allowance(out) = out else {
         panic!("allowance")
     };
-    assert_eq!(out.allowances[0].used.as_ref().unwrap().value, "1.000001");
-    assert!(out.allowances[0].limit.is_none());
-    assert!(s.requests.lock()[1].url.contains("viewType=org%2Fid"));
+    assert_eq!(out.allowances[0].kind, "balance");
+    assert_eq!(out.allowances[0].remaining.as_ref().unwrap().value, "7.5");
+    let request = s.requests.lock()[1].clone();
+    assert!(request.url.ends_with("/api/profile/balance"));
+    assert!(
+        request
+            .headers
+            .contains(&("X-KiloCode-OrganizationId".into(), "org/id".into()))
+    );
     let count = s.requests.lock().len();
     assert!(
         run(
@@ -356,7 +389,7 @@ async fn anonymous_catalog_and_organization_usage_units() {
 }
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires built Kilo Wasm component"]
-async fn anonymous_route_alias_uses_the_verified_target_model() {
+async fn route_alias_uses_the_target_model_and_requires_sign_in() {
     let (runtime, plugin) = load().await;
     let services = Arc::new(Services::default());
     services.add(
@@ -365,15 +398,24 @@ async fn anonymous_route_alias_uses_the_verified_target_model() {
         "data: {\"id\":\"native\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"target accepted\"}}]}\n\ndata: {\"id\":\"native\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":2}}\n\ndata: [DONE]\n\n",
     );
     let mut target = provider();
-    target.channel = "anonymous".into();
     target.model = Some("vendor/free:free".into());
-    target.model_metadata = Some(ModelMetadata {
-        id: Some("vendor/free:free".into()),
-        extensions: BTreeMap::from([("pricing".into(), json!({"prompt":"0","completion":"0"}))]),
-        ..Default::default()
-    });
     let mut request = AiRequest::new("user-facing-route", vec![]);
     request.stream.enabled = true;
+    assert!(
+        run(
+            &runtime,
+            &plugin,
+            OperationInput::Infer {
+                provider: target.clone(),
+                request: request.clone(),
+            },
+            services.clone(),
+        )
+        .await
+        .is_err()
+    );
+    assert!(services.requests.lock().is_empty());
+    target.credentials.insert("apiKey".into(), json!("key"));
     let output = run(
         &runtime,
         &plugin,
@@ -395,8 +437,7 @@ async fn anonymous_route_alias_uses_the_verified_target_model() {
     assert!(
         requests[0]
             .headers
-            .iter()
-            .all(|(name, _)| !name.eq_ignore_ascii_case("authorization"))
+            .contains(&("authorization".into(), "Bearer key".into()))
     );
 }
 

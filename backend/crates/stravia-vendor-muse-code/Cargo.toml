@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Dedicated Muse Code subscription and Meta API key Wasm vendor guest"
+description = "Dedicated Muse Code subscription Wasm vendor guest"
 publish = false
 
 [lib]

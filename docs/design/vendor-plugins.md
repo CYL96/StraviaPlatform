@@ -24,8 +24,8 @@
 | `stravia-vendor-claudecode` | `claude-code` / `dedicated` | `provider_id = claude-code`、`catalog_id = anthropic`、channel `oauth`。 |
 | `stravia-vendor-antigravity` | `antigravity` / `dedicated` | `provider_id = antigravity`、无目录映射、channel `oauth`；模型与额度来自登录账号。 |
 | `stravia-vendor-opencode-free` | `opencode-free` / `dedicated` | `provider_id = opencode-free`、`catalog_id = opencode`、channel `default`。 |
-| `stravia-vendor-muse-code` | `muse-code` / `dedicated` | `provider_id = muse-code`、`catalog_id = meta`、channel `subscription`、`api-key`。 |
-| `stravia-vendor-kilo` | `kilo` / `dedicated` | `provider_id = kilo`、`catalog_id = kilo`、channel `default`、`api-key`、`anonymous`。 |
+| `stravia-vendor-muse-code` | `muse-code` / `dedicated` | `provider_id = muse-code`、`catalog_id = meta`、channel `subscription`。 |
+| `stravia-vendor-kilo` | `kilo` / `dedicated` | `provider_id = kilo`、`catalog_id = kilo`、channel `default`。 |
 
 ### 客户端身份版本
 
@@ -56,7 +56,7 @@ Claude Code 的 SDK 标记与 `claude-cli/2.1.300 (external, sdk-cli)` User-Agen
 |Grok|官方 [Grok Build 固定提交](https://github.com/xai-org/grok-build/tree/9684fa3cdbf2995e30ea8b9b637f1db008f144fc)的 Responses、sampler、tool override 实现|按源码重建 body、搜索控制与 `x-grok-*` 会话头；本轮未完成官方 CLI 账号抓包。|
 |Devin|已固定 OMP `v18.10.4` 的 `providers/devin.ts`、现有私有 protobuf 编码证据|官方 CLI 隔离配置尝试因无法确定 config directory 失败，捕获请求为零，不能宣称本轮 CLI 抓包成功。真实请求验证与源码证据分开记录。|
 |OpenCode Zen Free|官方 `1.18.25` 的隔离请求捕获、[原生 ID 算法](https://github.com/anomalyco/opencode/blob/cb7d8b2f5e44876ef98b661dc10590c915af3a9f/packages/schema/src/identifier.ts)与匿名单变量探测|捕获完整 UA、会话头和工具输入 schema；实际 Wasm 在 `/inference/v1` 对 `big-pickle` 返回 200 与准确探测文本。不能外推为所有免费模型、其他协议或未来门控的支持证明。|
-|其他插件|各自既有固定官方协议／工具源码、模型目录与 OMP 实现|通过实际 Wasm 合同验证投影与流式解析，不把离线 fixture 当作账号资格证明。Muse Code 账号授权与 Kilo OAuth 仍需要对应账号；Kilo 匿名调用仅允许真实目录确认的免费模型。|
+|其他插件|各自既有固定官方协议／工具源码、模型目录与 OMP 实现|通过实际 Wasm 合同验证投影与流式解析，不把离线 fixture 当作账号资格证明。Muse Code 账号授权与 Kilo OAuth 仍需要对应账号。|
 
 上述 CLI 捕获均使用合成凭据、隔离配置与 loopback 接收器，返回受控错误，不执行模型工具，不产生官方服务调用。它们证明工具构造出的参数形态，不证明上游接受任意字段取值；授权的真实调用另行验证成功终态。真实 Codex HTTP 对同一可用模型的 `stream:false` 返回 400／`stream must be set to true`，改为 `stream:true` 后返回 200 并完成。插件因此对非 compact 操作固定使用官方流式 wire；客户端可继续选择非流式响应，由宿主汇总结果，canonical 的交付选择不被改写。compact 保持其官方非流式契约。
 
@@ -85,10 +85,10 @@ Devin 的 `GetUserStatus` 在 `PlanStatus` 中报告每日、每周剩余百分�
 Muse Code 由独立 `muse-code` 插件提供，固定接入 `https://api.meta.ai/v1`，不把普通 Meta 目录 Profile 自动迁移为订阅连接。
 
 1. 在供应商插件管理页本地导入 Release 的 `stravia-vendor-muse-code-v{version}.wasm`；本地构建使用 `task build:vendors:all`，从 `target/vendor-plugins-all/manifest.json` 找到对应组件。更新同样须重新构建并导入独立 Wasm，仅升级宿主不会更新已安装 codec。
-2. 添加 **Muse Code** 模型服务。`subscription` 使用 Meta device login：打开界面提供的 `auth.meta.com` 验证页，完成设备授权；插件向设备 token 端点换取账号 token，再向 `/muse-code/key` 提交 onboarding 请求取得推理 API key。订阅 inactive 或需付款/账号操作时明确失败，用户在 Meta 账号完成操作后重新登录；不自动再次 mint key。`api-key` 则在秘密输入框填写手动 Model API key。
-3. 保存后同步模型，并把实际发现的模型绑定到 Route。两个 channel 均通过 Bearer API key 与 `x-api-version: 1.0.0` 读取 `/v1/models`、调用 `/v1/responses`；账号 OAuth token 不作为推理凭据。未知模型仍登记真实 ID，但不猜测上下文或能力。
+2. 添加 **Muse Code** 模型服务。`subscription` 使用 Meta device login：打开界面提供的 `auth.meta.com` 验证页，完成设备授权；插件向设备 token 端点换取账号 token，再向 `/muse-code/key` 提交 onboarding 请求取得推理 API key。订阅 inactive 或需付款/账号操作时明确失败，用户在 Meta 账号完成操作后重新登录；不自动再次 mint key。插件只提供这一种登录方式，不接受手动 Model API key。
+3. 保存后同步模型，并把实际发现的模型绑定到 Route。插件通过订阅换取的 Bearer API key 与 `x-api-version: 1.0.0` 读取 `/v1/models`、调用 `/v1/responses`；账号 OAuth token 不作为推理凭据。未知模型仍登记真实 ID，但不猜测上下文或能力。
 
-插件提供认证、模型发现与推理，没有额度查询能力，不把缺失额度显示为零。Meta 无已实现的 refresh/revoke grant；插件不伪造刷新成功或到期时间，失效后需重新登录或更换手动 key。接入边界见 [Meta Muse Code 认证](https://dev.meta.ai/docs/muse-code/auth)、[CreateResponse schema](https://dev.meta.ai/docs/api-reference/responses/schemas#create-response)、[Responses 兼容范围](https://dev.meta.ai/docs/protocols/responses#openai-compatibility)；已知型号能力种子固定依据 [oh-my-pi `v18.10.4`](https://github.com/can1357/oh-my-pi/tree/v18.10.4)，不扩大 `/models` 返回的集合。
+插件提供认证、模型发现与推理，没有额度查询能力，不把缺失额度显示为零。Meta 无已实现的 refresh/revoke grant；插件不伪造刷新成功或到期时间，失效后需重新登录。接入边界见 [Meta Muse Code 认证](https://dev.meta.ai/docs/muse-code/auth)、[CreateResponse schema](https://dev.meta.ai/docs/api-reference/responses/schemas#create-response)、[Responses 兼容范围](https://dev.meta.ai/docs/protocols/responses#openai-compatibility)；已知型号能力种子固定依据 [oh-my-pi `v18.10.4`](https://github.com/can1357/oh-my-pi/tree/v18.10.4)，不扩大 `/models` 返回的集合。
 
 推理始终为前台 SSE，复用 Responses codec 后按 Meta 白名单投影：只发送 function 工具，仅 `tool_choice: auto` 可表达；其它工具选择约束省略，不伪装成强制、禁止或具名调用。已核对型号支持 reasoning effort；`max` 只为种子明确支持的型号发送，禁用思考及 token budget 无原生等价，省略后仍由上游执行默认思考。已知型号输出上限约束为 16–131072 tokens（含思考），未知型号只应用最小值；未知型号不发送未核实采样控制。保留工具 schema 的 nullable/null 语义，不转发任意扩展。`truncation` 若存在改为原生 `disabled`，不承诺自动裁剪；`store` 默认 `false`，没有 `previous_response_id` 时请求真实 `reasoning.encrypted_content`，有原生续接 ID 时不同时索取该密文。支持仍取决于上游型号、订阅资格和实际响应，不保证所有账号或请求可用。
 
@@ -97,15 +97,15 @@ Muse Code 由独立 `muse-code` 插件提供，固定接入 `https://api.meta.ai
 Kilo 由独立 `kilo` 插件提供，固定地址 `https://api.kilo.ai/api/gateway`；模型集合来自 Kilo 上游，不消费宿主目录 scope。认证与 Gateway 范围见 [官方 Gateway](https://kilo.ai/docs/gateway)、[认证](https://kilo.ai/docs/gateway/authentication)、[模型与供应商](https://kilo.ai/docs/gateway/models-and-providers)、[用量与计费](https://kilo.ai/docs/gateway/usage-and-billing)。
 
 1. 在插件管理页本地导入 `stravia-vendor-kilo-v{version}.wasm`；本地构建及更新与 Muse Code 一样使用完整构建 manifest，更新须重新导入独立组件。
-2. 添加 **Kilo** 服务。`default` 打开上游提供的 device verification URL 并授权，宿主按描述符轮询；`api-key` 在秘密输入框手动提交 Kilo API key；两者均读取 `/api/profile` 核对身份。`anonymous` 无登录，仅用于已确认的免费模型，不提供额度查询。
+2. 添加 **Kilo** 服务。打开上游提供的 device verification URL 并授权，宿主按描述符轮询，登录后读取 `/api/profile` 核对身份。插件只提供这一种登录方式，不接受手动 API key，也不提供未登录的匿名调用；未登录时模型发现、推理与额度查询直接失败，不发起上游请求。
 3. 默认使用个人范围。需要组织范围时配置 `organizationId` 并登录核对该 ID 属于账号 profile 的 `organizations`；只有已验证的选中组织或 membership 才发送 `X-KiloCode-OrganizationId`。组织 ID 不是客户端 header 授权，也不能凭任意填写获得组织权限；账号或组织选择变化后重新认证并同步模型。
-4. 同步模型并绑定 Route：个人范围读取 `/api/gateway/models`，组织读取 `/api/organizations/{id}/models`。匿名集合只保留 prompt/completion 价格均为零且符合插件免费 ID 规则的模型，推理再次核对所选 ID 与同步的免费元数据；不凭名称猜免费，也不支持匿名组织范围。图片输出型号不纳入此推理清单。
+4. 同步模型并绑定 Route：个人范围读取 `/api/gateway/models`，组织读取 `/api/organizations/{id}/models`。图片输出型号不纳入此推理清单。
 
-推理使用 Route 选定的上游模型 ID，而不是客户端填写的平台路由名；匿名校验使用宿主规范化后的 typed model identity。上游目录的多行或超长 Markdown 说明保留在 `kilo.description` 来源空间，不使整份模型同步失败，也不截断原文。
+推理使用 Route 选定的上游模型 ID，而不是客户端填写的平台路由名。上游目录的多行或超长 Markdown 说明保留在 `kilo.description` 来源空间，不使整份模型同步失败，也不截断原文。
 
 模型 catalog 元数据是传输与控制支持的权威来源：仅 `opencode.ai_sdk_provider == "openai"` 选择 Responses（`/api/openrouter/responses`），其它型号选择 Chat Completions（`/api/gateway/chat/completions`）；GPT/o-series 名称本身不授予 Responses 权限。采样、工具选择、结构化输出、reasoning 等须同时符合目标协议白名单与 `supported_parameters`；effort 使用 catalog 的 `opencode.variants` 映射，无映射不编造档位。Chat 可按已声明支持发送 gateway 的 `top_k`、`min_p`、`repetition_penalty` 和 reasoning enabled/budget。仅 canonical function 工具跨越此网关，不承诺外来 hosted 工具、compaction、item reference、受保护思考签名或其它账号原生续接状态可回放；它们不会作为任意扩展透传，原始历史不删除。
 
-认证连接的额度页读取 `/api/profile/usage?period=all&viewType={personal或组织ID}&groupByModel=true`，按上游数字 `total_cost` 的 microdollar 单位精确除以 1,000,000，呈现总计及按模型的历史已用 USD，不生成余额、限额、剩余量或重置窗口；未确认单位的 balance 不当作美元。device token 记录插件的一年到期边界，手动 key 不杜撰到期时间；没有 refresh grant，刷新操作只用现有有效 token 重新核对 profile，不续期，过期须重新登录。插件接入不改变 API 权限、Route 重试或冷却策略；官方服务可用性和组织实际政策仍由上游决定。
+认证连接的额度页读取 `/api/profile/balance`（已验证组织时附带组织头，返回组织共享余额），把数字 `balance` 呈现为 `balance` 类额度的剩余 USD；单位依据官方客户端将其直接显示为 `$x.xx`。上游不提供已购总额，因此不生成限额、使用百分比或重置窗口；响应缺少数字 `balance` 时报错，不当作零余额。历史用量接口不再读取：宿主额度模型没有「仅已用、无上限」的类型。device token 记录插件的一年到期边界；没有 refresh grant，刷新操作只用现有有效 token 重新核对 profile，不续期，过期须重新登录。插件接入不改变 API 权限、Route 重试或冷却策略；官方服务可用性和组织实际政策仍由上游决定。
 
 ### Cline Pass 接入
 

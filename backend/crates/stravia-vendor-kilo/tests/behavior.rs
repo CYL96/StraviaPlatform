@@ -63,28 +63,26 @@ fn only_credentials_supply_auth_and_org_never_comes_from_headers() {
     assert!(matches!(key(&p).unwrap_err().kind, ErrorKind::Auth));
 }
 #[test]
-fn free_catalog_preserves_ids_metadata_and_ignores_zero_price_paid_models() {
+fn catalog_preserves_ids_and_metadata_and_skips_image_generators() {
     let catalog = json!({"data":[
         {"id":"vendor/paid","pricing":{"prompt":"0","completion":"0"}},
         {"id":"vendor/new:free","name":"Future","pricing":{"prompt":"0","completion":"0"},"context_length":1000,"supported_parameters":["reasoning","tools"],"opencode":{"variants":{"high":{}},"ai_sdk_provider":"openai"},"future":{"field":true}},
-        {"id":"native","pricing":{"prompt":"0","completion":"0"}},
-        {"id":"kilo-auto/free","pricing":{"prompt":"0","completion":"0"}}
+        {"id":"vendor/painter","architecture":{"output_modalities":["image"]}}
     ]});
-    let result = models::parse(catalog.clone(), true).unwrap();
-    assert_eq!(result.models.len(), 3);
-    assert_eq!(result.models[0].id, "vendor/new:free");
-    assert_eq!(result.models[0].metadata["future"], json!({"field":true}));
+    let result = models::parse(catalog).unwrap();
+    assert_eq!(result.models.len(), 2);
+    assert_eq!(result.models[1].id, "vendor/new:free");
+    assert_eq!(result.models[1].metadata["future"], json!({"field":true}));
     assert_eq!(
-        result.models[0].capabilities,
+        result.models[1].capabilities,
         vec!["reasoning", "tool_call"]
     );
-    assert_eq!(models::parse(catalog, false).unwrap().models.len(), 4);
-    assert!(models::parse(json!({}), false).is_err());
+    assert!(models::parse(json!({})).is_err());
 }
 #[test]
 fn catalog_markdown_cannot_invalidate_the_platform_inventory() {
     for description in ["first line\nsecond line".to_owned(), "界".repeat(1500)] {
-        let result = models::parse(json!({"data":[{"id":"vendor/model:free","description":description,"pricing":{"prompt":"0","completion":"0"}}]}),true).unwrap();
+        let result = models::parse(json!({"data":[{"id":"vendor/model:free","description":description,"pricing":{"prompt":"0","completion":"0"}}]})).unwrap();
         let metadata = &result.models[0].metadata;
         assert!(!metadata.contains_key("description"));
         assert_eq!(metadata["kilo"]["description"], description);
@@ -150,21 +148,20 @@ fn metadata_routing_does_not_guess_all_gpt_models_and_undeclared_effort_is_omitt
     assert!(body.get("session_id").is_none());
 }
 #[test]
-fn real_usage_unit_conversion_is_decimal_and_has_no_invented_balance_limit() {
-    let value: Value = serde_json::from_str(r#"{"usage":[{"date":"2026-10-01","total_cost":1.25,"model":"vendor/model"},{"date":"2026-10-02","total_cost":1000000.125,"model":"vendor/model"}]}"#).unwrap();
-    let response = allowance::parse(value).unwrap();
-    assert_eq!(
-        response.allowances[0].used.as_ref().unwrap().value,
-        "1.000001375"
-    );
-    assert_eq!(
-        response.models[0].allowances[0].used.as_ref().unwrap().unit,
-        "USD"
-    );
-    assert!(response.allowances[0].limit.is_none());
-    assert!(response.allowances[0].remaining.is_none());
-    assert!(allowance::parse(json!({"balance":100})).is_err());
-    assert!(allowance::parse(json!({"usage":[{"date":"bad","total_cost":0}]})).is_err());
+fn balance_is_a_usd_remaining_amount_without_an_invented_limit() {
+    let response = allowance::parse(json!({"balance":12.345678})).unwrap();
+    let [item] = response.allowances.as_slice() else {
+        panic!("exactly one balance item")
+    };
+    assert_eq!(item.kind, "balance");
+    let remaining = item.remaining.as_ref().unwrap();
+    assert_eq!(remaining.value, "12.345678");
+    assert_eq!(remaining.currency.as_deref(), Some("USD"));
+    assert!(item.used.is_none() && item.limit.is_none());
+    assert!(response.models.is_empty());
+    assert!(allowance::parse(json!({})).is_err());
+    assert!(allowance::parse(json!({"balance":"12"})).is_err());
+    assert!(allowance::parse(json!({"usage":[]})).is_err());
 }
 #[test]
 fn pending_denied_expired_and_gateway_failures_are_not_success() {
@@ -421,24 +418,6 @@ fn responses_family_filters_chat_sampling_and_foreign_native_state() {
         .insert("supported_parameters".into(), json!(["verbosity"]));
     let (_, body) = request::prepare(&p, controlled_request()).unwrap();
     assert_eq!(body["text"], json!({"verbosity":"low"}));
-}
-#[test]
-fn anonymous_free_entitlement_is_bound_to_discovered_model_identity() {
-    let mut p = provider();
-    let target_metadata = p.model_metadata.as_mut().unwrap();
-    target_metadata.id = Some("vendor/model:free".into());
-    let metadata = &mut target_metadata.extensions;
-    metadata.insert("pricing".into(), json!({"prompt":"0","completion":"0"}));
-    assert!(request::authorize_model(&p, "vendor/model:free").is_ok());
-    assert!(request::authorize_model(&p, "vendor/other:free").is_err());
-    p.model_metadata
-        .as_mut()
-        .unwrap()
-        .extensions
-        .insert("pricing".into(), json!({"prompt":"0.01","completion":"0"}));
-    assert!(request::authorize_model(&p, "vendor/model:free").is_err());
-    p.credentials.insert("apiKey".into(), json!("paid-user"));
-    assert!(request::authorize_model(&p, "vendor/paid").is_ok());
 }
 #[test]
 fn chat_reasoning_mode_and_budget_have_canonical_ownership() {
