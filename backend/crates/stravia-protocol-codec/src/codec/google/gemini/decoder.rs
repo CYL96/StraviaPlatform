@@ -14,9 +14,6 @@ use stravia_runtime_contract::protocol::ir::AiItem;
 use stravia_runtime_contract::protocol::ir::AiRequest;
 use stravia_runtime_contract::protocol::ir::ContentBlock;
 use stravia_runtime_contract::protocol::ir::GenerationConfig;
-use stravia_runtime_contract::protocol::ir::{
-    AudioOutput, Modality, ParameterReset, ReasoningSummary, native_tool_from_gemini,
-};
 use stravia_runtime_contract::protocol::ir::MediaSource;
 use stravia_runtime_contract::protocol::ir::MessageContent;
 use stravia_runtime_contract::protocol::ir::ReasoningConfig;
@@ -26,6 +23,9 @@ use stravia_runtime_contract::protocol::ir::StreamConfig;
 use stravia_runtime_contract::protocol::ir::ToolCall;
 use stravia_runtime_contract::protocol::ir::ToolChoice;
 use stravia_runtime_contract::protocol::ir::ToolSpec;
+use stravia_runtime_contract::protocol::ir::{
+    AudioOutput, Modality, ParameterReset, ReasoningSummary, native_tool_from_gemini,
+};
 
 use super::types::*;
 
@@ -38,7 +38,11 @@ pub(super) fn decode_tool_choice(value: &Value) -> Option<ToolChoice> {
         && let Some(names) = config.get("allowedFunctionNames").and_then(Value::as_array)
     {
         return Some(ToolChoice::Allowed {
-            names: names.iter().filter_map(Value::as_str).map(str::to_owned).collect(),
+            names: names
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect(),
             required: mode == "ANY",
         });
     }
@@ -57,11 +61,18 @@ impl GoogleDecoder {
             ("systemInstruction", ParameterReset::Instructions),
             ("tools", ParameterReset::NativeTools),
         ] {
-            if body.get(key).is_some_and(|v| v.is_null() || v.as_array().is_some_and(Vec::is_empty)) {
+            if body
+                .get(key)
+                .is_some_and(|v| v.is_null() || v.as_array().is_some_and(Vec::is_empty))
+            {
                 resets.push(reset);
             }
         }
-        if body.pointer("/systemInstruction/parts").and_then(Value::as_array).is_some_and(Vec::is_empty) {
+        if body
+            .pointer("/systemInstruction/parts")
+            .and_then(Value::as_array)
+            .is_some_and(Vec::is_empty)
+        {
             resets.push(ParameterReset::Instructions);
         }
         if let Some(config) = body.get("generationConfig") {
@@ -81,7 +92,8 @@ impl GoogleDecoder {
                 if config.get(key).is_some_and(|value| {
                     value.is_null()
                         || (key == "responseMimeType" && value.as_str() == Some(""))
-                        || (key == "thinkingConfig" && value.as_object().is_some_and(serde_json::Map::is_empty))
+                        || (key == "thinkingConfig"
+                            && value.as_object().is_some_and(serde_json::Map::is_empty))
                 }) {
                     resets.push(reset);
                 }
@@ -184,7 +196,8 @@ impl GoogleDecoder {
                     ("googleSearchRetrieval", entry.google_search_retrieval),
                 ] {
                     if let Some(value) = value
-                        && let Some(tool) = native_tool_from_gemini(&serde_json::json!({key: value}))
+                        && let Some(tool) =
+                            native_tool_from_gemini(&serde_json::json!({key: value}))
                     {
                         native_tools.push(tool);
                     }
@@ -231,8 +244,13 @@ impl GoogleDecoder {
                 },
                 budget_tokens: budget,
                 level,
-                summary: include_thoughts
-                    .map(|enabled| if enabled { ReasoningSummary::Auto } else { ReasoningSummary::None }),
+                summary: include_thoughts.map(|enabled| {
+                    if enabled {
+                        ReasoningSummary::Auto
+                    } else {
+                        ReasoningSummary::None
+                    }
+                }),
                 ..Default::default()
             }
         } else {
@@ -279,7 +297,12 @@ impl GoogleDecoder {
                     parameters.reset(ParameterReset::Logprobs);
                     None
                 }
-                Some(true) => Some(config.logprobs.and_then(|value| u32::try_from(value).ok()).unwrap_or(0)),
+                Some(true) => Some(
+                    config
+                        .logprobs
+                        .and_then(|value| u32::try_from(value).ok())
+                        .unwrap_or(0),
+                ),
                 None => config.logprobs.and_then(|value| u32::try_from(value).ok()),
             };
             parameters.modalities = config.response_modalities.map(|values| {
@@ -317,10 +340,15 @@ impl GoogleDecoder {
                     _ => None,
                 };
             }
-            parameters.audio = config.speech_config.as_ref()
+            parameters.audio = config
+                .speech_config
+                .as_ref()
                 .and_then(|speech| speech.pointer("/voiceConfig/prebuiltVoiceConfig/voiceName"))
                 .and_then(Value::as_str)
-                .map(|voice| AudioOutput { voice: Some(voice.into()), format: None });
+                .map(|voice| AudioOutput {
+                    voice: Some(voice.into()),
+                    format: None,
+                });
         }
         parameters.native_tools = native_tools;
         ai_req.meta.source_protocol = Some(GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA);

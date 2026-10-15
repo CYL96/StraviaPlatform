@@ -492,7 +492,9 @@ mod tests {
         let mut request = AiRequest::new("model", Vec::new());
         request.meta.source_protocol = Some(OPEN_RESPONSES_2026_04_24);
         request.parameters.continuation = Some(
-            stravia_runtime_contract::protocol::ir::Continuation::PreviousResponse(generation_id.to_owned()),
+            stravia_runtime_contract::protocol::ir::Continuation::PreviousResponse(
+                generation_id.to_owned(),
+            ),
         );
         let continuation = gateway
             .generation_chains

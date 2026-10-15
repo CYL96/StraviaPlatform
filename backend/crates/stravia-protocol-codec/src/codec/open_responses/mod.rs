@@ -67,7 +67,10 @@ pub fn hosted_image_generation_requested(
     request: &stravia_runtime_contract::protocol::ir::AiRequest,
 ) -> bool {
     request.parameters.native_tools.iter().any(|tool| {
-        matches!(tool, stravia_runtime_contract::protocol::ir::NativeTool::ImageGeneration(_))
+        matches!(
+            tool,
+            stravia_runtime_contract::protocol::ir::NativeTool::ImageGeneration(_)
+        )
     })
 }
 

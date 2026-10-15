@@ -212,7 +212,9 @@ fn historical_reasoning_replay_is_target_local_and_keeps_readable_parts() {
     })).unwrap();
     let before = serde_json::to_value(&original).unwrap();
     let mut compatible = original.clone();
-    assert!(!super::prepare_thinking_replay(&mut compatible, |_, _| true));
+    assert!(!super::prepare_thinking_replay(&mut compatible, |_, _| {
+        true
+    }));
     assert_eq!(
         native.encode_request(compatible).unwrap().body["input"][0]["encrypted_content"],
         "secret"
@@ -1089,28 +1091,34 @@ fn replay_selects_each_protected_payload_and_keeps_native_fields_until_all_are_s
     ]);
     let before = serde_json::to_value(&original).unwrap();
     let mut replay = original.clone();
-    assert!(super::prepare_thinking_replay(&mut replay, |item, block| {
-        assert_eq!(
-            item.meta.as_ref().unwrap().get("__open_responses_item_fields"),
-            original.items[0]
-                .meta
-                .as_ref()
-                .unwrap()
-                .get("__open_responses_item_fields")
-        );
-        match block {
-            ContentBlock::Thinking {
-                signature: Some(value),
-                ..
+    assert!(super::prepare_thinking_replay(
+        &mut replay,
+        |item, block| {
+            assert_eq!(
+                item.meta
+                    .as_ref()
+                    .unwrap()
+                    .get("__open_responses_item_fields"),
+                original.items[0]
+                    .meta
+                    .as_ref()
+                    .unwrap()
+                    .get("__open_responses_item_fields")
+            );
+            match block {
+                ContentBlock::Thinking {
+                    signature: Some(value),
+                    ..
+                }
+                | ContentBlock::Reasoning {
+                    encrypted_content: Some(value),
+                    ..
+                }
+                | ContentBlock::RedactedThinking { data: value } => value.starts_with("local"),
+                _ => panic!("only protected payloads require an origin decision"),
             }
-            | ContentBlock::Reasoning {
-                encrypted_content: Some(value),
-                ..
-            }
-            | ContentBlock::RedactedThinking { data: value } => value.starts_with("local"),
-            _ => panic!("only protected payloads require an origin decision"),
         }
-    }));
+    ));
     let MessageContent::Blocks(blocks) = &replay.items[0].content else {
         panic!("blocks")
     };
@@ -1142,7 +1150,8 @@ fn replay_selects_each_protected_payload_and_keeps_native_fields_until_all_are_s
                 thinking: String::new(),
                 signature: None,
             },
-        ]).unwrap()
+        ])
+        .unwrap()
     );
     assert_eq!(replay.items[0].meta, original.items[0].meta);
     let stable = serde_json::to_value(&replay).unwrap();
@@ -3194,7 +3203,11 @@ fn responses_stream_and_text_controls_project_to_chat_canonical_fields() {
         .encode_request(request)
         .expect("project shared controls")
         .body;
-    assert!(encoded["stream_options"].get("include_obfuscation").is_none());
+    assert!(
+        encoded["stream_options"]
+            .get("include_obfuscation")
+            .is_none()
+    );
     assert_eq!(encoded["verbosity"], "low");
     assert_eq!(encoded["prompt_cache_key"], "");
     assert_eq!(encoded["prompt_cache_retention"], "24h");

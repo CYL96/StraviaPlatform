@@ -148,7 +148,9 @@ impl EmbeddingsDecoder {
         ai_req.meta.source_protocol = Some(OPENAI_COMPATIBLE_EMBEDDINGS_V1);
         ai_req.parameters.end_user_id = user;
         if obj.get("user").is_some_and(Value::is_null) {
-            ai_req.parameters.reset(stravia_runtime_contract::protocol::ir::ParameterReset::EndUser);
+            ai_req
+                .parameters
+                .reset(stravia_runtime_contract::protocol::ir::ParameterReset::EndUser);
         }
 
         Ok(ai_req)

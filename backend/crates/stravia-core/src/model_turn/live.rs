@@ -1333,7 +1333,10 @@ async fn prepare_attempt(
             Arc::make_mut(&mut provider_request),
             |item, block| {
                 !gateway.reasoning_rejections.rejected(
-                    thinking_source.authority.as_deref().expect("thinking authority"),
+                    thinking_source
+                        .authority
+                        .as_deref()
+                        .expect("thinking authority"),
                     thinking_source.provenance(item, block),
                     block,
                 )
@@ -1494,12 +1497,7 @@ async fn prepare_attempt(
         ),
         (
             "forked_from_thread_transport_affinity",
-            input
-                .request
-                .parameters
-                .session
-                .forked_from_id
-                .as_deref(),
+            input.request.parameters.session.forked_from_id.as_deref(),
         ),
         (
             "context_window_transport_affinity",
@@ -2694,16 +2692,23 @@ fn rejected_protected_reasoning(
     request: &AiRequest,
     source: &crate::history_marker::ThinkingSource,
 ) -> Vec<crate::history_marker::RejectedReasoning> {
-    request.items.iter().flat_map(|item| {
-        let blocks = match &item.content {
-            MessageContent::Blocks(blocks) => blocks.as_slice(),
-            _ => &[],
-        };
-        blocks.iter().filter_map(|block| {
-            crate::history_marker::protected_payload_digest(block)?;
-            crate::history_marker::RejectedReasoning::for_payload(source.provenance(item, block), block)
+    request
+        .items
+        .iter()
+        .flat_map(|item| {
+            let blocks = match &item.content {
+                MessageContent::Blocks(blocks) => blocks.as_slice(),
+                _ => &[],
+            };
+            blocks.iter().filter_map(|block| {
+                crate::history_marker::protected_payload_digest(block)?;
+                crate::history_marker::RejectedReasoning::for_payload(
+                    source.provenance(item, block),
+                    block,
+                )
+            })
         })
-    }).collect()
+        .collect()
 }
 
 fn update_protected_reasoning_metadata(

@@ -143,17 +143,17 @@ impl ProtocolAdapter for BedrockConverseV1 {
                 },
             );
         }
-        request.parameters.metadata = body
-            .get("requestMetadata")
-            .and_then(Value::as_object)
-            .map(|metadata| {
-                metadata
-                    .iter()
-                    .filter_map(|(key, value)| {
-                        value.as_str().map(|value| (key.clone(), value.to_owned()))
-                    })
-                    .collect()
-            });
+        request.parameters.metadata =
+            body.get("requestMetadata")
+                .and_then(Value::as_object)
+                .map(|metadata| {
+                    metadata
+                        .iter()
+                        .filter_map(|(key, value)| {
+                            value.as_str().map(|value| (key.clone(), value.to_owned()))
+                        })
+                        .collect()
+                });
         request.parameters.service_tier =
             match body.pointer("/serviceTier/type").and_then(Value::as_str) {
                 Some("default") => Some(ServiceTier::Default),

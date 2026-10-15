@@ -238,4 +238,3 @@ pub struct AnthropicToolDef {
     #[serde(flatten)]
     pub options: serde_json::Map<String, Value>,
 }
-

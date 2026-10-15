@@ -78,9 +78,10 @@ impl ProtocolAdapter for CohereChatV2 {
             .and_then(Value::as_bool)
             .filter(|enabled| *enabled)
             .map(|_| 0);
-        if body.get("logprobs").is_some_and(|value| {
-            value.is_null() || value.as_bool() == Some(false)
-        }) {
+        if body
+            .get("logprobs")
+            .is_some_and(|value| value.is_null() || value.as_bool() == Some(false))
+        {
             request.parameters.reset(ParameterReset::Logprobs);
         }
         if body.get("thinking").is_some_and(Value::is_null) {

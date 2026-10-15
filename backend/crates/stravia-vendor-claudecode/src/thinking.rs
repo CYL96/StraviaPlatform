@@ -310,7 +310,9 @@ pub(crate) fn summary_display(
     use stravia_runtime_contract::protocol::ir::ReasoningSummary;
     match summary {
         ReasoningSummary::None => "omitted",
-        ReasoningSummary::Auto | ReasoningSummary::Concise | ReasoningSummary::Detailed => "summarized",
+        ReasoningSummary::Auto | ReasoningSummary::Concise | ReasoningSummary::Detailed => {
+            "summarized"
+        }
     }
 }
 
@@ -507,14 +509,13 @@ mod tests {
                 Some(display),
             );
             normalize(body.as_object_mut().unwrap(), &ModelCapabilities::default());
-            assert_eq!(body["thinking"], json!({"type":"adaptive","display":expected}));
+            assert_eq!(
+                body["thinking"],
+                json!({"type":"adaptive","display":expected})
+            );
         }
         let mut body = json!({"model":"claude-opus-5-5","thinking":{"type":"disabled"}});
-        preserve_implicit_summary_intent(
-            &mut body,
-            &ModelCapabilities::default(),
-            Some("omitted"),
-        );
+        preserve_implicit_summary_intent(&mut body, &ModelCapabilities::default(), Some("omitted"));
         assert_eq!(body["thinking"], json!({"type":"disabled"}));
     }
 

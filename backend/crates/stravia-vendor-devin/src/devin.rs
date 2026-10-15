@@ -328,14 +328,20 @@ fn infer(
     let status = response.status()?;
     if !(200..300).contains(&status) {
         return Err(http_error(
-            &response, status, "Devin Connect", protected_reasoning_untrusted(&provider),
+            &response,
+            status,
+            "Devin Connect",
+            protected_reasoning_untrusted(&provider),
         ));
     }
     decode_inference(host, response, protected_reasoning_untrusted(&provider))
 }
 
 fn protected_reasoning_untrusted(provider: &ProviderSnapshot) -> bool {
-    provider.operation_metadata.get("protected_reasoning_untrusted") == Some(&Value::Bool(true))
+    provider
+        .operation_metadata
+        .get("protected_reasoning_untrusted")
+        == Some(&Value::Bool(true))
 }
 
 fn decode_inference(
@@ -354,8 +360,13 @@ fn decode_inference(
                 format!("invalid Devin Connect stream: {err}"),
             )
         })?;
-        emit_deltas(host, &mut accumulator, &deltas, &mut produced_output,
-            parser.protected_reasoning_rejected())?;
+        emit_deltas(
+            host,
+            &mut accumulator,
+            &deltas,
+            &mut produced_output,
+            parser.protected_reasoning_rejected(),
+        )?;
     }
     let deltas = parser.finish().map_err(|err| {
         common::model_error(
@@ -363,8 +374,13 @@ fn decode_inference(
             format!("incomplete Devin Connect stream: {err}"),
         )
     })?;
-    emit_deltas(host, &mut accumulator, &deltas, &mut produced_output,
-        parser.protected_reasoning_rejected())?;
+    emit_deltas(
+        host,
+        &mut accumulator,
+        &deltas,
+        &mut produced_output,
+        parser.protected_reasoning_rejected(),
+    )?;
     let complete = accumulator.into_ai_response();
     host.emit_completed(&complete)?;
     Ok(OperationOutput::Infer(Box::new(complete)))
@@ -522,7 +538,12 @@ fn discover(
     })?;
     let status = response.status()?;
     if !(200..300).contains(&status) {
-        return Err(http_error(&response, status, "Devin model discovery", false));
+        return Err(http_error(
+            &response,
+            status,
+            "Devin model discovery",
+            false,
+        ));
     }
     let bytes = read_http_body(&response, MAX_UNARY_BODY)?;
     let entries = decode_cli_model_configs(&bytes).map_err(|err| {
@@ -669,10 +690,12 @@ fn connect_http_error_kind(bytes: &[u8], untrusted: bool) -> Option<ErrorKind> {
     let body: Value = serde_json::from_slice(bytes).ok()?;
     let code = body.get("code").and_then(Value::as_str)?;
     // invalid_argument 本身不构成推理拒绝证据，必须结合宿主的来源声明。
-    (code == "invalid_argument").then(|| if untrusted {
-        ErrorKind::ProtectedReasoningRejected
-    } else {
-        ErrorKind::upstream(Some(AiErrorKind::InvalidRequest), None)
+    (code == "invalid_argument").then(|| {
+        if untrusted {
+            ErrorKind::ProtectedReasoningRejected
+        } else {
+            ErrorKind::upstream(Some(AiErrorKind::InvalidRequest), None)
+        }
     })
 }
 
@@ -704,16 +727,33 @@ mod session_tests {
         };
         let body = br#"{"code":"invalid_argument","message":"invalid request"}"#;
         assert!(!protected_reasoning_untrusted(&provider));
-        for value in [Value::Null, Value::Bool(false), Value::String("true".into()), Value::from(1), Value::Bool(true)] {
+        for value in [
+            Value::Null,
+            Value::Bool(false),
+            Value::String("true".into()),
+            Value::from(1),
+            Value::Bool(true),
+        ] {
             let expected_rejection = value == Value::Bool(true);
-            provider.operation_metadata.insert("protected_reasoning_untrusted".into(), value);
-            let kind = connect_http_error_kind(body, protected_reasoning_untrusted(&provider)).unwrap();
-            assert_eq!(matches!(kind, ErrorKind::ProtectedReasoningRejected), expected_rejection);
+            provider
+                .operation_metadata
+                .insert("protected_reasoning_untrusted".into(), value);
+            let kind =
+                connect_http_error_kind(body, protected_reasoning_untrusted(&provider)).unwrap();
+            assert_eq!(
+                matches!(kind, ErrorKind::ProtectedReasoningRejected),
+                expected_rejection
+            );
             if !expected_rejection {
                 assert_eq!(kind.model_error_kind(), Some(AiErrorKind::InvalidRequest));
             }
         }
-        assert_eq!(connect_http_error_kind(body, false).unwrap().model_error_kind(), Some(AiErrorKind::InvalidRequest));
+        assert_eq!(
+            connect_http_error_kind(body, false)
+                .unwrap()
+                .model_error_kind(),
+            Some(AiErrorKind::InvalidRequest)
+        );
         assert!(connect_http_error_kind(br#"{"code":"permission_denied"}"#, true).is_none());
     }
 
@@ -721,11 +761,19 @@ mod session_tests {
     fn errors_before_stream_output_return_without_committing_terminal_events() {
         use stravia_runtime_contract::protocol::ir::AiError;
         for rejected in [false, true] {
-            let deltas = [AiStreamDelta::StreamError { error: AiError::new(AiErrorKind::InvalidRequest, "rejected") }];
+            let deltas = [AiStreamDelta::StreamError {
+                error: AiError::new(AiErrorKind::InvalidRequest, "rejected"),
+            }];
             let failure = uncommitted_stream_error(&deltas, false, rejected).unwrap();
-            assert_eq!(matches!(failure.kind, ErrorKind::ProtectedReasoningRejected), rejected);
+            assert_eq!(
+                matches!(failure.kind, ErrorKind::ProtectedReasoningRejected),
+                rejected
+            );
             if !rejected {
-                assert_eq!(failure.kind.model_error_kind(), Some(AiErrorKind::InvalidRequest));
+                assert_eq!(
+                    failure.kind.model_error_kind(),
+                    Some(AiErrorKind::InvalidRequest)
+                );
             }
             assert!(uncommitted_stream_error(&deltas, true, rejected).is_none());
         }
@@ -836,4 +884,3 @@ mod session_tests {
         );
     }
 }
-

@@ -121,7 +121,10 @@ mod tests {
     fn previous_response_helpers_stamp_and_clear_only_response_continuations() {
         let mut request = AiRequest::new("model", Vec::new());
         stamp_previous_response_id(&mut request, "response");
-        assert_eq!(parent_id_from_request(&request).as_deref(), Some("response"));
+        assert_eq!(
+            parent_id_from_request(&request).as_deref(),
+            Some("response")
+        );
         clear_previous_response_id(&mut request);
         assert!(request.parameters.continuation.is_none());
 

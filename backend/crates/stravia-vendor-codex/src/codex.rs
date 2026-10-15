@@ -159,27 +159,38 @@ impl NativeSession {
         let installation = identity.installation_id.clone();
         let turn = self.turn_key();
         if let Some((_, state)) = identity.turns.iter().find(|(key, _)| key == &turn) {
-            self.headers.push(("x-codex-turn-state".into(), state.clone()));
+            self.headers
+                .push(("x-codex-turn-state".into(), state.clone()));
             self.metadata["x-codex-turn-state"] = state.clone().into();
         }
         if created {
             write_identities(host, &mut root, identities)?;
         }
-        self.headers.push(("x-codex-installation-id".into(), installation.clone()));
+        self.headers
+            .push(("x-codex-installation-id".into(), installation.clone()));
         self.metadata["x-codex-installation-id"] = installation.clone().into();
         let mut turn_metadata: Value = serde_json::from_str(
-            self.metadata["x-codex-turn-metadata"].as_str().expect("native turn metadata"),
+            self.metadata["x-codex-turn-metadata"]
+                .as_str()
+                .expect("native turn metadata"),
         )
         .map_err(|_| invalid("Codex native turn metadata is invalid"))?;
         turn_metadata["installation_id"] = installation.into();
         let turn_metadata = turn_metadata.to_string();
-        set_header(&mut self.headers, "x-codex-turn-metadata", turn_metadata.clone());
+        set_header(
+            &mut self.headers,
+            "x-codex-turn-metadata",
+            turn_metadata.clone(),
+        );
         self.metadata["x-codex-turn-metadata"] = turn_metadata.into();
         Ok(())
     }
 
     fn turn_key(&self) -> String {
-        format!("{}:{}", self.metadata["session_id"], self.metadata["turn_id"])
+        format!(
+            "{}:{}",
+            self.metadata["session_id"], self.metadata["turn_id"]
+        )
     }
 
     pub(super) fn capture_turn_state(
@@ -188,7 +199,8 @@ impl NativeSession {
         provider: &ProviderSnapshot,
         headers: &[(String, String)],
     ) -> Result<(), stravia_vendor_sdk::PluginError> {
-        let Some(state) = headers.iter()
+        let Some(state) = headers
+            .iter()
             .find(|(name, _)| name.eq_ignore_ascii_case("x-codex-turn-state"))
             .and_then(|(_, value)| clean_id(Some(value)))
         else {
@@ -244,10 +256,17 @@ fn credential_key(provider: &ProviderSnapshot) -> Result<String, stravia_vendor_
     use sha2::{Digest, Sha256};
     let token = secret(provider, "access_token")?;
     // 账号身份跨 OAuth 刷新保持稳定；没有账号声明的凭据只按自身散列隔离。
-    let account = provider.credentials.get("account_id").and_then(Value::as_str).map(str::to_owned)
+    let account = provider
+        .credentials
+        .get("account_id")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
         .or_else(|| account_id_from_jwt(token));
     let identity = account.as_deref().unwrap_or(token);
-    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(identity.as_bytes())))
+    Ok(
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(Sha256::digest(identity.as_bytes())),
+    )
 }
 
 fn read_identities(
@@ -258,7 +277,8 @@ fn read_identities(
             .map_err(|_| invalid("Codex native identity state is invalid"))?,
         None => Default::default(),
     };
-    let identities = root.remove("native_identities")
+    let identities = root
+        .remove("native_identities")
         .map(serde_json::from_value)
         .transpose()
         .map_err(|_| invalid("Codex native identity state is invalid"))?
@@ -271,10 +291,15 @@ fn write_identities(
     root: &mut serde_json::Map<String, Value>,
     identities: Identities,
 ) -> Result<(), stravia_vendor_sdk::PluginError> {
-    root.insert("native_identities".into(), serde_json::to_value(identities)
-        .map_err(|_| invalid("Codex native identity state could not be encoded"))?);
-    host.write_private_state(&serde_json::to_vec(root)
-        .map_err(|_| invalid("Codex native identity state could not be encoded"))?)
+    root.insert(
+        "native_identities".into(),
+        serde_json::to_value(identities)
+            .map_err(|_| invalid("Codex native identity state could not be encoded"))?,
+    );
+    host.write_private_state(
+        &serde_json::to_vec(root)
+            .map_err(|_| invalid("Codex native identity state could not be encoded"))?,
+    )
 }
 
 fn clean_id(value: Option<&str>) -> Option<&str> {
@@ -300,7 +325,8 @@ pub(super) fn encode_tools(
     let functions = request.tools.as_deref().unwrap_or_default();
     let mut tools = Vec::with_capacity(functions.len() + request.parameters.native_tools.len());
     for tool in functions {
-        let mut encoded = json!({"type":"function", "name":tool.name, "parameters":tool.parameters});
+        let mut encoded =
+            json!({"type":"function", "name":tool.name, "parameters":tool.parameters});
         if let Some(description) = &tool.description {
             encoded["description"] = description.clone().into();
         }
@@ -372,13 +398,14 @@ pub(super) fn prepare_operation_body(
         .as_object_mut()
         .ok_or_else(|| invalid("Codex Responses request body must be an object"))?;
     object.retain(|key, value| {
-        !value.is_null() && if operation == BodyOperation::Compact {
-            COMPACT_FIELDS.contains(&key.as_str())
-        } else {
-            RESPONSE_FIELDS.contains(&key.as_str())
-                || (operation == BodyOperation::WebSocket
-                    && matches!(key.as_str(), "previous_response_id" | "generate"))
-        }
+        !value.is_null()
+            && if operation == BodyOperation::Compact {
+                COMPACT_FIELDS.contains(&key.as_str())
+            } else {
+                RESPONSE_FIELDS.contains(&key.as_str())
+                    || (operation == BodyOperation::WebSocket
+                        && matches!(key.as_str(), "previous_response_id" | "generate"))
+            }
     });
     if operation != BodyOperation::Compact {
         object.insert("store".into(), Value::Bool(false));
@@ -1031,22 +1058,40 @@ mod tests {
     fn installation_identity_persists_and_turn_state_stays_with_its_turn_and_credential() {
         let mut identities = Identities::new();
         let first_key = credential_key(&provider()).unwrap();
-        let identity = identities.entry(first_key.clone()).or_insert_with(NativeIdentity::new);
+        let identity = identities
+            .entry(first_key.clone())
+            .or_insert_with(NativeIdentity::new);
         let installation = identity.installation_id.clone();
-        assert_eq!(uuid::Uuid::parse_str(&installation).unwrap().get_version_num(), 4);
+        assert_eq!(
+            uuid::Uuid::parse_str(&installation)
+                .unwrap()
+                .get_version_num(),
+            4
+        );
         assert!(identity.capture("session-a:turn-a".into(), "first-state"));
         assert!(!identity.capture("session-a:turn-a".into(), "replacement"));
         assert!(identity.capture("session-a:turn-b".into(), "next-turn"));
-        let mut restored: Identities = serde_json::from_slice(&serde_json::to_vec(&identities).unwrap()).unwrap();
+        let mut restored: Identities =
+            serde_json::from_slice(&serde_json::to_vec(&identities).unwrap()).unwrap();
         let identity = restored.get_mut(&first_key).unwrap();
         assert_eq!(identity.installation_id, installation);
-        assert_eq!(identity.turns[0], ("session-a:turn-a".into(), "first-state".into()));
-        assert_eq!(identity.turns[1], ("session-a:turn-b".into(), "next-turn".into()));
+        assert_eq!(
+            identity.turns[0],
+            ("session-a:turn-a".into(), "first-state".into())
+        );
+        assert_eq!(
+            identity.turns[1],
+            ("session-a:turn-b".into(), "next-turn".into())
+        );
         let mut other = provider();
-        other.credentials.insert("access_token".into(), "other-token".into());
+        other
+            .credentials
+            .insert("access_token".into(), "other-token".into());
         let other_key = credential_key(&other).unwrap();
         assert_ne!(first_key, other_key);
-        let other_identity = restored.entry(other_key).or_insert_with(NativeIdentity::new);
+        let other_identity = restored
+            .entry(other_key)
+            .or_insert_with(NativeIdentity::new);
         assert_ne!(other_identity.installation_id, installation);
         assert!(other_identity.turns.is_empty());
     }
@@ -1054,20 +1099,30 @@ mod tests {
     #[test]
     fn canonical_native_choice_selects_search_but_not_unsupported_execution() {
         use stravia_runtime_contract::protocol::ir::{
-            AiItem, AiRequest, MessageContent, NativeTool, NativeToolKind, Role, ToolChoice, WebSearchTool,
+            AiItem, AiRequest, MessageContent, NativeTool, NativeToolKind, Role, ToolChoice,
+            WebSearchTool,
         };
-        let mut request = AiRequest::new("gpt-5.4", vec![AiItem {
-            role: Role::User,
-            content: MessageContent::Text("hello".to_owned().into()),
-            tool_calls: None,
-            tool_call_id: None,
-            meta: None,
-        }]);
-        request.parameters.native_tools.push(NativeTool::WebSearch(WebSearchTool::default()));
+        let mut request = AiRequest::new(
+            "gpt-5.4",
+            vec![AiItem {
+                role: Role::User,
+                content: MessageContent::Text("hello".to_owned().into()),
+                tool_calls: None,
+                tool_call_id: None,
+                meta: None,
+            }],
+        );
+        request
+            .parameters
+            .native_tools
+            .push(NativeTool::WebSearch(WebSearchTool::default()));
         request.tool_choice = Some(ToolChoice::Native(NativeToolKind::WebSearch));
         let mut body = stravia_vendor_common::common::encode_inference_request(
-            &OPEN_RESPONSES_2026_04_24.to_string(), request.clone(),
-        ).unwrap().body;
+            &OPEN_RESPONSES_2026_04_24.to_string(),
+            request.clone(),
+        )
+        .unwrap()
+        .body;
         body["tools"] = encode_tools(&request, BodyOperation::Http).into();
         prepare_body(&mut body).unwrap();
         assert_eq!(body["tools"][0]["type"], "web_search");

@@ -80,23 +80,37 @@ fn consumes_canonical_sampling_and_discards_unmapped_controls() {
 #[test]
 fn imports_and_derives_request_wide_tool_strictness() {
     for strict in [false, true] {
-        let mut request = CohereChatV2.decode_request(json!({
-            "model": "command-a", "messages": [],
-            "strict_tools": strict,
-            "tools": [
-                {"type": "function", "function": {"name": "first", "parameters": {}}},
-                {"type": "function", "function": {"name": "second", "parameters": {}}}
-            ]
-        })).unwrap();
-        assert!(request.tools.as_ref().unwrap().iter().all(|tool| tool.strict == Some(strict)));
-        assert_eq!(CohereChatV2.encode_request(request.clone()).unwrap().0["strict_tools"], strict);
+        let mut request = CohereChatV2
+            .decode_request(json!({
+                "model": "command-a", "messages": [],
+                "strict_tools": strict,
+                "tools": [
+                    {"type": "function", "function": {"name": "first", "parameters": {}}},
+                    {"type": "function", "function": {"name": "second", "parameters": {}}}
+                ]
+            }))
+            .unwrap();
+        assert!(
+            request
+                .tools
+                .as_ref()
+                .unwrap()
+                .iter()
+                .all(|tool| tool.strict == Some(strict))
+        );
+        assert_eq!(
+            CohereChatV2.encode_request(request.clone()).unwrap().0["strict_tools"],
+            strict
+        );
         request.tools.as_mut().unwrap()[0].strict = Some(true);
         request.tools.as_mut().unwrap()[1].strict = None;
         let (body, _) = CohereChatV2.encode_request(request.clone()).unwrap();
         assert_eq!(body["strict_tools"], false);
         assert!(body["tools"][0]["function"].get("strict").is_none());
         assert!(body["tools"][0]["function"].get("description").is_none());
-        request.tool_choice = Some(ToolChoice::Named { name: "first".into() });
+        request.tool_choice = Some(ToolChoice::Named {
+            name: "first".into(),
+        });
         let (body, _) = CohereChatV2.encode_request(request).unwrap();
         assert_eq!(body["strict_tools"], true);
         assert_eq!(body["tools"].as_array().unwrap().len(), 1);
@@ -106,41 +120,52 @@ fn imports_and_derives_request_wide_tool_strictness() {
 
 #[test]
 fn canonical_logprobs_enable_boolean_wire_output() {
-    let mut request = CohereChatV2.decode_request(json!({
-        "model": "command-a", "messages": [], "logprobs": true
-    })).unwrap();
+    let mut request = CohereChatV2
+        .decode_request(json!({
+            "model": "command-a", "messages": [], "logprobs": true
+        }))
+        .unwrap();
     assert_eq!(request.parameters.logprobs, Some(0));
     assert!(!request.parameters.resets(ParameterReset::Logprobs));
     for count in [0, 5] {
         request.parameters.logprobs = Some(count);
-        assert_eq!(CohereChatV2.encode_request(request.clone()).unwrap().0["logprobs"], true);
+        assert_eq!(
+            CohereChatV2.encode_request(request.clone()).unwrap().0["logprobs"],
+            true
+        );
     }
 }
 
 #[test]
 fn thinking_budget_uses_canonical_reasoning() {
-    let mut request = CohereChatV2.decode_request(json!({
-        "model": "command-a-reasoning", "messages": [],
-        "thinking": {"type": "enabled", "token_budget": 1024}
-    })).unwrap();
+    let mut request = CohereChatV2
+        .decode_request(json!({
+            "model": "command-a-reasoning", "messages": [],
+            "thinking": {"type": "enabled", "token_budget": 1024}
+        }))
+        .unwrap();
     assert_eq!(request.reasoning.budget_tokens, Some(1024));
     request.reasoning.budget_tokens = Some(2048);
-    assert_eq!(CohereChatV2.encode_request(request).unwrap().0["thinking"],
-        json!({"type": "enabled", "token_budget": 2048}));
+    assert_eq!(
+        CohereChatV2.encode_request(request).unwrap().0["thinking"],
+        json!({"type": "enabled", "token_budget": 2048})
+    );
 }
 
 #[test]
 fn ignores_null_controls_and_unrepresentable_documents() {
-    let request = CohereChatV2.decode_request(json!({
-        "model": "command-a", "messages": [], "thinking": null, "logprobs": null,
-        "response_format": null, "tools": null, "tool_choice": null,
-        "documents": [
-            {"data": {"custom": {"nested": true}}},
-            {"data": {"text": 42}},
-            {"data": "reference"},
-            {"data": {"text": "body", "title": "Title", "extra": true}}
-        ]
-    })).unwrap();
+    let request = CohereChatV2
+        .decode_request(json!({
+            "model": "command-a", "messages": [], "thinking": null, "logprobs": null,
+            "response_format": null, "tools": null, "tool_choice": null,
+            "documents": [
+                {"data": {"custom": {"nested": true}}},
+                {"data": {"text": 42}},
+                {"data": "reference"},
+                {"data": {"text": "body", "title": "Title", "extra": true}}
+            ]
+        }))
+        .unwrap();
     assert!(request.tools.is_none());
     assert!(request.tool_choice.is_none());
     assert!(request.response_format.is_none());
@@ -148,10 +173,13 @@ fn ignores_null_controls_and_unrepresentable_documents() {
     assert!(request.parameters.resets(ParameterReset::Reasoning));
     assert!(request.parameters.resets(ParameterReset::ResponseFormat));
     let (body, _) = CohereChatV2.encode_request(request).unwrap();
-    assert_eq!(body["documents"], json!([
-        {"data": {"text": "reference"}},
-        {"data": {"text": "body", "title": "Title"}}
-    ]));
+    assert_eq!(
+        body["documents"],
+        json!([
+            {"data": {"text": "reference"}},
+            {"data": {"text": "body", "title": "Title"}}
+        ])
+    );
     assert_eq!(body["messages"], json!([]));
     for key in ["thinking", "response_format", "tools", "tool_choice"] {
         assert!(body.get(key).is_none());
@@ -161,12 +189,22 @@ fn ignores_null_controls_and_unrepresentable_documents() {
 #[test]
 fn ignores_unsupported_canonical_tool_choices() {
     for choice in [
-        ToolChoice::Allowed { names: vec!["weather".into()], required: true },
+        ToolChoice::Allowed {
+            names: vec!["weather".into()],
+            required: true,
+        },
         ToolChoice::Native(stravia_runtime_contract::protocol::ir::NativeToolKind::WebSearch),
     ] {
         let mut request = AiRequest::new("command-a", vec![]);
         request.tool_choice = Some(choice);
-        assert!(CohereChatV2.encode_request(request).unwrap().0.get("tool_choice").is_none());
+        assert!(
+            CohereChatV2
+                .encode_request(request)
+                .unwrap()
+                .0
+                .get("tool_choice")
+                .is_none()
+        );
     }
 }
 

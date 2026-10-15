@@ -4,8 +4,8 @@ use stravia_runtime_contract::artifact::{ArtifactStore, bytes_stream};
 #[test]
 fn native_generation_controls_inherit_without_inheriting_resets() {
     use stravia_runtime_contract::protocol::ir::{
-        AudioOutput, CacheRetention, CompactionControl, Modality, NativeTool,
-        RequestParameters, ServiceTier, Truncation, Verbosity, WebSearchTool,
+        AudioOutput, CacheRetention, CompactionControl, Modality, NativeTool, RequestParameters,
+        ServiceTier, Truncation, Verbosity, WebSearchTool,
     };
     let mut parent = RequestParameters::default();
     parent.top_k = Some(20);
@@ -26,7 +26,10 @@ fn native_generation_controls_inherit_without_inheriting_resets() {
     parent.compaction = Some(CompactionControl {
         threshold_tokens: Some(2000),
     });
-    parent.metadata = Some(std::collections::BTreeMap::from([("key".into(), "value".into())]));
+    parent.metadata = Some(std::collections::BTreeMap::from([(
+        "key".into(),
+        "value".into(),
+    )]));
     parent.end_user_id = Some("user".into());
     parent.service_tier = Some(ServiceTier::Default);
     parent.cache.key = Some("cache".into());
@@ -51,8 +54,8 @@ fn native_generation_controls_inherit_without_inheriting_resets() {
 #[test]
 fn continuation_resets_block_defaults_without_inheriting_per_turn_controls() {
     use stravia_runtime_contract::protocol::ir::{
-        CacheRetention, Continuation, NativeTool, CodeExecutionTool, ServiceTier,
-        Truncation, Verbosity,
+        CacheRetention, CodeExecutionTool, Continuation, NativeTool, ServiceTier, Truncation,
+        Verbosity,
     };
     let mut parent = responses_request(Vec::new());
     parent.instructions = Some("parent instructions".into());
@@ -81,12 +84,23 @@ fn continuation_resets_block_defaults_without_inheriting_per_turn_controls() {
     let config = EffectiveRequestConfig::from_request(&parent);
     let mut current = responses_request(Vec::new());
     for reset in [
-        ParameterReset::Instructions, ParameterReset::Temperature, ParameterReset::TopP,
-        ParameterReset::PresencePenalty, ParameterReset::FrequencyPenalty, ParameterReset::MaxTokens,
-        ParameterReset::ParallelToolCalls, ParameterReset::Background, ParameterReset::MaxToolCalls,
-        ParameterReset::CacheKey, ParameterReset::CacheRetention, ParameterReset::Logprobs,
-        ParameterReset::Truncation, ParameterReset::ServiceTier, ParameterReset::Verbosity,
-        ParameterReset::EndUser, ParameterReset::NativeTools,
+        ParameterReset::Instructions,
+        ParameterReset::Temperature,
+        ParameterReset::TopP,
+        ParameterReset::PresencePenalty,
+        ParameterReset::FrequencyPenalty,
+        ParameterReset::MaxTokens,
+        ParameterReset::ParallelToolCalls,
+        ParameterReset::Background,
+        ParameterReset::MaxToolCalls,
+        ParameterReset::CacheKey,
+        ParameterReset::CacheRetention,
+        ParameterReset::Logprobs,
+        ParameterReset::Truncation,
+        ParameterReset::ServiceTier,
+        ParameterReset::Verbosity,
+        ParameterReset::EndUser,
+        ParameterReset::NativeTools,
     ] {
         current.parameters.reset(reset);
     }
@@ -103,12 +117,22 @@ fn continuation_resets_block_defaults_without_inheriting_per_turn_controls() {
     config.apply_missing_to(&mut current);
     assert_eq!(current.generation.temperature, Some(0.1));
     assert_eq!(current.parameters.logprobs, Some(0));
-    assert_eq!(current.parameters.cache.key.as_deref(), Some("current cache"));
     assert_eq!(
-        current.parameters.continuation.as_ref().and_then(|value| value.conversation_id()),
+        current.parameters.cache.key.as_deref(),
+        Some("current cache")
+    );
+    assert_eq!(
+        current
+            .parameters
+            .continuation
+            .as_ref()
+            .and_then(|value| value.conversation_id()),
         Some("conversation")
     );
-    assert_eq!(current.parameters.session.id.as_deref(), Some("current session"));
+    assert_eq!(
+        current.parameters.session.id.as_deref(),
+        Some("current session")
+    );
     assert!(current.parameters.store.is_none());
     assert!(current.parameters.generate.is_none());
     assert_eq!(current.instructions.as_deref(), Some("parent instructions"));
@@ -116,7 +140,7 @@ fn continuation_resets_block_defaults_without_inheriting_per_turn_controls() {
 
 #[test]
 fn nullable_nested_controls_block_inherited_values() {
-    use stravia_runtime_contract::protocol::ir::{ResponseFormat, ReasoningSummary};
+    use stravia_runtime_contract::protocol::ir::{ReasoningSummary, ResponseFormat};
     let mut parent = responses_request(Vec::new());
     parent.reasoning.level = Some(stravia_runtime_contract::thinking::ThinkingLevel::High);
     parent.reasoning.summary = Some(ReasoningSummary::Auto);
@@ -130,7 +154,9 @@ fn nullable_nested_controls_block_inherited_values() {
     let mut current = responses_request(Vec::new());
     current.parameters.reset(ParameterReset::ReasoningLevel);
     current.parameters.reset(ParameterReset::ReasoningSummary);
-    current.parameters.reset(ParameterReset::ResponseFormatStrict);
+    current
+        .parameters
+        .reset(ParameterReset::ResponseFormatStrict);
     config.apply_missing_to(&mut current);
     assert!(current.reasoning.level.is_none());
     assert!(current.reasoning.summary.is_none());
@@ -3348,7 +3374,10 @@ async fn previous_response_inherits_request_configuration_and_keeps_overrides() 
     root.parameters.store = Some(false);
     root.parameters.min_p = Some(0.12);
     root.parameters.logprobs = Some(3);
-    root.parameters.metadata = Some(std::collections::BTreeMap::from([("trace".into(), "parent".into())]));
+    root.parameters.metadata = Some(std::collections::BTreeMap::from([(
+        "trace".into(),
+        "parent".into(),
+    )]));
     root.parameters.cache.key = Some("prompt-bucket".into());
     root.parameters.verbosity = Some(stravia_runtime_contract::protocol::ir::Verbosity::High);
     root.response_format = Some(stravia_runtime_contract::protocol::ir::ResponseFormat::Text);
@@ -3703,7 +3732,10 @@ async fn compatible_parent_uses_upstream_id_and_only_new_messages() {
     ));
     assert_eq!(next.items.len(), 1);
     assert_eq!(
-        next.parameters.continuation.as_ref().and_then(|value| value.previous_response_id()),
+        next.parameters
+            .continuation
+            .as_ref()
+            .and_then(|value| value.previous_response_id()),
         Some("upstream-1")
     );
 }
@@ -3962,11 +3994,8 @@ fn target_continuation_namespace_includes_every_hard_request_control() {
         GenerationChainState::from_request(&tools, "target-a", OPEN_RESPONSES_2026_04_24);
     let mut changed_tools = tools.clone();
     changed_tools.tools.as_mut().unwrap()[0].defer_loading = Some(true);
-    let changed_state = GenerationChainState::from_request(
-        &changed_tools,
-        "target-a",
-        OPEN_RESPONSES_2026_04_24,
-    );
+    let changed_state =
+        GenerationChainState::from_request(&changed_tools, "target-a", OPEN_RESPONSES_2026_04_24);
     assert!(!changed_state.compatible_continuation(&tool_state));
     variants.push(tools);
     let mut reasoning = original.clone();

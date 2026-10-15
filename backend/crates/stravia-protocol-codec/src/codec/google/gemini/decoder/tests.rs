@@ -2,26 +2,36 @@ use super::*;
 
 #[test]
 fn explicit_null_controls_reset_inheritance_without_null_output() {
-    let request = GoogleDecoder.decode_request(serde_json::json!({
-        "contents": [], "systemInstruction": null, "tools": null,
-        "generationConfig": {
-            "temperature": null, "topP": null, "maxOutputTokens": null,
-            "presencePenalty": null, "frequencyPenalty": null,
-            "responseJsonSchema": null, "responseLogprobs": null,
-            "thinkingConfig": {"thinkingLevel": null, "includeThoughts": null}
-        }
-    })).unwrap();
+    let request = GoogleDecoder
+        .decode_request(serde_json::json!({
+            "contents": [], "systemInstruction": null, "tools": null,
+            "generationConfig": {
+                "temperature": null, "topP": null, "maxOutputTokens": null,
+                "presencePenalty": null, "frequencyPenalty": null,
+                "responseJsonSchema": null, "responseLogprobs": null,
+                "thinkingConfig": {"thinkingLevel": null, "includeThoughts": null}
+            }
+        }))
+        .unwrap();
     for reset in [
-        ParameterReset::Instructions, ParameterReset::NativeTools,
-        ParameterReset::Temperature, ParameterReset::TopP, ParameterReset::MaxTokens,
-        ParameterReset::PresencePenalty, ParameterReset::FrequencyPenalty,
-        ParameterReset::ResponseFormat, ParameterReset::Logprobs,
-        ParameterReset::ReasoningLevel, ParameterReset::ReasoningSummary,
+        ParameterReset::Instructions,
+        ParameterReset::NativeTools,
+        ParameterReset::Temperature,
+        ParameterReset::TopP,
+        ParameterReset::MaxTokens,
+        ParameterReset::PresencePenalty,
+        ParameterReset::FrequencyPenalty,
+        ParameterReset::ResponseFormat,
+        ParameterReset::Logprobs,
+        ParameterReset::ReasoningLevel,
+        ParameterReset::ReasoningSummary,
     ] {
         assert!(request.parameters.resets(reset));
     }
     assert!(request.response_format.is_none());
-    let (body, _) = crate::codec::google::gemini::encoder::GoogleEncoder.encode_request(request).unwrap();
+    let (body, _) = crate::codec::google::gemini::encoder::GoogleEncoder
+        .encode_request(request)
+        .unwrap();
     assert!(!body.to_string().contains(":null"));
     assert!(body.get("systemInstruction").is_none());
     assert!(body.get("tools").is_none());
@@ -32,40 +42,54 @@ fn explicit_null_controls_reset_inheritance_without_null_output() {
 fn allowed_function_names_preserve_the_complete_selection_and_mode() {
     for (mode, required) in [("AUTO", false), ("ANY", true)] {
         for names in [vec!["lookup"], vec!["lookup", "search"], vec![]] {
-            let request = GoogleDecoder.decode_request(serde_json::json!({
-                "contents": [],
-                "toolConfig": {"functionCallingConfig": {
-                    "mode": mode, "allowedFunctionNames": names,
-                    "streamFunctionCallArguments": true
-                }}
-            })).unwrap();
+            let request = GoogleDecoder
+                .decode_request(serde_json::json!({
+                    "contents": [],
+                    "toolConfig": {"functionCallingConfig": {
+                        "mode": mode, "allowedFunctionNames": names,
+                        "streamFunctionCallArguments": true
+                    }}
+                }))
+                .unwrap();
             assert!(matches!(&request.tool_choice,
                 Some(ToolChoice::Allowed { names: actual, required: actual_required })
                 if actual.iter().map(String::as_str).collect::<Vec<_>>() == names && *actual_required == required
             ));
-            let (body, _) = crate::codec::google::gemini::encoder::GoogleEncoder.encode_request(request).unwrap();
-            assert_eq!(body["toolConfig"], serde_json::json!({
-                "functionCallingConfig": {"mode": mode, "allowedFunctionNames": names}
-            }));
+            let (body, _) = crate::codec::google::gemini::encoder::GoogleEncoder
+                .encode_request(request)
+                .unwrap();
+            assert_eq!(
+                body["toolConfig"],
+                serde_json::json!({
+                    "functionCallingConfig": {"mode": mode, "allowedFunctionNames": names}
+                })
+            );
         }
     }
 }
 
 #[test]
 fn native_tools_normalize_supported_kinds_and_discard_unsupported_tools() {
-    let request = GoogleDecoder.decode_request(serde_json::json!({
-        "contents": [],
-        "safetySettings": {"unsupported": "shape"},
-        "cachedContent": {"unsupported": "shape"},
-        "tools": [
-            {"googleSearchRetrieval": {"dynamicRetrievalConfig": {"mode": "MODE_DYNAMIC"}}},
-            {"codeExecution": {"private": true}},
-            {"urlContext": {}}
-        ]
-    })).unwrap();
+    let request = GoogleDecoder
+        .decode_request(serde_json::json!({
+            "contents": [],
+            "safetySettings": {"unsupported": "shape"},
+            "cachedContent": {"unsupported": "shape"},
+            "tools": [
+                {"googleSearchRetrieval": {"dynamicRetrievalConfig": {"mode": "MODE_DYNAMIC"}}},
+                {"codeExecution": {"private": true}},
+                {"urlContext": {}}
+            ]
+        }))
+        .unwrap();
     assert_eq!(request.parameters.native_tools.len(), 2);
-    let (body, _) = crate::codec::google::gemini::encoder::GoogleEncoder.encode_request(request).unwrap();
-    assert_eq!(body["tools"], serde_json::json!([{"googleSearch": {}}, {"codeExecution": {}}]));
+    let (body, _) = crate::codec::google::gemini::encoder::GoogleEncoder
+        .encode_request(request)
+        .unwrap();
+    assert_eq!(
+        body["tools"],
+        serde_json::json!([{"googleSearch": {}}, {"codeExecution": {}}])
+    );
     assert!(body.get("safetySettings").is_none());
     assert!(body.get("cachedContent").is_none());
 }
@@ -77,19 +101,26 @@ fn mime_formats_and_logprobs_use_unified_controls() {
         ("text/plain", Some(ResponseFormat::Text)),
         ("image/png", None),
     ] {
-        let request = GoogleDecoder.decode_request(serde_json::json!({
-            "contents": [], "generationConfig": {
-                "responseMimeType": mime, "responseLogprobs": true, "logprobs": 0,
-                "responseModalities": ["TEXT", "AUDIO", "IMAGE", "UNSUPPORTED"]
-            }
-        })).unwrap();
+        let request = GoogleDecoder
+            .decode_request(serde_json::json!({
+                "contents": [], "generationConfig": {
+                    "responseMimeType": mime, "responseLogprobs": true, "logprobs": 0,
+                    "responseModalities": ["TEXT", "AUDIO", "IMAGE", "UNSUPPORTED"]
+                }
+            }))
+            .unwrap();
         assert_eq!(
             serde_json::to_value(&request.response_format).unwrap(),
             serde_json::to_value(&expected).unwrap()
         );
         assert_eq!(request.parameters.logprobs, Some(0));
-        assert_eq!(request.parameters.modalities, Some(vec![Modality::Text, Modality::Audio, Modality::Image]));
-        let (body, _) = crate::codec::google::gemini::encoder::GoogleEncoder.encode_request(request).unwrap();
+        assert_eq!(
+            request.parameters.modalities,
+            Some(vec![Modality::Text, Modality::Audio, Modality::Image])
+        );
+        let (body, _) = crate::codec::google::gemini::encoder::GoogleEncoder
+            .encode_request(request)
+            .unwrap();
         assert_eq!(body["generationConfig"]["responseLogprobs"], true);
         assert_eq!(body["generationConfig"]["logprobs"], 0);
         if expected.is_some() {
@@ -111,7 +142,14 @@ fn official_native_generation_controls_project_nested_keys() {
         },
         "toolConfig": {"functionCallingConfig": {"mode": "AUTO", "private": true}, "private": true}
     })).unwrap();
-    assert_eq!(request.parameters.audio.as_ref().and_then(|audio| audio.voice.as_deref()), Some("Kore"));
+    assert_eq!(
+        request
+            .parameters
+            .audio
+            .as_ref()
+            .and_then(|audio| audio.voice.as_deref()),
+        Some("Kore")
+    );
     let (body, _) = crate::codec::google::gemini::encoder::GoogleEncoder
         .encode_request(request)
         .unwrap();
@@ -200,7 +238,12 @@ fn roundtrips_canonical_controls_without_native_request_copies() {
     assert!(config.get("responseLogprobs").is_none());
     assert!(config.get("logprobs").is_none());
     assert_eq!(config["responseModalities"], serde_json::json!([]));
-    for key in ["responseMimeType", "audioTimestamp", "mediaResolution", "routingConfig"] {
+    for key in [
+        "responseMimeType",
+        "audioTimestamp",
+        "mediaResolution",
+        "routingConfig",
+    ] {
         assert!(config.get(key).is_none());
     }
     assert!(config.get("unknownGenerationControl").is_none());
@@ -369,11 +412,7 @@ fn decodes_and_roundtrips_native_function_calling_modes() {
         match config["mode"].as_str().unwrap() {
             "AUTO" => assert!(matches!(request.tool_choice, Some(ToolChoice::Auto))),
             "NONE" => assert!(matches!(request.tool_choice, Some(ToolChoice::None))),
-            "ANY"
-                if config["allowedFunctionNames"]
-                    .as_array()
-                    .is_some() =>
-            {
+            "ANY" if config["allowedFunctionNames"].as_array().is_some() => {
                 assert!(
                     matches!(&request.tool_choice, Some(ToolChoice::Allowed { names, required: true })
                         if serde_json::json!(names) == config["allowedFunctionNames"])
@@ -495,7 +534,10 @@ fn missing_function_ids_are_compact_deterministic_and_skip_supplied_ids() {
 
 #[test]
 fn include_thoughts_preserves_summary_without_selecting_intensity() {
-    for (include, summary) in [(true, ReasoningSummary::Auto), (false, ReasoningSummary::None)] {
+    for (include, summary) in [
+        (true, ReasoningSummary::Auto),
+        (false, ReasoningSummary::None),
+    ] {
         let request = GoogleDecoder
             .decode_request(serde_json::json!({
                 "contents": [{"role": "user", "parts": [{"text": "reason"}]}],

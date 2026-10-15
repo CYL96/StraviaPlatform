@@ -35,11 +35,11 @@ pub use error::{AiError, AiErrorKind};
 // ── ProtocolExt ───────────────────────────────────────────────────────────────
 use ext::ProtocolExt;
 pub use native_tools::{
-    CodeExecutionTool, CustomTool, ImageGenerationTool, NamespaceMember, NativeTool, NativeToolKind,
-    SearchContextSize, ToolGrammar, ToolNamespace, ToolSearchTool, UserLocation, WebSearchTool,
-    native_tool_from_anthropic, native_tool_from_chat_web_search_options, native_tool_from_gemini,
-    native_tool_from_responses, native_tool_to_anthropic, native_tool_to_chat_web_search_options,
-    native_tool_to_gemini, native_tool_to_responses,
+    CodeExecutionTool, CustomTool, ImageGenerationTool, NamespaceMember, NativeTool,
+    NativeToolKind, SearchContextSize, ToolGrammar, ToolNamespace, ToolSearchTool, UserLocation,
+    WebSearchTool, native_tool_from_anthropic, native_tool_from_chat_web_search_options,
+    native_tool_from_gemini, native_tool_from_responses, native_tool_to_anthropic,
+    native_tool_to_chat_web_search_options, native_tool_to_gemini, native_tool_to_responses,
 };
 pub use parameters::{
     AudioOutput, CacheParameters, CacheRetention, CompactionControl, Continuation, Modality,
@@ -51,9 +51,9 @@ pub use request::TOOL_RESULT_CONTENT_KIND_META;
 pub use request::{
     AiItem, AiItemAudience, AiItemMetadata, AiItemProvenance, AiItemStatus, AiRequest,
     CanonicalItemId, ContentBlock, DocumentSource, EmbeddingInput, EmbeddingRequest,
-    GenerationConfig, ItemReference, MediaSource, MessageContent, ReasoningConfig, ReasoningSummary,
-    RequestMetadata, ResponseFormat, Role, StreamConfig, ToolCall, ToolCallId, ToolChoice,
-    ToolResultContentKind, ToolSpec,
+    GenerationConfig, ItemReference, MediaSource, MessageContent, ReasoningConfig,
+    ReasoningSummary, RequestMetadata, ResponseFormat, Role, StreamConfig, ToolCall, ToolCallId,
+    ToolChoice, ToolResultContentKind, ToolSpec,
 };
 
 // ── Response ──────────────────────────────────────────────────────────────────

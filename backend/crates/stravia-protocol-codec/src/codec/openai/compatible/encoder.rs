@@ -166,38 +166,48 @@ impl OpenAIEncoder {
             }
             obj.insert("audio".into(), Value::Object(value));
         }
-        for (name, value) in [
-            ("metadata", parameters.metadata.map(|value| serde_json::json!(value))),
-            (
-                "logit_bias",
-                parameters.logit_bias.map(|value| serde_json::json!(value)),
-            ),
-            (
-                "modalities",
-                parameters.modalities.map(|value| serde_json::json!(value)),
-            ),
-            ("n", parameters.candidate_count.map(Value::from)),
-            ("store", parameters.store.map(Value::from)),
-            (
-                "safety_identifier",
-                parameters.end_user_id.map(Value::String),
-            ),
-            ("verbosity", parameters.verbosity.map(|value| serde_json::json!(value))),
-            ("prompt_cache_key", parameters.cache.key.map(Value::String)),
-            (
-                "prompt_cache_retention",
-                parameters.cache.retention.map(|value| Value::String(match value {
+        for (name, value) in
+            [
+                (
+                    "metadata",
+                    parameters.metadata.map(|value| serde_json::json!(value)),
+                ),
+                (
+                    "logit_bias",
+                    parameters.logit_bias.map(|value| serde_json::json!(value)),
+                ),
+                (
+                    "modalities",
+                    parameters.modalities.map(|value| serde_json::json!(value)),
+                ),
+                ("n", parameters.candidate_count.map(Value::from)),
+                ("store", parameters.store.map(Value::from)),
+                (
+                    "safety_identifier",
+                    parameters.end_user_id.map(Value::String),
+                ),
+                (
+                    "verbosity",
+                    parameters.verbosity.map(|value| serde_json::json!(value)),
+                ),
+                ("prompt_cache_key", parameters.cache.key.map(Value::String)),
+                (
+                    "prompt_cache_retention",
+                    parameters.cache.retention.map(|value| {
+                        Value::String(match value {
                     stravia_runtime_contract::protocol::ir::CacheRetention::Default => "in_memory",
                     stravia_runtime_contract::protocol::ir::CacheRetention::Extended => "24h",
-                }.into())),
-            ),
-        ] {
+                }.into())
+                    }),
+                ),
+            ]
+        {
             if let Some(value) = value {
                 obj.insert(name.into(), value);
             }
         }
         if let Some(options) = parameters.native_tools.iter().find_map(
-            stravia_runtime_contract::protocol::ir::native_tool_to_chat_web_search_options
+            stravia_runtime_contract::protocol::ir::native_tool_to_chat_web_search_options,
         ) {
             obj.insert("web_search_options".into(), options);
         }

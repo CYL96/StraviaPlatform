@@ -1159,8 +1159,13 @@ pub enum ToolChoice {
     /// Model must call at least one tool.
     Required,
     /// Force a specific tool by name.
-    Named { name: String },
-    Allowed { names: Vec<String>, required: bool },
+    Named {
+        name: String,
+    },
+    Allowed {
+        names: Vec<String>,
+        required: bool,
+    },
     Native(NativeToolKind),
 }
 
@@ -1209,7 +1214,11 @@ fn legacy_tool_choice(value: &Value) -> Option<ToolChoice> {
         "auto" | "AUTO" => {
             if let Some(names) = value.get("allowedFunctionNames").and_then(Value::as_array) {
                 return Some(ToolChoice::Allowed {
-                    names: names.iter().filter_map(Value::as_str).map(str::to_owned).collect(),
+                    names: names
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect(),
                     required: false,
                 });
             }
@@ -1219,7 +1228,11 @@ fn legacy_tool_choice(value: &Value) -> Option<ToolChoice> {
         "required" | "any" | "ANY" => {
             if let Some(names) = value.get("allowedFunctionNames").and_then(Value::as_array) {
                 return Some(ToolChoice::Allowed {
-                    names: names.iter().filter_map(Value::as_str).map(str::to_owned).collect(),
+                    names: names
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect(),
                     required: true,
                 });
             }
@@ -1227,17 +1240,27 @@ fn legacy_tool_choice(value: &Value) -> Option<ToolChoice> {
         }
         "function" | "tool" | "custom" => value
             .get("name")
-            .or_else(|| value.get("function").and_then(|function| function.get("name")))
+            .or_else(|| {
+                value
+                    .get("function")
+                    .and_then(|function| function.get("name"))
+            })
             .and_then(Value::as_str)
             .map(|name| ToolChoice::Named { name: name.into() }),
         "allowed_tools" => {
             let tools = value.get("tools")?.as_array()?;
-            let names = tools.iter().filter_map(|tool| {
-                tool.get("name")
-                    .or_else(|| tool.get("function").and_then(|function| function.get("name")))
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-            }).collect();
+            let names = tools
+                .iter()
+                .filter_map(|tool| {
+                    tool.get("name")
+                        .or_else(|| {
+                            tool.get("function")
+                                .and_then(|function| function.get("name"))
+                        })
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+                .collect();
             Some(ToolChoice::Allowed {
                 names,
                 required: value.get("mode").and_then(Value::as_str) == Some("required"),
@@ -1462,7 +1485,9 @@ impl<'de> Deserialize<'de> for ResponseFormat {
             ResponseFormatWire::JsonObject => Self::JsonObject,
             ResponseFormatWire::JsonSchema { shape } => {
                 let (ResponseSchemaWire::Direct(fields)
-                    | ResponseSchemaWire::Nested { json_schema: fields }) = shape;
+                | ResponseSchemaWire::Nested {
+                    json_schema: fields,
+                }) = shape;
                 Self::JsonSchema {
                     name: fields.name,
                     description: fields.description,
@@ -1649,13 +1674,21 @@ impl GenerationConfigWire {
     fn into_config(self, resets: &mut Vec<super::parameters::ParameterReset>) -> GenerationConfig {
         use super::parameters::ParameterReset;
         GenerationConfig {
-            temperature: self.temperature.into_value(resets, ParameterReset::Temperature),
-            max_tokens: self.max_tokens.into_value(resets, ParameterReset::MaxTokens),
+            temperature: self
+                .temperature
+                .into_value(resets, ParameterReset::Temperature),
+            max_tokens: self
+                .max_tokens
+                .into_value(resets, ParameterReset::MaxTokens),
             top_p: self.top_p.into_value(resets, ParameterReset::TopP),
             seed: self.seed,
             stop: self.stop,
-            presence_penalty: self.presence_penalty.into_value(resets, ParameterReset::PresencePenalty),
-            frequency_penalty: self.frequency_penalty.into_value(resets, ParameterReset::FrequencyPenalty),
+            presence_penalty: self
+                .presence_penalty
+                .into_value(resets, ParameterReset::PresencePenalty),
+            frequency_penalty: self
+                .frequency_penalty
+                .into_value(resets, ParameterReset::FrequencyPenalty),
         }
     }
 }
@@ -1697,10 +1730,16 @@ impl From<AiRequestWire> for AiRequest {
     fn from(wire: AiRequestWire) -> Self {
         use super::parameters::ParameterReset;
         let mut parameters = wire.parameters;
-        let generation = wire.generation.unwrap_or_default().into_config(&mut parameters.resets);
-        let instructions = wire.instructions.into_value(&mut parameters.resets, ParameterReset::Instructions);
+        let generation = wire
+            .generation
+            .unwrap_or_default()
+            .into_config(&mut parameters.resets);
+        let instructions = wire
+            .instructions
+            .into_value(&mut parameters.resets, ParameterReset::Instructions);
         let parallel_is_missing = matches!(&wire.parallel_tool_calls, NullableControl::Missing);
-        let parallel_tool_calls = wire.parallel_tool_calls
+        let parallel_tool_calls = wire
+            .parallel_tool_calls
             .into_value(&mut parameters.resets, ParameterReset::ParallelToolCalls)
             .or_else(|| {
                 if parallel_is_missing {
@@ -1709,8 +1748,13 @@ impl From<AiRequestWire> for AiRequest {
                     None
                 }
             });
-        let reasoning = wire.reasoning.into_value(&mut parameters.resets, ParameterReset::Reasoning).unwrap_or_default();
-        let response_format = wire.response_format.into_value(&mut parameters.resets, ParameterReset::ResponseFormat);
+        let reasoning = wire
+            .reasoning
+            .into_value(&mut parameters.resets, ParameterReset::Reasoning)
+            .unwrap_or_default();
+        let response_format = wire
+            .response_format
+            .into_value(&mut parameters.resets, ParameterReset::ResponseFormat);
         let mut request = Self {
             model: wire.model,
             items: wire.items,
@@ -1801,21 +1845,31 @@ mod tests {
             "disable_parallel_tool_calls": true,
             "reasoning": {"enabled": true, "display": "summarized"},
             "response_format": {"type": "json_schema", "name": "answer", "schema": {}}
-        })).unwrap();
+        }))
+        .unwrap();
         let stored = serde_json::to_value(&request).unwrap();
-        assert_eq!(stored["tools"], json!([{
-            "name": "lookup",
-            "description": "Find a record",
-            "parameters": {"type": "object", "properties": {"opaque": {"vendor": true}}},
-            "strict": false,
-            "defer_loading": true
-        }]));
+        assert_eq!(
+            stored["tools"],
+            json!([{
+                "name": "lookup",
+                "description": "Find a record",
+                "parameters": {"type": "object", "properties": {"opaque": {"vendor": true}}},
+                "strict": false,
+                "defer_loading": true
+            }])
+        );
         assert!(stored.get("safety_settings").is_none());
         assert_eq!(stored["parallel_tool_calls"], false);
-        assert_eq!(stored["reasoning"], json!({"mode": "enabled", "summary": "auto"}));
-        assert_eq!(stored["response_format"], json!({
-            "type": "json_schema", "name": "answer", "schema": {}
-        }));
+        assert_eq!(
+            stored["reasoning"],
+            json!({"mode": "enabled", "summary": "auto"})
+        );
+        assert_eq!(
+            stored["response_format"],
+            json!({
+                "type": "json_schema", "name": "answer", "schema": {}
+            })
+        );
         let restored: super::AiRequest = serde_json::from_value(stored.clone()).unwrap();
         assert_eq!(serde_json::to_value(restored).unwrap(), stored);
     }
@@ -1824,38 +1878,74 @@ mod tests {
     fn legacy_raw_tool_choices_import_without_preserving_vendor_json() {
         for (raw, canonical) in [
             (json!("required"), json!("required")),
-            (json!({"type": "function", "function": {"name": "lookup"}}),
-             json!({"named": {"name": "lookup"}})),
-            (json!({"type": "allowed_tools", "mode": "required",
+            (
+                json!({"type": "function", "function": {"name": "lookup"}}),
+                json!({"named": {"name": "lookup"}}),
+            ),
+            (
+                json!({"type": "allowed_tools", "mode": "required",
                     "tools": [{"type": "function", "name": "lookup"}, {"type": "custom", "name": "script"}]}),
-             json!({"allowed": {"names": ["lookup", "script"], "required": true}})),
-            (json!({"mode": "AUTO", "allowedFunctionNames": ["lookup"]}),
-             json!({"allowed": {"names": ["lookup"], "required": false}})),
-            (json!({"type": "web_search_preview_2025_03_11"}),
-             json!({"native": "web_search"})),
-            (json!({"type": "code_interpreter"}), json!({"native": "code_execution"})),
-            (json!({"type": "image_generation"}), json!({"native": "image_generation"})),
-            (json!({"type": "tool_search"}), json!({"native": "tool_search"})),
-            (json!({"type": "file_search", "private_control": true}), Value::Null),
+                json!({"allowed": {"names": ["lookup", "script"], "required": true}}),
+            ),
+            (
+                json!({"mode": "AUTO", "allowedFunctionNames": ["lookup"]}),
+                json!({"allowed": {"names": ["lookup"], "required": false}}),
+            ),
+            (
+                json!({"type": "web_search_preview_2025_03_11"}),
+                json!({"native": "web_search"}),
+            ),
+            (
+                json!({"type": "code_interpreter"}),
+                json!({"native": "code_execution"}),
+            ),
+            (
+                json!({"type": "image_generation"}),
+                json!({"native": "image_generation"}),
+            ),
+            (
+                json!({"type": "tool_search"}),
+                json!({"native": "tool_search"}),
+            ),
+            (
+                json!({"type": "file_search", "private_control": true}),
+                Value::Null,
+            ),
         ] {
             let request: super::AiRequest = serde_json::from_value(json!({
                 "model": "model", "items": [], "tool_choice": {"raw": raw}
-            })).unwrap();
+            }))
+            .unwrap();
             let stored = serde_json::to_value(&request).unwrap();
             assert_eq!(stored["tool_choice"], canonical);
             let restored: super::AiRequest = serde_json::from_value(stored).unwrap();
-            assert_eq!(serde_json::to_value(restored.tool_choice).unwrap(), canonical);
+            assert_eq!(
+                serde_json::to_value(restored.tool_choice).unwrap(),
+                canonical
+            );
         }
     }
 
     #[test]
     fn reasoning_summary_replaces_display_and_prefers_canonical_value() {
         for (wire, summary) in [
-            (json!({"display": "summarized"}), Some(super::ReasoningSummary::Auto)),
-            (json!({"display": "omitted"}), Some(super::ReasoningSummary::None)),
+            (
+                json!({"display": "summarized"}),
+                Some(super::ReasoningSummary::Auto),
+            ),
+            (
+                json!({"display": "omitted"}),
+                Some(super::ReasoningSummary::None),
+            ),
             (json!({"display": "unknown"}), None),
-            (json!({"summary": "detailed", "display": "omitted"}), Some(super::ReasoningSummary::Detailed)),
-            (json!({"summary": "concise"}), Some(super::ReasoningSummary::Concise)),
+            (
+                json!({"summary": "detailed", "display": "omitted"}),
+                Some(super::ReasoningSummary::Detailed),
+            ),
+            (
+                json!({"summary": "concise"}),
+                Some(super::ReasoningSummary::Concise),
+            ),
         ] {
             let reasoning: super::ReasoningConfig = serde_json::from_value(wire).unwrap();
             assert_eq!(reasoning.summary, summary);
@@ -1927,7 +2017,8 @@ mod tests {
                 "presence_penalty": null,
                 "frequency_penalty": null
             }
-        })).unwrap();
+        }))
+        .unwrap();
         assert!(request.instructions.is_none());
         assert!(request.parallel_tool_calls.is_none());
         assert!(request.response_format.is_none());
@@ -1952,7 +2043,8 @@ mod tests {
         assert_eq!(serde_json::to_value(restored).unwrap(), stored);
         let missing: super::AiRequest = serde_json::from_value(json!({
             "model": "model", "items": []
-        })).unwrap();
+        }))
+        .unwrap();
         assert!(missing.parameters.resets.is_empty());
     }
 
@@ -1989,10 +2081,7 @@ mod tests {
             assert_eq!(name, "answer");
             assert_eq!(schema["properties"]["opaque"]["unknown"], true);
             assert_eq!(*strict, None);
-            assert_eq!(
-                description.as_deref(),
-                Some("documented answer")
-            );
+            assert_eq!(description.as_deref(), Some("documented answer"));
             let stored = serde_json::to_value(&request).unwrap();
             assert!(stored["parameters"].get("bedrock_output_config").is_none());
             assert!(stored["parameters"].get("extensions").is_none());
@@ -2023,9 +2112,14 @@ mod tests {
         assert_eq!(request.tools.as_ref().unwrap()[0].strict, Some(false));
         let stored = serde_json::to_value(&request).unwrap();
         for field in [
-            "extensions", "future_optional_control", "cohere_strict_tools",
-            "cohere_priority", "cohere_documents", "google_audio_timestamp",
-            "google_speech_config", "response_presence",
+            "extensions",
+            "future_optional_control",
+            "cohere_strict_tools",
+            "cohere_priority",
+            "cohere_documents",
+            "google_audio_timestamp",
+            "google_speech_config",
+            "response_presence",
         ] {
             assert!(stored["parameters"].get(field).is_none(), "{field}");
         }

@@ -825,10 +825,11 @@ mod tests {
 
     #[test]
     fn invalid_argument_trailer_requires_untrusted_reasoning_before_output() {
-        let trailer = trailer_frame(r#"{"error":{"code":"invalid_argument","message":"rejected"}}"#);
+        let trailer =
+            trailer_frame(r#"{"error":{"code":"invalid_argument","message":"rejected"}}"#);
         for untrusted in [false, true] {
-            let mut parser = DevinConnectStreamParser::new()
-                .with_protected_reasoning_untrusted(untrusted);
+            let mut parser =
+                DevinConnectStreamParser::new().with_protected_reasoning_untrusted(untrusted);
             let deltas = parser.parse_chunk(&trailer).unwrap();
             assert!(matches!(&deltas[..], [AiStreamDelta::StreamError { error }]
                 if error.kind == AiErrorKind::InvalidRequest));
@@ -841,8 +842,8 @@ mod tests {
     fn invalid_argument_after_output_is_never_a_reasoning_rejection() {
         let trailer = trailer_frame(r#"{"error":{"code":"invalid_argument"}}"#);
         for same_chunk in [false, true] {
-            let mut parser = DevinConnectStreamParser::new()
-                .with_protected_reasoning_untrusted(true);
+            let mut parser =
+                DevinConnectStreamParser::new().with_protected_reasoning_untrusted(true);
             let mut wire = data_frame(&text_payload("answer"));
             if same_chunk {
                 wire.extend_from_slice(&trailer);
@@ -851,8 +852,10 @@ mod tests {
                 wire = trailer.clone();
             }
             let deltas = parser.parse_chunk(&wire).unwrap();
-            assert!(matches!(deltas.last(), Some(AiStreamDelta::StreamError { error })
-                if error.kind == AiErrorKind::InvalidRequest));
+            assert!(
+                matches!(deltas.last(), Some(AiStreamDelta::StreamError { error })
+                if error.kind == AiErrorKind::InvalidRequest)
+            );
             assert!(!parser.protected_reasoning_rejected());
         }
     }
@@ -883,8 +886,14 @@ mod tests {
                 wire = trailer.clone();
             }
             let deltas = parser.parse_chunk(&wire).unwrap();
-            assert!(matches!(deltas.last(), Some(AiStreamDelta::StreamError { .. })));
-            assert!(parser.protected_reasoning_rejected(), "same_chunk={same_chunk}");
+            assert!(matches!(
+                deltas.last(),
+                Some(AiStreamDelta::StreamError { .. })
+            ));
+            assert!(
+                parser.protected_reasoning_rejected(),
+                "same_chunk={same_chunk}"
+            );
         }
     }
 

@@ -241,10 +241,5 @@ async fn continuation_recovery_discards_failed_operation_metadata() {
             .and_then(|continuation| continuation.previous_response_id()),
         Some("resp-zdr")
     );
-    assert!(
-        replay
-            .parameters
-            .continuation
-            .is_none()
-    );
+    assert!(replay.parameters.continuation.is_none());
 }

@@ -25,10 +25,7 @@ fn unified_controls_project_and_unsupported_vendor_controls_are_dropped() {
         body["context_management"],
         serde_json::json!([{"type": "compaction", "compact_threshold": 10000}])
     );
-    assert_eq!(
-        body["metadata"],
-        serde_json::json!({})
-    );
+    assert_eq!(body["metadata"], serde_json::json!({}));
     assert!(body.get("unknown_body").is_none());
 }
 
@@ -66,23 +63,42 @@ use stravia_runtime_contract::protocol::ir::AiItem;
 #[test]
 fn responses_include_is_derived_only_from_unified_intent() {
     for (store, effort, logprobs, expected) in [
-        (false, "high", Some(0), serde_json::json!(["reasoning.encrypted_content", "message.output_text.logprobs"])),
-        (true, "high", Some(2), serde_json::json!(["message.output_text.logprobs"])),
+        (
+            false,
+            "high",
+            Some(0),
+            serde_json::json!([
+                "reasoning.encrypted_content",
+                "message.output_text.logprobs"
+            ]),
+        ),
+        (
+            true,
+            "high",
+            Some(2),
+            serde_json::json!(["message.output_text.logprobs"]),
+        ),
         (false, "none", None, Value::Null),
     ] {
-        let request = ResponsesDecoder.decode_request(serde_json::json!({
-            "model": "gpt", "input": "hello", "store": store,
-            "reasoning": {"effort": effort}, "top_logprobs": logprobs,
-            "include": ["file_search_call.results", "reasoning.encrypted_content"],
-        })).unwrap();
+        let request = ResponsesDecoder
+            .decode_request(serde_json::json!({
+                "model": "gpt", "input": "hello", "store": store,
+                "reasoning": {"effort": effort}, "top_logprobs": logprobs,
+                "include": ["file_search_call.results", "reasoning.encrypted_content"],
+            }))
+            .unwrap();
         let (body, _) = ResponsesEncoder.encode_request(request).unwrap();
         assert_eq!(body["include"], expected);
-        if expected.is_null() { assert!(body.get("include").is_none()); }
+        if expected.is_null() {
+            assert!(body.get("include").is_none());
+        }
     }
-    let request = ResponsesDecoder.decode_request(serde_json::json!({
-        "model": "gpt", "input": "hello", "store": false,
-        "include": ["reasoning.encrypted_content"],
-    })).unwrap();
+    let request = ResponsesDecoder
+        .decode_request(serde_json::json!({
+            "model": "gpt", "input": "hello", "store": false,
+            "include": ["reasoning.encrypted_content"],
+        }))
+        .unwrap();
     let (body, _) = ResponsesEncoder.encode_request(request).unwrap();
     assert!(body.get("include").is_none());
 }
@@ -91,16 +107,30 @@ fn responses_include_is_derived_only_from_unified_intent() {
 fn native_tools_and_choices_use_current_official_types() {
     use stravia_runtime_contract::protocol::ir::{NativeToolKind, ToolChoice};
     for (wire_type, kind, official_type) in [
-        ("web_search_preview", NativeToolKind::WebSearch, "web_search"),
-        ("code_interpreter", NativeToolKind::CodeExecution, "code_interpreter"),
-        ("image_generation", NativeToolKind::ImageGeneration, "image_generation"),
+        (
+            "web_search_preview",
+            NativeToolKind::WebSearch,
+            "web_search",
+        ),
+        (
+            "code_interpreter",
+            NativeToolKind::CodeExecution,
+            "code_interpreter",
+        ),
+        (
+            "image_generation",
+            NativeToolKind::ImageGeneration,
+            "image_generation",
+        ),
         ("tool_search", NativeToolKind::ToolSearch, "tool_search"),
     ] {
-        let request = ResponsesDecoder.decode_request(serde_json::json!({
-            "model": "gpt", "input": "hello",
-            "tools": [{"type": wire_type}, {"type": "file_search"}, {"type": "mcp"}],
-            "tool_choice": {"type": wire_type},
-        })).unwrap();
+        let request = ResponsesDecoder
+            .decode_request(serde_json::json!({
+                "model": "gpt", "input": "hello",
+                "tools": [{"type": wire_type}, {"type": "file_search"}, {"type": "mcp"}],
+                "tool_choice": {"type": wire_type},
+            }))
+            .unwrap();
         assert!(matches!(request.tool_choice, Some(ToolChoice::Native(actual)) if actual == kind));
         assert_eq!(request.parameters.native_tools.len(), 1);
         let profile = response_profile_from_request(&request);
@@ -115,38 +145,56 @@ fn native_tools_and_choices_use_current_official_types() {
 
 #[test]
 fn custom_and_allowed_choices_remain_typed_without_tool_definition_passthrough() {
-    let request = ResponsesDecoder.decode_request(serde_json::json!({
-        "model": "gpt", "input": "hello",
-        "tools": [{"type": "custom", "name": "patch", "format": {
-            "type": "grammar", "syntax": "lark", "definition": "start: \"ok\""
-        }, "private": true}],
-        "tool_choice": {"type": "allowed_tools", "mode": "required",
-            "tools": [{"type": "custom", "name": "patch"}]},
-    })).unwrap();
+    let request = ResponsesDecoder
+        .decode_request(serde_json::json!({
+            "model": "gpt", "input": "hello",
+            "tools": [{"type": "custom", "name": "patch", "format": {
+                "type": "grammar", "syntax": "lark", "definition": "start: \"ok\""
+            }, "private": true}],
+            "tool_choice": {"type": "allowed_tools", "mode": "required",
+                "tools": [{"type": "custom", "name": "patch"}]},
+        }))
+        .unwrap();
     let (body, _) = ResponsesEncoder.encode_request(request).unwrap();
     assert_eq!(body["tools"][0]["type"], "custom");
     assert_eq!(body["tools"][0]["format"]["definition"], "start: \"ok\"");
     assert!(body["tools"][0].get("private").is_none());
-    assert_eq!(body["tool_choice"], serde_json::json!({
-        "type": "allowed_tools", "mode": "required", "tools": [{"type": "custom", "name": "patch"}]
-    }));
+    assert_eq!(
+        body["tool_choice"],
+        serde_json::json!({
+            "type": "allowed_tools", "mode": "required", "tools": [{"type": "custom", "name": "patch"}]
+        })
+    );
 }
 
 #[test]
 fn effective_profile_round_trip_retains_unified_response_controls() {
-    use stravia_runtime_contract::protocol::ir::{CompactionControl, ReasoningSummary, ServiceTier};
-    let request = ResponsesDecoder.decode_request(serde_json::json!({
-        "model": "gpt", "input": "hello", "store": false,
-        "user": "legacy-user", "safety_identifier": "safe-user",
-        "metadata": {"tenant": "acme", "discard": 42},
-        "reasoning": {"effort": "high", "summary": "concise"},
-        "service_tier": "priority",
-        "context_management": [{"type": "compaction", "compact_threshold": 12000}],
-    })).unwrap();
+    use stravia_runtime_contract::protocol::ir::{
+        CompactionControl, ReasoningSummary, ServiceTier,
+    };
+    let request = ResponsesDecoder
+        .decode_request(serde_json::json!({
+            "model": "gpt", "input": "hello", "store": false,
+            "user": "legacy-user", "safety_identifier": "safe-user",
+            "metadata": {"tenant": "acme", "discard": 42},
+            "reasoning": {"effort": "high", "summary": "concise"},
+            "service_tier": "priority",
+            "context_management": [{"type": "compaction", "compact_threshold": 12000}],
+        }))
+        .unwrap();
     assert_eq!(request.parameters.end_user_id.as_deref(), Some("safe-user"));
-    assert_eq!(request.parameters.compaction, Some(CompactionControl { threshold_tokens: Some(12000) }));
+    assert_eq!(
+        request.parameters.compaction,
+        Some(CompactionControl {
+            threshold_tokens: Some(12000)
+        })
+    );
     let profile = effective_response_profile_from_request(&request);
-    let decoded = super::super::decoder::decode_effective_response_profile("gpt", profile.as_object().unwrap()).unwrap();
+    let decoded = super::super::decoder::decode_effective_response_profile(
+        "gpt",
+        profile.as_object().unwrap(),
+    )
+    .unwrap();
     assert_eq!(decoded.reasoning.summary, Some(ReasoningSummary::Concise));
     assert_eq!(decoded.parameters.service_tier, Some(ServiceTier::Priority));
     assert_eq!(decoded.parameters.compaction, request.parameters.compaction);
@@ -154,12 +202,17 @@ fn effective_profile_round_trip_retains_unified_response_controls() {
     assert_eq!(body["safety_identifier"], "safe-user");
     assert!(body.get("user").is_none());
     assert_eq!(body["metadata"], serde_json::json!({"tenant": "acme"}));
-    assert_eq!(body["context_management"], serde_json::json!([{"type": "compaction", "compact_threshold": 12000}]));
+    assert_eq!(
+        body["context_management"],
+        serde_json::json!([{"type": "compaction", "compact_threshold": 12000}])
+    );
 }
 
 #[test]
 fn canonical_controls_win_in_encoder_and_borrowed_profile() {
-    use stravia_runtime_contract::protocol::ir::{CacheRetention, Continuation, ServiceTier, Verbosity, NativeTool, WebSearchTool};
+    use stravia_runtime_contract::protocol::ir::{
+        CacheRetention, Continuation, NativeTool, ServiceTier, Verbosity, WebSearchTool,
+    };
     let mut request = ResponsesDecoder
         .decode_request(serde_json::json!({
             "model": "gpt", "input": "hello"
@@ -175,7 +228,10 @@ fn canonical_controls_win_in_encoder_and_borrowed_profile() {
     request.parameters.cache.retention = Some(CacheRetention::Extended);
     request.parameters.continuation = Some(Continuation::Conversation("conv_canonical".into()));
     request.parameters.service_tier = Some(ServiceTier::Priority);
-    request.parameters.native_tools.push(NativeTool::WebSearch(WebSearchTool::default()));
+    request
+        .parameters
+        .native_tools
+        .push(NativeTool::WebSearch(WebSearchTool::default()));
     let schema =
         serde_json::json!({"type": "object", "properties": {"optional": {"type": "string"}}});
     request.response_format = Some(ResponseFormat::JsonSchema {
@@ -203,7 +259,10 @@ fn canonical_controls_win_in_encoder_and_borrowed_profile() {
         assert_eq!(output["text"]["format"]["strict"], false);
         assert_eq!(output["tools"][0]["type"], "web_search");
     }
-    assert_eq!(body["include"], serde_json::json!(["message.output_text.logprobs"]));
+    assert_eq!(
+        body["include"],
+        serde_json::json!(["message.output_text.logprobs"])
+    );
     assert!(body.get("stream_options").is_none());
     assert!(profile.get("include").is_none());
     assert!(profile.get("stream_options").is_none());
@@ -278,8 +337,12 @@ fn explicit_null_resets_never_leave_as_null_controls() {
 #[test]
 fn canonical_presence_and_reasoning_mode_project_without_native_maps() {
     let mut request = AiRequest::new("gpt", vec![AiItem::output_text("hello")]);
-    request.parameters.reset(stravia_runtime_contract::protocol::ir::ParameterReset::Instructions);
-    request.parameters.reset(stravia_runtime_contract::protocol::ir::ParameterReset::NativeTools);
+    request
+        .parameters
+        .reset(stravia_runtime_contract::protocol::ir::ParameterReset::Instructions);
+    request
+        .parameters
+        .reset(stravia_runtime_contract::protocol::ir::ParameterReset::NativeTools);
     request.reasoning.mode = Some("disabled".into());
     let profile = effective_response_profile_from_request(&request);
     let (body, _) = ResponsesEncoder.encode_request(request).unwrap();
@@ -332,12 +395,17 @@ fn consumed_text_requests_preserve_shared_snapshots_and_wire_roles() {
 
 #[test]
 fn responses_summary_respects_explicit_intent_and_disabled_target() {
-    use stravia_runtime_contract::thinking::{TargetThinkingControl, ThinkingLevel};
     use stravia_runtime_contract::protocol::ir::ReasoningSummary;
+    use stravia_runtime_contract::thinking::{TargetThinkingControl, ThinkingLevel};
     for (summary, level, control, expected) in [
         (Some(ReasoningSummary::None), None, None, None),
         (Some(ReasoningSummary::Concise), None, None, Some("concise")),
-        (Some(ReasoningSummary::Detailed), None, None, Some("detailed")),
+        (
+            Some(ReasoningSummary::Detailed),
+            None,
+            None,
+            Some("detailed"),
+        ),
         (
             None,
             Some(ThinkingLevel::Off),
@@ -703,7 +771,11 @@ fn encodes_responses_supported_media_without_text_coercion() {
 #[test]
 fn continuation_without_new_input_omits_input() {
     let mut request = AiRequest::new("logical-model", Vec::new());
-    request.parameters.continuation = Some(stravia_runtime_contract::protocol::ir::Continuation::PreviousResponse("resp_parent".into()));
+    request.parameters.continuation = Some(
+        stravia_runtime_contract::protocol::ir::Continuation::PreviousResponse(
+            "resp_parent".into(),
+        ),
+    );
 
     let (body, _) = ResponsesEncoder
         .encode_request(request)

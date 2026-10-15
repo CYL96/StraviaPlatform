@@ -23,8 +23,8 @@ use stravia_runtime_contract::protocol::ir::ToolCall;
 use stravia_runtime_contract::protocol::ir::ToolChoice;
 use stravia_runtime_contract::protocol::ir::ToolSpec;
 use stravia_runtime_contract::protocol::ir::{
-    native_tool_from_responses, CacheRetention, CompactionControl, Continuation, NativeTool,
-    NativeToolKind, ParameterReset, ReasoningSummary,
+    CacheRetention, CompactionControl, Continuation, NativeTool, NativeToolKind, ParameterReset,
+    ReasoningSummary, native_tool_from_responses,
 };
 
 pub struct ResponsesDecoder;
@@ -126,9 +126,7 @@ impl ResponsesDecoder {
             tools,
             native_tools,
         } = parse_tools(obj.get("tools"))?;
-        let tool_choice = obj
-            .get("tool_choice")
-            .and_then(parse_tool_choice);
+        let tool_choice = obj.get("tool_choice").and_then(parse_tool_choice);
 
         // ── Reasoning ─────────────────────────────────────────────────────────
         let reasoning = if let Some(reasoning) = obj.get("reasoning") {
@@ -174,19 +172,30 @@ impl ResponsesDecoder {
         ai_req.normalize_parameters();
         let parameters = &mut ai_req.parameters;
         parameters.background = obj.get("background").and_then(Value::as_bool);
-        parameters.continuation = previous_response_id.map(Continuation::PreviousResponse)
-            .or_else(|| obj.get("conversation").and_then(|value| {
-                value.as_str().or_else(|| value.get("id").and_then(Value::as_str))
-                    .map(|id| Continuation::Conversation(id.to_owned()))
-            }));
+        parameters.continuation = previous_response_id
+            .map(Continuation::PreviousResponse)
+            .or_else(|| {
+                obj.get("conversation").and_then(|value| {
+                    value
+                        .as_str()
+                        .or_else(|| value.get("id").and_then(Value::as_str))
+                        .map(|id| Continuation::Conversation(id.to_owned()))
+                })
+            });
         parameters.max_tool_calls = optional_u32(obj, "max_tool_calls")?;
         parameters.logprobs = optional_u32(obj, "top_logprobs")?;
         parameters.store = obj.get("store").and_then(Value::as_bool);
-        parameters.metadata = obj.get("metadata").and_then(Value::as_object).map(|metadata| {
-            metadata.iter().filter_map(|(key, value)| {
-                value.as_str().map(|value| (key.clone(), value.to_owned()))
-            }).collect()
-        });
+        parameters.metadata = obj
+            .get("metadata")
+            .and_then(Value::as_object)
+            .map(|metadata| {
+                metadata
+                    .iter()
+                    .filter_map(|(key, value)| {
+                        value.as_str().map(|value| (key.clone(), value.to_owned()))
+                    })
+                    .collect()
+            });
         parameters.end_user_id = obj
             .get("safety_identifier")
             .and_then(Value::as_str)
@@ -199,14 +208,22 @@ impl ResponsesDecoder {
         parameters.truncation = obj
             .get("truncation")
             .and_then(|value| serde_json::from_value(value.clone()).ok());
-        parameters.service_tier =
-            obj.get("service_tier")
-                .and_then(|value| serde_json::from_value(value.clone()).ok());
+        parameters.service_tier = obj
+            .get("service_tier")
+            .and_then(|value| serde_json::from_value(value.clone()).ok());
         parameters.native_tools = native_tools;
-        parameters.compaction = obj.get("context_management").and_then(Value::as_array)
-            .and_then(|controls| controls.iter().find(|control| control["type"] == "compaction"))
+        parameters.compaction = obj
+            .get("context_management")
+            .and_then(Value::as_array)
+            .and_then(|controls| {
+                controls
+                    .iter()
+                    .find(|control| control["type"] == "compaction")
+            })
             .map(|control| CompactionControl {
-                threshold_tokens: control.get("compact_threshold").and_then(Value::as_u64)
+                threshold_tokens: control
+                    .get("compact_threshold")
+                    .and_then(Value::as_u64)
                     .and_then(|value| u32::try_from(value).ok()),
             });
         if let Some(metadata) = obj.get("client_metadata") {
@@ -214,7 +231,9 @@ impl ResponsesDecoder {
         }
         parameters.generate = obj.get("generate").and_then(Value::as_bool);
         if ai_req.reasoning.summary.is_none() {
-            ai_req.reasoning.summary = obj.get("stream_options").and_then(|value| value.get("reasoning_summary_delivery"))
+            ai_req.reasoning.summary = obj
+                .get("stream_options")
+                .and_then(|value| value.get("reasoning_summary_delivery"))
                 .and_then(|value| serde_json::from_value::<ReasoningSummary>(value.clone()).ok());
         }
         parameters.verbosity = obj
@@ -252,9 +271,11 @@ impl ResponsesDecoder {
             ("safety_identifier", ParameterReset::EndUser),
             ("user", ParameterReset::EndUser),
         ] {
-            if obj.get(field).is_some_and(|value| value.is_null()
-                || value.as_str().is_some_and(str::is_empty)
-                || value.as_array().is_some_and(Vec::is_empty)) {
+            if obj.get(field).is_some_and(|value| {
+                value.is_null()
+                    || value.as_str().is_some_and(str::is_empty)
+                    || value.as_array().is_some_and(Vec::is_empty)
+            }) {
                 parameters.reset(reset);
             }
         }
@@ -265,11 +286,19 @@ impl ResponsesDecoder {
             ("text", "verbosity", ParameterReset::Verbosity),
         ] {
             if obj.get(parent).is_some_and(Value::is_null)
-                || obj.get(parent).and_then(|value| value.get(field)).is_some_and(Value::is_null) {
+                || obj
+                    .get(parent)
+                    .and_then(|value| value.get(field))
+                    .is_some_and(Value::is_null)
+            {
                 parameters.reset(reset);
             }
         }
-        if obj.get("text").and_then(|value| value.pointer("/format/strict")).is_some_and(Value::is_null) {
+        if obj
+            .get("text")
+            .and_then(|value| value.pointer("/format/strict"))
+            .is_some_and(Value::is_null)
+        {
             parameters.reset(ParameterReset::ResponseFormatStrict);
         }
 
@@ -502,7 +531,10 @@ fn parse_response_format(text: Option<&Value>) -> Result<Option<ResponseFormat>>
                 .and_then(Value::as_str)
                 .expect("validated text.format.name")
                 .to_owned(),
-            description: object.get("description").and_then(Value::as_str).map(str::to_owned),
+            description: object
+                .get("description")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
             schema: object
                 .get("schema")
                 .expect("validated text.format.schema")
@@ -1018,22 +1050,36 @@ fn parse_tool_choice(v: &Value) -> Option<ToolChoice> {
             let name = obj
                 .get("name")
                 .and_then(Value::as_str)
-                .filter(|name| !name.is_empty())
-                ?;
+                .filter(|name| !name.is_empty())?;
             Some(ToolChoice::Named {
                 name: name.to_owned(),
             })
         }
         Value::Object(obj) => match obj.get("type").and_then(Value::as_str)? {
-            "custom" => Some(ToolChoice::Named { name: obj.get("name")?.as_str()?.to_owned() }),
+            "custom" => Some(ToolChoice::Named {
+                name: obj.get("name")?.as_str()?.to_owned(),
+            }),
             "allowed_tools" => Some(ToolChoice::Allowed {
-                names: obj.get("tools")?.as_array()?.iter()
-                    .filter(|tool| matches!(tool.get("type").and_then(Value::as_str), Some("function" | "custom")))
-                    .filter_map(|tool| tool.get("name").and_then(Value::as_str).map(str::to_owned)).collect(),
+                names: obj
+                    .get("tools")?
+                    .as_array()?
+                    .iter()
+                    .filter(|tool| {
+                        matches!(
+                            tool.get("type").and_then(Value::as_str),
+                            Some("function" | "custom")
+                        )
+                    })
+                    .filter_map(|tool| tool.get("name").and_then(Value::as_str).map(str::to_owned))
+                    .collect(),
                 required: obj.get("mode").and_then(Value::as_str) == Some("required"),
             }),
-            "web_search" | "web_search_preview" | "web_search_2025_08_26"
-                | "web_search_preview_2025_03_11" => Some(ToolChoice::Native(NativeToolKind::WebSearch)),
+            "web_search"
+            | "web_search_preview"
+            | "web_search_2025_08_26"
+            | "web_search_preview_2025_03_11" => {
+                Some(ToolChoice::Native(NativeToolKind::WebSearch))
+            }
             "code_interpreter" => Some(ToolChoice::Native(NativeToolKind::CodeExecution)),
             "image_generation" => Some(ToolChoice::Native(NativeToolKind::ImageGeneration)),
             "tool_search" => Some(ToolChoice::Native(NativeToolKind::ToolSearch)),

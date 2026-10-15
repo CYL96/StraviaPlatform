@@ -234,22 +234,36 @@ fn unified_tools_and_summary_cross_the_anthropic_codec_boundary() {
     assert_eq!(tools.len(), 1);
     assert_eq!(tools[0].strict, Some(true));
     assert_eq!(tools[0].defer_loading, Some(false));
-    assert_eq!(tools[0].parameters["properties"]["cache_control"]["type"], "string");
+    assert_eq!(
+        tools[0].parameters["properties"]["cache_control"]["type"],
+        "string"
+    );
     let [NativeTool::WebSearch(search)] = request.parameters.native_tools.as_slice() else {
         panic!("expected unified native web search");
     };
     assert_eq!(search.max_uses, Some(8));
     assert_eq!(search.allowed_domains, ["example.com"]);
-    assert_eq!(search.user_location.as_ref().unwrap().city.as_deref(), Some("Paris"));
+    assert_eq!(
+        search.user_location.as_ref().unwrap().city.as_deref(),
+        Some("Paris")
+    );
     let encoded = stravia_vendor_common::common::encode_inference_request(
-        "anthropic-messages/messages/2023-06-01", request,
-    ).unwrap();
+        "anthropic-messages/messages/2023-06-01",
+        request,
+    )
+    .unwrap();
     assert_eq!(encoded.body["tools"][0]["name"], "read");
     assert_eq!(encoded.body["tools"][1]["type"], "web_search_20250305");
     assert_eq!(encoded.body["tools"][1]["name"], "web_search");
     for tool in encoded.body["tools"].as_array().unwrap() {
-        for field in ["eager_input_streaming", "cache_control", "allowed_callers",
-            "input_examples", "citations", "search_profile"] {
+        for field in [
+            "eager_input_streaming",
+            "cache_control",
+            "allowed_callers",
+            "input_examples",
+            "citations",
+            "search_profile",
+        ] {
             assert!(tool.get(field).is_none(), "{field}");
         }
     }
@@ -484,17 +498,20 @@ async fn inference_is_sent_in_claude_code_shape_and_tool_names_round_trip() {
         "messages": [{"role": "user", "content": "Read a."}]
     }));
     let mut provider = signed_in();
-    provider.operation_metadata.insert("transport_affinity".into(), json!("host-session"));
-    provider.operation_metadata.insert("parent_transport_affinity".into(), json!("host-parent"));
-    provider.client_headers.push(("x-claude-code-session-id".into(), "client-session".into()));
+    provider
+        .operation_metadata
+        .insert("transport_affinity".into(), json!("host-session"));
+    provider
+        .operation_metadata
+        .insert("parent_transport_affinity".into(), json!("host-parent"));
+    provider
+        .client_headers
+        .push(("x-claude-code-session-id".into(), "client-session".into()));
     let output = run(
         &runtime,
         &plugin,
         &services,
-        OperationInput::Infer {
-            provider,
-            request,
-        },
+        OperationInput::Infer { provider, request },
     )
     .await
     .expect("inference succeeds");
@@ -562,7 +579,10 @@ async fn inference_is_sent_in_claude_code_shape_and_tool_names_round_trip() {
     assert!(body["tools"][0].get("cache_control").is_none());
     assert_eq!(body["tools"][1]["type"], "web_search_20250305");
     assert_eq!(body["tools"][1]["name"], "web_search");
-    assert_eq!(body["tools"][1]["cache_control"], json!({"type":"ephemeral","ttl":"1h"}));
+    assert_eq!(
+        body["tools"][1]["cache_control"],
+        json!({"type":"ephemeral","ttl":"1h"})
+    );
     assert_eq!(body["stream"], json!(true));
     let user_id: Value =
         serde_json::from_str(body["metadata"]["user_id"].as_str().unwrap()).unwrap();

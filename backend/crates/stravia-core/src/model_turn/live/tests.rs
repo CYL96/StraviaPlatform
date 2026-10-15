@@ -3,7 +3,7 @@ use super::{
     UpstreamLocalWork, VendorDriverHandle, strip_rejected_protected_reasoning, thinking_authority,
 };
 use crate::history_marker::{
-    ReasoningRejections, ThinkingProvenance, ThinkingSource, RejectedReasoning,
+    ReasoningRejections, RejectedReasoning, ThinkingProvenance, ThinkingSource,
 };
 use crate::router::{RoutePolicyState, TargetRuntimeState};
 use std::sync::{Arc, atomic::AtomicU8};
@@ -215,7 +215,10 @@ fn thinking_provenance_trusts_signing_scope_not_target_wiring() {
         ),
     ];
     for (case, current, item, expected) in &cases {
-        let stravia_runtime_contract::protocol::ir::MessageContent::Blocks(blocks) = &item.content else { panic!("blocks"); };
+        let stravia_runtime_contract::protocol::ir::MessageContent::Blocks(blocks) = &item.content
+        else {
+            panic!("blocks");
+        };
         assert_eq!(current.provenance(item, &blocks[0]), *expected, "{case}");
     }
 
@@ -226,9 +229,20 @@ fn thinking_provenance_trusts_signing_scope_not_target_wiring() {
     );
     let mut unrelated = AiItem::thinking("reasoning", Some("new-signature".into()));
     other_scope.stamp_item(&mut unrelated);
-    let stravia_runtime_contract::protocol::ir::MessageContent::Blocks(blocks) = &unrelated.content else { panic!("blocks"); };
-    assert!(rejections.rejected("deployment-a", target.provenance(&unrelated, &blocks[0]), &blocks[0]));
-    assert!(!rejections.rejected("deployment-c", target.provenance(&unrelated, &blocks[0]), &blocks[0]));
+    let stravia_runtime_contract::protocol::ir::MessageContent::Blocks(blocks) = &unrelated.content
+    else {
+        panic!("blocks");
+    };
+    assert!(rejections.rejected(
+        "deployment-a",
+        target.provenance(&unrelated, &blocks[0]),
+        &blocks[0]
+    ));
+    assert!(!rejections.rejected(
+        "deployment-c",
+        target.provenance(&unrelated, &blocks[0]),
+        &blocks[0]
+    ));
     assert!(!rejections.rejected("deployment-a", ThinkingProvenance::Own, &blocks[0]));
 }
 
@@ -305,49 +319,91 @@ fn protected_reasoning_payload_inventory_and_dispatch_metadata_follow_actual_req
     let mut item = AiItem::thinking("own", Some("own-signature".into()));
     item.role = Role::Assistant;
     source.stamp_item(&mut item);
-    let MessageContent::Blocks(blocks) = &mut item.content else { panic!("blocks"); };
-    blocks.push(ContentBlock::Thinking { thinking: "inserted".into(), signature: Some("inserted-signature".into()) });
+    let MessageContent::Blocks(blocks) = &mut item.content else {
+        panic!("blocks");
+    };
+    blocks.push(ContentBlock::Thinking {
+        thinking: "inserted".into(),
+        signature: Some("inserted-signature".into()),
+    });
     let mut external = AiItem::thinking("external", Some("external-signature".into()));
     external.role = Role::Assistant;
     foreign.stamp_item(&mut external);
-    let MessageContent::Blocks(blocks) = &item.content else { panic!("blocks"); };
-    assert_eq!(source.provenance(&item, &blocks[0]), ThinkingProvenance::Own);
-    assert_eq!(source.provenance(&item, &blocks[1]), ThinkingProvenance::Unknown);
+    let MessageContent::Blocks(blocks) = &item.content else {
+        panic!("blocks");
+    };
+    assert_eq!(
+        source.provenance(&item, &blocks[0]),
+        ThinkingProvenance::Own
+    );
+    assert_eq!(
+        source.provenance(&item, &blocks[1]),
+        ThinkingProvenance::Unknown
+    );
     let mut legacy = item.clone();
     let mut legacy_source = ThinkingSource::from_item(&legacy).unwrap();
     legacy_source.issued.clear();
-    legacy.meta.as_mut().unwrap().insert_graph_extension(
-        "__stravia_thinking_source",
-        serde_json::to_value(legacy_source).unwrap(),
-    ).unwrap();
-    assert_eq!(source.provenance(&legacy, &blocks[1]), ThinkingProvenance::Own);
+    legacy
+        .meta
+        .as_mut()
+        .unwrap()
+        .insert_graph_extension(
+            "__stravia_thinking_source",
+            serde_json::to_value(legacy_source).unwrap(),
+        )
+        .unwrap();
+    assert_eq!(
+        source.provenance(&legacy, &blocks[1]),
+        ThinkingProvenance::Own
+    );
     let mut request = AiRequest::new("model", vec![item, external]);
     let rejections = ReasoningRejections::default();
-    assert!(!stravia_protocol_codec::transform::prepare_thinking_replay(&mut request, |item, block| {
-        !rejections.rejected("current-authority", source.provenance(item, block), block)
-    }));
+    assert!(!stravia_protocol_codec::transform::prepare_thinking_replay(
+        &mut request,
+        |item, block| {
+            !rejections.rejected("current-authority", source.provenance(item, block), block)
+        }
+    ));
     let mut metadata = Default::default();
     super::update_protected_reasoning_metadata(&mut metadata, &request, &source);
-    assert_eq!(metadata.get("protected_reasoning_untrusted"), Some(&serde_json::Value::Bool(true)));
+    assert_eq!(
+        metadata.get("protected_reasoning_untrusted"),
+        Some(&serde_json::Value::Bool(true))
+    );
     let rejected = super::rejected_protected_reasoning(&request, &source);
     let mut stage = 0;
-    assert!(strip_rejected_protected_reasoning(&mut request, &mut stage, &source));
+    assert!(strip_rejected_protected_reasoning(
+        &mut request,
+        &mut stage,
+        &source
+    ));
     super::update_protected_reasoning_metadata(&mut metadata, &request, &source);
     assert!(!metadata.contains_key("protected_reasoning_untrusted"));
-    let MessageContent::Blocks(blocks) = &request.items[0].content else { panic!("blocks"); };
-    assert!(matches!(&blocks[0], ContentBlock::Thinking { signature: Some(signature), .. } if signature == "own-signature"));
+    let MessageContent::Blocks(blocks) = &request.items[0].content else {
+        panic!("blocks");
+    };
+    assert!(
+        matches!(&blocks[0], ContentBlock::Thinking { signature: Some(signature), .. } if signature == "own-signature")
+    );
     rejections.record("current-authority", rejected);
     // 同一来源新载荷命中上游对；未知来源仍只按原载荷记忆。
     let mut new_external = AiItem::thinking("new", Some("new-external-signature".into()));
     new_external.role = Role::Assistant;
     foreign.stamp_item(&mut new_external);
     let mut next = AiRequest::new("model", vec![new_external]);
-    assert!(stravia_protocol_codec::transform::prepare_thinking_replay(&mut next, |item, block| {
-        !rejections.rejected("current-authority", source.provenance(item, block), block)
-    }));
-    let inserted = ContentBlock::RedactedThinking { data: "inserted-signature".into() };
+    assert!(stravia_protocol_codec::transform::prepare_thinking_replay(
+        &mut next,
+        |item, block| {
+            !rejections.rejected("current-authority", source.provenance(item, block), block)
+        }
+    ));
+    let inserted = ContentBlock::RedactedThinking {
+        data: "inserted-signature".into(),
+    };
     assert!(rejections.rejected("current-authority", ThinkingProvenance::Unknown, &inserted));
-    let unrelated = ContentBlock::RedactedThinking { data: "other-signature".into() };
+    let unrelated = ContentBlock::RedactedThinking {
+        data: "other-signature".into(),
+    };
     assert!(!rejections.rejected("current-authority", ThinkingProvenance::Unknown, &unrelated));
 }
 

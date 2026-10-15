@@ -161,7 +161,9 @@ fn execute_inference(
     request.model = model.to_owned();
     if matches!(
         request.tool_choice,
-        Some(stravia_runtime_contract::protocol::ir::ToolChoice::Native(_))
+        Some(stravia_runtime_contract::protocol::ir::ToolChoice::Native(
+            _
+        ))
     ) {
         request.tool_choice = None;
     }

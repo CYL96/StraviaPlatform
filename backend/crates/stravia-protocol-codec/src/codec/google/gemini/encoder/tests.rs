@@ -827,7 +827,9 @@ fn assistant_item_with_only_unmappable_protected_payload_is_skipped() {
 }
 #[test]
 fn canonical_parameters_choice_schema_and_native_tools_are_projected() {
-    use stravia_runtime_contract::protocol::ir::{NativeTool, WebSearchTool, ImageGenerationTool, ToolSpec};
+    use stravia_runtime_contract::protocol::ir::{
+        ImageGenerationTool, NativeTool, ToolSpec, WebSearchTool,
+    };
     let canonical_schema = serde_json::json!({
         "type": "object",
         "properties": {"answer": {"enum": [null, false, 0, ""]}},

@@ -5,8 +5,8 @@ use serde_json::Value;
 
 use super::{RedactionError, marker, store::Mapping};
 use stravia_runtime_contract::protocol::ir::{
-    AiItem, AiRequest, AiResponse, ContentBlock, DocumentSource, EmbeddingInput, MessageContent,
-    CustomTool, NamespaceMember, NativeTool, ResponseFormat, TOOL_RESULT_CONTENT_KIND_META,
+    AiItem, AiRequest, AiResponse, ContentBlock, CustomTool, DocumentSource, EmbeddingInput,
+    MessageContent, NamespaceMember, NativeTool, ResponseFormat, TOOL_RESULT_CONTENT_KIND_META,
     ToolResultContentKind, ToolSpec,
 };
 
@@ -1136,9 +1136,8 @@ mod tests {
         };
         let mut request = AiRequest::new("model", Vec::new());
         request.parameters.session.id = Some(mapping.secret.clone());
-        request.parameters.metadata = Some(
-            [(mapping.secret.clone(), mapping.secret.clone())].into(),
-        );
+        request.parameters.metadata =
+            Some([(mapping.secret.clone(), mapping.secret.clone())].into());
         request.parameters.native_tools = serde_json::from_value(serde_json::json!([
             {"type": "tool_search", "description": mapping.secret,
                 "parameters": {"type": "object", "description": mapping.secret}},
@@ -1152,7 +1151,8 @@ mod tests {
                     {"type": "custom", "name": mapping.secret,
                         "grammar": {"syntax": "regex", "definition": mapping.secret}}
                 ]}
-        ])).unwrap();
+        ]))
+        .unwrap();
         let (texts, _) = request_texts(&request, true).unwrap();
         assert_eq!(
             texts
@@ -1162,8 +1162,14 @@ mod tests {
             9
         );
         redact_request(&mut request, std::slice::from_ref(&mapping)).unwrap();
-        assert_eq!(request.parameters.session.id.as_deref(), Some(mapping.secret.as_str()));
-        assert_eq!(request.parameters.metadata.as_ref().unwrap()[&mapping.secret], mapping.reference);
+        assert_eq!(
+            request.parameters.session.id.as_deref(),
+            Some(mapping.secret.as_str())
+        );
+        assert_eq!(
+            request.parameters.metadata.as_ref().unwrap()[&mapping.secret],
+            mapping.reference
+        );
         let tools = serde_json::to_value(&request.parameters.native_tools).unwrap();
         assert_eq!(tools[0]["description"], mapping.reference);
         assert_eq!(tools[0]["parameters"]["description"], mapping.reference);
@@ -1171,12 +1177,19 @@ mod tests {
         assert_eq!(tools[1]["grammar"]["definition"], mapping.reference);
         assert_eq!(tools[2]["name"], mapping.secret);
         assert_eq!(tools[2]["tools"][0]["name"], mapping.secret);
-        assert_eq!(tools[2]["tools"][0]["parameters"]["description"], mapping.reference);
-        assert_eq!(tools[2]["tools"][1]["grammar"]["definition"], mapping.reference);
+        assert_eq!(
+            tools[2]["tools"][0]["parameters"]["description"],
+            mapping.reference
+        );
+        assert_eq!(
+            tools[2]["tools"][1]["grammar"]["definition"],
+            mapping.reference
+        );
         read_surface::request(&request, true, "request", &mut |text, _, _| {
             assert!(!text.contains(&mapping.secret));
             Ok(())
-        }).unwrap();
+        })
+        .unwrap();
     }
 
     #[test]

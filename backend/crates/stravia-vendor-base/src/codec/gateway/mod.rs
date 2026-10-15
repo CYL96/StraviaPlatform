@@ -557,7 +557,10 @@ fn decode_gateway_response_format(
         Some("text") => Ok(stravia_runtime_contract::protocol::ir::ResponseFormat::Text),
         Some("json") if value.get("schema").is_some() => Ok(
             stravia_runtime_contract::protocol::ir::ResponseFormat::JsonSchema {
-                description: value.get("description").and_then(Value::as_str).map(str::to_owned),
+                description: value
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
                 schema: value.get("schema").cloned().unwrap_or(Value::Null),
                 name: value
                     .get("name")
@@ -770,7 +773,10 @@ fn encode_response_format(
             Ok(json!({"type": "json"}))
         }
         stravia_runtime_contract::protocol::ir::ResponseFormat::JsonSchema {
-            schema, name, description, ..
+            schema,
+            name,
+            description,
+            ..
         } => {
             let mut result = Map::from_iter([
                 ("type".into(), Value::String("json".into())),

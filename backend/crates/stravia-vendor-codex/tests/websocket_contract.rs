@@ -8,7 +8,8 @@ use async_trait::async_trait;
 use parking_lot::Mutex;
 use serde_json::Value;
 use stravia_runtime_contract::protocol::ir::{
-    AiItem, AiRequest, AiStreamDelta, CacheRetention, Continuation, MessageContent, Role, ServiceTier,
+    AiItem, AiRequest, AiStreamDelta, CacheRetention, Continuation, MessageContent, Role,
+    ServiceTier,
 };
 use stravia_runtime_contract::{CancellationToken, Deadline};
 use stravia_vendor_runtime::{
@@ -251,18 +252,24 @@ async fn http_case(case: &'static str) {
         }
         if case == "logprobs"
             && body["include"].as_array().is_some_and(|include| {
-                include.iter().any(|value| value == "message.output_text.logprobs")
+                include
+                    .iter()
+                    .any(|value| value == "message.output_text.logprobs")
             })
         {
             let payload = serde_json::json!({"error":{
                 "type":"invalid_request_error",
                 "message":"logprobs are not supported with reasoning models."
-            }}).to_string();
+            }})
+            .to_string();
             socket.write_all(format!("HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}", payload.len()).as_bytes()).await.unwrap();
             return;
         }
         if case == "logprobs" {
-            assert_eq!(body["include"], serde_json::json!(["reasoning.encrypted_content"]));
+            assert_eq!(
+                body["include"],
+                serde_json::json!(["reasoning.encrypted_content"])
+            );
             assert_eq!(body["reasoning"]["effort"], "high");
             assert!(body.get("top_logprobs").is_none());
         }
@@ -765,7 +772,10 @@ async fn websocket_ignores_chat_logprobs_without_disabling_reasoning() {
     assert_eq!(response.output_text(), "你好，我是 ChatGPT。");
     assert_eq!(response.usage.reasoning_tokens, Some(12));
     let sent = recorded.sent.lock();
-    assert_eq!(sent[0]["include"], serde_json::json!(["reasoning.encrypted_content"]));
+    assert_eq!(
+        sent[0]["include"],
+        serde_json::json!(["reasoning.encrypted_content"])
+    );
     assert_eq!(sent[0]["reasoning"]["effort"], "high");
     assert!(sent[0].get("top_logprobs").is_none());
 }
@@ -851,8 +861,10 @@ async fn affinity_and_account_headers_follow_actual_codex_frames() {
                 .insert("access_token".into(), access_token.into());
         }
         let mut turn_request = request();
-        turn_request.parameters.metadata =
-            Some(BTreeMap::from([("verification".into(), "canonical-final".into())]));
+        turn_request.parameters.metadata = Some(BTreeMap::from([(
+            "verification".into(),
+            "canonical-final".into(),
+        )]));
         turn_request.parameters.cache.key = Some("canonical-final-smoke".into());
         turn_request.parameters.cache.retention = Some(CacheRetention::Extended);
         turn_request.parallel_tool_calls = Some(false);
@@ -862,7 +874,8 @@ async fn affinity_and_account_headers_follow_actual_codex_frames() {
             "auto" => ServiceTier::Auto,
             _ => ServiceTier::Default,
         });
-        turn_request.parameters.continuation = previous_id.map(|id| Continuation::PreviousResponse(id.into()));
+        turn_request.parameters.continuation =
+            previous_id.map(|id| Continuation::PreviousResponse(id.into()));
         let result = execute_once(
             &runtime,
             &plugin,
@@ -1000,7 +1013,8 @@ async fn no_code_continuation_error_requires_requested_id_before_response_create
         (Some("resp_missing"), true, false),
     ] {
         let mut turn_request = request();
-        turn_request.parameters.continuation = previous_id.map(|id| Continuation::PreviousResponse(id.into()));
+        turn_request.parameters.continuation =
+            previous_id.map(|id| Continuation::PreviousResponse(id.into()));
         let mut frames = Vec::new();
         if saw_created {
             frames.push(created.clone());

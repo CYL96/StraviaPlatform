@@ -6,10 +6,6 @@ use http::header::{HeaderMap, HeaderValue};
 use serde_json::Value;
 
 use stravia_runtime_contract::protocol::ir::AiRequest;
-use stravia_runtime_contract::protocol::ir::{
-    CacheRetention, NativeTool, NativeToolKind, ParameterReset, ReasoningSummary, ServiceTier,
-    native_tool_to_anthropic,
-};
 use stravia_runtime_contract::protocol::ir::request::AiItem;
 use stravia_runtime_contract::protocol::ir::request::ContentBlock;
 use stravia_runtime_contract::protocol::ir::request::MediaSource;
@@ -17,6 +13,10 @@ use stravia_runtime_contract::protocol::ir::request::MessageContent;
 use stravia_runtime_contract::protocol::ir::request::Role;
 use stravia_runtime_contract::protocol::ir::request::ToolChoice;
 use stravia_runtime_contract::protocol::ir::request::ToolResultContentKind;
+use stravia_runtime_contract::protocol::ir::{
+    CacheRetention, NativeTool, NativeToolKind, ParameterReset, ReasoningSummary, ServiceTier,
+    native_tool_to_anthropic,
+};
 
 pub struct AnthropicEncoder;
 
@@ -99,10 +99,14 @@ impl AnthropicEncoder {
 
         // ── Tools ─────────────────────────────────────────────────────────────
         let has_tools = req.tools.is_some();
-        let container = req.parameters.native_tools.iter().find_map(|tool| match tool {
-            NativeTool::CodeExecution(tool) => tool.container.as_ref(),
-            _ => None,
-        });
+        let container = req
+            .parameters
+            .native_tools
+            .iter()
+            .find_map(|tool| match tool {
+                NativeTool::CodeExecution(tool) => tool.container.as_ref(),
+                _ => None,
+            });
         if let Some(container) = container {
             obj.insert("container".into(), container.clone().into());
         }
@@ -145,7 +149,9 @@ impl AnthropicEncoder {
                 .iter()
                 .filter_map(native_tool_to_anthropic),
         );
-        if (has_tools && !req.parameters.resets(ParameterReset::NativeTools)) || !tools_val.is_empty() {
+        if (has_tools && !req.parameters.resets(ParameterReset::NativeTools))
+            || !tools_val.is_empty()
+        {
             obj.insert("tools".into(), Value::Array(tools_val));
         }
 
@@ -181,12 +187,16 @@ impl AnthropicEncoder {
                 serde_json::json!({"type": "json_schema", "schema": schema}),
             );
         }
-        if let Some(mut thinking) = encode_thinking(&req.reasoning, max_tokens, &mut output_config)? {
+        if let Some(mut thinking) = encode_thinking(&req.reasoning, max_tokens, &mut output_config)?
+        {
             if let Some(summary) = req.reasoning.summary {
                 thinking["display"] = match summary {
                     ReasoningSummary::None => "omitted",
-                    ReasoningSummary::Auto | ReasoningSummary::Concise | ReasoningSummary::Detailed => "summarized",
-                }.into();
+                    ReasoningSummary::Auto
+                    | ReasoningSummary::Concise
+                    | ReasoningSummary::Detailed => "summarized",
+                }
+                .into();
             }
             obj.insert("thinking".into(), thinking);
         }
@@ -201,14 +211,20 @@ impl AnthropicEncoder {
                 CacheRetention::Default => "5m",
                 CacheRetention::Extended => "1h",
             };
-            obj.insert("cache_control".into(), serde_json::json!({"type": "ephemeral", "ttl": ttl}));
+            obj.insert(
+                "cache_control".into(),
+                serde_json::json!({"type": "ephemeral", "ttl": ttl}),
+            );
         }
         if let Some(compaction) = req.parameters.compaction {
             let mut edit = serde_json::json!({"type": "compact_20260112"});
             if let Some(threshold) = compaction.threshold_tokens {
                 edit["trigger"] = serde_json::json!({"type": "input_tokens", "value": threshold});
             }
-            obj.insert("context_management".into(), serde_json::json!({"edits": [edit]}));
+            obj.insert(
+                "context_management".into(),
+                serde_json::json!({"edits": [edit]}),
+            );
         }
         if let Some(tier) = req.parameters.service_tier.and_then(|tier| match tier {
             ServiceTier::Auto => Some("auto"),
@@ -288,7 +304,12 @@ fn strict_budget_exceeded(request: &AiRequest) -> bool {
         .parameters
         .native_tools
         .iter()
-        .filter(|tool| matches!(tool, NativeTool::WebSearch(_) | NativeTool::CodeExecution(_)))
+        .filter(|tool| {
+            matches!(
+                tool,
+                NativeTool::WebSearch(_) | NativeTool::CodeExecution(_)
+            )
+        })
         .count();
     let tool_count = tools.len() + native_count;
     if tool_count > 20 {
@@ -445,9 +466,13 @@ fn tool_choice_for_anthropic(tc: ToolChoice) -> Option<Value> {
             ("type", Value::String("tool".into())),
             ("name", Value::String(name)),
         ])),
-        ToolChoice::Allowed { names, required: true } if names.len() == 1 => {
-            names.into_iter().next().map(|name| serde_json::json!({"type": "tool", "name": name}))
-        }
+        ToolChoice::Allowed {
+            names,
+            required: true,
+        } if names.len() == 1 => names
+            .into_iter()
+            .next()
+            .map(|name| serde_json::json!({"type": "tool", "name": name})),
         ToolChoice::Native(kind) => {
             let name = match kind {
                 NativeToolKind::WebSearch => "web_search",

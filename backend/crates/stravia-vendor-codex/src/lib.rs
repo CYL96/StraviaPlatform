@@ -836,7 +836,11 @@ mod tests {
     #[test]
     fn http_continuation_requires_host_full_history_before_dispatch() {
         let mut request = AiRequest::new("gpt-5.4", Vec::new());
-        request.parameters.continuation = Some(stravia_runtime_contract::protocol::ir::Continuation::PreviousResponse("resp_previous".into()));
+        request.parameters.continuation = Some(
+            stravia_runtime_contract::protocol::ir::Continuation::PreviousResponse(
+                "resp_previous".into(),
+            ),
+        );
         let error = require_native_continuation_transport(&request, false).unwrap_err();
         assert!(matches!(error.kind, ErrorKind::ContinuationUnavailable));
         assert!(require_native_continuation_transport(&request, true).is_ok());
@@ -852,11 +856,19 @@ mod tests {
         request.generation.top_p = Some(0.9);
         request.generation.max_tokens = Some(256);
         request.parallel_tool_calls = Some(false);
-        request.parameters.metadata = Some(BTreeMap::from([("verification".into(), "canonical-final".into())]));
+        request.parameters.metadata = Some(BTreeMap::from([(
+            "verification".into(),
+            "canonical-final".into(),
+        )]));
         request.parameters.cache.key = Some("canonical-final-smoke".into());
-        request.parameters.cache.retention = Some(stravia_runtime_contract::protocol::ir::CacheRetention::Extended);
+        request.parameters.cache.retention =
+            Some(stravia_runtime_contract::protocol::ir::CacheRetention::Extended);
         request.parameters.generate = Some(false);
-        request.parameters.continuation = Some(stravia_runtime_contract::protocol::ir::Continuation::PreviousResponse("resp_previous".into()));
+        request.parameters.continuation = Some(
+            stravia_runtime_contract::protocol::ir::Continuation::PreviousResponse(
+                "resp_previous".into(),
+            ),
+        );
         let original = request.clone();
         let mut body = common::encode_inference_request(
             &OPEN_RESPONSES_2026_04_24.to_string(),
@@ -989,7 +1001,6 @@ mod tests {
             assert!(body.get("tool_choice").is_none());
         }
     }
-
 
     #[test]
     fn discovered_model_translates_declared_specifications() {

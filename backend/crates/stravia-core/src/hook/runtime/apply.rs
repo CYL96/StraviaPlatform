@@ -452,7 +452,9 @@ pub(super) fn apply_request_patch(
         }
         RequestPatch::SetSystem(system) => {
             request.instructions = system.clone();
-            request.parameters.reset(stravia_runtime_contract::protocol::ir::ParameterReset::Instructions);
+            request
+                .parameters
+                .reset(stravia_runtime_contract::protocol::ir::ParameterReset::Instructions);
             current.system = system;
         }
         RequestPatch::SetGeneration(generation) => request.generation = generation,

@@ -2972,7 +2972,10 @@ mod tests {
         {
             let mut stamped = item.clone();
             source.stamp_item(&mut stamped);
-            assert_eq!(ThinkingSource::from_item(item), ThinkingSource::from_item(&stamped));
+            assert_eq!(
+                ThinkingSource::from_item(item),
+                ThinkingSource::from_item(&stamped)
+            );
         }
         assert!(replay.items.iter().any(|item| {
             item.function_call_ref()
@@ -3155,7 +3158,10 @@ mod tests {
             );
             let mut stamped = original.clone();
             source.stamp_item(&mut stamped);
-            assert_eq!(ThinkingSource::from_item(thoughts[0]), ThinkingSource::from_item(&stamped));
+            assert_eq!(
+                ThinkingSource::from_item(thoughts[0]),
+                ThinkingSource::from_item(&stamped)
+            );
         }
     }
 
@@ -3251,7 +3257,10 @@ mod tests {
             );
             let mut stamped = original.clone();
             source.stamp_item(&mut stamped);
-            assert_eq!(ThinkingSource::from_item(thoughts[0]), ThinkingSource::from_item(&stamped));
+            assert_eq!(
+                ThinkingSource::from_item(thoughts[0]),
+                ThinkingSource::from_item(&stamped)
+            );
             let mut response = AiResponse::new("response", "responses-model");
             response.items = vec![original];
             let batch = session
@@ -3380,7 +3389,10 @@ mod tests {
         );
         let mut stamped = original.clone();
         source.stamp_item(&mut stamped);
-        assert_eq!(ThinkingSource::from_item(thought[0]), ThinkingSource::from_item(&stamped));
+        assert_eq!(
+            ThinkingSource::from_item(thought[0]),
+            ThinkingSource::from_item(&stamped)
+        );
     }
 
     #[tokio::test]

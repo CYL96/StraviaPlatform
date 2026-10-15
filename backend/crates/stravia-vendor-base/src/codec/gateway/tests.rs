@@ -47,9 +47,11 @@ fn gateway_skips_unrepresentable_choices_and_null_controls() {
             "providerOptions": {"untrusted": {"control": true}}
         }))
         .unwrap();
-    assert!(decoded.parameters.resets(
-        stravia_runtime_contract::protocol::ir::ParameterReset::ResponseFormat
-    ));
+    assert!(
+        decoded
+            .parameters
+            .resets(stravia_runtime_contract::protocol::ir::ParameterReset::ResponseFormat)
+    );
     let body = GatewayLanguageModelV4.encode_request(decoded).unwrap().0;
     for field in ["tools", "toolChoice", "responseFormat", "providerOptions"] {
         assert!(body.get(field).is_none(), "{field}");

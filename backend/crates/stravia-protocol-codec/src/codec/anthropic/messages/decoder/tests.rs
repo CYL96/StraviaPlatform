@@ -21,7 +21,14 @@ fn unsupported_official_controls_are_dropped_and_cache_is_unified() {
         body["cache_control"],
         serde_json::json!({"type": "ephemeral", "ttl": "1h"})
     );
-    for key in ["speed", "thread", "diagnostics", "safeguards", "context_hint", "fallbacks"] {
+    for key in [
+        "speed",
+        "thread",
+        "diagnostics",
+        "safeguards",
+        "context_hint",
+        "fallbacks",
+    ] {
         assert!(body.get(key).is_none(), "{key}");
     }
     assert!(body["output_config"].get("task_budget").is_none());
@@ -262,98 +269,156 @@ fn unified_reasoning_cache_container_and_compaction_roundtrip() {
             "metadata": {"user_id": "user_1", "private": "ignored"}
         }))).unwrap();
         assert_eq!(request.reasoning.summary, Some(summary));
-        assert_eq!(request.parameters.cache.retention, Some(CacheRetention::Default));
-        assert_eq!(request.parameters.compaction.as_ref().unwrap().threshold_tokens, Some(120000));
+        assert_eq!(
+            request.parameters.cache.retention,
+            Some(CacheRetention::Default)
+        );
+        assert_eq!(
+            request
+                .parameters
+                .compaction
+                .as_ref()
+                .unwrap()
+                .threshold_tokens,
+            Some(120000)
+        );
         assert_eq!(request.parameters.service_tier, Some(ServiceTier::Default));
         let NativeTool::CodeExecution(tool) = &request.parameters.native_tools[0] else {
             panic!("expected code execution");
         };
         assert_eq!(tool.container.as_deref(), Some("container_1"));
-        let (body, _) = crate::codec::anthropic::messages::encoder::AnthropicEncoder.encode_request(request).unwrap();
+        let (body, _) = crate::codec::anthropic::messages::encoder::AnthropicEncoder
+            .encode_request(request)
+            .unwrap();
         assert_eq!(body["thinking"]["display"], display);
         assert_eq!(body["container"], "container_1");
         assert_eq!(body["tools"][0]["type"], "code_execution_20260120");
         assert!(body["tools"][0].get("container").is_none());
-        assert_eq!(body["context_management"], serde_json::json!({"edits": [{
-            "type": "compact_20260112", "trigger": {"type": "input_tokens", "value": 120000}
-        }]}));
+        assert_eq!(
+            body["context_management"],
+            serde_json::json!({"edits": [{
+                "type": "compact_20260112", "trigger": {"type": "input_tokens", "value": 120000}
+            }]})
+        );
         assert_eq!(body["metadata"], serde_json::json!({"user_id": "user_1"}));
     }
 }
 
 #[test]
 fn explicit_nulls_only_reset_inheritance_and_are_not_emitted() {
-    let request = AnthropicDecoder.decode_request(request_with(serde_json::json!({
-        "system": null, "tools": null, "temperature": null, "top_p": null,
-        "max_tokens": null, "thinking": null, "cache_control": null,
-        "service_tier": null, "metadata": {"user_id": null}, "output_config": null
-    }))).unwrap();
+    let request = AnthropicDecoder
+        .decode_request(request_with(serde_json::json!({
+            "system": null, "tools": null, "temperature": null, "top_p": null,
+            "max_tokens": null, "thinking": null, "cache_control": null,
+            "service_tier": null, "metadata": {"user_id": null}, "output_config": null
+        })))
+        .unwrap();
     for reset in [
-        ParameterReset::Instructions, ParameterReset::NativeTools, ParameterReset::Temperature,
-        ParameterReset::TopP, ParameterReset::MaxTokens, ParameterReset::Reasoning,
-        ParameterReset::CacheRetention, ParameterReset::ServiceTier,
-        ParameterReset::EndUser, ParameterReset::ResponseFormat,
+        ParameterReset::Instructions,
+        ParameterReset::NativeTools,
+        ParameterReset::Temperature,
+        ParameterReset::TopP,
+        ParameterReset::MaxTokens,
+        ParameterReset::Reasoning,
+        ParameterReset::CacheRetention,
+        ParameterReset::ServiceTier,
+        ParameterReset::EndUser,
+        ParameterReset::ResponseFormat,
     ] {
         assert!(request.parameters.resets(reset), "{reset:?}");
     }
-    let (body, _) = crate::codec::anthropic::messages::encoder::AnthropicEncoder.encode_request(request).unwrap();
-    assert!(body.as_object().unwrap().values().all(|value| !value.is_null()));
+    let (body, _) = crate::codec::anthropic::messages::encoder::AnthropicEncoder
+        .encode_request(request)
+        .unwrap();
+    assert!(
+        body.as_object()
+            .unwrap()
+            .values()
+            .all(|value| !value.is_null())
+    );
 }
 
 #[test]
 fn unsupported_tools_and_vendor_function_controls_are_silently_dropped() {
-    let request = AnthropicDecoder.decode_request(request_with(serde_json::json!({
-        "tools": [
-            {"type": "computer_20250124", "name": "computer", "display_width_px": 1024},
-            {"type": "web_fetch_20250910", "name": "web_fetch"},
-            {"type": "bash_20250124", "name": "bash"},
-            {"name": "read", "input_schema": {"type": "object"},
-             "eager_input_streaming": {"unsupported": true}, "allowed_callers": 123,
-             "citations": "unsupported", "input_examples": false, "cache_control": false}
-        ],
-        "speed": {"unsupported": true},
-        "inference_geo": 123
-    }))).unwrap();
+    let request = AnthropicDecoder
+        .decode_request(request_with(serde_json::json!({
+            "tools": [
+                {"type": "computer_20250124", "name": "computer", "display_width_px": 1024},
+                {"type": "web_fetch_20250910", "name": "web_fetch"},
+                {"type": "bash_20250124", "name": "bash"},
+                {"name": "read", "input_schema": {"type": "object"},
+                 "eager_input_streaming": {"unsupported": true}, "allowed_callers": 123,
+                 "citations": "unsupported", "input_examples": false, "cache_control": false}
+            ],
+            "speed": {"unsupported": true},
+            "inference_geo": 123
+        })))
+        .unwrap();
     assert!(request.parameters.native_tools.is_empty());
-    let (body, _) = crate::codec::anthropic::messages::encoder::AnthropicEncoder.encode_request(request).unwrap();
-    assert_eq!(body["tools"], serde_json::json!([{
-        "name": "read", "input_schema": {"type": "object"}
-    }]));
+    let (body, _) = crate::codec::anthropic::messages::encoder::AnthropicEncoder
+        .encode_request(request)
+        .unwrap();
+    assert_eq!(
+        body["tools"],
+        serde_json::json!([{
+            "name": "read", "input_schema": {"type": "object"}
+        }])
+    );
     assert!(body.get("speed").is_none());
     assert!(body.get("inference_geo").is_none());
 }
 
 #[test]
 fn native_tool_choice_has_unified_ownership() {
-    let request = AnthropicDecoder.decode_request(request_with(serde_json::json!({
-        "tools": [{"type": "web_search_20250305", "name": "web_search"}],
-        "tool_choice": {"type": "tool", "name": "web_search"}
-    }))).unwrap();
-    assert!(matches!(request.tool_choice, Some(ToolChoice::Native(NativeToolKind::WebSearch))));
-    let (body, _) = crate::codec::anthropic::messages::encoder::AnthropicEncoder.encode_request(request).unwrap();
-    assert_eq!(body["tool_choice"], serde_json::json!({"type": "tool", "name": "web_search"}));
+    let request = AnthropicDecoder
+        .decode_request(request_with(serde_json::json!({
+            "tools": [{"type": "web_search_20250305", "name": "web_search"}],
+            "tool_choice": {"type": "tool", "name": "web_search"}
+        })))
+        .unwrap();
+    assert!(matches!(
+        request.tool_choice,
+        Some(ToolChoice::Native(NativeToolKind::WebSearch))
+    ));
+    let (body, _) = crate::codec::anthropic::messages::encoder::AnthropicEncoder
+        .encode_request(request)
+        .unwrap();
+    assert_eq!(
+        body["tool_choice"],
+        serde_json::json!({"type": "tool", "name": "web_search"})
+    );
 }
 
 #[test]
 fn nested_null_controls_reset_without_emitting_nulls() {
-    let request = AnthropicDecoder.decode_request(request_with(serde_json::json!({
-        "thinking": {"type": "adaptive", "display": null},
-        "output_config": {"effort": null, "format": null},
-        "cache_control": {"type": "ephemeral", "ttl": null},
-        "tool_choice": {"type": "auto", "disable_parallel_tool_use": null}
-    }))).unwrap();
+    let request = AnthropicDecoder
+        .decode_request(request_with(serde_json::json!({
+            "thinking": {"type": "adaptive", "display": null},
+            "output_config": {"effort": null, "format": null},
+            "cache_control": {"type": "ephemeral", "ttl": null},
+            "tool_choice": {"type": "auto", "disable_parallel_tool_use": null}
+        })))
+        .unwrap();
     for reset in [
-        ParameterReset::ReasoningSummary, ParameterReset::ReasoningLevel,
-        ParameterReset::ResponseFormat, ParameterReset::CacheRetention,
+        ParameterReset::ReasoningSummary,
+        ParameterReset::ReasoningLevel,
+        ParameterReset::ResponseFormat,
+        ParameterReset::CacheRetention,
         ParameterReset::ParallelToolCalls,
     ] {
         assert!(request.parameters.resets(reset), "{reset:?}");
     }
     assert!(request.reasoning.summary.is_none());
     assert!(request.parameters.cache.retention.is_none());
-    let (body, _) = crate::codec::anthropic::messages::encoder::AnthropicEncoder.encode_request(request).unwrap();
+    let (body, _) = crate::codec::anthropic::messages::encoder::AnthropicEncoder
+        .encode_request(request)
+        .unwrap();
     assert!(body["thinking"].get("display").is_none());
     assert!(body.get("cache_control").is_none());
-    assert!(body["tool_choice"].get("disable_parallel_tool_use").is_none());
+    assert!(
+        body["tool_choice"]
+            .get("disable_parallel_tool_use")
+            .is_none()
+    );
     assert!(body["output_config"].get("format").is_none());
 }

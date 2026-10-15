@@ -764,7 +764,10 @@ fn prune_request(pair: ProtocolPair, request: &mut AiRequest, capabilities: &End
                 match pair.egress.protocol {
                     Protocol::OpenResponses => true,
                     Protocol::AnthropicMessages | Protocol::GoogleGemini => {
-                        matches!(tool, NativeTool::WebSearch(_) | NativeTool::CodeExecution(_))
+                        matches!(
+                            tool,
+                            NativeTool::WebSearch(_) | NativeTool::CodeExecution(_)
+                        )
                     }
                     _ => false,
                 }

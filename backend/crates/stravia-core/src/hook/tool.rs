@@ -96,10 +96,13 @@ impl PlatformToolRegistry {
         Ok(ExposedPlatformTool {
             id: id.clone(),
             provider_name: provider_name.clone(),
-            spec: ToolSpec { name: provider_name,
-            description: tool.description().map(str::to_string),
-            parameters: tool.parameters(),
-            strict: Some(tool.strict_schema()), defer_loading: None },
+            spec: ToolSpec {
+                name: provider_name,
+                description: tool.description().map(str::to_string),
+                parameters: tool.parameters(),
+                strict: Some(tool.strict_schema()),
+                defer_loading: None,
+            },
         })
     }
 

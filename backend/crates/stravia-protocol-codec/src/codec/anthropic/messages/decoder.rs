@@ -23,8 +23,8 @@ use stravia_runtime_contract::protocol::ir::ToolCall;
 use stravia_runtime_contract::protocol::ir::ToolChoice;
 use stravia_runtime_contract::protocol::ir::ToolSpec;
 use stravia_runtime_contract::protocol::ir::{
-    CacheRetention, CompactionControl, NativeTool, NativeToolKind, ParameterReset, ReasoningSummary, ServiceTier,
-    native_tool_from_anthropic,
+    CacheRetention, CompactionControl, NativeTool, NativeToolKind, ParameterReset,
+    ReasoningSummary, ServiceTier, native_tool_from_anthropic,
 };
 
 use super::types::{
@@ -52,32 +52,55 @@ impl AnthropicDecoder {
                 resets.push(reset);
             }
         }
-        if body.get("system").is_some_and(|v| v == "" || v.as_array().is_some_and(Vec::is_empty)) {
+        if body
+            .get("system")
+            .is_some_and(|v| v == "" || v.as_array().is_some_and(Vec::is_empty))
+        {
             resets.push(ParameterReset::Instructions);
         }
-        if body.get("tools").and_then(Value::as_array).is_some_and(Vec::is_empty) {
+        if body
+            .get("tools")
+            .and_then(Value::as_array)
+            .is_some_and(Vec::is_empty)
+        {
             resets.push(ParameterReset::NativeTools);
         }
-        if body.pointer("/thinking/display").is_some_and(Value::is_null) {
+        if body
+            .pointer("/thinking/display")
+            .is_some_and(Value::is_null)
+        {
             resets.push(ParameterReset::ReasoningSummary);
         }
-        if body.pointer("/cache_control/ttl").is_some_and(Value::is_null) {
+        if body
+            .pointer("/cache_control/ttl")
+            .is_some_and(Value::is_null)
+        {
             resets.push(ParameterReset::CacheRetention);
         }
-        if body.pointer("/output_config/effort").is_some_and(Value::is_null) {
+        if body
+            .pointer("/output_config/effort")
+            .is_some_and(Value::is_null)
+        {
             resets.push(ParameterReset::ReasoningLevel);
         }
         if body.get("output_config").is_some_and(Value::is_null)
-            || body.pointer("/output_config/format").is_some_and(Value::is_null)
+            || body
+                .pointer("/output_config/format")
+                .is_some_and(Value::is_null)
         {
             resets.push(ParameterReset::ResponseFormat);
         }
         if body.get("metadata").is_some_and(Value::is_null)
-            || body.pointer("/metadata/user_id").is_some_and(|v| v.is_null() || v == "")
+            || body
+                .pointer("/metadata/user_id")
+                .is_some_and(|v| v.is_null() || v == "")
         {
             resets.push(ParameterReset::EndUser);
         }
-        if body.pointer("/tool_choice/disable_parallel_tool_use").is_some_and(Value::is_null) {
+        if body
+            .pointer("/tool_choice/disable_parallel_tool_use")
+            .is_some_and(Value::is_null)
+        {
             resets.push(ParameterReset::ParallelToolCalls);
         }
         let req: AnthropicRequest = serde_json::from_value(body)?;
@@ -189,15 +212,28 @@ impl AnthropicDecoder {
                 })
             })
             .transpose()?;
-        let tool_choice = req.tool_choice.and_then(parse_tool_choice).map(|choice| match choice {
-            ToolChoice::Named { ref name } if name == "web_search"
-                && native_tools.iter().any(|tool| matches!(tool, NativeTool::WebSearch(_))) =>
-                ToolChoice::Native(NativeToolKind::WebSearch),
-            ToolChoice::Named { ref name } if name == "code_execution"
-                && native_tools.iter().any(|tool| matches!(tool, NativeTool::CodeExecution(_))) =>
-                ToolChoice::Native(NativeToolKind::CodeExecution),
-            choice => choice,
-        });
+        let tool_choice = req
+            .tool_choice
+            .and_then(parse_tool_choice)
+            .map(|choice| match choice {
+                ToolChoice::Named { ref name }
+                    if name == "web_search"
+                        && native_tools
+                            .iter()
+                            .any(|tool| matches!(tool, NativeTool::WebSearch(_))) =>
+                {
+                    ToolChoice::Native(NativeToolKind::WebSearch)
+                }
+                ToolChoice::Named { ref name }
+                    if name == "code_execution"
+                        && native_tools
+                            .iter()
+                            .any(|tool| matches!(tool, NativeTool::CodeExecution(_))) =>
+                {
+                    ToolChoice::Native(NativeToolKind::CodeExecution)
+                }
+                choice => choice,
+            });
         let output_effort = parse_output_effort(req.output_config.as_ref())?;
         let response_format = parse_output_format(req.output_config)?;
 
@@ -292,34 +328,45 @@ impl AnthropicDecoder {
         ai_req.reasoning = reasoning;
         ai_req.parameters.top_k = req.top_k;
         let container = req.container.as_ref().and_then(|value| {
-            value.as_str().or_else(|| value.get("id").and_then(Value::as_str))
+            value
+                .as_str()
+                .or_else(|| value.get("id").and_then(Value::as_str))
         });
         for tool in &mut native_tools {
             if let NativeTool::CodeExecution(tool) = tool {
                 tool.container = container.map(str::to_owned);
             }
         }
-        ai_req.parameters.compaction = req.context_management.as_ref()
+        ai_req.parameters.compaction = req
+            .context_management
+            .as_ref()
             .and_then(|value| value.get("edits"))
             .and_then(Value::as_array)
-            .and_then(|edits| edits.iter().find(|edit| edit.get("type").and_then(Value::as_str) == Some("compact_20260112")))
+            .and_then(|edits| {
+                edits.iter().find(|edit| {
+                    edit.get("type").and_then(Value::as_str) == Some("compact_20260112")
+                })
+            })
             .map(|edit| CompactionControl {
-                threshold_tokens: edit.get("trigger")
-                    .filter(|trigger| trigger.get("type").and_then(Value::as_str) == Some("input_tokens"))
+                threshold_tokens: edit
+                    .get("trigger")
+                    .filter(|trigger| {
+                        trigger.get("type").and_then(Value::as_str) == Some("input_tokens")
+                    })
                     .and_then(|trigger| trigger.get("value"))
                     .and_then(Value::as_u64)
                     .and_then(|value| u32::try_from(value).ok()),
             });
-        ai_req.parameters.cache.retention = req.cache_control.as_ref()
+        ai_req.parameters.cache.retention = req
+            .cache_control
+            .as_ref()
             .filter(|control| control.get("type").and_then(Value::as_str) == Some("ephemeral"))
-            .and_then(|control| {
-            match control.get("ttl").and_then(Value::as_str) {
+            .and_then(|control| match control.get("ttl").and_then(Value::as_str) {
                 Some("1h") => Some(CacheRetention::Extended),
                 Some("5m") => Some(CacheRetention::Default),
                 None if control.get("ttl").is_none() => Some(CacheRetention::Default),
                 _ => None,
-            }
-        });
+            });
         ai_req.parameters.end_user_id = req
             .metadata
             .and_then(|mut metadata| metadata.as_object_mut()?.remove("user_id"))
@@ -824,9 +871,12 @@ fn parse_tool_choice(v: Value) -> Option<ToolChoice> {
         Some("auto") => Some(ToolChoice::Auto),
         Some("any") => Some(ToolChoice::Required),
         Some("none") => Some(ToolChoice::None),
-        Some("tool") => v.get("name").and_then(Value::as_str).map(|name| ToolChoice::Named {
-            name: name.to_string(),
-        }),
+        Some("tool") => v
+            .get("name")
+            .and_then(Value::as_str)
+            .map(|name| ToolChoice::Named {
+                name: name.to_string(),
+            }),
         _ => None,
     }
 }
@@ -887,7 +937,10 @@ fn parse_summary(display: Option<&str>) -> Option<ReasoningSummary> {
     }
 }
 
-fn reasoning_from_effort(effort: &str, summary: Option<ReasoningSummary>) -> Result<ReasoningConfig> {
+fn reasoning_from_effort(
+    effort: &str,
+    summary: Option<ReasoningSummary>,
+) -> Result<ReasoningConfig> {
     let level = stravia_runtime_contract::thinking::ThinkingLevel::from_wire(effort)?;
     Ok(ReasoningConfig {
         summary,

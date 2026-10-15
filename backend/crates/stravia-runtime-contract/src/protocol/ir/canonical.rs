@@ -1459,26 +1459,35 @@ mod tests {
         let baseline = AiRequest::new("model", Vec::new());
         let mutations: [fn(&mut crate::protocol::ir::RequestParameters); 9] = [
             |p| p.modalities = Some(vec![Modality::Audio]),
-            |p| p.audio = Some(AudioOutput {
-                voice: Some("voice".into()),
-                format: Some("pcm".into()),
-            }),
+            |p| {
+                p.audio = Some(AudioOutput {
+                    voice: Some("voice".into()),
+                    format: Some("pcm".into()),
+                })
+            },
             |p| p.verbosity = Some(Verbosity::High),
             |p| p.max_tool_calls = Some(2),
             |p| p.truncation = Some(Truncation::Auto),
             |p| p.service_tier = Some(ServiceTier::Priority),
             |p| p.generate = Some(false),
-            |p| p.native_tools = vec![NativeTool::CodeExecution(CodeExecutionTool {
-                container: Some("container".into()),
-            })],
-            |p| p.compaction = Some(CompactionControl {
-                threshold_tokens: Some(1_000),
-            }),
+            |p| {
+                p.native_tools = vec![NativeTool::CodeExecution(CodeExecutionTool {
+                    container: Some("container".into()),
+                })]
+            },
+            |p| {
+                p.compaction = Some(CompactionControl {
+                    threshold_tokens: Some(1_000),
+                })
+            },
         ];
         for mutate in mutations {
             let mut changed = baseline.clone();
             mutate(&mut changed.parameters);
-            assert_ne!(cache_controls_hash(&baseline), cache_controls_hash(&changed));
+            assert_ne!(
+                cache_controls_hash(&baseline),
+                cache_controls_hash(&changed)
+            );
             assert_ne!(
                 history_request_controls_hash(&baseline),
                 history_request_controls_hash(&changed)

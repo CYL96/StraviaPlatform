@@ -874,9 +874,8 @@ async fn store_false_keeps_the_gateway_generation_chain_available() {
         }],
     );
     continuation.meta.source_protocol = Some(OPEN_RESPONSES_2026_04_24);
-    continuation.parameters.continuation = Some(
-        stravia_runtime_contract::protocol::ir::Continuation::PreviousResponse(response_id),
-    );
+    continuation.parameters.continuation =
+        Some(stravia_runtime_contract::protocol::ir::Continuation::PreviousResponse(response_id));
     continuation.parameters.store = Some(false);
     let continuation_response = execute_request_with_headers(
         gateway.clone(),

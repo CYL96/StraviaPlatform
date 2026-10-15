@@ -1911,7 +1911,11 @@ async fn sqlite_0007_upgrade_and_generation_v3_rebuild_find_existing_history() {
     let pool = crate::db::init_pool(data_dir.path()).await.unwrap();
     let migrator = sqlx::migrate!("./migrations/sqlite");
     migrator.run_to(7, &pool).await.unwrap();
-    assert!(expected.namespace.starts_with("stravia-generation-history-v5:"));
+    assert!(
+        expected
+            .namespace
+            .starts_with("stravia-generation-history-v5:")
+    );
     let mut encoded = content::encode(nodes[0].payload.clone()).unwrap();
     let now = chrono::Utc::now().timestamp_millis();
     let mut transaction = pool.begin().await.unwrap();

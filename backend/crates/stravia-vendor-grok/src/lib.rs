@@ -236,10 +236,16 @@ fn project_native_tool(tool: stravia_runtime_contract::protocol::ir::NativeTool)
     let mut definition = serde_json::json!({"type": "web_search"});
     let mut filters = serde_json::Map::new();
     if !tool.allowed_domains.is_empty() {
-        filters.insert("allowed_domains".into(), serde_json::json!(tool.allowed_domains));
+        filters.insert(
+            "allowed_domains".into(),
+            serde_json::json!(tool.allowed_domains),
+        );
     }
     if !tool.blocked_domains.is_empty() {
-        filters.insert("excluded_domains".into(), serde_json::json!(tool.blocked_domains));
+        filters.insert(
+            "excluded_domains".into(),
+            serde_json::json!(tool.blocked_domains),
+        );
     }
     if !filters.is_empty() {
         definition["filters"] = Value::Object(filters);
@@ -961,9 +967,9 @@ mod tests {
                 }
             }))
         );
-        assert!(project_native_tool(NativeTool::CodeExecution(
-            CodeExecutionTool::default()
-        )).is_none());
+        assert!(
+            project_native_tool(NativeTool::CodeExecution(CodeExecutionTool::default())).is_none()
+        );
     }
 
     #[test]

@@ -389,39 +389,38 @@ mod tests {
         first.tools = Some(vec![crate::protocol::ir::ToolSpec {
             name: "lookup".into(),
             description: None,
-            parameters: serde_json::from_str(
-                r#"{"outer":{"a":1,"b":[true,null]},"tail":"text"}"#,
-            )
-            .unwrap(),
+            parameters: serde_json::from_str(r#"{"outer":{"a":1,"b":[true,null]},"tail":"text"}"#)
+                .unwrap(),
             strict: None,
             defer_loading: None,
         }]);
-        first.parameters.logit_bias = Some(HashMap::from([
-            ("a".into(), 1.0),
-            ("b".into(), 2.0),
-        ]));
-        first.parameters.metadata = Some([
-            ("a".into(), "first".into()),
-            ("b".into(), "second".into()),
-        ].into_iter().collect());
+        first.parameters.logit_bias = Some(HashMap::from([("a".into(), 1.0), ("b".into(), 2.0)]));
+        first.parameters.metadata = Some(
+            [("a".into(), "first".into()), ("b".into(), "second".into())]
+                .into_iter()
+                .collect(),
+        );
         let mut reordered = first.clone();
-        reordered.tools.as_mut().unwrap()[0].parameters = serde_json::from_str(
-            r#"{"tail":"text","outer":{"b":[true,null],"a":1}}"#,
-        ).unwrap();
-        reordered.parameters.logit_bias = Some(HashMap::from([
-            ("b".into(), 2.0),
-            ("a".into(), 1.0),
-        ]));
-        reordered.parameters.metadata = Some([
-            ("b".into(), "second".into()),
-            ("a".into(), "first".into()),
-        ].into_iter().collect());
+        reordered.tools.as_mut().unwrap()[0].parameters =
+            serde_json::from_str(r#"{"tail":"text","outer":{"b":[true,null],"a":1}}"#).unwrap();
+        reordered.parameters.logit_bias =
+            Some(HashMap::from([("b".into(), 2.0), ("a".into(), 1.0)]));
+        reordered.parameters.metadata = Some(
+            [("b".into(), "second".into()), ("a".into(), "first".into())]
+                .into_iter()
+                .collect(),
+        );
         assert_eq!(
             request_hash(&first).unwrap(),
             request_hash(&reordered).unwrap()
         );
 
-        reordered.parameters.logit_bias.as_mut().unwrap().insert("a".into(), 3.0);
+        reordered
+            .parameters
+            .logit_bias
+            .as_mut()
+            .unwrap()
+            .insert("a".into(), 3.0);
         assert_ne!(
             request_hash(&first).unwrap(),
             request_hash(&reordered).unwrap()
@@ -435,9 +434,15 @@ mod tests {
         first.parameters.session.request_id = Some("attempt-1".into());
         let mut retried = first.clone();
         retried.parameters.session.request_id = Some("attempt-2".into());
-        assert_eq!(request_hash(&first).unwrap(), request_hash(&retried).unwrap());
+        assert_eq!(
+            request_hash(&first).unwrap(),
+            request_hash(&retried).unwrap()
+        );
         retried.parameters.session.request_id = None;
-        assert_eq!(request_hash(&first).unwrap(), request_hash(&retried).unwrap());
+        assert_eq!(
+            request_hash(&first).unwrap(),
+            request_hash(&retried).unwrap()
+        );
 
         let mutations: [fn(&mut SessionParameters); 7] = [
             |s| s.id = Some("session".into()),
@@ -451,15 +456,23 @@ mod tests {
         for mutate in mutations {
             let mut changed = first.clone();
             mutate(&mut changed.parameters.session);
-            assert_ne!(request_hash(&first).unwrap(), request_hash(&changed).unwrap());
+            assert_ne!(
+                request_hash(&first).unwrap(),
+                request_hash(&changed).unwrap()
+            );
         }
 
         // 同名业务键不属于会话关联 ID，不能跟随路径过滤一起丢失。
         let mut changed = first.clone();
-        changed.parameters.metadata = Some([
-            ("request_id".into(), "business-value".into()),
-        ].into_iter().collect());
-        assert_ne!(request_hash(&first).unwrap(), request_hash(&changed).unwrap());
+        changed.parameters.metadata = Some(
+            [("request_id".into(), "business-value".into())]
+                .into_iter()
+                .collect(),
+        );
+        assert_ne!(
+            request_hash(&first).unwrap(),
+            request_hash(&changed).unwrap()
+        );
     }
 
     #[test]

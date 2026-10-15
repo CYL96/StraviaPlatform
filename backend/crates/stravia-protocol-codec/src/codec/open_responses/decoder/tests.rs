@@ -43,10 +43,7 @@ fn accepts_codex_rolling_request_extensions() {
         request.reasoning.level,
         Some(stravia_runtime_contract::thinking::ThinkingLevel::High)
     );
-    assert_eq!(
-        request.parameters.session.id.as_deref(),
-        Some("session")
-    );
+    assert_eq!(request.parameters.session.id.as_deref(), Some("session"));
     assert_eq!(request.parameters.session.turn_id.as_deref(), Some("turn"));
     assert_eq!(request.parameters.native_tools.len(), 2);
     assert_eq!(
@@ -68,8 +65,12 @@ fn rolling_tools_are_preserved_and_client_function_names_remain_independent() {
             .expect("rolling hosted tool");
         assert!(matches!(parsed.native_tools[0], NativeTool::WebSearch(_)));
     }
-    assert!(parse_tools(Some(&serde_json::json!([{"type": "vendor:unknown"}])))
-        .expect("unsupported tools are dropped").native_tools.is_empty());
+    assert!(
+        parse_tools(Some(&serde_json::json!([{"type": "vendor:unknown"}])))
+            .expect("unsupported tools are dropped")
+            .native_tools
+            .is_empty()
+    );
 
     let ParsedTools {
         tools,
@@ -260,29 +261,38 @@ fn accepts_nullable_dated_integer_controls() {
     assert_eq!(request.generation.max_tokens, None);
     assert_eq!(request.parameters.max_tool_calls, None);
     assert_eq!(request.parameters.logprobs, None);
-    for reset in [ParameterReset::MaxTokens, ParameterReset::MaxToolCalls, ParameterReset::Logprobs] {
+    for reset in [
+        ParameterReset::MaxTokens,
+        ParameterReset::MaxToolCalls,
+        ParameterReset::Logprobs,
+    ] {
         assert!(request.parameters.resets(reset));
     }
 }
 
 #[test]
 fn unsupported_controls_are_dropped_without_rejecting_supported_intent() {
-    let request = ResponsesDecoder.decode_request(serde_json::json!({
-        "model": "gpt", "input": "hello",
-        "service_tier": "scale",
-        "prompt_cache_retention": "vendor-specific",
-        "truncation": "vendor-specific",
-        "include": ["file_search_call.results"],
-        "tools": [{"type": "file_search"}, {"type": "mcp"}, {"type": "computer"}],
-        "tool_choice": {"type": "file_search"},
-        "metadata": {"tenant": "acme", "nested": {"private": true}},
-    })).unwrap();
+    let request = ResponsesDecoder
+        .decode_request(serde_json::json!({
+            "model": "gpt", "input": "hello",
+            "service_tier": "scale",
+            "prompt_cache_retention": "vendor-specific",
+            "truncation": "vendor-specific",
+            "include": ["file_search_call.results"],
+            "tools": [{"type": "file_search"}, {"type": "mcp"}, {"type": "computer"}],
+            "tool_choice": {"type": "file_search"},
+            "metadata": {"tenant": "acme", "nested": {"private": true}},
+        }))
+        .unwrap();
     assert!(request.parameters.service_tier.is_none());
     assert!(request.parameters.cache.retention.is_none());
     assert!(request.parameters.truncation.is_none());
     assert!(request.parameters.native_tools.is_empty());
     assert!(request.tool_choice.is_none());
-    assert_eq!(request.parameters.metadata, Some([("tenant".into(), "acme".into())].into()));
+    assert_eq!(
+        request.parameters.metadata,
+        Some([("tenant".into(), "acme".into())].into())
+    );
 }
 
 #[test]

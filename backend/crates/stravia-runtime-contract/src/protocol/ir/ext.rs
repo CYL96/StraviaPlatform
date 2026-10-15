@@ -185,7 +185,10 @@ mod tests {
         let ProtocolExt::OpenResponses(responses) = &extension else {
             panic!("expected legacy Responses extension");
         };
-        assert_eq!(responses.previous_response_id.as_deref(), Some("response-parent"));
+        assert_eq!(
+            responses.previous_response_id.as_deref(),
+            Some("response-parent")
+        );
         assert_eq!(serde_json::to_value(extension).unwrap(), wire);
     }
 }

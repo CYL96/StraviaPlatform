@@ -194,18 +194,16 @@ async fn shared_text_normalization_scrubs_parameter_keys_and_keeps_sql_errors() 
     let mut input = AiRequest::new("model", vec![item]);
     input.instructions = Some("existing instructions".into());
     input.parameters.session.id = Some(grant.into());
-    input.parameters.metadata = Some(std::collections::BTreeMap::from([
-        (grant.to_owned(), grant.to_owned()),
-    ]));
+    input.parameters.metadata = Some(std::collections::BTreeMap::from([(
+        grant.to_owned(),
+        grant.to_owned(),
+    )]));
     let mut input = Arc::new(input);
     ingest::normalize_shared_request(&gateway, &owner, &mut input, &cancellation)
         .await
         .unwrap();
     let parameters = serde_json::to_value(&input.parameters).unwrap();
-    assert_eq!(
-        parameters["session"]["id"],
-        "<stravia-upload-key>"
-    );
+    assert_eq!(parameters["session"]["id"], "<stravia-upload-key>");
     assert_eq!(
         parameters["metadata"]["<stravia-upload-key>"],
         "<stravia-upload-key>"

@@ -48,29 +48,38 @@ impl OpenAIDecoder {
                 resets.push(reset);
             }
         }
-        if body.get("max_completion_tokens").or_else(|| body.get("max_tokens"))
+        if body
+            .get("max_completion_tokens")
+            .or_else(|| body.get("max_tokens"))
             .is_some_and(Value::is_null)
         {
             resets.push(ParameterReset::MaxTokens);
         }
-        if body.get("safety_identifier").or_else(|| body.get("user"))
+        if body
+            .get("safety_identifier")
+            .or_else(|| body.get("user"))
             .is_some_and(Value::is_null)
         {
             resets.push(ParameterReset::EndUser);
         }
         if body.get("web_search_options").is_some_and(Value::is_null)
-            || body.get("tools").is_some_and(|value| {
-                value.is_null() || value.as_array().is_some_and(Vec::is_empty)
-            })
+            || body
+                .get("tools")
+                .is_some_and(|value| value.is_null() || value.as_array().is_some_and(Vec::is_empty))
         {
             resets.push(ParameterReset::NativeTools);
         }
-        if body.get("logprobs").is_some_and(|v| v.is_null() || v.as_bool() == Some(false))
+        if body
+            .get("logprobs")
+            .is_some_and(|v| v.is_null() || v.as_bool() == Some(false))
             || body.get("top_logprobs").is_some_and(Value::is_null)
         {
             resets.push(ParameterReset::Logprobs);
         }
-        if body.pointer("/response_format/json_schema/strict").is_some_and(Value::is_null) {
+        if body
+            .pointer("/response_format/json_schema/strict")
+            .is_some_and(Value::is_null)
+        {
             resets.push(ParameterReset::ResponseFormatStrict);
         }
         let req: OpenAIRequest = serde_json::from_value(body)?;
@@ -122,8 +131,9 @@ impl OpenAIDecoder {
         let effective_max_tokens = req.max_completion_tokens.or(req.max_tokens);
 
         let reasoning = ReasoningConfig {
-            level: req.reasoning_effort.as_deref().and_then(|value|
-                stravia_runtime_contract::thinking::ThinkingLevel::from_wire(value).ok()),
+            level: req.reasoning_effort.as_deref().and_then(|value| {
+                stravia_runtime_contract::thinking::ThinkingLevel::from_wire(value).ok()
+            }),
             ..Default::default()
         };
 
@@ -167,27 +177,44 @@ impl OpenAIDecoder {
             Some(true) => Some(req.top_logprobs.unwrap_or(0)),
             None => req.top_logprobs,
         };
-        ai_req.parameters.modalities = req.modalities.map(|values| values.into_iter()
-            .filter_map(|value| serde_json::from_value(Value::String(value)).ok()).collect());
+        ai_req.parameters.modalities = req.modalities.map(|values| {
+            values
+                .into_iter()
+                .filter_map(|value| serde_json::from_value(Value::String(value)).ok())
+                .collect()
+        });
         ai_req.parameters.candidate_count = req.n;
         ai_req.parameters.store = req.store;
-        ai_req.parameters.metadata = req.metadata.and_then(|value| value.as_object().map(|map| {
-            map.iter().filter_map(|(key, value)| value.as_str()
-                .map(|value| (key.clone(), value.to_owned()))).collect()
-        }));
+        ai_req.parameters.metadata = req.metadata.and_then(|value| {
+            value.as_object().map(|map| {
+                map.iter()
+                    .filter_map(|(key, value)| {
+                        value.as_str().map(|value| (key.clone(), value.to_owned()))
+                    })
+                    .collect()
+            })
+        });
         ai_req.parameters.end_user_id = req.safety_identifier.or(req.user);
         ai_req.parameters.cache.key = req.prompt_cache_key;
-        ai_req.parameters.cache.retention = req.prompt_cache_retention.and_then(|value| match value.as_str() {
-            "in_memory" => Some(CacheRetention::Default),
-            "24h" => Some(CacheRetention::Extended),
-            _ => None,
-        });
-        ai_req.parameters.verbosity = req.verbosity.and_then(|value|
-            serde_json::from_value(Value::String(value)).ok());
-        ai_req.parameters.native_tools = req.web_search_options.as_ref()
-            .and_then(native_tool_from_chat_web_search_options).into_iter().collect();
-        ai_req.parameters.service_tier = req.service_tier.and_then(|value|
-            serde_json::from_value(Value::String(value)).ok());
+        ai_req.parameters.cache.retention =
+            req.prompt_cache_retention
+                .and_then(|value| match value.as_str() {
+                    "in_memory" => Some(CacheRetention::Default),
+                    "24h" => Some(CacheRetention::Extended),
+                    _ => None,
+                });
+        ai_req.parameters.verbosity = req
+            .verbosity
+            .and_then(|value| serde_json::from_value(Value::String(value)).ok());
+        ai_req.parameters.native_tools = req
+            .web_search_options
+            .as_ref()
+            .and_then(native_tool_from_chat_web_search_options)
+            .into_iter()
+            .collect();
+        ai_req.parameters.service_tier = req
+            .service_tier
+            .and_then(|value| serde_json::from_value(Value::String(value)).ok());
         ai_req.meta.source_protocol = Some(OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1);
         ai_req.meta.vendor.ingress = Default::default();
         ai_req.normalize_parameters();

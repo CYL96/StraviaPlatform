@@ -1678,7 +1678,9 @@ async fn post_commit_hook_failures_end_the_stream_without_retry_or_response_chai
         let mut continuation = AiRequest::new(failure.id(), Vec::new());
         continuation.meta.source_protocol = Some(OPEN_RESPONSES_2026_04_24);
         continuation.parameters.continuation = Some(
-            stravia_runtime_contract::protocol::ir::Continuation::PreviousResponse(response_id.clone()),
+            stravia_runtime_contract::protocol::ir::Continuation::PreviousResponse(
+                response_id.clone(),
+            ),
         );
         let headers = authorized_headers(&gateway).await;
         let continuation_response = execute(RunInput {

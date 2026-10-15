@@ -364,7 +364,10 @@ pub(super) async fn orchestrate(
         // delivery rather than rejecting otherwise representable inference.
         request.parameters.background = None;
     }
-    let previous_response_id = request.parameters.continuation.as_ref()
+    let previous_response_id = request
+        .parameters
+        .continuation
+        .as_ref()
         .and_then(stravia_runtime_contract::protocol::ir::Continuation::previous_response_id)
         .map(str::to_owned);
     let credential = ClientCredential::from_inference_headers(&headers);

@@ -199,7 +199,8 @@ fn controlled_request() -> AiRequest {
         "cache":{"key":"","retention":"extended"},
         "continuation":{"previous_response":"foreign"},
         "session":{"id":"foreign"}
-    })).unwrap();
+    }))
+    .unwrap();
     r.response_format = Some(
         stravia_runtime_contract::protocol::ir::ResponseFormat::JsonSchema {
             name: "nullable".into(),
@@ -447,9 +448,9 @@ fn unknown_parameters_and_native_tool_choices_never_gain_wire_rights() {
     r.tool_choice = Some(ToolChoice::Native(
         stravia_runtime_contract::protocol::ir::NativeToolKind::WebSearch,
     ));
-    r.parameters.native_tools.push(
-        stravia_runtime_contract::protocol::ir::NativeTool::WebSearch(Default::default()),
-    );
+    r.parameters
+        .native_tools
+        .push(stravia_runtime_contract::protocol::ir::NativeTool::WebSearch(Default::default()));
     let (_, body) = request::prepare(&p, r).unwrap();
     assert!(body.get("tool_choice").is_none());
     assert!(body.get("tools").is_none());

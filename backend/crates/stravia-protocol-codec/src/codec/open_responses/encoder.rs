@@ -159,9 +159,7 @@ impl ResponsesEncoder {
             }
         }
 
-        if input.is_empty()
-            && req.parameters.continuation.is_none()
-        {
+        if input.is_empty() && req.parameters.continuation.is_none() {
             anyhow::bail!("responses request requires input or previous_response_id");
         }
 
@@ -247,21 +245,21 @@ fn insert_owned_request_control_fields(
         let encoded = tools
             .into_iter()
             .map(|tool| {
-                    let mut encoded = serde_json::json!({"type": "function"});
-                    encoded["name"] = Value::String(tool.name);
-                    if let Some(description) = tool.description {
-                        encoded["description"] = Value::String(description);
-                    }
-                    encoded["parameters"] = tool.parameters;
-                    // Preserve foreign ingress's non-strict default: Responses
-                    // otherwise makes an omitted strict flag strict-by-default.
-                    if let Some(strict) = tool.strict.or(foreign_ingress.then_some(false)) {
-                        encoded["strict"] = Value::Bool(strict);
-                    }
-                    if let Some(defer_loading) = tool.defer_loading {
-                        encoded["defer_loading"] = Value::Bool(defer_loading);
-                    }
-                    encoded
+                let mut encoded = serde_json::json!({"type": "function"});
+                encoded["name"] = Value::String(tool.name);
+                if let Some(description) = tool.description {
+                    encoded["description"] = Value::String(description);
+                }
+                encoded["parameters"] = tool.parameters;
+                // Preserve foreign ingress's non-strict default: Responses
+                // otherwise makes an omitted strict flag strict-by-default.
+                if let Some(strict) = tool.strict.or(foreign_ingress.then_some(false)) {
+                    encoded["strict"] = Value::Bool(strict);
+                }
+                if let Some(defer_loading) = tool.defer_loading {
+                    encoded["defer_loading"] = Value::Bool(defer_loading);
+                }
+                encoded
             })
             .collect();
         obj.insert("tools".into(), Value::Array(encoded));
@@ -299,7 +297,10 @@ fn insert_owned_request_control_fields(
             obj.entry("text").or_insert_with(|| serde_json::json!({}))["format"] = format;
         }
     }
-    for tool in native_tools.iter().filter_map(stravia_runtime_contract::protocol::ir::native_tool_to_responses) {
+    for tool in native_tools
+        .iter()
+        .filter_map(stravia_runtime_contract::protocol::ir::native_tool_to_responses)
+    {
         obj.entry("tools")
             .or_insert_with(|| Value::Array(Vec::new()))
             .as_array_mut()
@@ -363,14 +364,28 @@ fn insert_request_control_fields(obj: &mut serde_json::Map<String, Value>, req: 
         Some(ReasoningSummary::None) => None,
         Some(summary) => Some(summary),
         None if req.reasoning.mode.as_deref() == Some("disabled")
-            || req.reasoning.level == Some(stravia_runtime_contract::thinking::ThinkingLevel::Off)
-            || matches!(req.reasoning.target_control, Some(stravia_runtime_contract::thinking::TargetThinkingControl::Disabled))
-            || req.parameters.resets(stravia_runtime_contract::protocol::ir::ParameterReset::Reasoning)
-            || req.parameters.resets(stravia_runtime_contract::protocol::ir::ParameterReset::ReasoningSummary) => None,
+            || req.reasoning.level
+                == Some(stravia_runtime_contract::thinking::ThinkingLevel::Off)
+            || matches!(
+                req.reasoning.target_control,
+                Some(stravia_runtime_contract::thinking::TargetThinkingControl::Disabled)
+            )
+            || req
+                .parameters
+                .resets(stravia_runtime_contract::protocol::ir::ParameterReset::Reasoning)
+            || req.parameters.resets(
+                stravia_runtime_contract::protocol::ir::ParameterReset::ReasoningSummary,
+            ) =>
+        {
+            None
+        }
         None => Some(&ReasoningSummary::Auto),
     };
     if let Some(summary) = summary {
-        reasoning.insert("summary".into(), serde_json::to_value(summary).expect("summary serializes"));
+        reasoning.insert(
+            "summary".into(),
+            serde_json::to_value(summary).expect("summary serializes"),
+        );
     }
     if !reasoning.is_empty() {
         obj.insert("reasoning".into(), Value::Object(reasoning));
@@ -382,29 +397,32 @@ fn insert_request_control_fields(obj: &mut serde_json::Map<String, Value>, req: 
         let tools = tools
             .iter()
             .map(|tool| {
-                    let mut encoded = serde_json::json!({
-                        "type": "function",
-                        "name": tool.name,
-                        "parameters": tool.parameters,
-                    });
-                    if let Some(description) = &tool.description {
-                        encoded["description"] = Value::String(description.clone());
-                    }
-                    // Chat、Anthropic 等协议省略 `strict` 即非严格；Responses 省略时上游会自动
-                    // 严格化并把可选参数改成必填，所以非 Responses 入口必须显式写出 false。
-                    if let Some(strict) = tool.strict.or(foreign_ingress.then_some(false)) {
-                        encoded["strict"] = Value::Bool(strict);
-                    }
-                    if let Some(defer_loading) = tool.defer_loading {
-                        encoded["defer_loading"] = Value::Bool(defer_loading);
-                    }
-                    encoded
+                let mut encoded = serde_json::json!({
+                    "type": "function",
+                    "name": tool.name,
+                    "parameters": tool.parameters,
+                });
+                if let Some(description) = &tool.description {
+                    encoded["description"] = Value::String(description.clone());
+                }
+                // Chat、Anthropic 等协议省略 `strict` 即非严格；Responses 省略时上游会自动
+                // 严格化并把可选参数改成必填，所以非 Responses 入口必须显式写出 false。
+                if let Some(strict) = tool.strict.or(foreign_ingress.then_some(false)) {
+                    encoded["strict"] = Value::Bool(strict);
+                }
+                if let Some(defer_loading) = tool.defer_loading {
+                    encoded["defer_loading"] = Value::Bool(defer_loading);
+                }
+                encoded
             })
             .collect();
         obj.insert("tools".into(), Value::Array(tools));
     }
     if let Some(tool_choice) = &req.tool_choice {
-        obj.insert("tool_choice".into(), tool_choice_to_value(tool_choice, &req.parameters.native_tools));
+        obj.insert(
+            "tool_choice".into(),
+            tool_choice_to_value(tool_choice, &req.parameters.native_tools),
+        );
     }
     if let Some(format) = req.response_format.as_ref() {
         let format = match format {
@@ -451,9 +469,17 @@ fn insert_request_control_fields(obj: &mut serde_json::Map<String, Value>, req: 
     }
     let reasoning_enabled = req.reasoning.mode.as_deref() != Some("disabled")
         && req.reasoning.level != Some(stravia_runtime_contract::thinking::ThinkingLevel::Off)
-        && !matches!(req.reasoning.target_control, Some(stravia_runtime_contract::thinking::TargetThinkingControl::Disabled))
-        && (req.reasoning.mode.as_deref().is_some_and(|mode| matches!(mode, "enabled" | "auto"))
-            || req.reasoning.level.is_some() || req.reasoning.target_control.is_some()
+        && !matches!(
+            req.reasoning.target_control,
+            Some(stravia_runtime_contract::thinking::TargetThinkingControl::Disabled)
+        )
+        && (req
+            .reasoning
+            .mode
+            .as_deref()
+            .is_some_and(|mode| matches!(mode, "enabled" | "auto"))
+            || req.reasoning.level.is_some()
+            || req.reasoning.target_control.is_some()
             || req.reasoning.budget_tokens.is_some());
     let mut include = Vec::new();
     if parameters.store == Some(false) && reasoning_enabled {
@@ -475,33 +501,48 @@ fn insert_request_control_fields(obj: &mut serde_json::Map<String, Value>, req: 
         use stravia_runtime_contract::protocol::ir::CacheRetention;
         obj.insert(
             "prompt_cache_retention".into(),
-            Value::String(match value {
-                CacheRetention::Default => "in_memory",
-                CacheRetention::Extended => "24h",
-            }.into()),
+            Value::String(
+                match value {
+                    CacheRetention::Default => "in_memory",
+                    CacheRetention::Extended => "24h",
+                }
+                .into(),
+            ),
         );
     }
     if let Some(value) = parameters.logprobs {
         obj.insert("top_logprobs".into(), value.into());
     }
     if let Some(value) = &parameters.truncation {
-        obj.insert("truncation".into(), serde_json::to_value(value).expect("truncation serializes"));
+        obj.insert(
+            "truncation".into(),
+            serde_json::to_value(value).expect("truncation serializes"),
+        );
     }
     if let Some(value) = &parameters.verbosity {
         obj.entry("text").or_insert_with(|| serde_json::json!({}))["verbosity"] =
             serde_json::to_value(value).expect("verbosity serializes");
     }
     if let Some(value) = &parameters.service_tier {
-        obj.insert("service_tier".into(), serde_json::to_value(value).expect("service tier serializes"));
+        obj.insert(
+            "service_tier".into(),
+            serde_json::to_value(value).expect("service tier serializes"),
+        );
     }
     if let Some(value) = &parameters.metadata {
-        obj.insert("metadata".into(), serde_json::to_value(value).expect("string metadata serializes"));
+        obj.insert(
+            "metadata".into(),
+            serde_json::to_value(value).expect("string metadata serializes"),
+        );
     }
     if let Some(value) = &parameters.end_user_id {
         obj.insert("safety_identifier".into(), Value::String(value.clone()));
     }
-    for tool in parameters.native_tools.iter()
-        .filter_map(stravia_runtime_contract::protocol::ir::native_tool_to_responses) {
+    for tool in parameters
+        .native_tools
+        .iter()
+        .filter_map(stravia_runtime_contract::protocol::ir::native_tool_to_responses)
+    {
         let tools = obj
             .entry("tools")
             .or_insert_with(|| Value::Array(Vec::new()))
@@ -1249,7 +1290,9 @@ fn tool_choice_to_value(
 ) -> Value {
     use stravia_runtime_contract::protocol::ir::{NativeTool, NativeToolKind};
     let named = |name: &str| {
-        let custom = native_tools.iter().any(|tool| matches!(tool, NativeTool::Custom(tool) if tool.name == name));
+        let custom = native_tools
+            .iter()
+            .any(|tool| matches!(tool, NativeTool::Custom(tool) if tool.name == name));
         serde_json::json!({"type": if custom { "custom" } else { "function" }, "name": name})
     };
     match tc {

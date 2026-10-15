@@ -157,7 +157,11 @@ mod tests {
             request.parameters.session.id.as_deref(),
             Some("body-session")
         );
-        assert!(!serde_json::to_string(&request.parameters).unwrap().contains("opaque-state"));
+        assert!(
+            !serde_json::to_string(&request.parameters)
+                .unwrap()
+                .contains("opaque-state")
+        );
         assert!(forwarded_client_headers(&headers).is_empty());
     }
 

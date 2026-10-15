@@ -1013,11 +1013,7 @@ fn encode_thinking(block: &ContentBlock) -> Option<ChatMsg> {
             encrypted_content.as_deref(),
             false,
         ),
-        ContentBlock::RedactedThinking { data } => (
-            String::new(),
-            Some(data.as_str()),
-            true,
-        ),
+        ContentBlock::RedactedThinking { data } => (String::new(), Some(data.as_str()), true),
         _ => unreachable!("thinking block"),
     };
     let Some(signature) = signature.filter(|value| !value.is_empty()) else {
@@ -2274,8 +2270,10 @@ mod tests {
                 .any(|f| f.number == 12 && f.bytes == b"gAAAA_foreign_responses_ciphertext")
         );
         assert!(
-            prompts.iter().flatten().any(|f|
-                f.number == 12 && f.bytes == b"gAAAA_empty_ciphertext")
+            prompts
+                .iter()
+                .flatten()
+                .any(|f| f.number == 12 && f.bytes == b"gAAAA_empty_ciphertext")
         );
         assert_eq!(serde_json::to_value(&request).unwrap(), snapshot);
 
@@ -2285,11 +2283,17 @@ mod tests {
         }]);
         let request = AiRequest::new("swe-2", vec![text_item(Role::User, "go"), redacted]);
         let fields = top_level(&request);
-        let prompts: Vec<_> = fields.iter().filter(|f| f.number == 3)
-            .map(|f| parse_fields(f.bytes).unwrap()).collect();
+        let prompts: Vec<_> = fields
+            .iter()
+            .filter(|f| f.number == 3)
+            .map(|f| parse_fields(f.bytes).unwrap())
+            .collect();
         assert_eq!(prompts.len(), 2);
-        assert!(prompts[1].iter().any(|f|
-            f.number == 12 && f.bytes == b"foreign-redacted-ciphertext"));
+        assert!(
+            prompts[1]
+                .iter()
+                .any(|f| f.number == 12 && f.bytes == b"foreign-redacted-ciphertext")
+        );
         assert!(prompts[1].iter().any(|f| f.number == 13 && f.scalar == 1));
     }
 

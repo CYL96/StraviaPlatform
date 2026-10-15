@@ -1303,8 +1303,12 @@ mod tests {
         assert_eq!(body["tools"][0]["input_schema"], schema);
         assert_eq!(body["tools"][0]["defer_loading"], false);
         for field in [
-            "eager_input_streaming", "citations", "cache_control",
-            "allowed_callers", "input_examples", "private_parameter",
+            "eager_input_streaming",
+            "citations",
+            "cache_control",
+            "allowed_callers",
+            "input_examples",
+            "private_parameter",
         ] {
             assert!(body["tools"][0].get(field).is_none(), "{field}");
         }

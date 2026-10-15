@@ -17,8 +17,8 @@ use stravia_runtime_contract::protocol::ir::AiResponse;
 use stravia_runtime_contract::protocol::ir::ContentBlock;
 use stravia_runtime_contract::protocol::ir::MediaSource;
 use stravia_runtime_contract::protocol::ir::MessageContent;
-use stravia_runtime_contract::protocol::ir::Role;
 use stravia_runtime_contract::protocol::ir::ParameterReset;
+use stravia_runtime_contract::protocol::ir::Role;
 use stravia_runtime_contract::protocol::ir::request::VERIFIED_HISTORY_REPLAY_META;
 use stravia_runtime_contract::turn_chain::ReusablePrefixMetadata;
 use stravia_runtime_contract::turn_chain::ReusablePrefixQuery;
@@ -530,8 +530,8 @@ impl GenerationChain {
             } else {
                 // 原生窗口允许本轮更改控制；完整交付前缀仍能证明后代身份，
                 // 但只能继承祖先关系，不能恢复旧控制或已替换的执行窗口。
-                let leading_controls = request.items.len()
-                    - canonical_client_history_request(&request).items.len();
+                let leading_controls =
+                    request.items.len() - canonical_client_history_request(&request).items.len();
                 let source_prefix = self
                     .store
                     .compaction_source_from_items(&principal, &request, workspace)
@@ -541,10 +541,7 @@ impl GenerationChain {
                     .as_ref()
                     .map(|(_, id)| id.as_str())
                     .or(native.source_generation_id.as_deref());
-                if explicit
-                    .as_deref()
-                    .is_some_and(|id| Some(id) != parent_id)
-                {
+                if explicit.as_deref().is_some_and(|id| Some(id) != parent_id) {
                     return Err(BeginError::CompactionConflict);
                 }
                 if let (Some((_, id)), Some(source)) =
@@ -1023,7 +1020,9 @@ impl EffectiveRequestConfig {
         if request.model.is_empty() {
             request.model.clone_from(&self.model);
         }
-        if request.instructions.is_none() && !request.parameters.resets(ParameterReset::Instructions) {
+        if request.instructions.is_none()
+            && !request.parameters.resets(ParameterReset::Instructions)
+        {
             request.instructions.clone_from(&self.instructions);
         }
         macro_rules! inherit_generation {
@@ -1061,7 +1060,9 @@ impl EffectiveRequestConfig {
         }
         if !request.parameters.resets(ParameterReset::ResponseFormat) {
             inherit_option(&mut request.response_format, &self.response_format);
-            if request.parameters.resets(ParameterReset::ResponseFormatStrict)
+            if request
+                .parameters
+                .resets(ParameterReset::ResponseFormatStrict)
                 && let Some(stravia_runtime_contract::protocol::ir::ResponseFormat::JsonSchema {
                     strict,
                     ..

@@ -2514,9 +2514,10 @@ mod tests {
                 "turn" => next.parameters.session.turn_id = Some("other-turn".into()),
                 "parent" => next.parameters.session.parent_id = Some("other-parent".into()),
                 "metadata" => {
-                    next.parameters.metadata = Some(std::collections::BTreeMap::from([
-                        ("request_id".into(), "payload".into()),
-                    ]));
+                    next.parameters.metadata = Some(std::collections::BTreeMap::from([(
+                        "request_id".into(),
+                        "payload".into(),
+                    )]));
                 }
                 "older_history" => next.items[0] = user("different old history"),
                 "new_user" => next.items.push(user("genuinely new input")),

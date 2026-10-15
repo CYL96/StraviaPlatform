@@ -130,8 +130,13 @@ fn string(value: &Value, key: &str) -> Option<String> {
 }
 
 fn strings(value: Option<&Value>) -> Vec<String> {
-    value.and_then(Value::as_array).into_iter().flatten()
-        .filter_map(Value::as_str).map(str::to_owned).collect()
+    value
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect()
 }
 
 fn location(value: &Value) -> Option<UserLocation> {
@@ -155,7 +160,10 @@ fn context_size(value: &Value) -> Option<SearchContextSize> {
 
 fn web_search(value: &Value) -> WebSearchTool {
     WebSearchTool {
-        max_uses: value.get("max_uses").and_then(Value::as_u64).and_then(|n| u32::try_from(n).ok()),
+        max_uses: value
+            .get("max_uses")
+            .and_then(Value::as_u64)
+            .and_then(|n| u32::try_from(n).ok()),
         allowed_domains: strings(value.get("allowed_domains")),
         blocked_domains: strings(value.get("blocked_domains")),
         user_location: value.get("user_location").and_then(location),
@@ -164,11 +172,15 @@ fn web_search(value: &Value) -> WebSearchTool {
 }
 
 fn custom(value: &Value) -> Option<CustomTool> {
-    let grammar = value.get("format").filter(|format| format.get("type").and_then(Value::as_str) == Some("grammar"))
-        .and_then(|format| Some(ToolGrammar {
-            syntax: string(format, "syntax")?,
-            definition: string(format, "definition")?,
-        }));
+    let grammar = value
+        .get("format")
+        .filter(|format| format.get("type").and_then(Value::as_str) == Some("grammar"))
+        .and_then(|format| {
+            Some(ToolGrammar {
+                syntax: string(format, "syntax")?,
+                definition: string(format, "definition")?,
+            })
+        });
     Some(CustomTool {
         name: string(value, "name")?,
         description: string(value, "description"),
@@ -180,37 +192,61 @@ fn custom(value: &Value) -> Option<CustomTool> {
 /// 从 Responses 工具对象提取可统一的意图，未知工具不透传。
 pub fn native_tool_from_responses(value: &Value) -> Option<NativeTool> {
     match value.get("type")?.as_str()? {
-        "web_search" | "web_search_preview" | "web_search_2025_08_26" | "web_search_preview_2025_03_11" => {
+        "web_search"
+        | "web_search_preview"
+        | "web_search_2025_08_26"
+        | "web_search_preview_2025_03_11" => {
             let mut tool = web_search(value);
             tool.max_uses = None;
             tool.blocked_domains.clear();
-            tool.allowed_domains = strings(value.get("filters").and_then(|filters| filters.get("allowed_domains")));
+            tool.allowed_domains = strings(
+                value
+                    .get("filters")
+                    .and_then(|filters| filters.get("allowed_domains")),
+            );
             Some(NativeTool::WebSearch(tool))
         }
-        "code_interpreter" => Some(NativeTool::CodeExecution(CodeExecutionTool { container: string(value, "container") })),
+        "code_interpreter" => Some(NativeTool::CodeExecution(CodeExecutionTool {
+            container: string(value, "container"),
+        })),
         "image_generation" => Some(NativeTool::ImageGeneration(ImageGenerationTool {
-            action: string(value, "action"), output_format: string(value, "output_format"),
-            size: string(value, "size"), quality: string(value, "quality"),
+            action: string(value, "action"),
+            output_format: string(value, "output_format"),
+            size: string(value, "size"),
+            quality: string(value, "quality"),
         })),
         "tool_search" => Some(NativeTool::ToolSearch(ToolSearchTool {
-            execution: string(value, "execution"), description: string(value, "description"),
-            parameters: value.get("parameters").filter(|value| !value.is_null()).cloned(),
+            execution: string(value, "execution"),
+            description: string(value, "description"),
+            parameters: value
+                .get("parameters")
+                .filter(|value| !value.is_null())
+                .cloned(),
         })),
         "custom" => custom(value).map(NativeTool::Custom),
         "namespace" => Some(NativeTool::Namespace(ToolNamespace {
-            name: string(value, "name")?, description: string(value, "description"),
-            tools: value.get("tools").and_then(Value::as_array).into_iter().flatten().filter_map(|member| {
-                match member.get("type")?.as_str()? {
+            name: string(value, "name")?,
+            description: string(value, "description"),
+            tools: value
+                .get("tools")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|member| match member.get("type")?.as_str()? {
                     "function" => Some(NamespaceMember::Function(ToolSpec {
-                        name: string(member, "name")?, description: string(member, "description"),
-                        parameters: member.get("parameters").cloned().unwrap_or_else(|| json!({})),
+                        name: string(member, "name")?,
+                        description: string(member, "description"),
+                        parameters: member
+                            .get("parameters")
+                            .cloned()
+                            .unwrap_or_else(|| json!({})),
                         strict: member.get("strict").and_then(Value::as_bool),
                         defer_loading: member.get("defer_loading").and_then(Value::as_bool),
                     })),
                     "custom" => custom(member).map(NamespaceMember::Custom),
                     _ => None,
-                }
-            }).collect(),
+                })
+                .collect(),
         })),
         _ => None,
     }
@@ -241,9 +277,15 @@ fn custom_json(tool: &CustomTool) -> Value {
 fn search_options(tool: &WebSearchTool) -> Map<String, Value> {
     let mut fields = Map::new();
     if let Some(context_size) = tool.context_size {
-        fields.insert("search_context_size".into(), match context_size {
-            SearchContextSize::Low => "low", SearchContextSize::Medium => "medium", SearchContextSize::High => "high",
-        }.into());
+        fields.insert(
+            "search_context_size".into(),
+            match context_size {
+                SearchContextSize::Low => "low",
+                SearchContextSize::Medium => "medium",
+                SearchContextSize::High => "high",
+            }
+            .into(),
+        );
     }
     fields
 }
@@ -254,10 +296,16 @@ pub fn native_tool_to_responses(tool: &NativeTool) -> Option<Value> {
         NativeTool::WebSearch(tool) => {
             let mut fields = search_options(tool);
             if !tool.allowed_domains.is_empty() {
-                fields.insert("filters".into(), json!({"allowed_domains": tool.allowed_domains}));
+                fields.insert(
+                    "filters".into(),
+                    json!({"allowed_domains": tool.allowed_domains}),
+                );
             }
             if let Some(location) = &tool.user_location {
-                fields.insert("user_location".into(), typed(object(location), "approximate"));
+                fields.insert(
+                    "user_location".into(),
+                    typed(object(location), "approximate"),
+                );
             }
             typed(fields, "web_search")
         }
@@ -273,10 +321,18 @@ pub fn native_tool_to_responses(tool: &NativeTool) -> Option<Value> {
                 fields.insert("description".into(), description.clone().into());
             }
             // 协议要求 tools 数组，即使 canonical 的空集合在快照中省略。
-            fields.insert("tools".into(), Value::Array(tool.tools.iter().map(|member| match member {
-                NamespaceMember::Function(tool) => typed(object(tool), "function"),
-                NamespaceMember::Custom(tool) => custom_json(tool),
-            }).collect()));
+            fields.insert(
+                "tools".into(),
+                Value::Array(
+                    tool.tools
+                        .iter()
+                        .map(|member| match member {
+                            NamespaceMember::Function(tool) => typed(object(tool), "function"),
+                            NamespaceMember::Custom(tool) => custom_json(tool),
+                        })
+                        .collect(),
+                ),
+            );
             typed(fields, "namespace")
         }
     })
@@ -302,7 +358,10 @@ pub fn native_tool_to_anthropic(tool: &NativeTool) -> Option<Value> {
             let mut fields = object(tool);
             fields.remove("context_size");
             if let Some(location) = &tool.user_location {
-                fields.insert("user_location".into(), typed(object(location), "approximate"));
+                fields.insert(
+                    "user_location".into(),
+                    typed(object(location), "approximate"),
+                );
             }
             fields.insert("name".into(), "web_search".into());
             Some(typed(fields, "web_search_20250305"))
@@ -318,9 +377,13 @@ pub fn native_tool_to_anthropic(tool: &NativeTool) -> Option<Value> {
 pub fn native_tool_from_gemini(value: &Value) -> Option<NativeTool> {
     if let Some(search) = value.get("googleSearch").filter(|value| value.is_object()) {
         Some(NativeTool::WebSearch(WebSearchTool {
-            blocked_domains: strings(search.get("excludeDomains")), ..WebSearchTool::default()
+            blocked_domains: strings(search.get("excludeDomains")),
+            ..WebSearchTool::default()
         }))
-    } else if value.get("googleSearchRetrieval").is_some_and(Value::is_object) {
+    } else if value
+        .get("googleSearchRetrieval")
+        .is_some_and(Value::is_object)
+    {
         Some(NativeTool::WebSearch(WebSearchTool::default()))
     } else if value.get("codeExecution").is_some_and(Value::is_object) {
         Some(NativeTool::CodeExecution(CodeExecutionTool::default()))
@@ -345,16 +408,24 @@ pub fn native_tool_from_chat_web_search_options(value: &Value) -> Option<NativeT
     value.as_object()?;
     Some(NativeTool::WebSearch(WebSearchTool {
         context_size: context_size(value),
-        user_location: value.get("user_location").and_then(|location| location.get("approximate")).and_then(location),
+        user_location: value
+            .get("user_location")
+            .and_then(|location| location.get("approximate"))
+            .and_then(location),
         ..WebSearchTool::default()
     }))
 }
 
 pub fn native_tool_to_chat_web_search_options(tool: &NativeTool) -> Option<Value> {
-    let NativeTool::WebSearch(tool) = tool else { return None; };
+    let NativeTool::WebSearch(tool) = tool else {
+        return None;
+    };
     let mut fields = search_options(tool);
     if let Some(location) = &tool.user_location {
-        fields.insert("user_location".into(), json!({"type": "approximate", "approximate": location}));
+        fields.insert(
+            "user_location".into(),
+            json!({"type": "approximate", "approximate": location}),
+        );
     }
     Some(Value::Object(fields))
 }
@@ -377,7 +448,10 @@ mod tests {
         for value in values {
             let tool = native_tool_from_responses(&value).unwrap();
             assert_eq!(native_tool_to_responses(&tool), Some(value));
-            assert_eq!(serde_json::from_value::<NativeTool>(serde_json::to_value(&tool).unwrap()).unwrap(), tool);
+            assert_eq!(
+                serde_json::from_value::<NativeTool>(serde_json::to_value(&tool).unwrap()).unwrap(),
+                tool
+            );
         }
     }
 
@@ -391,17 +465,33 @@ mod tests {
             let tool = native_tool_from_anthropic(&value).unwrap();
             assert_eq!(native_tool_to_anthropic(&tool), Some(value));
         }
-        assert_eq!(native_tool_to_anthropic(&native_tool_from_anthropic(&json!({"type":"code_execution_20250522"})).unwrap()).unwrap()["type"], "code_execution_20260120");
+        assert_eq!(
+            native_tool_to_anthropic(
+                &native_tool_from_anthropic(&json!({"type":"code_execution_20250522"})).unwrap()
+            )
+            .unwrap()["type"],
+            "code_execution_20260120"
+        );
     }
 
     #[test]
     fn gemini_roundtrips_and_normalizes_legacy_search() {
-        for value in [json!({"googleSearch":{}}), json!({"googleSearch":{"excludeDomains":["blocked.test"]}}), json!({"codeExecution":{}})] {
+        for value in [
+            json!({"googleSearch":{}}),
+            json!({"googleSearch":{"excludeDomains":["blocked.test"]}}),
+            json!({"codeExecution":{}}),
+        ] {
             let tool = native_tool_from_gemini(&value).unwrap();
             assert_eq!(native_tool_to_gemini(&tool), Some(value));
         }
-        let tool = native_tool_from_gemini(&json!({"googleSearchRetrieval":{"dynamicRetrievalConfig":{"mode":"MODE_DYNAMIC"}}})).unwrap();
-        assert_eq!(native_tool_to_gemini(&tool), Some(json!({"googleSearch":{}})));
+        let tool = native_tool_from_gemini(
+            &json!({"googleSearchRetrieval":{"dynamicRetrievalConfig":{"mode":"MODE_DYNAMIC"}}}),
+        )
+        .unwrap();
+        assert_eq!(
+            native_tool_to_gemini(&tool),
+            Some(json!({"googleSearch":{}}))
+        );
     }
 
     #[test]
@@ -410,13 +500,29 @@ mod tests {
         let tool = native_tool_from_chat_web_search_options(&value).unwrap();
         assert_eq!(native_tool_to_chat_web_search_options(&tool), Some(value));
         let tool = native_tool_from_chat_web_search_options(&json!({"private":true,"user_location":{"type":"approximate","approximate":{"city":"Tokyo","private":true}}})).unwrap();
-        assert_eq!(native_tool_to_chat_web_search_options(&tool), Some(json!({"user_location":{"type":"approximate","approximate":{"city":"Tokyo"}}})));
+        assert_eq!(
+            native_tool_to_chat_web_search_options(&tool),
+            Some(json!({"user_location":{"type":"approximate","approximate":{"city":"Tokyo"}}}))
+        );
         assert!(native_tool_from_chat_web_search_options(&Value::Null).is_none());
     }
 
     #[test]
     fn unsupported_tools_are_not_imported_or_projected() {
-        for kind in ["file_search", "mcp", "computer", "computer_use_preview", "local_shell", "shell", "apply_patch", "bash", "text_editor", "memory", "web_fetch", "function"] {
+        for kind in [
+            "file_search",
+            "mcp",
+            "computer",
+            "computer_use_preview",
+            "local_shell",
+            "shell",
+            "apply_patch",
+            "bash",
+            "text_editor",
+            "memory",
+            "web_fetch",
+            "function",
+        ] {
             assert!(native_tool_from_responses(&json!({"type":kind})).is_none());
             assert!(native_tool_from_anthropic(&json!({"type":kind})).is_none());
         }
@@ -424,29 +530,64 @@ mod tests {
         for tool in [
             NativeTool::ImageGeneration(ImageGenerationTool::default()),
             NativeTool::ToolSearch(ToolSearchTool::default()),
-            NativeTool::Custom(CustomTool { name:"text".into(), description:None, defer_loading:None, grammar:None }),
-            NativeTool::Namespace(ToolNamespace { name:"tools".into(), description:None, tools:vec![] }),
+            NativeTool::Custom(CustomTool {
+                name: "text".into(),
+                description: None,
+                defer_loading: None,
+                grammar: None,
+            }),
+            NativeTool::Namespace(ToolNamespace {
+                name: "tools".into(),
+                description: None,
+                tools: vec![],
+            }),
         ] {
             assert!(native_tool_to_responses(&tool).is_some());
             assert!(native_tool_to_anthropic(&tool).is_none());
             assert!(native_tool_to_gemini(&tool).is_none());
             assert!(native_tool_to_chat_web_search_options(&tool).is_none());
         }
-        assert!(native_tool_to_chat_web_search_options(&NativeTool::CodeExecution(CodeExecutionTool::default())).is_none());
+        assert!(
+            native_tool_to_chat_web_search_options(&NativeTool::CodeExecution(
+                CodeExecutionTool::default()
+            ))
+            .is_none()
+        );
     }
 
     #[test]
     fn defaults_omit_empty_fields_and_protocol_options_do_not_leak() {
         let tool: NativeTool = serde_json::from_value(json!({"type":"web_search"})).unwrap();
-        assert_eq!(serde_json::to_value(&tool).unwrap(), json!({"type":"web_search"}));
-        assert_eq!(native_tool_to_responses(&tool), Some(json!({"type":"web_search"})));
-        assert_eq!(native_tool_to_anthropic(&tool), Some(json!({"type":"web_search_20250305","name":"web_search"})));
-        for kind in ["web_search_preview", "web_search_preview_2025_03_11", "web_search_2025_08_26"] {
+        assert_eq!(
+            serde_json::to_value(&tool).unwrap(),
+            json!({"type":"web_search"})
+        );
+        assert_eq!(
+            native_tool_to_responses(&tool),
+            Some(json!({"type":"web_search"}))
+        );
+        assert_eq!(
+            native_tool_to_anthropic(&tool),
+            Some(json!({"type":"web_search_20250305","name":"web_search"}))
+        );
+        for kind in [
+            "web_search_preview",
+            "web_search_preview_2025_03_11",
+            "web_search_2025_08_26",
+        ] {
             let tool = native_tool_from_responses(&json!({"type":kind,"private":true,"max_uses":10,"blocked_domains":["private"],"filters":{"allowed_domains":["example.com",1]}})).unwrap();
-            assert_eq!(native_tool_to_responses(&tool), Some(json!({"type":"web_search","filters":{"allowed_domains":["example.com"]}})));
+            assert_eq!(
+                native_tool_to_responses(&tool),
+                Some(json!({"type":"web_search","filters":{"allowed_domains":["example.com"]}}))
+            );
         }
         let tool = native_tool_from_responses(&json!({"type":"namespace","name":"business","tools":[{"type":"web_search"},{"type":"namespace","name":"nested"},{"type":"custom","name":"text","private":true}]})).unwrap();
-        assert_eq!(native_tool_to_responses(&tool), Some(json!({"type":"namespace","name":"business","tools":[{"type":"custom","name":"text"}]})));
+        assert_eq!(
+            native_tool_to_responses(&tool),
+            Some(
+                json!({"type":"namespace","name":"business","tools":[{"type":"custom","name":"text"}]})
+            )
+        );
     }
 
     #[test]
@@ -455,25 +596,48 @@ mod tests {
             max_uses: Some(3),
             allowed_domains: vec!["allowed.test".into()],
             blocked_domains: vec!["blocked.test".into()],
-            user_location: Some(UserLocation { city: Some("Paris".into()), ..UserLocation::default() }),
+            user_location: Some(UserLocation {
+                city: Some("Paris".into()),
+                ..UserLocation::default()
+            }),
             context_size: Some(SearchContextSize::Medium),
         });
-        assert_eq!(native_tool_to_responses(&tool), Some(json!({
-            "type":"web_search","filters":{"allowed_domains":["allowed.test"]},
-            "user_location":{"type":"approximate","city":"Paris"},"search_context_size":"medium"
-        })));
-        assert_eq!(native_tool_to_anthropic(&tool), Some(json!({
-            "type":"web_search_20250305","name":"web_search","max_uses":3,
-            "allowed_domains":["allowed.test"],"blocked_domains":["blocked.test"],
-            "user_location":{"type":"approximate","city":"Paris"}
-        })));
-        assert_eq!(native_tool_to_gemini(&tool), Some(json!({"googleSearch":{"excludeDomains":["blocked.test"]}})));
-        assert_eq!(native_tool_to_chat_web_search_options(&tool), Some(json!({
-            "search_context_size":"medium","user_location":{"type":"approximate","approximate":{"city":"Paris"}}
-        })));
-        let code = NativeTool::CodeExecution(CodeExecutionTool { container: Some("cntr_123".into()) });
-        assert_eq!(native_tool_to_anthropic(&code), Some(json!({"type":"code_execution_20260120","name":"code_execution"})));
-        assert_eq!(native_tool_to_gemini(&code), Some(json!({"codeExecution":{}})));
+        assert_eq!(
+            native_tool_to_responses(&tool),
+            Some(json!({
+                "type":"web_search","filters":{"allowed_domains":["allowed.test"]},
+                "user_location":{"type":"approximate","city":"Paris"},"search_context_size":"medium"
+            }))
+        );
+        assert_eq!(
+            native_tool_to_anthropic(&tool),
+            Some(json!({
+                "type":"web_search_20250305","name":"web_search","max_uses":3,
+                "allowed_domains":["allowed.test"],"blocked_domains":["blocked.test"],
+                "user_location":{"type":"approximate","city":"Paris"}
+            }))
+        );
+        assert_eq!(
+            native_tool_to_gemini(&tool),
+            Some(json!({"googleSearch":{"excludeDomains":["blocked.test"]}}))
+        );
+        assert_eq!(
+            native_tool_to_chat_web_search_options(&tool),
+            Some(json!({
+                "search_context_size":"medium","user_location":{"type":"approximate","approximate":{"city":"Paris"}}
+            }))
+        );
+        let code = NativeTool::CodeExecution(CodeExecutionTool {
+            container: Some("cntr_123".into()),
+        });
+        assert_eq!(
+            native_tool_to_anthropic(&code),
+            Some(json!({"type":"code_execution_20260120","name":"code_execution"}))
+        );
+        assert_eq!(
+            native_tool_to_gemini(&code),
+            Some(json!({"codeExecution":{}}))
+        );
     }
 
     #[test]
@@ -481,10 +645,14 @@ mod tests {
         let tool = native_tool_from_responses(&json!({
             "type":"web_search","search_context_size":"unknown","user_location":null,
             "filters":{"allowed_domains":[false,"valid.test",null]}
-        })).unwrap();
-        assert_eq!(native_tool_to_responses(&tool), Some(json!({
-            "type":"web_search","filters":{"allowed_domains":["valid.test"]}
-        })));
+        }))
+        .unwrap();
+        assert_eq!(
+            native_tool_to_responses(&tool),
+            Some(json!({
+                "type":"web_search","filters":{"allowed_domains":["valid.test"]}
+            }))
+        );
         for value in [Value::Null, json!([]), json!({}), json!({"type":1})] {
             assert!(native_tool_from_responses(&value).is_none());
             assert!(native_tool_from_anthropic(&value).is_none());
@@ -492,6 +660,8 @@ mod tests {
         }
         assert!(native_tool_from_responses(&json!({"type":"custom"})).is_none());
         assert!(native_tool_from_responses(&json!({"type":"namespace"})).is_none());
-        assert!(native_tool_from_gemini(&json!({"googleSearch":null,"codeExecution":false})).is_none());
+        assert!(
+            native_tool_from_gemini(&json!({"googleSearch":null,"codeExecution":false})).is_none()
+        );
     }
 }

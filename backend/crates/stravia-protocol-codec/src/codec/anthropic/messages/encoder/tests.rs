@@ -12,14 +12,22 @@ fn anthropic_projects_only_explicit_summary_controls() {
         .unwrap();
     let (body, _) = AnthropicEncoder.encode_request(request.clone()).unwrap();
     assert!(body.get("thinking").is_none());
-    for summary in [None, Some(ReasoningSummary::None), Some(ReasoningSummary::Concise)] {
+    for summary in [
+        None,
+        Some(ReasoningSummary::None),
+        Some(ReasoningSummary::Concise),
+    ] {
         request.reasoning.summary = summary;
         request.reasoning.target_control = Some(TargetThinkingControl::Budget { value: 2048 });
         let (body, _) = AnthropicEncoder.encode_request(request.clone()).unwrap();
         assert_eq!(body["thinking"]["budget_tokens"], 2048);
         assert_eq!(
             body["thinking"].get("display").and_then(Value::as_str),
-            summary.map(|value| if value == ReasoningSummary::None { "omitted" } else { "summarized" })
+            summary.map(|value| if value == ReasoningSummary::None {
+                "omitted"
+            } else {
+                "summarized"
+            })
         );
     }
     request.reasoning.target_control = Some(TargetThinkingControl::Disabled);
@@ -915,7 +923,14 @@ fn canonical_tools_and_controls_win_over_raw_tools_and_aliases() {
     assert_eq!(body["tools"][0]["input_schema"], schema);
     assert_eq!(body["tools"][0]["strict"], false);
     assert_eq!(body["tools"][0]["defer_loading"], false);
-    for field in ["eager_input_streaming", "citations", "allowed_callers", "input_examples", "cache_control", "description"] {
+    for field in [
+        "eager_input_streaming",
+        "citations",
+        "allowed_callers",
+        "input_examples",
+        "cache_control",
+        "description",
+    ] {
         assert!(body["tools"][0].get(field).is_none(), "{field}");
     }
     assert_eq!(body["top_k"], 0);
@@ -934,13 +949,17 @@ fn unsupported_native_variants_and_service_tiers_are_omitted() {
     let mut request = parameter_request();
     request.parameters.service_tier = Some(ServiceTier::Priority);
     request.parameters.native_tools = vec![
-        NativeTool::WebSearch(WebSearchTool { max_uses: Some(0), ..Default::default() }),
+        NativeTool::WebSearch(WebSearchTool {
+            max_uses: Some(0),
+            ..Default::default()
+        }),
         NativeTool::ImageGeneration(ImageGenerationTool::default()),
     ];
 
-    request.parameters.metadata = Some(std::collections::BTreeMap::from([
-        ("user_id".into(), "not-an-anthropic-user".into()),
-    ]));
+    request.parameters.metadata = Some(std::collections::BTreeMap::from([(
+        "user_id".into(),
+        "not-an-anthropic-user".into(),
+    )]));
     let (body, _) = AnthropicEncoder.encode_request(request).unwrap();
     assert!(body.get("service_tier").is_none());
     assert!(body.get("unknown").is_none());

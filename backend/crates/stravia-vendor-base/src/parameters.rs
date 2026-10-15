@@ -157,8 +157,7 @@ fn legalize_model_controls(provider: &ProviderSnapshot, request: &mut AiRequest)
             .and_then(Value::as_u64)
             .and_then(|limit| u32::try_from(limit).ok())
     {
-        request.generation.max_tokens =
-            request.generation.max_tokens.map(|value| value.min(limit));
+        request.generation.max_tokens = request.generation.max_tokens.map(|value| value.min(limit));
     }
 }
 
@@ -272,10 +271,12 @@ mod tests {
             .body;
         assert!(body.get("logprobs").is_none());
         assert!(body.get("top_logprobs").is_none());
-        target.model_metadata.as_mut().unwrap().extensions.insert(
-            "supported_parameters".into(),
-            json!(["logprobs"]),
-        );
+        target
+            .model_metadata
+            .as_mut()
+            .unwrap()
+            .extensions
+            .insert("supported_parameters".into(), json!(["logprobs"]));
         let body = encode(&target, "openai-chat-completions", request.clone())
             .unwrap()
             .body;

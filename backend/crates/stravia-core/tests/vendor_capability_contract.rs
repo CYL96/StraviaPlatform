@@ -3317,7 +3317,10 @@ async fn manually_installed_codex_component_reuses_one_connection_for_search_and
         );
         assert!(!request.headers.contains_key("x-codex-beta-features"));
         assert_ne!(
-            request.headers.get("x-codex-turn-state").and_then(|value| value.to_str().ok()),
+            request
+                .headers
+                .get("x-codex-turn-state")
+                .and_then(|value| value.to_str().ok()),
             Some("native-turn-state")
         );
     }

@@ -290,7 +290,9 @@ fn infer(
     request.parameters.native_tools.clear();
     if matches!(
         request.tool_choice,
-        Some(stravia_runtime_contract::protocol::ir::ToolChoice::Native(_))
+        Some(stravia_runtime_contract::protocol::ir::ToolChoice::Native(
+            _
+        ))
     ) {
         request.tool_choice = None;
     }
@@ -384,15 +386,45 @@ pub fn descriptor() -> VendorDescriptor {
         model_capabilities: BTreeSet::new(),
     };
     VendorDescriptor {
-        vendor_id: ID.into(), version: semver::Version::parse(env!("CARGO_PKG_VERSION")).expect("package semver"), display_name: "Muse Code".into(),
-        description: Some("Meta Muse Code subscription device login; automatic tool selection only.".into()), authors: vec!["Stravia".into()],
-        canonical_format_version: CANONICAL_FORMAT_VERSION, kind: VendorKind::Dedicated,
-        providers: vec![ProviderDescriptor { provider_id: ID.into(), catalog_id: Some("meta".into()), icon_svg: stravia_vendor_common::icons::provider_svg("meta").map(str::to_owned),
-            display_name: "Muse Code".into(), description: Some(messages::compatibility().english_text().to_owned()), channels: vec![channel], capabilities,
-            website: Some("https://dev.meta.ai/docs/muse-code/auth".into()), implementation: None,
+        vendor_id: ID.into(),
+        version: semver::Version::parse(env!("CARGO_PKG_VERSION")).expect("package semver"),
+        display_name: "Muse Code".into(),
+        description: Some(
+            "Meta Muse Code subscription device login; automatic tool selection only.".into(),
+        ),
+        authors: vec!["Stravia".into()],
+        canonical_format_version: CANONICAL_FORMAT_VERSION,
+        kind: VendorKind::Dedicated,
+        providers: vec![ProviderDescriptor {
+            provider_id: ID.into(),
+            catalog_id: Some("meta".into()),
+            icon_svg: stravia_vendor_common::icons::provider_svg("meta").map(str::to_owned),
+            display_name: "Muse Code".into(),
+            description: Some(messages::compatibility().english_text().to_owned()),
+            channels: vec![channel],
+            capabilities,
+            website: Some("https://dev.meta.ai/docs/muse-code/auth".into()),
+            implementation: None,
             config_groups: Vec::new(),
             config_fields: Vec::new(),
-            network: NetworkDeclaration { base_url_field: None, extra_origins: vec![OriginDeclaration { scheme: "https".into(), host: "api.meta.ai".into(), port: None }, OriginDeclaration { scheme: "https".into(), host: "auth.meta.com".into(), port: None }], field_origins: Vec::new() }, data_compat: DataCompatibility::default() }],
+            network: NetworkDeclaration {
+                base_url_field: None,
+                extra_origins: vec![
+                    OriginDeclaration {
+                        scheme: "https".into(),
+                        host: "api.meta.ai".into(),
+                        port: None,
+                    },
+                    OriginDeclaration {
+                        scheme: "https".into(),
+                        host: "auth.meta.com".into(),
+                        port: None,
+                    },
+                ],
+                field_origins: Vec::new(),
+            },
+            data_compat: DataCompatibility::default(),
+        }],
     }
 }
 #[cfg(target_arch = "wasm32")]

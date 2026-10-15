@@ -39,7 +39,9 @@ pub(super) fn prepare(
     }
     if matches!(
         request.tool_choice.as_ref(),
-        Some(stravia_runtime_contract::protocol::ir::ToolChoice::Native(_))
+        Some(stravia_runtime_contract::protocol::ir::ToolChoice::Native(
+            _
+        ))
     ) {
         request.tool_choice = None;
     }

@@ -6,7 +6,6 @@ use http::header::HeaderMap;
 use serde_json::Value;
 
 use stravia_runtime_contract::protocol::ir::AiRequest;
-use stravia_runtime_contract::protocol::ir::{Modality, ReasoningSummary, native_tool_to_gemini};
 use stravia_runtime_contract::protocol::ir::request::AiItem;
 use stravia_runtime_contract::protocol::ir::request::ContentBlock;
 use stravia_runtime_contract::protocol::ir::request::MediaSource;
@@ -14,6 +13,7 @@ use stravia_runtime_contract::protocol::ir::request::MessageContent;
 use stravia_runtime_contract::protocol::ir::request::ResponseFormat;
 use stravia_runtime_contract::protocol::ir::request::Role;
 use stravia_runtime_contract::protocol::ir::request::ToolChoice;
+use stravia_runtime_contract::protocol::ir::{Modality, ReasoningSummary, native_tool_to_gemini};
 
 pub struct GoogleEncoder;
 
@@ -97,8 +97,7 @@ impl GoogleEncoder {
         }
 
         let system_val = raw_system.or_else(|| {
-            (!system_parts.is_empty())
-                .then(|| object([("parts", Value::Array(system_parts))]))
+            (!system_parts.is_empty()).then(|| object([("parts", Value::Array(system_parts))]))
         });
         let mut body = object([("contents", Value::Array(contents))]);
         let obj = body.as_object_mut().unwrap();
@@ -110,9 +109,12 @@ impl GoogleEncoder {
         // ── generationConfig ──────────────────────────────────────────────────
         let mut gen_config = serde_json::Map::new();
         if let Some(voice) = req.parameters.audio.take().and_then(|audio| audio.voice) {
-            gen_config.insert("speechConfig".into(), serde_json::json!({
-                "voiceConfig": {"prebuiltVoiceConfig": {"voiceName": voice}}
-            }));
+            gen_config.insert(
+                "speechConfig".into(),
+                serde_json::json!({
+                    "voiceConfig": {"prebuiltVoiceConfig": {"voiceName": voice}}
+                }),
+            );
         }
         for (key, value) in [
             ("topK", req.parameters.top_k.map(Value::from)),
@@ -120,7 +122,10 @@ impl GoogleEncoder {
                 "candidateCount",
                 req.parameters.candidate_count.map(Value::from),
             ),
-            ("responseLogprobs", req.parameters.logprobs.map(|_| Value::Bool(true))),
+            (
+                "responseLogprobs",
+                req.parameters.logprobs.map(|_| Value::Bool(true)),
+            ),
             ("logprobs", req.parameters.logprobs.map(Value::from)),
             (
                 "responseModalities",
@@ -128,11 +133,16 @@ impl GoogleEncoder {
                     Value::Array(
                         values
                             .into_iter()
-                            .map(|value| Value::String(match value {
-                                Modality::Text => "TEXT",
-                                Modality::Audio => "AUDIO",
-                                Modality::Image => "IMAGE",
-                            }.into()))
+                            .map(|value| {
+                                Value::String(
+                                    match value {
+                                        Modality::Text => "TEXT",
+                                        Modality::Audio => "AUDIO",
+                                        Modality::Image => "IMAGE",
+                                    }
+                                    .into(),
+                                )
+                            })
                             .collect(),
                     )
                 }),
@@ -240,8 +250,7 @@ impl GoogleEncoder {
             };
         }
         let summary_disabled = req.reasoning.summary == Some(ReasoningSummary::None)
-            || req.reasoning.level
-            == Some(stravia_runtime_contract::thinking::ThinkingLevel::Off)
+            || req.reasoning.level == Some(stravia_runtime_contract::thinking::ThinkingLevel::Off)
             || req.reasoning.mode.as_deref() == Some("disabled")
             || matches!(
                 req.reasoning.target_control,
@@ -289,24 +298,25 @@ impl GoogleEncoder {
 
         // ── Tool choice ───────────────────────────────────────────────────────
         let calling_config = match req.tool_choice {
-                Some(ToolChoice::Auto) => Some(serde_json::json!({"mode": "AUTO"})),
-                Some(ToolChoice::None) => Some(serde_json::json!({"mode": "NONE"})),
-                Some(ToolChoice::Required) => Some(serde_json::json!({"mode": "ANY"})),
-                Some(ToolChoice::Named { name }) => {
-                    Some(serde_json::json!({"mode": "ANY", "allowedFunctionNames": [name]}))
-                }
-                Some(ToolChoice::Allowed { names, required }) => {
-                    Some(serde_json::json!({
-                        "mode": if required { "ANY" } else { "AUTO" },
-                        "allowedFunctionNames": names,
-                    }))
-                }
-                _ => None,
+            Some(ToolChoice::Auto) => Some(serde_json::json!({"mode": "AUTO"})),
+            Some(ToolChoice::None) => Some(serde_json::json!({"mode": "NONE"})),
+            Some(ToolChoice::Required) => Some(serde_json::json!({"mode": "ANY"})),
+            Some(ToolChoice::Named { name }) => {
+                Some(serde_json::json!({"mode": "ANY", "allowedFunctionNames": [name]}))
+            }
+            Some(ToolChoice::Allowed { names, required }) => Some(serde_json::json!({
+                "mode": if required { "ANY" } else { "AUTO" },
+                "allowedFunctionNames": names,
+            })),
+            _ => None,
         };
         if let Some(calling_config) = calling_config {
-            obj.insert("toolConfig".into(), serde_json::json!({
-                "functionCallingConfig": calling_config
-            }));
+            obj.insert(
+                "toolConfig".into(),
+                serde_json::json!({
+                    "functionCallingConfig": calling_config
+                }),
+            );
         }
 
         crate::codec::control_projection::project_request(

@@ -263,9 +263,7 @@ fn bedrock_projects_unified_metadata_without_vendor_specific_state() {
 
 #[test]
 fn bedrock_omits_unrepresentable_tool_choices_and_native_tools() {
-    use stravia_runtime_contract::protocol::ir::{
-        NativeTool, NativeToolKind, WebSearchTool,
-    };
+    use stravia_runtime_contract::protocol::ir::{NativeTool, NativeToolKind, WebSearchTool};
 
     for choice in [
         ToolChoice::Allowed {
@@ -325,10 +323,7 @@ fn bedrock_native_structured_output_normalizes_to_one_canonical_format() {
     assert_eq!(name, "native");
     assert_eq!(decoded_schema, &schema);
     assert!(strict.is_none());
-    assert_eq!(
-        description.as_deref(),
-        Some("native description")
-    );
+    assert_eq!(description.as_deref(), Some("native description"));
 }
 
 #[test]

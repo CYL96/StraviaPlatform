@@ -376,4 +376,3 @@ pub struct GoogleFunctionDecl {
     )]
     pub parameters_json_schema: Option<Value>,
 }
-

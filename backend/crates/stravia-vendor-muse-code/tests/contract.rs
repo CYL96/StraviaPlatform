@@ -690,16 +690,16 @@ async fn meta_projection_omits_foreign_controls_and_keeps_supported_native_value
     parameters["extensions"] = json!({"open-responses":{"arbitrary_control":true}});
     parameters["arbitrary_control"] = json!(true);
     req.parameters = serde_json::from_value(parameters).unwrap();
-    req.parameters.native_tools.push(
-        stravia_runtime_contract::protocol::ir::NativeTool::Custom(
+    req.parameters
+        .native_tools
+        .push(stravia_runtime_contract::protocol::ir::NativeTool::Custom(
             stravia_runtime_contract::protocol::ir::CustomTool {
                 name: "patch".into(),
                 description: None,
                 defer_loading: None,
                 grammar: None,
             },
-        ),
-    );
+        ));
     let mut p = provider("subscription", true);
     p.operation_metadata
         .insert("transport_affinity".into(), json!("scoped-session"));

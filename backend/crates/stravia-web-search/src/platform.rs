@@ -589,7 +589,10 @@ mod tests {
         for tool in tools {
             let mut request = AiRequest::new("model", Vec::<AiItem>::new());
             assert!(!native_web_search_requested(&request));
-            request.parameters.native_tools.push(tool.expect("native search"));
+            request
+                .parameters
+                .native_tools
+                .push(tool.expect("native search"));
             assert!(native_web_search_requested(&request));
         }
     }
@@ -662,9 +665,12 @@ mod tests {
             .parameters
             .native_tools
             .push(NativeTool::WebSearch(WebSearchTool::default()));
-        request.parameters.native_tools.push(NativeTool::CodeExecution(
-            stravia_runtime_contract::protocol::ir::CodeExecutionTool::default(),
-        ));
+        request
+            .parameters
+            .native_tools
+            .push(NativeTool::CodeExecution(
+                stravia_runtime_contract::protocol::ir::CodeExecutionTool::default(),
+            ));
         request.tool_choice = Some(ToolChoice::Native(NativeToolKind::WebSearch));
 
         let batch = client_web_search_precedence(&request).expect("client-owned collision");
