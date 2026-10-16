@@ -1,6 +1,6 @@
 use super::manifest_index::DebugTraceIndex;
 use serde_json::Value;
-use sqlx::{Connection, PgPool, Row, SqlitePool};
+use sqlx::{PgPool, Row, SqlitePool};
 use std::sync::Arc;
 
 use super::types::{
@@ -137,7 +137,11 @@ impl ObservationStore {
         };
         match self {
             Self::Sqlite(pool, _, write_gate) => {
-                let _write_gate = write_gate.lock().await;
+                let _write_gate = tracing::Instrument::instrument(
+                    write_gate.lock(),
+                    tracing::info_span!(target: "stravia::perf", "sqlite.write_gate.wait"),
+                )
+                .await;
                 let mut tx = pool.begin().await?;
                 let seq = next_sqlite(&mut tx).await?;
                 let row: Option<CompletionRow> = sqlx::query_as(
@@ -277,31 +281,55 @@ impl ObservationStore {
     ) -> anyhow::Result<()> {
         match self {
             Self::Sqlite(pool, _, write_gate) => {
-                let _write_gate = write_gate.lock().await;
+                let _write_gate = tracing::Instrument::instrument(
+                    write_gate.lock(),
+                    tracing::info_span!(target: "stravia::perf", "sqlite.write_gate.wait"),
+                )
+                .await;
                 let mut tx = pool.begin().await?;
                 sqlx::query("INSERT INTO observation_tail_sources (run_id,interaction_id,principal,last_unit_hash,expires_at) VALUES (?,?,?,?,?) ON CONFLICT(run_id) DO UPDATE SET interaction_id=excluded.interaction_id,principal=excluded.principal,last_unit_hash=excluded.last_unit_hash,expires_at=excluded.expires_at")
-                    .bind(run_id).bind(interaction_id).bind(principal).bind(last_unit_hash).bind(expires_at).execute(&mut *tx).await?;
+                .bind(run_id)
+                .bind(interaction_id)
+                .bind(principal)
+                .bind(last_unit_hash)
+                .bind(expires_at)
+                .execute(&mut *tx).await?;
                 sqlx::query("DELETE FROM observation_pending_tools WHERE run_id=?")
                     .bind(run_id)
                     .execute(&mut *tx)
                     .await?;
                 for tool_id in pending_tool_ids {
                     sqlx::query("INSERT INTO observation_pending_tools (principal,tool_id,run_id,interaction_id,expires_at) VALUES (?,?,?,?,?)")
-                        .bind(principal).bind(tool_id).bind(run_id).bind(interaction_id).bind(expires_at).execute(&mut *tx).await?;
+                    .bind(principal)
+                    .bind(tool_id)
+                    .bind(run_id)
+                    .bind(interaction_id)
+                    .bind(expires_at)
+                    .execute(&mut *tx).await?;
                 }
                 tx.commit().await?;
             }
             Self::Postgres(pool, _) => {
                 let mut tx = pool.begin().await?;
                 sqlx::query("INSERT INTO observation_tail_sources (run_id,interaction_id,principal,last_unit_hash,expires_at) VALUES ($1,$2,$3,$4,$5) ON CONFLICT(run_id) DO UPDATE SET interaction_id=EXCLUDED.interaction_id,principal=EXCLUDED.principal,last_unit_hash=EXCLUDED.last_unit_hash,expires_at=EXCLUDED.expires_at")
-                    .bind(run_id).bind(interaction_id).bind(principal).bind(last_unit_hash).bind(expires_at).execute(&mut *tx).await?;
+                .bind(run_id)
+                .bind(interaction_id)
+                .bind(principal)
+                .bind(last_unit_hash)
+                .bind(expires_at)
+                .execute(&mut *tx).await?;
                 sqlx::query("DELETE FROM observation_pending_tools WHERE run_id=$1")
                     .bind(run_id)
                     .execute(&mut *tx)
                     .await?;
                 for tool_id in pending_tool_ids {
                     sqlx::query("INSERT INTO observation_pending_tools (principal,tool_id,run_id,interaction_id,expires_at) VALUES ($1,$2,$3,$4,$5)")
-                        .bind(principal).bind(tool_id).bind(run_id).bind(interaction_id).bind(expires_at).execute(&mut *tx).await?;
+                    .bind(principal)
+                    .bind(tool_id)
+                    .bind(run_id)
+                    .bind(interaction_id)
+                    .bind(expires_at)
+                    .execute(&mut *tx).await?;
                 }
                 tx.commit().await?;
             }
@@ -321,7 +349,11 @@ impl ObservationStore {
     ) -> anyhow::Result<()> {
         match self {
             Self::Sqlite(pool, _, write_gate) => {
-                let _write_gate = write_gate.lock().await;
+                let _write_gate = tracing::Instrument::instrument(
+                    write_gate.lock(),
+                    tracing::info_span!(target: "stravia::perf", "sqlite.write_gate.wait"),
+                )
+                .await;
                 sqlx::query(
                     "UPDATE observation_tail_sources SET generation_node_id=? WHERE run_id=?",
                 )
@@ -536,7 +568,11 @@ impl ObservationStore {
         match self {
             Self::Sqlite(pool, _, write_gate) => {
                 // 先取得写锁，避免读取父状态后升级事务因并发写入而丢失子 Interaction。
-                let _write_gate = write_gate.lock().await;
+                let _write_gate = tracing::Instrument::instrument(
+                    write_gate.lock(),
+                    tracing::info_span!(target: "stravia::perf", "sqlite.write_gate.wait"),
+                )
+                .await;
                 let mut connection = pool.acquire().await?;
                 let mut tx = connection.begin_with("BEGIN IMMEDIATE").await?;
                 if admission.interrupt_parent
@@ -665,7 +701,11 @@ impl ObservationStore {
     pub async fn mark_observation_gap(&self, interaction_id: &str) -> anyhow::Result<bool> {
         let affected = match self {
             Self::Sqlite(pool, _, write_gate) => {
-                let _write_gate = write_gate.lock().await;
+                let _write_gate = tracing::Instrument::instrument(
+                    write_gate.lock(),
+                    tracing::info_span!(target: "stravia::perf", "sqlite.write_gate.wait"),
+                )
+                .await;
                 sqlx::query("UPDATE interaction_observations SET observation_gap=1 WHERE id=?")
                     .bind(interaction_id)
                     .execute(pool)
@@ -701,11 +741,13 @@ impl ObservationStore {
         let sequence = match self {
             Self::Sqlite(pool, _, write_gate) => {
                 // 没有 schema 级唯一约束，必须与所有事件写入串行化查询，事务锁即每个 run 的幂等边界。
-                let _write_gate = write_gate.lock().await;
-                let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
-                let root_run_id: Option<String> = sqlx::query_scalar(
-                    "SELECT i.root_run_id FROM inference_run_observations r JOIN interaction_observations i ON i.id=r.interaction_id WHERE r.id=? AND i.id=?",
+                let _write_gate = tracing::Instrument::instrument(
+                    write_gate.lock(),
+                    tracing::info_span!(target: "stravia::perf", "sqlite.write_gate.wait"),
                 )
+                .await;
+                let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+                let root_run_id: Option<String> = sqlx::query_scalar("SELECT i.root_run_id FROM inference_run_observations r JOIN interaction_observations i ON i.id=r.interaction_id WHERE r.id=? AND i.id=?")
                 .bind(run_id)
                 .bind(interaction_id)
                 .fetch_optional(&mut *tx)
@@ -1127,7 +1169,11 @@ impl ObservationStore {
             Self::Sqlite(pool, _, write_gate) => {
                 // Acquire the writer lock before reading the projection cursor: a deferred
                 // WAL read cannot upgrade after a concurrent admission/storage commit.
-                let _write_gate = write_gate.lock().await;
+                let _write_gate = tracing::Instrument::instrument(
+                    write_gate.lock(),
+                    tracing::info_span!(target: "stravia::perf", "sqlite.write_gate.wait"),
+                )
+                .await;
                 let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
                 // 过滤后才按批预占：被跳过的 Wire/空 credential 不占号。
                 let mut current_sequence: i64 = sqlx::query_scalar(
@@ -1317,10 +1363,15 @@ impl ObservationStore {
         let payload = serde_json::json!({"status":"disconnected","reason":"client_disconnected"});
         match self {
             Self::Sqlite(pool, _, write_gate) => {
-                let _write_gate = write_gate.lock().await;
+                let _write_gate = tracing::Instrument::instrument(
+                    write_gate.lock(),
+                    tracing::info_span!(target: "stravia::perf", "sqlite.write_gate.wait"),
+                )
+                .await;
                 let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
                 let interaction: Option<String> = sqlx::query_scalar("SELECT interaction_id FROM inference_run_observations WHERE id=? AND status='waiting_client' AND NOT EXISTS(SELECT 1 FROM inference_run_observations c WHERE c.parent_run_id=inference_run_observations.id AND c.interaction_id=inference_run_observations.interaction_id)")
-                    .bind(run_id).fetch_optional(&mut *tx).await?;
+                    .bind(run_id)
+                    .fetch_optional(&mut *tx).await?;
                 let Some(interaction) = interaction else {
                     return Ok(None);
                 };
@@ -1441,9 +1492,15 @@ impl ObservationStore {
         let payload = serde_json::json!({"status":"disconnected","reason":"client_wait_expired"});
         match self {
             Self::Sqlite(pool, _, write_gate) => {
-                let _write_gate = write_gate.lock().await;
+                let _write_gate = tracing::Instrument::instrument(
+                    write_gate.lock(),
+                    tracing::info_span!(target: "stravia::perf", "sqlite.write_gate.wait"),
+                )
+                .await;
                 let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
-                let candidates: Vec<(String, String)> = sqlx::query_as("SELECT interaction_id,id FROM inference_run_observations r WHERE r.status='waiting_client' AND r.last_active_at<=? AND NOT EXISTS(SELECT 1 FROM inference_run_observations c WHERE c.parent_run_id=r.id) ORDER BY r.interaction_id,r.id").bind(cutoff).fetch_all(&mut *tx).await?;
+                let candidates: Vec<(String, String)> = sqlx::query_as("SELECT interaction_id,id FROM inference_run_observations r WHERE r.status='waiting_client' AND r.last_active_at<=? AND NOT EXISTS(SELECT 1 FROM inference_run_observations c WHERE c.parent_run_id=r.id) ORDER BY r.interaction_id,r.id")
+                .bind(cutoff)
+                .fetch_all(&mut *tx).await?;
                 let mut events = Vec::new();
                 let mut index = 0;
                 while index < candidates.len() {
@@ -1577,9 +1634,15 @@ impl ObservationStore {
         })?;
         let seq = match self {
             Self::Sqlite(pool, _, write_gate) => {
-                let _write_gate = write_gate.lock().await;
+                let _write_gate = tracing::Instrument::instrument(
+                    write_gate.lock(),
+                    tracing::info_span!(target: "stravia::perf", "sqlite.write_gate.wait"),
+                )
+                .await;
                 let mut tx = pool.begin().await?;
-                let attempts = sqlx::query("SELECT id,model_turn_id,started_at,first_token_ms,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,reasoning_tokens,usage_recorded FROM target_attempt_observations WHERE run_id=? AND status='running' ORDER BY id").bind(run_id).fetch_all(&mut *tx).await?;
+                let attempts = sqlx::query("SELECT id,model_turn_id,started_at,first_token_ms,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,reasoning_tokens,usage_recorded FROM target_attempt_observations WHERE run_id=? AND status='running' ORDER BY id")
+                .bind(run_id)
+                .fetch_all(&mut *tx).await?;
                 for attempt in attempts {
                     let recorded: bool = attempt.try_get("usage_recorded")?;
                     let usage = if recorded {
@@ -1752,12 +1815,20 @@ impl ObservationStore {
     ) -> anyhow::Result<ObservationEvent> {
         match self {
             Self::Sqlite(pool, _, write_gate) => {
-                let _write_gate = write_gate.lock().await;
+                let _write_gate = tracing::Instrument::instrument(
+                    write_gate.lock(),
+                    tracing::info_span!(target: "stravia::perf", "sqlite.write_gate.wait"),
+                )
+                .await;
                 let mut tx = pool.begin().await?;
                 let seq = next_sqlite(&mut tx).await?;
                 // 耗时采用实际结束时刻；终态事件不能排到延迟记录的前序事件之前。
                 let (interrupted, recorded_at): (bool, i64) = sqlx::query_as("UPDATE inference_run_observations SET status=CASE WHEN user_interrupted=1 AND ?1!='failed' THEN 'user_interrupted' WHEN ?1='waiting_client' AND EXISTS(SELECT 1 FROM inference_run_observations c WHERE c.parent_run_id=inference_run_observations.id AND c.interaction_id=inference_run_observations.interaction_id) THEN 'superseded' ELSE ?1 END,terminal_reason=CASE WHEN user_interrupted=1 AND ?1!='failed' THEN 'user_interrupted' ELSE ?2 END,generation_node_id=COALESCE(?3,generation_node_id),finished_at=?4,last_active_at=MAX(last_active_at,?5),last_event_sequence=?6 WHERE id=?7 RETURNING user_interrupted,last_active_at").bind(&outcome.status).bind(&outcome.terminal_reason).bind(&outcome.generation_node_id).bind(now).bind(now).bind(seq).bind(run_id).fetch_one(&mut *tx).await?;
-                let (committed, parent, status, reason, delivered_at): (bool, Option<String>, String, Option<String>, Option<i64>) = sqlx::query_as("UPDATE inference_run_observations SET delivery_completed_at=COALESCE(delivery_completed_at,?),client_output_committed=MAX(client_output_committed,?),terminal_reason=CASE WHEN status='superseded' THEN 'superseded' ELSE terminal_reason END WHERE id=? RETURNING client_output_committed,generation_parent_id,status,terminal_reason,delivery_completed_at").bind(outcome.delivery_completed_at).bind(outcome.client_output_committed).bind(run_id).fetch_one(&mut *tx).await?;
+                let (committed, parent, status, reason, delivered_at): (bool, Option<String>, String, Option<String>, Option<i64>) = sqlx::query_as("UPDATE inference_run_observations SET delivery_completed_at=COALESCE(delivery_completed_at,?),client_output_committed=MAX(client_output_committed,?),terminal_reason=CASE WHEN status='superseded' THEN 'superseded' ELSE terminal_reason END WHERE id=? RETURNING client_output_committed,generation_parent_id,status,terminal_reason,delivery_completed_at")
+                        .bind(outcome.delivery_completed_at)
+                        .bind(outcome.client_output_committed)
+                        .bind(run_id)
+                        .fetch_one(&mut *tx).await?;
                 let mut payload = finish_payload(outcome, interrupted)?;
                 payload["finished_at"] = Value::from(now);
                 payload["status"] = Value::String(status);
@@ -1865,12 +1936,32 @@ impl ObservationStore {
             .transpose()?;
         match self {
             Self::Sqlite(pool, _, write_gate) => {
-                let _write_gate = write_gate.lock().await;
+                let _write_gate = tracing::Instrument::instrument(
+                    write_gate.lock(),
+                    tracing::info_span!(target: "stravia::perf", "sqlite.write_gate.wait"),
+                )
+                .await;
                 let mut tx = pool.begin().await?;
                 let seq = next_sqlite(&mut tx).await?;
                 sqlx::query("INSERT INTO rejected_request_observations (id,occurred_at,method,path,ingress_protocol,stage,code,status_code,debug_enabled,last_event_sequence,expires_at,started_at,duration_ms,failure_json,request_model,api_key_id,api_key_name) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
-                    .bind(&ingress.id).bind(now).bind(&ingress.method).bind(&ingress.path).bind(&ingress.protocol).bind(&outcome.stage).bind(&outcome.code).bind(outcome.status_code).bind(debug).bind(seq).bind(expires_at)
-                    .bind(started_at).bind(duration_ms).bind(&failure).bind(&metadata.model).bind(&metadata.api_key_id).bind(&metadata.api_key_name).execute(&mut *tx).await?;
+                    .bind(&ingress.id)
+                    .bind(now)
+                    .bind(&ingress.method)
+                    .bind(&ingress.path)
+                    .bind(&ingress.protocol)
+                    .bind(&outcome.stage)
+                    .bind(&outcome.code)
+                    .bind(outcome.status_code)
+                    .bind(debug)
+                    .bind(seq)
+                    .bind(expires_at)
+                    .bind(started_at)
+                    .bind(duration_ms)
+                    .bind(&failure)
+                    .bind(&metadata.model)
+                    .bind(&metadata.api_key_id)
+                    .bind(&metadata.api_key_name)
+                    .execute(&mut *tx).await?;
                 insert_event_sqlite(
                     &mut tx,
                     EventInsert {
@@ -1961,13 +2052,20 @@ impl ObservationStore {
         let now = chrono::Utc::now().timestamp_millis();
         match self {
             Self::Sqlite(pool, _, write_gate) => {
-                let _write_gate = write_gate.lock().await;
+                let _write_gate = tracing::Instrument::instrument(
+                    write_gate.lock(),
+                    tracing::info_span!(target: "stravia::perf", "sqlite.write_gate.wait"),
+                )
+                .await;
                 let mut tx = pool.begin().await?;
-                let mut runs:Vec<(String,String,String,i64)>=sqlx::query_as("SELECT r.interaction_id,r.id,r.status,r.expires_at FROM inference_run_observations r WHERE r.status='running' OR r.background_active>0 OR EXISTS(SELECT 1 FROM model_turn_observations mt WHERE mt.run_id=r.id AND mt.status='running') OR EXISTS(SELECT 1 FROM target_attempt_observations ta WHERE ta.run_id=r.id AND ta.status='running')").fetch_all(&mut *tx).await?;
-                let old_interactions: Vec<(String, i64)> = sqlx::query_as("SELECT id,last_event_sequence FROM interaction_observations WHERE status IN ('running','waiting_client')").fetch_all(&mut *tx).await?;
+                let mut runs:Vec<(String,String,String,i64)>=sqlx::query_as("SELECT r.interaction_id,r.id,r.status,r.expires_at FROM inference_run_observations r WHERE r.status='running' OR r.background_active>0 OR EXISTS(SELECT 1 FROM model_turn_observations mt WHERE mt.run_id=r.id AND mt.status='running') OR EXISTS(SELECT 1 FROM target_attempt_observations ta WHERE ta.run_id=r.id AND ta.status='running')")
+                    .fetch_all(&mut *tx).await?;
+                let old_interactions: Vec<(String, i64)> = sqlx::query_as("SELECT id,last_event_sequence FROM interaction_observations WHERE status IN ('running','waiting_client')")
+                    .fetch_all(&mut *tx).await?;
                 let mut affected: std::collections::HashMap<String, i64> =
                     old_interactions.into_iter().collect();
-                let waiting: Vec<(String, String, String, i64)> = sqlx::query_as("SELECT r.interaction_id,r.id,r.status,r.expires_at FROM inference_run_observations r WHERE r.status='waiting_client' AND EXISTS(SELECT 1 FROM interaction_observations i WHERE i.id=r.interaction_id AND i.status IN ('running','waiting_client')) AND NOT EXISTS(SELECT 1 FROM inference_run_observations c WHERE c.parent_run_id=r.id AND c.interaction_id=r.interaction_id) ORDER BY r.interaction_id,r.id").fetch_all(&mut *tx).await?;
+                let waiting: Vec<(String, String, String, i64)> = sqlx::query_as("SELECT r.interaction_id,r.id,r.status,r.expires_at FROM inference_run_observations r WHERE r.status='waiting_client' AND EXISTS(SELECT 1 FROM interaction_observations i WHERE i.id=r.interaction_id AND i.status IN ('running','waiting_client')) AND NOT EXISTS(SELECT 1 FROM inference_run_observations c WHERE c.parent_run_id=r.id AND c.interaction_id=r.interaction_id) ORDER BY r.interaction_id,r.id")
+                    .fetch_all(&mut *tx).await?;
                 let existing: std::collections::HashSet<_> =
                     runs.iter().map(|run| run.1.as_str()).collect();
                 let mut pending = Vec::new();

@@ -82,10 +82,15 @@ impl ClientConnectionObservation {
         }
         let writer = self.observation.inner.writer.clone();
         let command = WriterCommand::ClientDisconnected { runs };
+        let perf_context = crate::performance::current_context();
         if let Err(error) = writer.try_send(command) {
             // 断线不阻塞传输清理；队列繁忙时仍按写者顺序提交状态更新。
             tokio::spawn(async move {
-                if writer.send(error.into_inner()).await.is_err() {
+                if writer
+                    .send_with_context(*error.into_inner(), perf_context)
+                    .await
+                    .is_err()
+                {
                     tracing::warn!("client disconnect observation unavailable");
                 }
             });
@@ -99,7 +104,7 @@ const WAITING_CLIENT_IDLE_MS: i64 = 24 * 60 * 60 * 1000;
 
 struct Inner {
     store: ObservationStore,
-    writer: mpsc::Sender<WriterCommand>,
+    writer: writer::WriterSender,
     text_slots: Arc<tokio::sync::Semaphore>,
     writer_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     updates: broadcast::Sender<ObservationUpdate>,
@@ -165,6 +170,8 @@ impl InteractionObservation {
         generation_chains: crate::generation_chain::GenerationChain,
         sqlite_write_gate: Option<Arc<tokio::sync::Mutex<()>>>,
     ) -> Self {
+        let performance_sqlite_pool = sqlite.clone();
+        let performance_postgres_pool = postgres.clone();
         let ephemeral_root = (!persistent).then(|| {
             data_dir.join(format!(
                 ".ephemeral-{}",
@@ -251,7 +258,10 @@ impl InteractionObservation {
                 live_content,
                 trace_sequence,
                 debug,
-                metrics_upkeep: Mutex::new(crate::performance::spawn_upkeep()),
+                metrics_upkeep: Mutex::new(crate::performance::spawn_upkeep(
+                    performance_sqlite_pool,
+                    performance_postgres_pool,
+                )),
                 retention_days,
                 traces,
                 bundles,
@@ -745,7 +755,7 @@ pub(crate) struct IngressObserver {
     start: Option<IngressStart>,
     debug_enabled: bool,
     trace: Option<TraceHandle>,
-    finalization: Option<mpsc::OwnedPermit<WriterCommand>>,
+    finalization: Option<writer::WriterPermit>,
     rejection_id: Option<String>,
     websocket: bool,
 }
@@ -1009,10 +1019,10 @@ struct RunObserverInner {
     event_boundary: Mutex<()>,
     gap: AtomicBool,
     gap_reported: AtomicBool,
-    finalization: Mutex<Option<mpsc::OwnedPermit<WriterCommand>>>,
-    completion: Mutex<Option<mpsc::OwnedPermit<WriterCommand>>>,
+    finalization: Mutex<Option<writer::WriterPermit>>,
+    completion: Mutex<Option<writer::WriterPermit>>,
     pending_finish: Mutex<Option<(RunOutcome, i64)>>,
-    queued_text: Mutex<Option<Arc<Mutex<Option<RunEvent>>>>>,
+    queued_text: Mutex<Option<Arc<Mutex<writer::QueuedText>>>>,
     failure: Mutex<Option<FailureDiagnostic>>,
     generation_commit_fences: Mutex<Vec<crate::generation_chain::GenerationCommitFence>>,
     // Canonical user text remains memory-only until Model Turn protection succeeds.
@@ -1440,7 +1450,7 @@ impl RunObserver {
         let text_len = writer::text_mut(&mut event).map(|text| text.len());
         if let (Some(len), Some(pending)) = (text_len, queued.as_ref()) {
             let mut pending = pending.lock();
-            if let Some(previous) = pending.as_mut()
+            if let Some(previous) = pending.event.as_mut()
                 && writer::same_scope(previous, &event)
                 && writer::text_mut(previous).is_some_and(|text| {
                     text.len().saturating_add(len) <= writer::LIVE_COALESCE_BYTES
@@ -1450,6 +1460,7 @@ impl RunObserver {
                 writer::text_mut(previous)
                     .expect("same text scope")
                     .push_str(text);
+                pending.resize_usage();
                 return;
             }
         }
@@ -1473,7 +1484,7 @@ impl RunObserver {
                     .record(&self.inner.run_id, writer::now());
                 return;
             };
-            let pending = Arc::new(Mutex::new(Some(event)));
+            let pending = Arc::new(Mutex::new(writer::QueuedText::new(event)));
             *queued = Some(Arc::clone(&pending));
             WriterCommand::Text {
                 run_id: self.inner.run_id.clone(),
@@ -1544,7 +1555,7 @@ impl RunObserver {
                     outcome,
                     finished_at,
                     ..
-                } = error.into_inner()
+                } = *error.into_inner()
                 {
                     *self.inner.pending_finish.lock() = Some((outcome, finished_at));
                 }

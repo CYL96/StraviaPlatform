@@ -177,7 +177,7 @@ async fn sqlite_upgrade_requires_explicit_route_reconfiguration_and_preserves_id
             .cloned()
             .collect(),
     );
-    prefix.run(&pool).await?;
+    prefix.run(pool.migration_pool()).await?;
     sqlx::raw_sql(HISTORICAL_ROUTES).execute(&pool).await?;
     stravia_core::migrations::migrate_sqlite(&pool, None).await?;
     let storage = SqliteStorage::from_pool(pool.clone());
@@ -230,7 +230,7 @@ async fn postgres_upgrade_requires_explicit_route_reconfiguration_and_preserves_
                 .cloned()
                 .collect(),
         );
-        prefix.run(&pool).await?;
+        prefix.run(pool.migration_pool()).await?;
         sqlx::raw_sql(HISTORICAL_ROUTES).execute(&pool).await?;
         stravia_core::migrations::migrate_postgres(&pool, None).await?;
         let mut storage_url = url::Url::parse(&url)?;

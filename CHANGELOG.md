@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Added
+
+- Debug performance exports now include bounded timestamped host CPU/RSS and managed-resource histories for active inference, observation queues, local and last-observed Redis cache usage, Wire buffers, and SQL pools, with explicit capacities, drops, epochs, freshness, and measurement limits. Explicit `active` / `frozen` / `finished` capture states and separate live/frozen counts distinguish in-flight work from truncated records; legacy incomplete totals no longer imply data loss.
+- SQL diagnostics are collected centrally through shared pool, connection, and transaction handles without wrapping individual queries. Timelines include template fingerprints, driver outcomes, safe error codes, row counts, and successful, failed, or cancelled acquisition timings; SQL text, bind values, and formatted database errors remain excluded.
+- Split key admission, write-gate, upstream-header, and observation-queue waits from processing, and link background commands to their originating Debug epoch without retaining request spans. Documented explicit Windows CPU/heap profiling workflows; performance timelines are still not CPU or heap profiles.
+
 ### Changed
 
 - **Breaking — all historical Routes require reconfiguration:** SQLite and PostgreSQL incremental migration `0021` leaves every existing Route nonexecutable until an administrator explicitly selects text or image output, fixes mismatched Targets, and saves each Route. Route IDs, Targets, scheduling parameters, enabled preferences, and image-generation references are retained; toggling enabled, ordinary edits, and repeated OneClick onboarding do not restore execution. Stop the instance and back up the complete data directory and any external database before upgrading; reopen traffic only after reconfiguration. Rollback requires restoring the pre-upgrade backup, not running an older binary against the upgraded schema.

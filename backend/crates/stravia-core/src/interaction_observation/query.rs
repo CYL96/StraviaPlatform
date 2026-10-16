@@ -379,14 +379,14 @@ macro_rules! interaction_batch_queries {
 }
 interaction_batch_queries!(
     sqlx::Sqlite,
-    sqlx::SqliteConnection,
+    sqlx::SqliteConnection<'_>,
     debug_flags_sqlite,
     context_events_sqlite,
     map_sqlite_events
 );
 interaction_batch_queries!(
     sqlx::Postgres,
-    sqlx::PgConnection,
+    sqlx::PgConnection<'_>,
     debug_flags_postgres,
     context_events_postgres,
     map_postgres_events
@@ -1395,7 +1395,7 @@ fn add_chain_token_filter_postgres(b: &mut QueryBuilder<sqlx::Postgres>, q: &For
 }
 
 async fn forest_roots_sqlite(
-    connection: &mut sqlx::SqliteConnection,
+    connection: &mut sqlx::SqliteConnection<'_>,
     q: &ForestQuery,
     start: i64,
     end: i64,
@@ -1435,7 +1435,7 @@ async fn forest_roots_sqlite(
     ))
 }
 async fn forest_roots_postgres(
-    connection: &mut sqlx::PgConnection,
+    connection: &mut sqlx::PgConnection<'_>,
     q: &ForestQuery,
     start: i64,
     end: i64,
@@ -1476,7 +1476,7 @@ async fn forest_roots_postgres(
 }
 
 async fn interactions_for_roots_sqlite(
-    p: &mut sqlx::SqliteConnection,
+    p: &mut sqlx::SqliteConnection<'_>,
     ids: &[String],
 ) -> anyhow::Result<Vec<InteractionRow>> {
     if ids.is_empty() {
@@ -1492,7 +1492,7 @@ async fn interactions_for_roots_sqlite(
     Ok(b.build_query_as().fetch_all(p).await?)
 }
 async fn interactions_for_roots_postgres(
-    p: &mut sqlx::PgConnection,
+    p: &mut sqlx::PgConnection<'_>,
     ids: &[String],
 ) -> anyhow::Result<Vec<InteractionRow>> {
     if ids.is_empty() {
@@ -1524,7 +1524,7 @@ async fn interaction_postgres(
     Ok(b.build_query_as().fetch_optional(p).await?)
 }
 async fn matching_in_roots_sqlite(
-    p: &mut sqlx::SqliteConnection,
+    p: &mut sqlx::SqliteConnection<'_>,
     q: &ForestQuery,
     ids: &[String],
 ) -> anyhow::Result<HashSet<String>> {
@@ -1547,7 +1547,7 @@ async fn matching_in_roots_sqlite(
         .collect())
 }
 async fn matching_in_roots_postgres(
-    p: &mut sqlx::PgConnection,
+    p: &mut sqlx::PgConnection<'_>,
     q: &ForestQuery,
     ids: &[String],
 ) -> anyhow::Result<HashSet<String>> {

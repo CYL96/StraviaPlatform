@@ -570,7 +570,7 @@ backend!(
     restore_sqlite,
     restore_sqlite_context,
     sqlx::Sqlite,
-    sqlx::SqliteConnection,
+    sqlx::SqliteConnection<'_>,
     ""
 );
 backend!(
@@ -581,6 +581,6 @@ backend!(
     restore_postgres,
     restore_postgres_context,
     sqlx::Postgres,
-    sqlx::PgConnection,
+    sqlx::PgConnection<'_>,
     " FOR KEY SHARE"
 );

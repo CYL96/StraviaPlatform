@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::StreamExt;
 use sha2::{Digest, Sha256};
-use sqlx::{Connection, PgPool, SqlitePool};
+use sqlx::{PgPool, SqlitePool};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 

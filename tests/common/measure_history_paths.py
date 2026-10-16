@@ -376,7 +376,11 @@ def trace_key(event):
 
 
 def attach_performance(session, row, before):
-    snapshot = timeline(session)
+    attach_performance_snapshot(row, before, timeline(session))
+
+
+def attach_performance_snapshot(row, before, snapshot):
+    """按完整因果链验收快照；活动状态本身不是采集丢失。"""
     prior = {trace_key(event) for event in before.get("traceEvents", []) if event.get("ph") == "X"}
     events = []
     for event in snapshot.get("traceEvents", []):
@@ -386,6 +390,9 @@ def attach_performance(session, row, before):
         # provider credentials, request content, or debug wire payloads.
         args = {key: value for key, value in event.get("args", {}).items()
                 if isinstance(value, (int, float, bool)) and not any(word in key.lower() for word in ("token", "key", "secret"))}
+        capture_state = event.get("args", {}).get("capture_state")
+        if capture_state in ("active", "frozen", "finished"):
+            args["capture_state"] = capture_state
         events.append({"name": event["name"], "ts_us": event.get("ts"), "dur_us": event.get("dur"), "args": args,
                        "sql_count": args.get("sql_query_count", 0), "sql_duration_us": args.get("sql_query_duration_us", 0)})
     row["performance_spans"] = events
@@ -393,13 +400,18 @@ def attach_performance(session, row, before):
     for event in events:
         stage_counts[event["name"]] = stage_counts.get(event["name"], 0) + 1
     row["performance_stage_counts"] = stage_counts
-    metadata_fields = ("dropped_active", "dropped_completed", "incomplete", "incomplete_total")
+    metadata_fields = ("dropped_active", "dropped_completed", "dropped_sql_completed", "dropped_resource_samples",
+                       "incomplete", "incomplete_total", "active_spans", "frozen_spans", "frozen_total")
+    loss_fields = ("dropped_active", "dropped_completed", "dropped_sql_completed", "dropped_resource_samples",
+                   "frozen_spans", "frozen_total")
     row["trace_metadata_before"] = {key: before.get("metadata", {}).get(key) for key in metadata_fields}
     row["trace_metadata_after"] = {key: snapshot.get("metadata", {}).get(key) for key in metadata_fields}
     row["trace_metadata_valid"] = all(
-        isinstance(row["trace_metadata_before"][key], int)
-        and isinstance(row["trace_metadata_after"][key], int)
-        and row["trace_metadata_after"][key] <= row["trace_metadata_before"][key]
+        type(row["trace_metadata_before"][key]) is int
+        and type(row["trace_metadata_after"][key]) is int
+        and row["trace_metadata_before"][key] >= 0
+        and row["trace_metadata_after"][key] >= 0
+        and (key not in loss_fields or row["trace_metadata_after"][key] <= row["trace_metadata_before"][key])
         for key in metadata_fields
     )
     prior_all = {trace_key(event) for event in before.get("traceEvents", [])}
@@ -407,34 +419,107 @@ def attach_performance(session, row, before):
                         if event.get("ph") == "B" and trace_key(event) not in prior_all]
     row["fresh_incomplete_spans"] = fresh_incomplete
     row["global_incomplete_spans"] = [event["name"] for event in snapshot.get("traceEvents", []) if event.get("ph") == "B"]
-    row["trace_metadata_valid"] = row["trace_metadata_valid"] and not row["global_incomplete_spans"]
+    span_events = [event for event in snapshot.get("traceEvents", []) if event.get("ph") in ("B", "X")]
+    capture_errors = []
+    for label, value in (("before", before), ("after", snapshot)):
+        states = {"active": 0, "frozen": 0}
+        for event in value.get("traceEvents", []):
+            if event.get("ph") not in ("B", "X"):
+                continue
+            state = event.get("args", {}).get("capture_state")
+            if (state, event["ph"]) not in (("active", "B"), ("frozen", "B"), ("finished", "X")):
+                capture_errors.append(f"{label}: invalid capture state: {event.get('name')}")
+            if isinstance(state, str) and state in states:
+                states[state] += 1
+            if state == "frozen":
+                capture_errors.append(f"{label}: frozen span: {event.get('name')}")
+        for state, field in (("active", "active_spans"), ("frozen", "frozen_spans")):
+            if value.get("metadata", {}).get(field) != states[state]:
+                capture_errors.append(f"{label}: {field} does not match retained spans")
     roots = [span for span in events if span["name"] == "proxy.inference_run"]
     row["inference_root_span_count"] = len(roots)
     root_id = roots[0]["args"].get("span_id") if len(roots) == 1 else None
     row["inference_root_span_id"] = root_id
-    by_id = {span["args"]["span_id"]: span for span in events if "span_id" in span["args"]}
+    by_id = {
+        event["args"]["span_id"]: {"name": event["name"], "dur_us": event.get("dur"), "args": event["args"]}
+        for event in snapshot.get("traceEvents", [])
+        if event.get("ph") in ("B", "X") and type(event.get("args", {}).get("span_id")) is int
+    }
+    if len(by_id) != len(span_events):
+        capture_errors.append("missing or duplicate span_id")
 
     def attribution(span):
         current = span
         visited = set()
+        background = False
         while True:
             identifier = current["args"].get("span_id")
-            if not isinstance(identifier, int) or identifier in visited:
+            if type(identifier) is not int or identifier in visited:
                 return "unattributed"
             visited.add(identifier)
-            if not isinstance(current.get("dur_us"), (int, float)):
+            if current["args"].get("capture_state") == "finished" and not isinstance(current.get("dur_us"), (int, float)):
                 return "unattributed"
+            background |= current["name"] == "observation.command.process"
             parent = current["args"].get("parent_id")
             if parent is None:
                 if identifier == root_id:
-                    return "inference"
+                    return "observation" if background else "inference"
                 if current["name"].startswith("observation."):
                     return "observation"
+                if background and current["name"] == "proxy.inference_run":
+                    return "observation"
+                if current["name"] == "proxy.inference_run":
+                    return "other_inference"
+                if current["name"] in ("sql.query", "sql.pool.acquire") and len(visited) == 1:
+                    return "unrelated_sql"
+                return "unattributed"
+            if type(parent) is not int:
                 return "unattributed"
             current = by_id.get(parent)
             if current is None:
                 return "unattributed"
 
+    # 缺失父节点和环不能用 observation 名称或已结束状态掩盖。
+    for span in by_id.values():
+        current = span
+        visited = set()
+        while True:
+            identifier = current["args"]["span_id"]
+            if identifier in visited:
+                capture_errors.append(f"causal cycle: {span['name']}")
+                break
+            visited.add(identifier)
+            parent = current["args"].get("parent_id")
+            if parent is None:
+                break
+            if type(parent) is not int or parent not in by_id:
+                capture_errors.append(f"missing parent: {span['name']}")
+                break
+            current = by_id[parent]
+
+    active = [
+        {"name": event["name"], "span_id": event.get("args", {}).get("span_id"),
+         "parent_id": event.get("args", {}).get("parent_id"),
+         "attribution": attribution({"name": event["name"], "args": event.get("args", {})})}
+        for event in span_events if event.get("args", {}).get("capture_state") == "active"
+    ]
+    row["active_request_spans"] = [span for span in active if span["attribution"] == "inference"]
+    row["active_observation_spans"] = [span for span in active if span["attribution"] == "observation"]
+    row["active_unrelated_spans"] = [
+        span for span in active if span["attribution"] in ("other_inference", "unrelated_sql")
+    ]
+    row["unattributed_active_spans"] = [span for span in active if span["attribution"] == "unattributed"]
+    row["trace_capture_errors"] = capture_errors
+    row["trace_metadata_valid"] = (
+        row["trace_metadata_valid"] and not capture_errors
+        and not row["active_request_spans"] and not row["unattributed_active_spans"]
+    )
+    request_spans = [span for span in events if attribution(span) == "inference"]
+    row["request_sql_span_count"] = sum(span["name"] == "sql.query" for span in request_spans)
+    row["request_sql_duration_us"] = sum(
+        span["dur_us"] for span in request_spans
+        if span["name"] == "sql.query" and isinstance(span["dur_us"], (int, float))
+    )
     routing_history = [span for span in events
                        if span["name"].startswith(("router.select", "generation_chain.", "turn_chain."))]
     request_history = [span for span in routing_history if attribution(span) == "inference"]
@@ -457,8 +542,9 @@ def attach_performance(session, row, before):
         len(roots) == 1 and isinstance(root_id, int)
         and isinstance(roots[0].get("dur_us"), (int, float))
         and bool(request_history) and not row["unattributed_routing_history_spans"]
+        and not row["active_request_spans"]
     )
-    row["trace_attribution"] = "exactly one completed inference root and its routing/history subtree; independent history is accepted only under complete observation.* roots and reported separately; nested SQL counts are not summed"
+    row["trace_attribution"] = "唯一已结束推理根及其同步 routing/history 因果子树；完整 observation 根或 command.process 因果链单列，活动的同步请求节点拒收；无父 SQL 或其他已证实推理根下的活动节点单列且不计请求 SQL；不均摊后台成本、不累加嵌套 SQL 计数"
 
 
 def finalize_validity(result, args):
@@ -528,7 +614,7 @@ def finalize_validity(result, args):
     if any(not row.get("performance_spans") for row in rows):
         result["failure_reasons"].append("missing per-request performance spans")
     if any(not row.get("trace_metadata_valid") for row in rows):
-        result["failure_reasons"].append("trace metadata missing or dropped/incomplete spans during request window")
+        result["failure_reasons"].append("trace metadata missing, dropped/frozen spans, invalid causal chains or unfinished request spans")
     if any(not row.get("request_span_valid") for row in rows):
         result["failure_reasons"].append("request trace lacks exactly one completed inference root or routing/history spans are outside its subtree")
     if result["rss_peak_bytes"] is None:
@@ -624,6 +710,7 @@ def main():
                     process, logs = start_stravia_server(stravia_binary=binary, args=command, env={
                         "RUST_LOG": "warn,stravia_server=info",
                         "STRAVIA_PERF_TRACE_COMPLETED_CAPACITY": str(args.trace_completed_capacity),
+                        "STRAVIA_PERF_SQL_COMPLETED_CAPACITY": str(args.trace_completed_capacity),
                     })
                     stage = f"repetition-{repetition}:setup-token"
                     token = wait_for_setup_token(logs, process, timeout=180)

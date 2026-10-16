@@ -6,7 +6,7 @@ use axum::body::{Body, to_bytes};
 use axum::extract::{Request as AxumRequest, State};
 use axum::http::{HeaderMap, Method, Request, StatusCode, Uri};
 use axum::response::Response;
-use sqlx::Connection as _;
+
 use stravia_core::Gateway;
 use stravia_core::config::GatewayConfig;
 use stravia_core::data_paths::DataPaths;

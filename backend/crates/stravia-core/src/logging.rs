@@ -9,7 +9,7 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer, fmt};
 
-use crate::performance::{self, PerformanceLayer, SqlxMetricsLayer};
+use crate::performance::{self, PerformanceLayer};
 
 /// 日志目录保留的滚动文件数上限；按天滚动下单文件不封顶，
 /// 以天数约束目录占用换取稳定可预期的命名。
@@ -60,32 +60,19 @@ pub fn init_runtime_logging(
         }
     });
     // callsite 虽固定，Debug 却可在运行时切换；不能把关闭缓存成 Interest::never。
-    let sql_layer = SqlxMetricsLayer.with_filter(
+    let perf_layer = PerformanceLayer.with_filter(
         dynamic_filter_fn(|meta, _ctx| {
-            (performance::is_sqlx_metric_target(meta.target()) || meta.target() == "stravia::perf")
-                && performance::enabled()
+            performance::is_performance_target(meta.target()) && performance::enabled()
         })
         .with_callsite_filter(|meta| {
-            if performance::is_sqlx_metric_target(meta.target()) || meta.target() == "stravia::perf"
-            {
+            if performance::is_performance_target(meta.target()) {
                 Interest::sometimes()
             } else {
                 Interest::never()
             }
         }),
     );
-    let perf_layer = PerformanceLayer.with_filter(
-        dynamic_filter_fn(|meta, _ctx| meta.target() == "stravia::perf" && performance::enabled())
-            .with_callsite_filter(|meta| {
-                if meta.target() == "stravia::perf" {
-                    Interest::sometimes()
-                } else {
-                    Interest::never()
-                }
-            }),
-    );
     let registry = tracing_subscriber::registry()
-        .with(sql_layer)
         .with(perf_layer)
         .with(stdout_layer);
     let installed = match file_layer {
@@ -100,7 +87,7 @@ pub fn init_runtime_logging(
 }
 
 fn is_telemetry_target(target: &str) -> bool {
-    target == "stravia::perf" || target == "sqlx::query"
+    performance::is_performance_target(target) || target == "sqlx::query"
 }
 
 fn build_file_writer(

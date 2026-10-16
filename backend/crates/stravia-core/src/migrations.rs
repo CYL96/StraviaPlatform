@@ -71,7 +71,7 @@ fn supported_history(rows: &[(i64, bool, Vec<u8>)], migrator: &mut Migrator) -> 
 
 /// Offline copy accepts an existing supported prefix; startup upgrades the copy.
 pub async fn check_sqlite_source_history(
-    connection: &mut sqlx::SqliteConnection,
+    connection: &mut sqlx::SqliteConnection<'_>,
 ) -> anyhow::Result<()> {
     let mut runner = unlocked_runner(&SQLITE_MIGRATOR);
     reject_incompatible_sqlite(connection, &mut runner).await
@@ -291,13 +291,11 @@ pub async fn run_postgres_migrator(
 }
 
 async fn reject_incompatible_sqlite(
-    connection: &mut sqlx::SqliteConnection,
+    connection: &mut sqlx::SqliteConnection<'_>,
     migrator: &mut Migrator,
 ) -> anyhow::Result<()> {
-    let has_history: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = '_sqlx_migrations')",
-    )
-    .fetch_one(&mut *connection)
+    let has_history: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = '_sqlx_migrations')")
+        .fetch_one(&mut *connection)
     .await?;
     if has_history {
         let rows: Vec<(i64, bool, Vec<u8>)> = sqlx::query_as(
@@ -326,12 +324,12 @@ async fn reject_incompatible_sqlite(
 }
 
 async fn reject_incompatible_postgres(
-    connection: &mut sqlx::PgConnection,
+    connection: &mut sqlx::PgConnection<'_>,
     migrator: &mut Migrator,
 ) -> anyhow::Result<()> {
     let has_history: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM information_schema.tables \
-         WHERE table_schema = current_schema() AND table_name = '_sqlx_migrations')",
+     WHERE table_schema = current_schema() AND table_name = '_sqlx_migrations')",
     )
     .fetch_one(&mut *connection)
     .await?;
@@ -416,12 +414,10 @@ mod tests {
         ] {
             let pool = sqlite_pool().await;
             retained_value_migrator(historical, false)
-                .run(&pool)
+                .run(pool.migration_pool())
                 .await
                 .unwrap();
-            let installed: (Vec<u8>, String, i64, bool) = sqlx::query_as(
-                "SELECT checksum, CAST(installed_on AS TEXT), execution_time, success FROM _sqlx_migrations WHERE version=1",
-            )
+            let installed: (Vec<u8>, String, i64, bool) = sqlx::query_as("SELECT checksum, CAST(installed_on AS TEXT), execution_time, success FROM _sqlx_migrations WHERE version=1")
             .fetch_one(&pool)
             .await
             .unwrap();
@@ -469,7 +465,7 @@ mod tests {
                 .await
                 .unwrap();
             retained_value_migrator(historical, false)
-                .run(&pool)
+                .run(pool.migration_pool())
                 .await
                 .unwrap();
             let before: Vec<(i64, String)> = sqlx::query_as("SELECT id, value FROM retained_value")
@@ -568,12 +564,10 @@ mod tests {
             .await
             .unwrap();
         retained_value_migrator(RETAINED_VALUE_SQL.replace('\n', "\r\n"), false)
-            .run(&pool)
+            .run(pool.migration_pool())
             .await
             .unwrap();
-        let installed: (Vec<u8>, String, i64, bool) = sqlx::query_as(
-            "SELECT checksum, CAST(installed_on AS TEXT), execution_time, success FROM _sqlx_migrations WHERE version=1",
-        )
+        let installed: (Vec<u8>, String, i64, bool) = sqlx::query_as("SELECT checksum, CAST(installed_on AS TEXT), execution_time, success FROM _sqlx_migrations WHERE version=1")
         .fetch_one(&pool)
         .await
         .unwrap();
@@ -623,8 +617,9 @@ mod tests {
                 .cloned()
                 .collect(),
         );
-        prefix.run(&pool).await.unwrap();
-        sqlx::raw_sql("INSERT INTO interaction_observations(id,principal,api_key_id,api_key_name,root_id,root_run_id,first_route_id,status,started_at,last_active_at,expires_at) VALUES ('historical','owner','deleted-key','Old Key','historical','historical','deleted-model','completed',900000,900100,1);\nINSERT INTO inference_run_observations(id,interaction_id,ingress_protocol,route_id,status,debug_enabled,started_at,last_active_at,finished_at,expires_at) VALUES ('historical','historical','responses','deleted-model','completed',FALSE,900000,900100,900100,1);\nINSERT INTO model_turn_observations(id,run_id,interaction_id,route_id,model_display_name,api_key_id,api_key_name,status,started_at,finished_at,last_event_sequence) VALUES ('turn','historical','historical','deleted-model','Old Model','deleted-key','Old Key','completed',1800000,1800200,1);\nINSERT INTO target_attempt_observations(id,model_turn_id,run_id,interaction_id,target_id,provider_id,provider_name,upstream_model,protocol,status,started_at,duration_ms,input_tokens,output_tokens,cache_read_tokens,last_event_sequence) VALUES ('known','turn','historical','historical','target','deleted-provider','Old Provider','upstream','responses','completed',1800000,100,10,0,2,1), ('unknown','turn','historical','historical','target','deleted-provider','Old Provider','upstream','responses','completed',1800000,NULL,NULL,NULL,NULL,2);\nINSERT INTO rejected_request_observations(id,occurred_at,method,path,ingress_protocol,stage,code,status_code,debug_enabled,last_event_sequence,expires_at) VALUES ('rejected',900000,'POST','/v1/responses','responses','admission','invalid_request',400,FALSE,3,1);").execute(&pool).await.unwrap();
+        prefix.run(pool.migration_pool()).await.unwrap();
+        sqlx::raw_sql("INSERT INTO interaction_observations(id,principal,api_key_id,api_key_name,root_id,root_run_id,first_route_id,status,started_at,last_active_at,expires_at) VALUES ('historical','owner','deleted-key','Old Key','historical','historical','deleted-model','completed',900000,900100,1);\nINSERT INTO inference_run_observations(id,interaction_id,ingress_protocol,route_id,status,debug_enabled,started_at,last_active_at,finished_at,expires_at) VALUES ('historical','historical','responses','deleted-model','completed',FALSE,900000,900100,900100,1);\nINSERT INTO model_turn_observations(id,run_id,interaction_id,route_id,model_display_name,api_key_id,api_key_name,status,started_at,finished_at,last_event_sequence) VALUES ('turn','historical','historical','deleted-model','Old Model','deleted-key','Old Key','completed',1800000,1800200,1);\nINSERT INTO target_attempt_observations(id,model_turn_id,run_id,interaction_id,target_id,provider_id,provider_name,upstream_model,protocol,status,started_at,duration_ms,input_tokens,output_tokens,cache_read_tokens,last_event_sequence) VALUES ('known','turn','historical','historical','target','deleted-provider','Old Provider','upstream','responses','completed',1800000,100,10,0,2,1), ('unknown','turn','historical','historical','target','deleted-provider','Old Provider','upstream','responses','completed',1800000,NULL,NULL,NULL,NULL,2);\nINSERT INTO rejected_request_observations(id,occurred_at,method,path,ingress_protocol,stage,code,status_code,debug_enabled,last_event_sequence,expires_at) VALUES ('rejected',900000,'POST','/v1/responses','responses','admission','invalid_request',400,FALSE,3,1);")
+            .execute(&pool).await.unwrap();
         let mut interrupted = pool.begin().await.unwrap();
         sqlx::raw_sql(include_str!("../migrations/sqlite/0018_stats_usage.sql"))
             .execute(&mut *interrupted)
@@ -688,8 +683,9 @@ mod tests {
                 .cloned()
                 .collect(),
         );
-        prefix.run(&pool).await.unwrap();
-        sqlx::raw_sql("INSERT INTO interaction_observations(id,principal,api_key_id,api_key_name,root_id,root_run_id,first_route_id,status,started_at,last_active_at,expires_at) VALUES ('historical','owner','deleted-key','Old Key','historical','historical','deleted-model','completed',900000,900100,1);\nINSERT INTO inference_run_observations(id,interaction_id,ingress_protocol,route_id,status,debug_enabled,started_at,last_active_at,finished_at,expires_at) VALUES ('historical','historical','responses','deleted-model','completed',FALSE,900000,900100,900100,1);\nINSERT INTO model_turn_observations(id,run_id,interaction_id,route_id,model_display_name,api_key_id,api_key_name,status,started_at,finished_at,last_event_sequence) VALUES ('turn','historical','historical','deleted-model','Old Model','deleted-key','Old Key','completed',1800000,1800200,1);\nINSERT INTO target_attempt_observations(id,model_turn_id,run_id,interaction_id,target_id,provider_id,provider_name,upstream_model,protocol,status,started_at,duration_ms,input_tokens,output_tokens,cache_read_tokens,last_event_sequence) VALUES ('known','turn','historical','historical','target','deleted-provider','Old Provider','upstream','responses','completed',1800000,100,10,0,2,1), ('unknown','turn','historical','historical','target','deleted-provider','Old Provider','upstream','responses','completed',1800000,NULL,NULL,NULL,NULL,2);\nINSERT INTO rejected_request_observations(id,occurred_at,method,path,ingress_protocol,stage,code,status_code,debug_enabled,last_event_sequence,expires_at) VALUES ('rejected',900000,'POST','/v1/responses','responses','admission','invalid_request',400,FALSE,3,1);").execute(&pool).await.unwrap();
+        prefix.run(pool.migration_pool()).await.unwrap();
+        sqlx::raw_sql("INSERT INTO interaction_observations(id,principal,api_key_id,api_key_name,root_id,root_run_id,first_route_id,status,started_at,last_active_at,expires_at) VALUES ('historical','owner','deleted-key','Old Key','historical','historical','deleted-model','completed',900000,900100,1);\nINSERT INTO inference_run_observations(id,interaction_id,ingress_protocol,route_id,status,debug_enabled,started_at,last_active_at,finished_at,expires_at) VALUES ('historical','historical','responses','deleted-model','completed',FALSE,900000,900100,900100,1);\nINSERT INTO model_turn_observations(id,run_id,interaction_id,route_id,model_display_name,api_key_id,api_key_name,status,started_at,finished_at,last_event_sequence) VALUES ('turn','historical','historical','deleted-model','Old Model','deleted-key','Old Key','completed',1800000,1800200,1);\nINSERT INTO target_attempt_observations(id,model_turn_id,run_id,interaction_id,target_id,provider_id,provider_name,upstream_model,protocol,status,started_at,duration_ms,input_tokens,output_tokens,cache_read_tokens,last_event_sequence) VALUES ('known','turn','historical','historical','target','deleted-provider','Old Provider','upstream','responses','completed',1800000,100,10,0,2,1), ('unknown','turn','historical','historical','target','deleted-provider','Old Provider','upstream','responses','completed',1800000,NULL,NULL,NULL,NULL,2);\nINSERT INTO rejected_request_observations(id,occurred_at,method,path,ingress_protocol,stage,code,status_code,debug_enabled,last_event_sequence,expires_at) VALUES ('rejected',900000,'POST','/v1/responses','responses','admission','invalid_request',400,FALSE,3,1);")
+            .execute(&pool).await.unwrap();
         let mut interrupted = pool.begin().await.unwrap();
         sqlx::raw_sql(include_str!("../migrations/postgres/0018_stats_usage.sql"))
             .execute(&mut *interrupted)
@@ -789,7 +785,10 @@ mod tests {
     #[tokio::test]
     async fn sqlite_v1_upgrade_preserves_history_and_enforces_contracts() {
         let pool = sqlite_pool().await;
-        SQLITE_MIGRATOR.run_to(1, &pool).await.unwrap();
+        SQLITE_MIGRATOR
+            .run_to(1, pool.migration_pool())
+            .await
+            .unwrap();
         sqlx::query("INSERT INTO providers (id, name, protocol, base_url, api_key) VALUES ('p', 'Provider', 'openai', 'https://example.invalid', '')")
             .execute(&pool).await.unwrap();
         sqlx::query("INSERT INTO provider_models (provider_id, model_id, source_kind, presence, metadata_json) VALUES ('p', 'upstream', 'manual', 'present', '{\"name\":\"original\"}')")
@@ -1096,7 +1095,10 @@ mod tests {
             )
             .await
             .unwrap();
-        SQLITE_MIGRATOR.run_to(1, &pool).await.unwrap();
+        SQLITE_MIGRATOR
+            .run_to(1, pool.migration_pool())
+            .await
+            .unwrap();
         sqlx::query("INSERT INTO models (id, model_id, balance) VALUES ('r', 'route', 'invalid')")
             .execute(&pool)
             .await
@@ -1181,8 +1183,7 @@ mod tests {
         let scenario_pool = pool.clone();
         let result = tokio::spawn(async move {
         let pool = scenario_pool;
-        super::POSTGRES_MIGRATOR
-            .run_to(1, &pool)
+        super::POSTGRES_MIGRATOR.run_to(1, pool.migration_pool())
             .await
             .expect("v1 baseline");
         let expires_at = chrono::Utc::now().timestamp_millis() + 600_000;

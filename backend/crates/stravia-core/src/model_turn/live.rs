@@ -951,6 +951,9 @@ async fn select_with_rpm(
                     &input.deadline,
                     version,
                 )
+                .instrument(tracing::info_span!(
+                    target: "stravia::perf", "rpm.candidate.wait"
+                ))
                 .await
                 .map_err(|error| error.model_error())?;
         } else if !policy.is_empty() {

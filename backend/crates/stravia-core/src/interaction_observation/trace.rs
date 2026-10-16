@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 
+use crate::performance::{ResourceLease, ResourceUsage};
+
 use super::redaction::{REDACTED, RedactionKind};
 use super::types::TraceManifest;
 
@@ -141,6 +143,8 @@ struct ManagerInner {
     root: PathBuf,
     tx: mpsc::Sender<WriterCommand>,
     producer: parking_lot::Mutex<RecordProducer>,
+    queued_usage: ResourceUsage,
+    writing_usage: ResourceUsage,
     actual_retained: AtomicU64,
     clear_generation: AtomicU64,
     available: bool,
@@ -160,10 +164,16 @@ struct QueuedRecordBatch {
     records: Vec<Vec<u8>>,
     bytes: usize,
     sealed: bool,
+    usage: ResourceLease,
 }
 
 impl QueuedRecordBatch {
-    fn new(trace_id: Arc<str>, state: Arc<TraceState>, bytes: Vec<u8>) -> Self {
+    fn new(
+        trace_id: Arc<str>,
+        state: Arc<TraceState>,
+        bytes: Vec<u8>,
+        usage: &ResourceUsage,
+    ) -> Self {
         let byte_count = bytes.len();
         Self {
             trace_id,
@@ -171,6 +181,7 @@ impl QueuedRecordBatch {
             records: vec![bytes],
             bytes: byte_count,
             sealed: false,
+            usage: usage.lease(1, byte_count as u64),
         }
     }
 
@@ -248,6 +259,9 @@ impl ManagerInner {
             if batch.can_append(trace_id, bytes.len()) {
                 batch.bytes = batch.bytes.saturating_add(bytes.len());
                 batch.records.push(bytes);
+                let items = batch.records.len() as u64;
+                let bytes = batch.bytes as u64;
+                batch.usage.resize(items, bytes);
                 return Ok(());
             }
             batch.seal();
@@ -258,6 +272,7 @@ impl ManagerInner {
             Arc::clone(trace_id),
             Arc::clone(state),
             bytes,
+            &self.queued_usage,
         )));
         self.tx
             .try_send(WriterCommand::RecordBatch {
@@ -302,6 +317,8 @@ impl TraceManager {
             root,
             tx,
             producer: parking_lot::Mutex::new(RecordProducer::default()),
+            queued_usage: ResourceUsage::new("wire_queued_payload", "observation"),
+            writing_usage: ResourceUsage::new("wire_writing_payload", "observation"),
             actual_retained: AtomicU64::new(retained),
             clear_generation: AtomicU64::new(0),
             available: true,
@@ -324,6 +341,8 @@ impl TraceManager {
                 root: PathBuf::new(),
                 tx,
                 producer: parking_lot::Mutex::new(RecordProducer::default()),
+                queued_usage: ResourceUsage::new("wire_queued_payload", "observation"),
+                writing_usage: ResourceUsage::new("wire_writing_payload", "observation"),
                 actual_retained: AtomicU64::new(0),
                 clear_generation: AtomicU64::new(0),
                 available: false,
@@ -608,17 +627,25 @@ async fn writer_loop(inner: Arc<ManagerInner>, mut rx: mpsc::Receiver<WriterComm
                 }
             }
             WriterCommand::RecordBatch { batch } => {
-                let (trace_id, state, records) = {
+                let (trace_id, state, records, mut usage, mut remaining_bytes) = {
                     let mut batch = batch.lock();
                     batch.seal();
+                    let usage = inner
+                        .writing_usage
+                        .lease(batch.records.len() as u64, batch.bytes as u64);
+                    batch.usage.resize(0, 0);
+                    let bytes = std::mem::take(&mut batch.bytes);
                     (
                         Arc::clone(&batch.trace_id),
                         Arc::clone(&batch.state),
                         std::mem::take(&mut batch.records),
+                        usage,
+                        bytes,
                     )
                 };
                 let result = if let Some(writer) = writers.get_mut(trace_id.as_ref()) {
                     let mut result = Ok(());
+                    let mut remaining_items = records.len();
                     for bytes in records {
                         if writer
                             .write_record(&bytes, &inner.actual_retained)
@@ -628,6 +655,9 @@ async fn writer_loop(inner: Arc<ManagerInner>, mut rx: mpsc::Receiver<WriterComm
                             result = Err(WriteFailure);
                             break;
                         }
+                        remaining_items -= 1;
+                        remaining_bytes -= bytes.len();
+                        usage.resize(remaining_items as u64, remaining_bytes as u64);
                     }
                     result
                 } else {
@@ -747,6 +777,9 @@ struct ActiveWriter {
     state: Arc<TraceState>,
     buffered: Vec<u8>,
     record_ends: Vec<usize>,
+    // Logical encoded payload bytes; retained Vec capacity is not heap measurement.
+    buffered_usage: ResourceLease,
+    encoding_usage: ResourceUsage,
 }
 
 struct WriteFailure;
@@ -761,6 +794,7 @@ impl ActiveWriter {
             .encoder
             .encode(bytes, self.segment_bytes)
             .map_err(|_| WriteFailure)?;
+        let mut encoded_usage = self.encoding_usage.lease(1, encoded.len() as u64);
         if self.segment_bytes > 0
             && self.segment_bytes.saturating_add(encoded.len() as u64) > SEGMENT_LIMIT_BYTES
         {
@@ -768,6 +802,7 @@ impl ActiveWriter {
                 return Err(WriteFailure);
             }
             encoded = self.encoder.encode(bytes, 0).map_err(|_| WriteFailure)?;
+            encoded_usage.resize(1, encoded.len() as u64);
         }
         if !self.buffered.is_empty()
             && self.buffered.len().saturating_add(encoded.len()) > WRITE_BATCH_BYTES
@@ -777,6 +812,8 @@ impl ActiveWriter {
         }
         self.buffered.extend_from_slice(&encoded);
         self.record_ends.push(self.buffered.len());
+        self.buffered_usage
+            .resize(self.record_ends.len() as u64, self.buffered.len() as u64);
         self.segment_bytes += encoded.len() as u64;
         if self.buffered.len() >= WRITE_BATCH_BYTES && self.flush(retained).await.is_err() {
             return Err(WriteFailure);
@@ -866,6 +903,7 @@ impl ActiveWriter {
     fn clear_buffer(&mut self) {
         self.buffered.clear();
         self.record_ends.clear();
+        self.buffered_usage.resize(0, 0);
         if self.buffered.capacity() > WRITE_BATCH_BYTES {
             self.buffered = Vec::with_capacity(WRITE_BATCH_BYTES);
         }
@@ -883,6 +921,10 @@ async fn create_writer(
     trace_id: &str,
     state: Arc<TraceState>,
 ) -> io::Result<ActiveWriter> {
+    static BUFFER_USAGE: std::sync::LazyLock<ResourceUsage> =
+        std::sync::LazyLock::new(|| ResourceUsage::new("wire_encoded_buffer", "observation"));
+    static ENCODING_USAGE: std::sync::LazyLock<ResourceUsage> =
+        std::sync::LazyLock::new(|| ResourceUsage::new("wire_encoding_payload", "observation"));
     validate_trace_id(trace_id)?;
     let directory = root.join(trace_id);
     match tokio::fs::create_dir(&directory).await {
@@ -912,6 +954,8 @@ async fn create_writer(
         state,
         buffered: Vec::with_capacity(WRITE_BATCH_BYTES),
         record_ends: Vec::new(),
+        buffered_usage: BUFFER_USAGE.lease(0, 0),
+        encoding_usage: ENCODING_USAGE.clone(),
     })
 }
 

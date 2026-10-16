@@ -149,6 +149,7 @@ struct DeadlineLeaseStream {
 struct RootDeliveryStream {
     inner: Pin<Box<dyn Stream<Item = Result<bytes::Bytes, axum::Error>> + Send>>,
     root: tracing::Span,
+    request_usage: Option<crate::performance::ResourceLease>,
 }
 
 impl Stream for RootDeliveryStream {
@@ -158,7 +159,11 @@ impl Stream for RootDeliveryStream {
         // 只围绕一次同步 poll enter，不将 guard 穿越 await。
         let this = self.get_mut();
         let _entered = this.root.enter();
-        this.inner.as_mut().poll_next(context)
+        let result = this.inner.as_mut().poll_next(context);
+        if matches!(&result, Poll::Ready(None | Some(Err(_)))) {
+            this.request_usage.take();
+        }
+        result
     }
 }
 
@@ -211,6 +216,7 @@ pub(crate) struct DeferredWebSocketDelivery;
 
 pub(crate) struct WebSocketRunDelivery {
     root: tracing::Span,
+    request_usage: Option<crate::performance::ResourceLease>,
     delivery_span: tracing::Span,
     observer: RunObserver,
     connection: Option<crate::interaction_observation::ClientConnectionObservation>,
@@ -301,6 +307,7 @@ impl WebSocketRunDelivery {
             return;
         }
         self.finished = true;
+        self.request_usage.take();
         let metric_status = match status {
             "delivered" => "completed",
             "cancelled" => "cancelled",
@@ -1171,12 +1178,24 @@ pub(super) fn execute(input: RunInput) -> impl std::future::Future<Output = Resp
     // Keep the complete run state out of each caller's async frame, including
     // callers that poll directly rather than spawning a separately boxed task.
     Box::pin(async move {
+        static REQUESTS: std::sync::LazyLock<crate::performance::ResourceUsage> =
+            std::sync::LazyLock::new(|| {
+                crate::performance::ResourceUsage::new("requests", "inference_run")
+            });
+        let request_usage = REQUESTS.lease(1, 0);
         let root = tracing::info_span!(target: "stravia::perf", "proxy.inference_run", status = tracing::field::Empty);
-        execute_observed(input, root.clone()).instrument(root).await
+        execute_observed(input, root.clone(), request_usage)
+            .instrument(root)
+            .await
     })
 }
 
-async fn execute_observed(input: RunInput, root: tracing::Span) -> Response {
+async fn execute_observed(
+    input: RunInput,
+    root: tracing::Span,
+    request_usage: crate::performance::ResourceLease,
+) -> Response {
+    let mut request_usage = Some(request_usage);
     let extensions = input.context.extensions.clone();
     let ingress = input.ingress;
     let protocol = input.ingress.to_string();
@@ -1247,6 +1266,7 @@ async fn execute_observed(input: RunInput, root: tracing::Span) -> Response {
         (Some(observer), Some(ledger)) if extensions.contains::<DeferredWebSocketDelivery>() => {
             extensions.insert(WebSocketRunDelivery {
                 root: root.clone(),
+                request_usage: request_usage.take(),
                 delivery_span: tracing::info_span!(target: "stravia::perf", parent: &root, "proxy.client_delivery", status = tracing::field::Empty),
                 observer,
                 connection: extensions
@@ -1277,6 +1297,7 @@ async fn execute_observed(input: RunInput, root: tracing::Span) -> Response {
         let stream = RootDeliveryStream {
             inner: Box::pin(body.into_data_stream()),
             root,
+            request_usage,
         };
         Response::from_parts(parts, axum::body::Body::from_stream(stream))
     }

@@ -20,7 +20,7 @@ use super::types::{
     BundleRequest, BundleResourceKind, BundleStream, ConfirmedUsage, DownloadTicket,
     ObservationEvent, TraceManifest,
 };
-use super::writer::WriterCommand;
+use super::writer::{WriterCommand, WriterSender};
 
 const BUNDLE_SCHEMA_VERSION: u32 = 1;
 const TICKET_TTL: Duration = Duration::from_secs(60);
@@ -61,7 +61,7 @@ impl std::error::Error for TicketUnavailable {}
 #[derive(Clone)]
 pub(super) struct BundleExport {
     store: ObservationStore,
-    writer: mpsc::Sender<WriterCommand>,
+    writer: WriterSender,
     traces: TraceManager,
     active_traces: Arc<Mutex<HashMap<String, TraceHandle>>>,
     tickets: Arc<Mutex<HashMap<String, TicketEntry>>>,
@@ -75,7 +75,7 @@ struct TicketEntry {
 impl BundleExport {
     pub(super) fn new(
         store: ObservationStore,
-        writer: mpsc::Sender<WriterCommand>,
+        writer: WriterSender,
         traces: TraceManager,
         active_traces: Arc<Mutex<HashMap<String, TraceHandle>>>,
     ) -> Self {

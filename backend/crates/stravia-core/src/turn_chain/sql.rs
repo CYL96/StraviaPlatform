@@ -1,5 +1,5 @@
 use super::*;
-use sqlx::Connection;
+
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -163,7 +163,11 @@ impl SqlTurnChainStore {
                         ids.push_bind(id);
                     }
                     ids.push_bind(last.1).push_unseparated(")");
-                    let _write_gate = gate.lock().await;
+                    let _write_gate = tracing::Instrument::instrument(
+                        gate.lock(),
+                        tracing::info_span!(target: "stravia::perf", "sqlite.write_gate.wait"),
+                    )
+                    .await;
                     query.build().execute(pool).await?;
                     cursor = Some(last);
                 }
@@ -551,7 +555,11 @@ impl TurnChainStore for SqlTurnChainStore {
         match self {
             Self::Sqlite(pool, gate) => {
                 // 先与 Observation 协调，再拿连接和写事务，避免进入 SQLite busy handler 竞争。
-                let _write_gate = gate.lock().await;
+                let _write_gate = tracing::Instrument::instrument(
+                    gate.lock(),
+                    tracing::info_span!(target: "stravia::perf", "sqlite.write_gate.wait"),
+                )
+                .await;
                 let mut connection = pool
                     .acquire()
                     .await
@@ -866,7 +874,7 @@ impl TurnChainStore for SqlTurnChainStore {
         macro_rules! rebuild {
         ($pool:expr, $restore:ident $(, $gate:expr)?) => {{
             // SQLite: 持共享池写闸门跨整个事务，直到 commit 完成。
-            $(let _write_gate = $gate.lock().await;)?
+            $(let _write_gate = tracing::Instrument::instrument($gate.lock(), tracing::info_span!(target: "stravia::perf", "sqlite.write_gate.wait")).await;)?
             let mut transaction = $pool.begin().await
                 .map_err(|error| TurnUnavailable::Storage(error.to_string()))?;
             let now = chrono::Utc::now().timestamp_millis();
@@ -950,11 +958,15 @@ impl TurnChainStore for SqlTurnChainStore {
         loop {
             let rows = match self {
                 Self::Sqlite(pool, gate) => {
-                    let _write_gate = gate.lock().await;
+                    let _write_gate = tracing::Instrument::instrument(
+                        gate.lock(),
+                        tracing::info_span!(target: "stravia::perf", "sqlite.write_gate.wait"),
+                    )
+                    .await;
                     sqlx::query(
                         "DELETE FROM turn_chain_nodes WHERE expires_at <= ? \
-                     AND NOT EXISTS (SELECT 1 FROM turn_chain_nodes child \
-                     WHERE child.parent_id = turn_chain_nodes.id)",
+                                         AND NOT EXISTS (SELECT 1 FROM turn_chain_nodes child \
+                                         WHERE child.parent_id = turn_chain_nodes.id)",
                     )
                     .bind(now)
                     .execute(pool)
@@ -1018,7 +1030,7 @@ impl SqlTurnChainStore {
                     let mut encoded = tokio::task::spawn_blocking(move || content::encode(payload))
                         .await
                         .map_err(|error| anyhow::anyhow!("history rewrite preparation worker failed: {error}"))??;
-                    $(let _write_gate = $gate.lock().await;)?
+                    $(let _write_gate = tracing::Instrument::instrument($gate.lock(), tracing::info_span!(target: "stravia::perf", "sqlite.write_gate.wait")).await;)?
                     let mut transaction = $pool.begin().await?;
                     if !encoded.contents.is_empty() {
                         sqlx::query($lock).execute(&mut *transaction).await?;

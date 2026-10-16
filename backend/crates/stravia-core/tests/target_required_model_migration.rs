@@ -1,5 +1,5 @@
 use serde_json::{Value, json};
-use sqlx::{Connection, SqliteConnection};
+use sqlx::SqliteConnection;
 
 #[tokio::test]
 async fn required_target_model_migration_preserves_model_targets_and_rpm_settings() {
@@ -19,15 +19,13 @@ async fn required_target_model_migration_preserves_model_targets_and_rpm_setting
     ] {
         sqlx::raw_sql(migration).execute(&mut db).await.unwrap();
     }
-    sqlx::raw_sql(
-        "INSERT INTO providers (id, name, protocol, base_url, api_key) VALUES ('provider', 'Provider', 'openai', 'http://localhost', 'test');
-         INSERT INTO models (id, model_id) VALUES ('route', 'search'), ('orphan', 'old-search');
-         INSERT INTO model_backends (id, model_id, provider_id, model, priority, first_token_timeout_ms, target_retry_budget, target_cooldown_ms, enabled)
-         VALUES ('keep', 'route', 'provider', 'real-model', -7, 123, 2, 456, 0),
-                ('remove', 'route', 'provider', NULL, 0, 60000, 5, 120000, 1),
-                ('remove-only', 'orphan', 'provider', NULL, 0, 60000, 5, 120000, 1);",
-    )
-    .execute(&mut db)
+    sqlx::raw_sql("INSERT INTO providers (id, name, protocol, base_url, api_key) VALUES ('provider', 'Provider', 'openai', 'http://localhost', 'test');
+     INSERT INTO models (id, model_id) VALUES ('route', 'search'), ('orphan', 'old-search');
+     INSERT INTO model_backends (id, model_id, provider_id, model, priority, first_token_timeout_ms, target_retry_budget, target_cooldown_ms, enabled)
+     VALUES ('keep', 'route', 'provider', 'real-model', -7, 123, 2, 456, 0),
+            ('remove', 'route', 'provider', NULL, 0, 60000, 5, 120000, 1),
+            ('remove-only', 'orphan', 'provider', NULL, 0, 60000, 5, 120000, 1);")
+        .execute(&mut db)
     .await
     .unwrap();
     let retained = json!({"provider_id": "provider", "model": "real-model", "rpm_limit": null, "rpm_pool_id": "pool"});

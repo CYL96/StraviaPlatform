@@ -1,7 +1,7 @@
 //! Startup-only, resumable conversion of the observation v1 storage.
 use anyhow::{Context, ensure};
 use serde_json::{Value, json};
-use sqlx::{Connection, Row};
+use sqlx::Row;
 use std::{io::Write, path::Path};
 
 fn worker_count() -> usize {
@@ -157,7 +157,7 @@ fn export_manifest(root: &Path, manifest: Value) -> anyhow::Result<()> {
 }
 
 pub(crate) async fn export_debug_manifests_sqlite(
-    connection: &mut sqlx::SqliteConnection,
+    connection: &mut sqlx::SqliteConnection<'_>,
     root: Option<&Path>,
 ) -> anyhow::Result<()> {
     let exists: bool = sqlx::query_scalar(
@@ -225,7 +225,7 @@ pub(crate) async fn export_debug_manifests_sqlite(
 }
 
 pub(crate) async fn convert_event_storage_sqlite(
-    connection: &mut sqlx::SqliteConnection,
+    connection: &mut sqlx::SqliteConnection<'_>,
 ) -> anyhow::Result<()> {
     let exists: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?)",
@@ -525,7 +525,7 @@ pub(crate) async fn convert_event_storage_sqlite(
 }
 
 pub(crate) async fn export_debug_manifests_postgres(
-    connection: &mut sqlx::PgConnection,
+    connection: &mut sqlx::PgConnection<'_>,
     root: Option<&Path>,
 ) -> anyhow::Result<()> {
     let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
@@ -591,7 +591,7 @@ pub(crate) async fn export_debug_manifests_postgres(
 }
 
 pub(crate) async fn convert_event_storage_postgres(
-    connection: &mut sqlx::PgConnection,
+    connection: &mut sqlx::PgConnection<'_>,
 ) -> anyhow::Result<()> {
     let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
         .bind("observation_events_legacy")

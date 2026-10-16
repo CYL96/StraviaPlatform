@@ -244,6 +244,7 @@ async fn websocket_sent_partial_excludes_unsent_staged_output_and_preserves_item
     );
     let mut delivery = WebSocketRunDelivery {
         root: tracing::Span::none(),
+        request_usage: None,
         delivery_span: tracing::Span::none(),
         observer: observer.clone(),
         connection: None,

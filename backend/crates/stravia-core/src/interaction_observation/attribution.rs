@@ -64,6 +64,17 @@ pub(super) struct PreparedAdmission {
     fingerprint_gap: bool,
 }
 
+impl PreparedAdmission {
+    pub(super) fn logical_bytes(&self) -> usize {
+        self.received_input
+            .as_ref()
+            .map_or(0, Window::logical_bytes)
+            + self.canonical_fingerprint.len()
+            + self.generation_root_id.as_ref().map_or(0, String::len)
+            + self.generation_parent_id.as_ref().map_or(0, String::len)
+    }
+}
+
 impl AdmissionFacts {
     pub(super) fn prepare(self, run_id: &str) -> PreparedAdmission {
         let items = &self.client_request.items;

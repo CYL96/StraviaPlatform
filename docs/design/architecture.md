@@ -183,6 +183,7 @@ stravia/
 │           ├── db/               # SQLite 连接与模型辅助函数
 │           └── auth/
 │   ├── stravia-runtime-contract/ # IR/协议身份、Hook、Agent、Artifact、TurnChain、脱敏 trace 契约
+│   ├── stravia-sql/              # SQLite/PostgreSQL 统一池、连接、事务与诊断执行边界
 │   ├── stravia-media/            # 完整媒体理解、预处理、bridge、Derivative、报告与配置策略
 │   ├── stravia-web-search/       # Runner、Backend、报告/证据、公开工具与配置策略
 │   ├── stravia-credential-protection/ # Betterleaks/Kingfisher 规则、检测、替换/还原与 SQL 映射实现
@@ -200,6 +201,8 @@ stravia/
         └── route-targets-form.ts      # Target 列表恢复、排序、校验与提交投影
 ```
 
+
+工作区依赖键 `sqlx` 指向内部 `stravia-sql`，上游依赖以 `sqlx-native` 留在该边界内。query／QueryBuilder、驱动和原生事务机制继续复用 SQLx；项目池、连接与事务句柄在同一执行层生成无 SQL 正文、无绑定值的诊断，不在业务查询调用点逐处包装。Core、媒体、凭据映射和开发工具共享这一入口。原生迁移器通过集中迁移入口委托，初始化 callback 和驱动内部控制语句不冒充已观测应用查询；性能记录与覆盖边界见[统一性能 span 与时间线](interaction-observation.md#711-统一性能-span-与时间线)。
 
 **开发构建与调试：**
 

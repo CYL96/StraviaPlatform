@@ -4,12 +4,14 @@ use std::{
         Arc,
         atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
+use crate::performance::{self, PerfContext, ResourceLease, ResourceUsage};
 use parking_lot::Mutex;
 use stravia_protocol_codec::accumulator::CanonicalPartIndex;
 use tokio::sync::{broadcast, mpsc, oneshot};
+use tracing::Instrument as _;
 
 use super::{
     attribution::{ObservationEvidence, RunAttribution},
@@ -30,6 +32,163 @@ pub(super) struct AdmitPayload {
 }
 
 pub(super) const QUEUE_CAPACITY: usize = 2048;
+
+struct CommandEnvelope {
+    command: WriterCommand,
+    context: PerfContext,
+    enqueued: Instant,
+    _lease: QueueLease,
+}
+
+enum QueueLease {
+    Direct { _lease: ResourceLease },
+    Text(Arc<Mutex<QueuedText>>),
+}
+
+impl Drop for QueueLease {
+    fn drop(&mut self) {
+        if let Self::Text(text) = self {
+            drop(text.lock().lease.take());
+        }
+    }
+}
+
+impl CommandEnvelope {
+    fn dequeue(self) -> (WriterCommand, PerfContext) {
+        performance::record_wait(
+            "observation.queue.wait",
+            self.context,
+            self.enqueued,
+            "completed",
+        );
+        drop(self._lease);
+        (self.command, self.context)
+    }
+}
+
+#[derive(Clone)]
+pub(super) struct WriterSender {
+    sender: mpsc::Sender<CommandEnvelope>,
+    usage: ResourceUsage,
+}
+
+pub(super) struct WriterPermit {
+    permit: mpsc::OwnedPermit<CommandEnvelope>,
+    usage: ResourceUsage,
+}
+
+pub(super) struct QueuedText {
+    pub(super) event: Option<RunEvent>,
+    lease: Option<ResourceLease>,
+    base_bytes: usize,
+}
+
+impl QueuedText {
+    pub(super) fn new(event: RunEvent) -> Self {
+        Self {
+            event: Some(event),
+            lease: None,
+            base_bytes: 0,
+        }
+    }
+
+    pub(super) fn resize_usage(&mut self) {
+        let bytes = self.base_bytes + self.event.as_ref().map_or(0, event_bytes);
+        if let Some(lease) = self.lease.as_mut() {
+            lease.resize(1, bytes as u64);
+        }
+    }
+}
+
+impl WriterSender {
+    fn envelope(usage: &ResourceUsage, command: WriterCommand) -> CommandEnvelope {
+        let lease = if let WriterCommand::Text { run_id, event, .. } = &command {
+            let mut text = event.lock();
+            text.base_bytes = std::mem::size_of::<WriterCommand>() + run_id.len();
+            let bytes = text.base_bytes + text.event.as_ref().map_or(0, event_bytes);
+            text.lease = Some(usage.lease(1, bytes as u64));
+            QueueLease::Text(Arc::clone(event))
+        } else {
+            QueueLease::Direct {
+                _lease: usage.lease(1, command.logical_bytes() as u64),
+            }
+        };
+        CommandEnvelope {
+            _lease: lease,
+            command,
+            context: performance::current_context(),
+            enqueued: Instant::now(),
+        }
+    }
+
+    pub(super) fn capacity(&self) -> usize {
+        self.sender.capacity()
+    }
+    pub(super) fn is_closed(&self) -> bool {
+        self.sender.is_closed()
+    }
+
+    pub(super) async fn send(
+        &self,
+        command: WriterCommand,
+    ) -> Result<(), mpsc::error::SendError<()>> {
+        self.send_with_context(command, performance::current_context())
+            .await
+    }
+
+    pub(super) async fn send_with_context(
+        &self,
+        command: WriterCommand,
+        context: PerfContext,
+    ) -> Result<(), mpsc::error::SendError<()>> {
+        // Preserve the originating context across admission backpressure, but
+        // start queue residence only once a channel slot is actually available.
+        let permit = match self.sender.reserve().await {
+            Ok(permit) => permit,
+            Err(_) => return Err(mpsc::error::SendError(())),
+        };
+        let mut envelope = Self::envelope(&self.usage, command);
+        envelope.context = context;
+        permit.send(envelope);
+        Ok(())
+    }
+
+    pub(super) fn try_send(
+        &self,
+        command: WriterCommand,
+    ) -> Result<(), mpsc::error::TrySendError<Box<WriterCommand>>> {
+        self.sender
+            .try_send(Self::envelope(&self.usage, command))
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(envelope) => {
+                    mpsc::error::TrySendError::Full(Box::new(envelope.command))
+                }
+                mpsc::error::TrySendError::Closed(envelope) => {
+                    mpsc::error::TrySendError::Closed(Box::new(envelope.command))
+                }
+            })
+    }
+
+    pub(super) fn try_reserve_owned(self) -> Result<WriterPermit, ()> {
+        self.sender
+            .try_reserve_owned()
+            .map(|permit| WriterPermit {
+                permit,
+                usage: self.usage,
+            })
+            .map_err(|_| ())
+    }
+}
+
+impl WriterPermit {
+    pub(super) fn send(self, command: WriterCommand) -> WriterSender {
+        let envelope = WriterSender::envelope(&self.usage, command);
+        WriterSender {
+            sender: self.permit.send(envelope),
+            usage: self.usage,
+        }
+    }
+}
 
 /// Host-only gate: accepting a loopback socket holds the actual bounded
 /// consumer until that socket closes. No synthetic queue errors are injected.
@@ -64,7 +223,7 @@ impl TestQueueHold {
         }
     }
 
-    async fn recv(&mut self, rx: &mut mpsc::Receiver<WriterCommand>) -> Option<WriterCommand> {
+    async fn recv(&mut self, rx: &mut mpsc::Receiver<CommandEnvelope>) -> Option<CommandEnvelope> {
         use tokio::io::AsyncReadExt;
         loop {
             if let Some(stream) = &mut self.held {
@@ -136,7 +295,7 @@ pub(super) enum WriterCommand {
     },
     Text {
         run_id: String,
-        event: Arc<Mutex<Option<RunEvent>>>,
+        event: Arc<Mutex<QueuedText>>,
         _slot: tokio::sync::OwnedSemaphorePermit,
     },
     Finish {
@@ -167,6 +326,334 @@ pub(super) enum WriterCommand {
     Shutdown(oneshot::Sender<()>),
 }
 
+fn optional_len(value: &Option<String>) -> usize {
+    value.as_ref().map_or(0, String::len)
+}
+
+// Borrow-only logical payload estimate: string UTF-8, JSON scalar widths and
+// container entries, plus inline command/event sizes. Never serialize content.
+fn json_bytes(value: &serde_json::Value) -> usize {
+    use serde_json::Value;
+    match value {
+        Value::Null => 0,
+        Value::Bool(_) => 1,
+        Value::Number(_) => 8,
+        Value::String(value) => value.len(),
+        Value::Array(values) => values
+            .iter()
+            .map(|v| std::mem::size_of_val(v) + json_bytes(v))
+            .sum(),
+        Value::Object(values) => values
+            .iter()
+            .map(|(k, v)| k.len() + std::mem::size_of_val(v) + json_bytes(v))
+            .sum(),
+    }
+}
+
+fn failure_bytes(value: &FailureDiagnostic) -> usize {
+    optional_len(&value.source)
+        + optional_len(&value.code)
+        + optional_len(&value.message)
+        + optional_len(&value.upstream_code)
+}
+
+fn event_bytes(event: &RunEvent) -> usize {
+    use RunEvent::*;
+    let payload = match event {
+        RequestFailed { error } => failure_bytes(error),
+        CredentialMappingsCreated { discoveries } => discoveries
+            .iter()
+            .map(|d| {
+                d.rule_ids
+                    .iter()
+                    .chain(&d.source_types)
+                    .map(String::len)
+                    .sum::<usize>()
+            })
+            .sum(),
+        CompactionOperation {
+            operation_id,
+            model_turn_id,
+            attempt_id,
+            source_generation_id,
+            source_operation_id,
+            registration_id,
+            error_code,
+            ..
+        } => {
+            operation_id.len()
+                + model_turn_id.len()
+                + [
+                    attempt_id,
+                    source_generation_id,
+                    source_operation_id,
+                    registration_id,
+                    error_code,
+                ]
+                .into_iter()
+                .map(optional_len)
+                .sum::<usize>()
+        }
+        NativeCompactionAssociated {
+            source_generation_id,
+            source_operation_id,
+            registration_id,
+        } => {
+            optional_len(source_generation_id)
+                + optional_len(source_operation_id)
+                + registration_id.len()
+        }
+        RetainedTailAssociated {
+            source_run_id,
+            source_interaction_id,
+            status,
+            ..
+        } => optional_len(source_run_id) + optional_len(source_interaction_id) + status.len(),
+        GenerationAssociated {
+            root_id, parent_id, ..
+        } => root_id.len() + optional_len(parent_id),
+        ModelTurnStarted {
+            model_turn_id,
+            route_id,
+            model_display_name,
+            ..
+        } => model_turn_id.len() + route_id.len() + optional_len(model_display_name),
+        ModelTurnFinished {
+            model_turn_id,
+            status,
+        } => model_turn_id.len() + status.len(),
+        TargetAttemptStarted {
+            model_turn_id,
+            attempt_id,
+            target_id,
+            provider_id,
+            provider_name,
+            upstream_model,
+            protocol,
+            upstream_url,
+        } => [
+            model_turn_id,
+            attempt_id,
+            target_id,
+            provider_id,
+            provider_name,
+            upstream_model,
+            protocol,
+            upstream_url,
+        ]
+        .into_iter()
+        .map(String::len)
+        .sum(),
+        TargetAttemptFinished {
+            model_turn_id,
+            attempt_id,
+            status,
+            error_code,
+            error,
+            ..
+        } => {
+            model_turn_id.len()
+                + attempt_id.len()
+                + status.len()
+                + optional_len(error_code)
+                + error.as_ref().map_or(0, failure_bytes)
+        }
+        UsageConfirmed {
+            model_turn_id,
+            attempt_id,
+            ..
+        }
+        | ModelThinkingFinished {
+            model_turn_id,
+            attempt_id,
+        } => model_turn_id.len() + attempt_id.len(),
+        PlatformToolStarted {
+            model_turn_id,
+            tool_id,
+            name,
+            input,
+        } => {
+            model_turn_id.len() + tool_id.len() + name.len() + input.as_ref().map_or(0, json_bytes)
+        }
+        PlatformToolFinished {
+            model_turn_id,
+            tool_id,
+            status,
+            content,
+            ..
+        } => {
+            model_turn_id.len()
+                + tool_id.len()
+                + status.len()
+                + content.as_ref().map_or(0, json_bytes)
+        }
+        ClientToolHandoff {
+            tool_id,
+            name,
+            input,
+        } => tool_id.len() + name.len() + input.as_ref().map_or(0, json_bytes),
+        ClientToolResult {
+            tool_id, content, ..
+        } => tool_id.len() + json_bytes(content),
+        ModelThinking {
+            model_turn_id,
+            attempt_id,
+            text,
+            parts,
+            block_id,
+            item,
+            ..
+        } => {
+            model_turn_id.len()
+                + attempt_id.len()
+                + text.len()
+                + parts.iter().map(json_bytes).sum::<usize>()
+                + block_id.len()
+                + json_bytes(item)
+        }
+        ClientVisibleContent {
+            text,
+            parts,
+            block_id,
+            item,
+            ..
+        } => {
+            text.len()
+                + parts.iter().map(json_bytes).sum::<usize>()
+                + block_id.len()
+                + json_bytes(item)
+        }
+        ModelThinkingDelta {
+            model_turn_id,
+            attempt_id,
+            text,
+            ..
+        } => model_turn_id.len() + attempt_id.len() + text.len(),
+        ClientVisibleContentDelta { text, .. } => text.len(),
+        ClientOutputCommitted => 0,
+        DeliveryFinished { status, reason } => status.len() + optional_len(reason),
+        Wire {
+            direction,
+            transport,
+            protocol,
+            message_type,
+            model_turn_id,
+            attempt_id,
+            url,
+            headers,
+            payload,
+            ..
+        } => {
+            [direction, transport, protocol, message_type]
+                .into_iter()
+                .map(String::len)
+                .sum::<usize>()
+                + optional_len(model_turn_id)
+                + optional_len(attempt_id)
+                + optional_len(url)
+                + json_bytes(headers)
+                + json_bytes(payload)
+        }
+        ObservationGap { reason } => reason.len(),
+    };
+    std::mem::size_of_val(event) + payload
+}
+
+fn outcome_bytes(outcome: &RunOutcome) -> usize {
+    outcome.status.len()
+        + optional_len(&outcome.terminal_reason)
+        + optional_len(&outcome.generation_node_id)
+        + optional_len(&outcome.generation_root_id)
+        + outcome
+            .delivery
+            .as_ref()
+            .map_or(0, |d| d.status.len() + optional_len(&d.reason))
+}
+
+impl WriterCommand {
+    fn logical_bytes(&self) -> usize {
+        let payload = match self {
+            Self::ClearTail
+            | Self::ClearDebug { .. }
+            | Self::Purge { .. }
+            | Self::Barrier(_)
+            | Self::Shutdown(_) => 0,
+            Self::ClientDisconnected { runs } => runs.iter().map(String::len).sum(),
+            Self::ClientToolResults { run_id, events } => {
+                run_id.len() + events.iter().map(event_bytes).sum::<usize>()
+            }
+            Self::InputPreview { run_id, preview } => run_id.len() + preview.len(),
+            Self::ClientCompletion {
+                run_id,
+                principal,
+                window,
+                ..
+            } => {
+                run_id.len()
+                    + principal.len()
+                    + window
+                        .as_ref()
+                        .map_or(0, super::tail::Window::logical_bytes)
+            }
+            Self::Admit(payload) => {
+                let s = &payload.start;
+                std::mem::size_of_val(payload.as_ref())
+                    + s.id.len()
+                    + s.principal.len()
+                    + s.route_id.len()
+                    + s.ingress_protocol.len()
+                    + optional_len(&s.api_key_id)
+                    + optional_len(&s.api_key_name)
+                    + optional_len(&s.model_display_name)
+                    + payload.facts.logical_bytes()
+                    + metadata_bytes(&payload.metadata)
+            }
+            Self::Event { run_id, event } => run_id.len() + event_bytes(event),
+            Self::Text { run_id, event, .. } => {
+                run_id.len() + event.lock().event.as_ref().map_or(0, event_bytes)
+            }
+            Self::Finish {
+                run_id, outcome, ..
+            } => run_id.len() + outcome_bytes(outcome),
+            Self::Reject {
+                ingress,
+                outcome,
+                metadata,
+                ..
+            } => {
+                ingress.id.len()
+                    + ingress.method.len()
+                    + ingress.path.len()
+                    + ingress.protocol.len()
+                    + outcome.stage.len()
+                    + outcome.code.len()
+                    + outcome.failure.as_ref().map_or(0, failure_bytes)
+                    + metadata_bytes(metadata)
+            }
+            Self::Finalize {
+                run_id,
+                rejection_id,
+                pending_finish,
+                ..
+            } => {
+                optional_len(run_id)
+                    + optional_len(rejection_id)
+                    + pending_finish
+                        .as_ref()
+                        .map_or(0, |(outcome, _)| outcome_bytes(outcome))
+            }
+            Self::FlushInteraction { interaction_id, .. } => interaction_id.len(),
+        };
+        std::mem::size_of_val(self) + payload
+    }
+}
+
+fn metadata_bytes(metadata: &super::RequestMetadata) -> usize {
+    optional_len(&metadata.model)
+        + optional_len(&metadata.api_key_id)
+        + optional_len(&metadata.api_key_name)
+}
+
 pub(super) struct WriterDeps {
     pub store: ObservationStore,
     pub debug_trace_index: Arc<super::manifest_index::DebugTraceIndex>,
@@ -190,9 +677,7 @@ struct WriterContext<'a> {
     live: &'a super::live::LiveState,
 }
 
-pub(super) fn spawn(
-    deps: WriterDeps,
-) -> (mpsc::Sender<WriterCommand>, tokio::task::JoinHandle<()>) {
+pub(super) fn spawn(deps: WriterDeps) -> (WriterSender, tokio::task::JoinHandle<()>) {
     let WriterDeps {
         store,
         debug_trace_index,
@@ -293,13 +778,23 @@ pub(super) fn spawn(
                         { queue_hold.recv(&mut rx).await }
                         #[cfg(not(feature = "test-support"))]
                         { rx.recv().await }
-                    } => command,
+                    } => command.map(CommandEnvelope::dequeue),
                 }
             };
+            let (command, perf_context) = command
+                .map_or((None, PerfContext::default()), |(command, context)| {
+                    (Some(command), context)
+                });
+            let processing = tracing::info_span!(
+                target: "stravia::perf", "observation.command.process",
+                causal_parent_id = perf_context.span_id(),
+                causal_epoch = perf_context.epoch()
+            );
+            let stop = async {
             let command = match command {
                 Some(WriterCommand::Text { run_id, event, .. }) => {
-                    let Some(event) = event.lock().take() else {
-                        continue;
+                    let Some(event) = event.lock().event.take() else {
+                        return false;
                     };
                     Some(WriterCommand::Event { run_id, event })
                 }
@@ -353,10 +848,10 @@ pub(super) fn spawn(
                 }
                 Some(WriterCommand::ClientToolResults { run_id, events }) => {
                     if replayed_tool_results.remove(&run_id) {
-                        continue;
+                        return false;
                     }
                     let Some(interaction) = attribution.interaction_for_run(&run_id) else {
-                        continue;
+                        return false;
                     };
                     let at = now();
                     let expiry = expires(at, retention_days.load(Ordering::Relaxed));
@@ -386,10 +881,10 @@ pub(super) fn spawn(
                 }
                 Some(WriterCommand::InputPreview { run_id, preview }) => {
                     if !attribution.has_new_user(&run_id) {
-                        continue;
+                        return false;
                     }
                     let Some(interaction) = attribution.interaction_for_run(&run_id) else {
-                        continue;
+                        return false;
                     };
                     let at = now();
                     let expiry = expires(at, retention_days.load(Ordering::Relaxed));
@@ -414,7 +909,7 @@ pub(super) fn spawn(
                 }) => {
                     if let Err(error) = ensure_usage_complete(incomplete_usage) {
                         let _ = done.send(Err(error));
-                        continue;
+                        return false;
                     }
                     let result = async {
                         loop {
@@ -463,7 +958,7 @@ pub(super) fn spawn(
                     let at = now();
                     let expiry = expires(at, retention_days.load(Ordering::Relaxed));
                     let Some(interaction) = attribution.interaction_for_run(&run_id) else {
-                        continue;
+                        return false;
                     };
                     // 客户端生命周期不依赖尾窗口或工具关联证据是否可捕获。
                     match store
@@ -678,7 +1173,7 @@ pub(super) fn spawn(
                     let Some(interaction) =
                         attribution.interaction_for_run(&run_id).map(str::to_owned)
                     else {
-                        continue;
+                        return false;
                     };
                     let mut event = event;
                     super::redaction::redact_run_event(&mut event);
@@ -692,7 +1187,7 @@ pub(super) fn spawn(
                     if block.overflowed {
                         // Canonical close is persisted independently; a capacity
                         // gap must not resurrect an incomplete volatile block.
-                        continue;
+                        return false;
                     }
                     let previous_bytes = block.allocated_bytes;
                     let growth_headroom = match &block.event {
@@ -746,12 +1241,13 @@ pub(super) fn spawn(
                     // the same transaction and poison their durability barrier.
                     let usage_bearing = affects_usage(&event);
                     let mut batch = vec![(event, block_id, now())];
+                    let mut batch_spans = Vec::new();
                     while batch.len() < 64 {
-                        match rx.try_recv() {
-                            Ok(WriterCommand::Event {
+                        match rx.try_recv().map(CommandEnvelope::dequeue) {
+                            Ok((WriterCommand::Event {
                                 run_id: next_run,
                                 event,
-                            }) if next_run == run_id
+                            }, context)) if next_run == run_id
                                 && affects_usage(&event) == usage_bearing
                                 && !matches!(
                                     event,
@@ -760,6 +1256,13 @@ pub(super) fn spawn(
                                         | RunEvent::NativeCompactionAssociated { .. }
                                 ) =>
                             {
+                                batch_spans.push(tracing::info_span!(
+                                    target: "stravia::perf",
+                                    parent: None,
+                                    "observation.command.process",
+                                    causal_parent_id = context.span_id(),
+                                    causal_epoch = context.epoch()
+                                ));
                                 let block_id = canonical_block_id(&event);
                                 batch.push((event, block_id, now()))
                             }
@@ -1104,17 +1607,28 @@ pub(super) fn spawn(
                 Some(WriterCommand::Shutdown(done)) => {
                     pending_text.publish_live();
                     let _ = done.send(());
-                    break;
+                    return true;
                 }
                 None => {
                     pending_text.publish_live();
-                    break;
+                    return true;
                 }
                 Some(WriterCommand::Text { .. }) => unreachable!("text command resolved above"),
             }
+            false
+            }.instrument(processing).await;
+            if stop {
+                break;
+            }
         }
     });
-    (tx, handle)
+    (
+        WriterSender {
+            sender: tx,
+            usage: ResourceUsage::new("observation_queue", "observation"),
+        },
+        handle,
+    )
 }
 
 async fn flush_active_manifests(
@@ -1519,6 +2033,86 @@ fn delta_block_id(event: &RunEvent, run_id: &str) -> String {
 
 #[cfg(test)]
 mod block_tests {
+    #[tokio::test]
+    async fn queue_text_accounting_releases_on_dequeue_failure_and_receiver_drop() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let writer = WriterSender {
+            sender,
+            usage: ResourceUsage::new("observation_queue", "observation"),
+        };
+        let slots = Arc::new(tokio::sync::Semaphore::new(4));
+        let command = || {
+            let text = Arc::new(Mutex::new(QueuedText::new(
+                RunEvent::ClientVisibleContentDelta {
+                    item_ordinal: 0,
+                    part_index: (false, 0),
+                    text: "first".into(),
+                },
+            )));
+            let command = WriterCommand::Text {
+                run_id: "run".into(),
+                event: text.clone(),
+                _slot: slots.clone().try_acquire_owned().unwrap(),
+            };
+            (command, text)
+        };
+        let (first, text) = command();
+        assert!(writer.try_send(first).is_ok());
+        let (items, bytes) = writer.usage.totals();
+        assert_eq!(items, 1);
+        {
+            let mut text = text.lock();
+            text_mut(text.event.as_mut().unwrap())
+                .unwrap()
+                .push_str(" next");
+            text.resize_usage();
+        }
+        assert_eq!(writer.usage.totals(), (1, bytes + 5));
+        let (overflow, _overflow_text) = command();
+        assert!(writer.try_send(overflow).is_err());
+        assert_eq!(writer.usage.totals(), (1, bytes + 5));
+        let (dequeued, _) = receiver.recv().await.unwrap().dequeue();
+        assert_eq!(writer.usage.totals(), (0, 0));
+        drop(dequeued);
+        let (last, _last_text) = command();
+        assert!(writer.try_send(last).is_ok());
+        drop(receiver);
+        assert_eq!(writer.usage.totals(), (0, 0));
+        assert_eq!(slots.available_permits(), 4);
+    }
+
+    #[tokio::test]
+    async fn cancelled_queue_admission_preserves_reserved_control_slot_and_fifo() {
+        let (sender, mut receiver) = mpsc::channel(2);
+        let writer = WriterSender {
+            sender,
+            usage: ResourceUsage::new("observation_queue", "observation"),
+        };
+        let permit = writer.clone().try_reserve_owned().ok().unwrap();
+        assert!(writer.try_send(WriterCommand::ClearTail).is_ok());
+        let (done, mut cancelled) = oneshot::channel();
+        let mut blocked = Box::pin(writer.send(WriterCommand::Shutdown(done)));
+        assert!(futures::poll!(&mut blocked).is_pending());
+        drop(blocked);
+        assert!(matches!(
+            cancelled.try_recv(),
+            Err(oneshot::error::TryRecvError::Closed)
+        ));
+        assert_eq!(writer.capacity(), 0);
+        let (done, receive) = oneshot::channel();
+        permit.send(WriterCommand::Shutdown(done));
+        assert!(matches!(
+            receiver.recv().await.unwrap().dequeue().0,
+            WriterCommand::ClearTail
+        ));
+        let (command, _) = receiver.recv().await.unwrap().dequeue();
+        let WriterCommand::Shutdown(done) = command else {
+            panic!("reserved shutdown lost")
+        };
+        assert!(done.send(()).is_ok());
+        assert!(receive.await.is_ok());
+        assert_eq!(writer.capacity(), 2);
+    }
     use super::*;
     #[tokio::test]
     async fn live_revisions_replace_and_committed_identity_is_removable() {

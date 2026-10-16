@@ -1,5 +1,5 @@
 use crate::db::models::RouteOutputModality;
-use sqlx::{Connection, SqliteConnection};
+use sqlx::SqliteConnection;
 use stravia_runtime_contract::thinking::ThinkingLevel;
 
 use super::*;
@@ -89,7 +89,7 @@ struct TargetMapRow {
 
 impl SqliteRouteStore {
     pub(super) async fn load_routes(
-        connection: &mut SqliteConnection,
+        connection: &mut SqliteConnection<'_>,
         active_only: bool,
     ) -> anyhow::Result<Vec<RouteConfig>> {
         let where_clause = if active_only {
@@ -116,12 +116,10 @@ impl SqliteRouteStore {
     }
 
     async fn load_targets(
-        connection: &mut SqliteConnection,
+        connection: &mut SqliteConnection<'_>,
         route_storage_id: &str,
     ) -> anyhow::Result<Vec<TargetConfig>> {
-        Ok(sqlx::query_as::<_, TargetRow>(
-            "SELECT id, model_id, provider_id, model, enabled, priority, first_token_timeout_ms, target_retry_budget, target_cooldown_ms, created_at, thinking_level_map FROM model_backends WHERE model_id = ? ORDER BY priority DESC, created_at ASC",
-        )
+        Ok(sqlx::query_as::<_, TargetRow>("SELECT id, model_id, provider_id, model, enabled, priority, first_token_timeout_ms, target_retry_budget, target_cooldown_ms, created_at, thinking_level_map FROM model_backends WHERE model_id = ? ORDER BY priority DESC, created_at ASC")
         .bind(route_storage_id)
         .fetch_all(&mut *connection)
         .await?
@@ -131,7 +129,7 @@ impl SqliteRouteStore {
     }
 
     async fn load_route(
-        connection: &mut SqliteConnection,
+        connection: &mut SqliteConnection<'_>,
         route_id: &str,
     ) -> anyhow::Result<Option<RouteConfig>> {
         let route = sqlx::query_as::<_, RouteRow>(
@@ -155,7 +153,7 @@ impl SqliteRouteStore {
     /// to `provider_id` + `provider_model_id`, inside the caller's transaction.
     /// Overridden rows, Target IDs and all other columns are preserved.
     pub(super) async fn refresh_generated_thinking_maps(
-        connection: &mut SqliteConnection,
+        connection: &mut SqliteConnection<'_>,
         provider_id: &str,
         provider_model_id: &str,
         metadata: &crate::provider_models::ProviderModelMetadata,
