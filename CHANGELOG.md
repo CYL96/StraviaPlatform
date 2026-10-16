@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## [0.5.0] - 2026-10-16
+
 ### Added
 
 - Added standalone Muse Code and Kilo Vendor components. Muse Code supports Meta subscription device authorization, account model discovery, and streaming Responses inference. Kilo supports device authorization, organization selection, model discovery, USD credit-balance allowance, and catalog-selected Chat/Responses inference. Build and locally import their Wasm packages; they are not embedded by default. See [Vendor setup and capability limits](docs/design/vendor-plugins.md).
