@@ -22,9 +22,10 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}-${{ inputs.cache_warm || 'none' }}
   cancel-in-progress: true
 
 env:
@@ -35,8 +36,25 @@ env:
   CACHE_WRITE_ALLOWED: ${{ github.repository == 'Stravia-AI/StraviaPlatform' && github.ref == 'refs/heads/main' && github.workflow_ref == 'Stravia-AI/StraviaPlatform/.github/workflows/ci.yml@refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
 
 jobs:
+  reuse-ci:
+    name: Select complete CI
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    outputs:
+      run_checks: ${{ steps.reuse.outputs.run_checks }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Reuse complete CI for the same commit
+        id: reuse
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/reuse_ci.py
+
   check:
-    if: ${{ (github.event_name != 'workflow_dispatch' || inputs.cache_warm == '' || inputs.cache_warm == 'none') }}
+    needs: reuse-ci
+    if: ${{ needs.reuse-ci.outputs.run_checks == 'true' && (github.event_name != 'workflow_dispatch' || inputs.cache_warm == '' || inputs.cache_warm == 'none') }}
     name: Static checks
     runs-on: ubuntu-24.04
     steps:
@@ -90,8 +108,12 @@ jobs:
       - name: Test updater manifest generator
         run: python3 .github/scripts/test_generate_updater_manifest.py
 
+      - name: Test complete CI reuse
+        run: python3 .github/scripts/test_reuse_ci.py
+
   unit-tests:
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.cache_warm == '' || inputs.cache_warm == 'none' || inputs.cache_warm == 'linux-test' || inputs.cache_warm == 'linux-stable' }}
+    needs: reuse-ci
+    if: ${{ needs.reuse-ci.outputs.run_checks == 'true' && (github.event_name != 'workflow_dispatch' || inputs.cache_warm == '' || inputs.cache_warm == 'none' || inputs.cache_warm == 'linux-test' || inputs.cache_warm == 'linux-stable') }}
     name: Unit tests (Rust ${{ matrix.toolchain }})
     runs-on: ubuntu-24.04
     env:
@@ -197,7 +219,8 @@ jobs:
         run: cargo test --locked --workspace --exclude stravia-desktop --exclude stravia-vendor-capability-contract-fixture --exclude stravia-vendor-lifecycle-contract-fixture --exclude stravia-vendor-management-contract-fixture
 
   web-access-browser:
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.cache_warm == '' || inputs.cache_warm == 'none' }}
+    needs: reuse-ci
+    if: ${{ needs.reuse-ci.outputs.run_checks == 'true' && (github.event_name != 'workflow_dispatch' || inputs.cache_warm == '' || inputs.cache_warm == 'none') }}
     name: Headless Chrome Web Access
     runs-on: windows-2022
     timeout-minutes: 45
@@ -245,7 +268,8 @@ jobs:
           STRAVIA_CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}
 
   backend-e2e:
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.cache_warm == '' || inputs.cache_warm == 'none' || inputs.cache_warm == 'linux-e2e' }}
+    needs: reuse-ci
+    if: ${{ needs.reuse-ci.outputs.run_checks == 'true' && (github.event_name != 'workflow_dispatch' || inputs.cache_warm == '' || inputs.cache_warm == 'none' || inputs.cache_warm == 'linux-e2e') }}
     name: Backend E2E (${{ matrix.suite }})
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -327,7 +351,8 @@ jobs:
         run: task test:e2e:admin
 
   postgres-e2e:
-    if: ${{ (github.event_name != 'workflow_dispatch' || inputs.cache_warm == '' || inputs.cache_warm == 'none') }}
+    needs: reuse-ci
+    if: ${{ needs.reuse-ci.outputs.run_checks == 'true' && (github.event_name != 'workflow_dispatch' || inputs.cache_warm == '' || inputs.cache_warm == 'none') }}
     name: PostgreSQL E2E
     runs-on: ubuntu-24.04
     timeout-minutes: 45
@@ -415,7 +440,8 @@ jobs:
           STRAVIA_TEST_REDIS_URL: redis://127.0.0.1:26379/0
 
   webui-e2e:
-    if: ${{ (github.event_name != 'workflow_dispatch' || inputs.cache_warm == '' || inputs.cache_warm == 'none') }}
+    needs: reuse-ci
+    if: ${{ needs.reuse-ci.outputs.run_checks == 'true' && (github.event_name != 'workflow_dispatch' || inputs.cache_warm == '' || inputs.cache_warm == 'none') }}
     name: WebUI E2E
     runs-on: ubuntu-24.04
     timeout-minutes: 45
@@ -475,7 +501,8 @@ jobs:
         run: task test:e2e:web
 
   desktop-smoke:
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.cache_warm == '' || inputs.cache_warm == 'none' || inputs.cache_warm == 'windows-debug' }}
+    needs: reuse-ci
+    if: ${{ needs.reuse-ci.outputs.run_checks == 'true' && (github.event_name != 'workflow_dispatch' || inputs.cache_warm == '' || inputs.cache_warm == 'none' || inputs.cache_warm == 'windows-debug') }}
     name: Windows desktop smoke
     runs-on: windows-2022
     timeout-minutes: 75

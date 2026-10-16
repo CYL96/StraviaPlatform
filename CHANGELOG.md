@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Fixed
+
+- CI now reuses successful complete checks for the exact same commit across `dev`, `main`, and Release, or waits for an existing automatic CI run instead of starting another full test matrix. PR merge checks and explicit manual/cache-warm runs remain independent; failed, cancelled, partial, or unavailable evidence cannot authorize a release.
+
 ## [0.5.1] - 2026-10-16
 
 ### Added

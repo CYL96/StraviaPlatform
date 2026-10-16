@@ -26,7 +26,7 @@ bunx --bun tauri signer generate -- -w /secure/offline/stravia-updater.key
 
 1. 确保 `Cargo.toml`、`package.json` 和 `backend/apps/stravia-desktop/tauri.conf.json` 版本一致，并在 `CHANGELOG.md` 中存在该版本的非空章节。
 2. 从 `main` 中的目标 commit 创建 `vMAJOR.MINOR.PATCH` 或合法 SemVer prerelease tag。
-3. 推送 tag。`release.yml` 会运行完整 CI，签署四个平台产物，执行 `.github/scripts/generate-updater-manifest.py`，创建 draft Release，发布容器镜像，最后公开 Release。
+3. 推送 tag。`release.yml` 会确认完整 CI 通过，签署四个平台产物，执行 `.github/scripts/generate_updater_manifest.py`，创建 draft Release，发布容器镜像，最后公开 Release。
 4. 任一签名 secret、`.sig`、平台产物或清单字段缺失时 workflow 必须失败。不要通过移除校验、手工上传无签名安装包或发布部分清单来绕过失败。
 
 发布回归必须遵循当前产品契约：已开始的 Responses 流只以单个 `response.failed` 收口，并保留部分输出和原生错误详情；重启恢复用例必须在上游请求仍受事件门控、尚未交付时模拟进程中断，不能以固定延迟或优雅关闭后的已完成请求代替崩溃场景。修复失败后先运行对应定向检查，再重新执行完整发布矩阵。
@@ -34,6 +34,14 @@ bunx --bun tauri signer generate -- -w /secure/offline/stravia-updater.key
 CI 的 Admin 与 Chromium E2E 复用 `task test:e2e:admin` 和 `task test:e2e:web`，不直接以生产 `target/release/stravia-server` 替代测试服务。Admin 先串行准备 `build:test:development` 与 `build:test:services`；Chromium 先串行准备 `build:test:release` 与 `build:test:services`。`target/test-artifacts/services/` 保留带 `test-harness` 的独立服务副本，支持 loopback catalog 等测试参数；生产副本与开发模式副本独立保存，后续不同 feature graph 的构建不能覆盖正在验证的测试服务。
 
 `stravia-updater.json` 使用版本化 Release asset URL，并内联每个平台 `.sig` 的内容。普通安装包、`.sig`、清单和 `SHA256SUMS` 会一起上传到同一个精确版本 Release。
+
+### 同一提交的 CI 复用
+
+`dev`、`main` push 与版本 tag 仍各自触发工作流，但 `ci.yml` 在启动重型检查前通过 `.github/scripts/reuse_ci.py` 查询同仓库、精确相同 SHA 的自动完整 CI。已有成功运行时直接复用；已有排队或执行中的运行时等待其成功，没有合格候选时照常运行完整检查。只有 `main` / `dev` 的 `push` CI 可以作为证据；其他 SHA、其他仓库、PR、手动运行、缓存预热、失败、取消或跳过的运行均不能作为成功证据。
+
+独立 CI 只等待运行 ID 更小的 CI，Release 只等待独立 CI，不互相等待。API 失败、等待超时、候选运行失败或被取消都会使守门任务失败，不会把未验证的提交报告为通过。PR 始终验证自己的合并结果；显式 `workflow_dispatch`（包括缓存预热）始终执行其选择的任务。并发组按调用工作流、事件、ref 和预热模式隔离，避免手动预热或分支 CI 取消 Release 检查。
+
+查询运行状态只需要 `actions: read`，不授予取消运行或其他 Actions 写权限。Actions 页面仍可能出现多个轻量守门/等待条目，其 summary 会链接被复用的 CI；不再为已确认的同一提交重复启动整套测试。Rust 缓存仍只由现有可信 `main` writer 写入；当 `main` 复用 `dev` CI 时不会额外写缓存，需要时可在 `main` 手动选择 `cache_warm`。`Docker cache` 负责独立预热镜像构建缓存，不是完整 CI，不参与此复用规则。
 
 ## 公钥轮换与恢复限制
 
