@@ -27,6 +27,8 @@ def snapshot(*events):
             "dropped_active": 0, "dropped_completed": 0, "dropped_sql_completed": 0,
             "dropped_resource_samples": 0, "active_spans": active, "frozen_spans": frozen,
             "frozen_total": frozen, "incomplete": active + frozen, "incomplete_total": active + frozen,
+            "schema_version": 3, "debug_epoch": 1, "debug_enabled": True,
+            "storage_status": "ready", "storage_errors": 0,
         },
     }
 
@@ -98,7 +100,7 @@ def test_history_benchmark_separates_observation_causal_chain(command):
 @pytest.mark.proxy
 @pytest.mark.parametrize("field", [
     "dropped_active", "dropped_completed", "dropped_sql_completed", "dropped_resource_samples",
-    "frozen_spans", "frozen_total",
+    "frozen_spans", "frozen_total", "storage_errors",
 ])
 def test_history_benchmark_rejects_growing_loss_counters(field):
     after = snapshot(*request_events())
@@ -212,3 +214,33 @@ def test_history_benchmark_accepts_active_completion_without_counter_loss():
     assert row["request_span_valid"]
     assert row["request_sql_span_count"] == 1
     assert row["active_unrelated_spans"] == []
+
+
+@pytest.mark.e2e
+@pytest.mark.proxy
+@pytest.mark.parametrize("change", ["session_changed", "debug_disabled", "storage_error"])
+def test_history_benchmark_rejects_reset_or_unreadable_recording(change):
+    before, after = snapshot(), snapshot(*request_events())
+    if change == "session_changed":
+        after["metadata"]["debug_epoch"] += 1
+    elif change == "debug_disabled":
+        after["metadata"]["debug_enabled"] = False
+    else:
+        before["metadata"]["storage_status"] = "error"
+        after["metadata"]["storage_status"] = "error"
+        before["metadata"]["storage_errors"] = 1
+        after["metadata"]["storage_errors"] = 1
+    assert not measure(after, before)["trace_metadata_valid"]
+
+
+@pytest.mark.e2e
+@pytest.mark.proxy
+def test_history_benchmark_accepts_successful_disk_spill_without_treating_it_as_loss():
+    before, after = snapshot(), snapshot(*request_events())
+    for field in ("spilled_completed", "spilled_sql_completed", "spilled_resource_samples"):
+        before["metadata"][field] = 0
+        after["metadata"][field] = 4
+    row = measure(after, before)
+    assert row["trace_metadata_valid"]
+    assert row["request_span_valid"]
+    assert row["request_sql_span_count"] == 1

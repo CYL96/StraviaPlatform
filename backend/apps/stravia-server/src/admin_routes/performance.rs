@@ -37,9 +37,21 @@ pub(super) async fn metrics(State(gateway): State<Gateway>) -> Response {
     response
 }
 
-/// 管理员导出有界 Chrome Trace 时间线，关闭 Debug 后仍可下载已有数据。
+/// 管理员导出本轮 Chrome Trace；磁盘历史读取不占用异步执行线程。
 pub(super) async fn timeline(State(gateway): State<Gateway>) -> Response {
-    let mut response = axum::Json(gateway.admin().performance_timeline()).into_response();
+    let snapshot =
+        tokio::task::spawn_blocking(move || gateway.admin().performance_timeline()).await;
+    let mut response = match snapshot {
+        Ok(snapshot) => axum::Json(snapshot).into_response(),
+        Err(error) => {
+            tracing::warn!(%error, "performance timeline export task failed");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "performance timeline unavailable",
+            )
+                .into_response()
+        }
+    };
     response.headers_mut().insert(
         header::CONTENT_DISPOSITION,
         "attachment; filename=\"stravia-performance-trace.json\""

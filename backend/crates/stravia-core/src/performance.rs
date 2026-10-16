@@ -20,6 +20,7 @@ use tracing::{
 };
 use tracing_subscriber::{Layer, layer::Context, registry::LookupSpan};
 
+mod history;
 mod resources;
 mod sql;
 pub(crate) use resources::{ResourceLease, ResourceUsage};
@@ -51,7 +52,7 @@ const SQL_COMPLETED_CAPACITY_ENV: &str = "STRAVIA_PERF_SQL_COMPLETED_CAPACITY";
 static NEXT_SPAN_ID: AtomicU64 = AtomicU64::new(1);
 static TIMELINE: LazyLock<Mutex<Timeline>> = LazyLock::new(|| Mutex::new(Timeline::default()));
 
-/// 容量取自环境变量以便现网诊断时免重编译扩大保留窗口；缺失或非法值回退默认。
+/// 环境变量仅调整内存缓冲；已完成历史溢出到本轮匿名文件，不因条数淘汰。
 fn env_capacity(key: &str, default: usize) -> usize {
     std::env::var(key)
         .ok()
@@ -200,18 +201,16 @@ impl ActiveSpan {
 
 struct Timeline {
     active: HashMap<u64, ActiveSpan>,
+    history: history::History,
     completed: VecDeque<TraceRecord>,
+    sql_completed: VecDeque<TraceRecord>,
+    samples: VecDeque<ResourceSample>,
     active_capacity: usize,
     completed_capacity: usize,
-    dropped_active: u64,
-    dropped_completed: u64,
-    incomplete: u64,
-    sql_completed: VecDeque<TraceRecord>,
     sql_capacity: usize,
-    dropped_sql: u64,
-    samples: VecDeque<ResourceSample>,
     resource_capacity: usize,
-    dropped_resources: u64,
+    dropped_active: u64,
+    current_resources: Vec<resources::ResourcePoint>,
     pools: HashMap<(&'static str, &'static str), PoolPoint>,
 }
 
@@ -219,18 +218,16 @@ impl Default for Timeline {
     fn default() -> Self {
         Self {
             active: HashMap::default(),
-            completed: VecDeque::default(),
+            history: history::History::new(),
+            completed: VecDeque::new(),
+            sql_completed: VecDeque::new(),
+            samples: VecDeque::new(),
             active_capacity: env_capacity(ACTIVE_CAPACITY_ENV, ACTIVE_CAPACITY),
             completed_capacity: env_capacity(COMPLETED_CAPACITY_ENV, COMPLETED_CAPACITY),
-            dropped_active: 0,
-            dropped_completed: 0,
-            incomplete: 0,
-            sql_completed: VecDeque::default(),
             sql_capacity: env_capacity(SQL_COMPLETED_CAPACITY_ENV, SQL_COMPLETED_CAPACITY),
-            dropped_sql: 0,
-            samples: VecDeque::default(),
             resource_capacity: env_capacity(RESOURCE_CAPACITY_ENV, RESOURCE_CAPACITY),
-            dropped_resources: 0,
+            dropped_active: 0,
+            current_resources: Vec::new(),
             pools: HashMap::default(),
         }
     }
@@ -238,256 +235,188 @@ impl Default for Timeline {
 
 impl Timeline {
     fn push(&mut self, record: TraceRecord) {
-        if record.kind != SpanKind::Operation {
-            if self.sql_completed.len() == self.sql_capacity {
-                self.sql_completed.pop_front();
-                self.dropped_sql += 1;
-            }
-            self.sql_completed.push_back(record);
-            return;
+        let (queue, capacity) = if record.kind == SpanKind::Operation {
+            (&mut self.completed, self.completed_capacity)
+        } else {
+            (&mut self.sql_completed, self.sql_capacity)
+        };
+        queue.push_back(record);
+        if queue.len() == capacity {
+            // 整批转移所有权；后台追加完成后释放该批分配，不维持满额滑动窗口。
+            self.history
+                .push(history::Pending::Traces(std::mem::take(queue)));
         }
-        if self.completed.len() == self.completed_capacity {
-            self.completed.pop_front();
-            self.dropped_completed += 1;
-        }
-        self.completed.push_back(record);
     }
 
     fn invalidate(&mut self) {
-        for (_, span) in std::mem::take(&mut self.active) {
-            self.incomplete += 1;
-            self.push(span.into_record(None));
-        }
+        self.active = HashMap::new();
+        self.completed = VecDeque::new();
+        self.sql_completed = VecDeque::new();
+        self.samples = VecDeque::new();
+        self.current_resources.clear();
+        self.pools.clear();
+        self.dropped_active = 0;
+        self.history.reset();
     }
 
     fn push_sample(&mut self, mut sample: ResourceSample) {
         // 资源所有者退出后显式给零；不能留下最后一次非零占用误导分析。
-        if let Some(previous) = self.samples.back() {
-            for old in &previous.resources {
-                if !sample
-                    .resources
-                    .iter()
-                    .any(|point| point.resource == old.resource && point.domain == old.domain)
-                {
-                    let mut retired = old.clone();
-                    retired.items = 0;
-                    retired.logical_bytes = 0;
-                    retired.observed_at_unix_ms = None;
-                    retired.observation_age_ms = None;
-                    sample.resources.push(retired);
-                }
+        for old in &self.current_resources {
+            if !sample
+                .resources
+                .iter()
+                .any(|point| point.resource == old.resource && point.domain == old.domain)
+            {
+                let mut retired = old.clone();
+                retired.items = 0;
+                retired.logical_bytes = 0;
+                retired.observed_at_unix_ms = None;
+                retired.observation_age_ms = None;
+                sample.resources.push(retired);
             }
         }
-        if self.samples.len() == self.resource_capacity {
-            self.samples.pop_front();
-            self.dropped_resources += 1;
-        }
+        self.current_resources.clone_from(&sample.resources);
         self.samples.push_back(sample);
+        if self.samples.len() == self.resource_capacity {
+            self.history
+                .push(history::Pending::Samples(std::mem::take(&mut self.samples)));
+        }
     }
 }
 
-/// Perfetto/Chrome Trace JSON：已结束的是 X，仍活动或因 Debug 关闭中断的是只有 B 的不完整 span。
+/// Perfetto/Chrome Trace JSON：已结束的是 X，仍活动的是 B；关闭 Debug 后本轮历史为空。
 /// 每个 span 使用自己的合成 track，tid 不是 CPU 线程；异步并发不会破坏同一 track 的嵌套约束。
 pub fn timeline_snapshot() -> Value {
+    // barrier 在释放活动锁之后等待，业务线程不等待磁盘 IO。
     let (
-        records,
+        mut disk,
         live,
-        active_capacity,
-        completed_capacity,
-        dropped_active,
-        dropped_completed,
-        frozen_total,
+        retained,
         samples,
-        resource_capacity,
-        dropped_resources,
-        sql_capacity,
-        dropped_sql,
-    ) = {
-        let state = TIMELINE.lock();
-        (
-            state
-                .completed
-                .iter()
-                .chain(&state.sql_completed)
-                .cloned()
-                .collect::<Vec<_>>(),
-            state
-                .active
-                .values()
-                .map(|span| span.record(None))
-                .collect::<Vec<_>>(),
-            state.active_capacity,
-            state.completed_capacity,
-            state.dropped_active,
-            state.dropped_completed,
-            state.incomplete,
-            state.samples.iter().cloned().collect::<Vec<_>>(),
-            state.resource_capacity,
-            state.dropped_resources,
-            state.sql_capacity,
-            state.dropped_sql,
-        )
+        capacities,
+        buffered,
+        dropped_active,
+        epoch,
+        debug_enabled,
+    ) = loop {
+        let (
+            barrier,
+            live,
+            retained,
+            samples,
+            capacities,
+            buffered,
+            dropped_active,
+            epoch,
+            debug_enabled,
+        ) = {
+            let sources = sources().read();
+            let state = TIMELINE.lock();
+            (
+                state.history.barrier(),
+                state
+                    .active
+                    .values()
+                    .map(|span| span.record(None))
+                    .collect::<Vec<_>>(),
+                state
+                    .completed
+                    .iter()
+                    .chain(&state.sql_completed)
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                state.samples.iter().cloned().collect::<Vec<_>>(),
+                [
+                    state.active_capacity,
+                    state.completed_capacity,
+                    state.sql_capacity,
+                    state.resource_capacity,
+                ],
+                [
+                    state.completed.len(),
+                    state.sql_completed.len(),
+                    state.samples.len(),
+                ],
+                state.dropped_active,
+                EPOCH.load(Ordering::Acquire),
+                any_enabled(&sources),
+            )
+        };
+        let disk = barrier.wait();
+        if !disk.session_ended && epoch == EPOCH.load(Ordering::Acquire) {
+            break (
+                disk,
+                live,
+                retained,
+                samples,
+                capacities,
+                buffered,
+                dropped_active,
+                epoch,
+                debug_enabled,
+            );
+        }
     };
     let active_spans = live.len();
-    let frozen_spans = records
+    let frozen_spans = 0;
+    let frozen_total = 0_u64;
+    let resource_sample_count = disk.samples + samples.len();
+    let mut events = std::mem::take(&mut disk.events);
+    events.extend(
+        retained
+            .into_iter()
+            .map(|span| trace_event(span, "finished")),
+    );
+    events.extend(samples.into_iter().flat_map(sample_events));
+    events.extend(live.into_iter().map(|span| trace_event(span, "active")));
+    events.sort_by_key(|event| event["ts"].as_u64().unwrap_or_default());
+    let retained_from = events.first().and_then(|event| event["ts"].as_u64());
+    let present = events
         .iter()
-        .filter(|record| record.finished.is_none())
-        .count();
-    // 来源决定采集状态：活动 map 的快照不是冻结记录，不在采集热路径存储额外状态。
-    let mut records = records
-        .into_iter()
-        .map(|record| {
-            let capture_state = if record.finished.is_some() {
-                "finished"
-            } else {
-                "frozen"
-            };
-            (record, capture_state)
-        })
-        .chain(live.into_iter().map(|record| (record, "active")))
-        .collect::<Vec<_>>();
-    records.sort_unstable_by_key(|(record, _)| record.started);
-    let retained_from = records
-        .first()
-        .map(|(record, _)| record.started)
-        .into_iter()
-        .chain(samples.first().map(|sample| sample.at))
-        .min();
-    let exported_at = Instant::now();
-    let present = records
-        .iter()
-        .map(|(record, _)| record.id)
+        .filter_map(|event| event["args"]["span_id"].as_u64())
         .collect::<HashSet<_>>();
-    let mut events = Vec::with_capacity(records.len() * 3);
-    for (span, capture_state) in records {
-        if let Some(parent_id) = span.parent_id.filter(|parent| present.contains(parent)) {
-            // Chrome flow 箭头关联合成 track，不暗示异步子任务运行在父任务的 CPU 线程。
-            let flow = json!({"name":"parent","cat":"stravia.perf","ph":"s","ts":timestamp(span.started),
-                "pid":1,"tid":parent_id,"id":span.id});
-            events.push(flow);
-            events.push(
-                json!({"name":"parent","cat":"stravia.perf","ph":"f","ts":timestamp(span.started),
-                "pid":1,"tid":span.id,"id":span.id,"bp":"s"}),
-            );
-        }
-        let mut args = json!({ "span_id": span.id, "capture_state": capture_state });
-        if let Some(parent_id) = span.parent_id {
-            args["parent_id"] = json!(parent_id);
-        }
-        if let Some(status) = span.status {
-            args["status"] = json!(status);
-        }
-        if let Some(active_us) = span.active_us {
-            args["active_us"] = json!(active_us);
-        }
-        if span.kind != SpanKind::Operation
-            && let Value::Object(details) = span.detail.export()
+    let mut flows = Vec::new();
+    for event in &events {
+        if let Some(parent) = event["args"]["parent_id"]
+            .as_u64()
+            .filter(|parent| present.contains(parent))
         {
-            args.as_object_mut()
-                .expect("span args object")
-                .extend(details);
+            let id = &event["args"]["span_id"];
+            flows.push(json!({"name":"parent","cat":"stravia.perf","ph":"s","ts":event["ts"],"pid":1,"tid":parent,"id":id}));
+            flows.push(json!({"name":"parent","cat":"stravia.perf","ph":"f","ts":event["ts"],"pid":1,"tid":id,"id":id,"bp":"s"}));
         }
-        for (name, value) in WORK_FIELDS.into_iter().zip(span.work) {
-            if let Some(value) = value {
-                args[name] = json!(value);
-            }
-        }
-        if span.sql.query_count > 0 {
-            args["sql_query_count"] = json!(span.sql.query_count);
-            args["sql_query_duration_us"] = json!(span.sql.query_duration_us);
-        }
-        if span.sql.pool_acquire_count > 0 {
-            args["sql_pool_acquire_count"] = json!(span.sql.pool_acquire_count);
-            args["sql_pool_acquire_duration_us"] = json!(span.sql.pool_acquire_duration_us);
-        }
-        let mut event = json!({
-            "name": span.name,
-            "cat": if span.kind == SpanKind::Operation { "stravia.perf" } else { "stravia.sql" },
-            "ph": if span.finished.is_some() { "X" } else { "B" },
-            "ts": timestamp(span.started),
-            "pid": 1,
-            "tid": span.id,
-            "args": args,
-        });
-        if let Some(finished) = span.finished {
-            event["dur"] = json!(micros(finished.saturating_duration_since(span.started)));
-        }
-        events.push(event);
     }
-    let resource_sample_count = samples.len();
-    for sample in samples {
-        let ts = timestamp(sample.at);
-        let mut process = serde_json::Map::new();
-        if let Some(rss) = sample.rss_bytes {
-            process.insert("rss_bytes".into(), json!(rss));
-        }
-        if let Some(cpu) = sample.cpu_percent {
-            process.insert("cpu_percent".into(), json!(cpu));
-        }
-        if !process.is_empty() {
-            events.push(json!({"name":"process","cat":"stravia.resources","ph":"C",
-                "pid":1,"tid":0,"ts":ts,"args":process}));
-        }
-        for point in sample.resources {
-            let mut args = json!({"items":point.items,"logical_bytes":point.logical_bytes});
-            if let Some(at) = point.observed_at_unix_ms {
-                args["observed_at_unix_ms"] = json!(at);
-            }
-            if let Some(age) = point.observation_age_ms {
-                args["observation_age_ms"] = json!(age);
-            }
-            events.push(json!({"name":format!("{}.{}",point.resource,point.domain),
-                "cat":"stravia.resources","ph":"C","pid":1,"tid":0,"ts":ts,"args":args}));
-        }
-        for pool in sample.pools {
-            let mut args = json!({"observation_age_us":ts.saturating_sub(pool.observed_at_us)});
-            if let Some(value) = pool.size {
-                args["size"] = json!(value);
-            }
-            if let Some(value) = pool.idle {
-                args["idle"] = json!(value);
-            }
-            if let Some(value) = pool.waiting {
-                args["instrumented_waiting"] = json!(value);
-            }
-            if let Some(value) = pool.failed {
-                args["instrumented_failed"] = json!(value);
-            }
-            if let Some(value) = pool.cancelled {
-                args["instrumented_cancelled"] = json!(value);
-            }
-            events.push(
-                json!({"name":format!("sql_pool.{}.{}",pool.backend,pool.pool),
-                "cat":"stravia.resources","ph":"C","pid":1,"tid":0,"ts":ts,"args":args}),
-            );
-        }
-        events.push(
-            json!({"name":"debug.epoch","cat":"stravia.resources","ph":"C",
-            "pid":1,"tid":0,"ts":ts,"args":{"epoch":sample.epoch}}),
-        );
-    }
-    json!({
+    events.extend(flows);
+    let exported_at = Instant::now();
+    let mut snapshot = json!({
         "traceEvents": events,
         "displayTimeUnit": "ms",
         "metadata": {
-            "schema_version": 2,
+            "schema_version": 3,
             "application_version": env!("CARGO_PKG_VERSION"),
             "process_id":std::process::id(),
             "clock_origin_unix_us":CLOCK.1,
             "host": {"os":std::env::consts::OS,"arch":std::env::consts::ARCH,
                 "logical_cpus":std::thread::available_parallelism().ok().map(|count|count.get())},
             "exported_at_unix_us":timestamp(exported_at),
-            "retained_from_unix_us":retained_from.map(timestamp),
-            "debug_enabled":enabled(),
-            "debug_epoch":EPOCH.load(Ordering::Acquire),
+            "retained_from_unix_us":retained_from,
+            "debug_enabled":debug_enabled,
+            "debug_epoch":epoch,
             "sample_interval_ms":SAMPLE_INTERVAL.as_millis(),
             "resource_sample_count":resource_sample_count,
-            "capacity": { "active": active_capacity, "completed": completed_capacity,
-                "sql_completed":sql_capacity,"resource_samples":resource_capacity },
+            "capacity": { "active": capacities[0], "completed": capacities[1],
+                "sql_completed": capacities[2], "resource_samples": capacities[3],
+                "writer_queue": history::QUEUE_CAPACITY },
+            "storage": "memory_and_temporary_file",
+            "storage_status": disk.status,
+            "storage_errors": disk.errors,
+            "spilled_completed": disk.spilled[0],
+            "spilled_sql_completed": disk.spilled[1],
+            "spilled_resource_samples": disk.spilled[2],
             "dropped_active": dropped_active,
-            "dropped_completed": dropped_completed,
-            "dropped_sql_completed":dropped_sql,
-            "dropped_resource_samples":dropped_resources,
+            "dropped_completed": disk.dropped[0],
+            "dropped_sql_completed":disk.dropped[1],
+            "dropped_resource_samples":disk.dropped[2],
             "incomplete": active_spans + frozen_spans,
             "incomplete_total": frozen_total + active_spans as u64,
             "active_spans": active_spans,
@@ -505,8 +434,117 @@ pub fn timeline_snapshot() -> Value {
             "pool_waiting_scope":"instrumented acquisitions; driver-internal waits excluded",
             "remote_cache_scope":"last received successful command snapshot; response order and remote TTL are not live gauges",
         }
-    })
+    });
+    snapshot["metadata"]["buffered"] = json!({
+        "completed": buffered[0],
+        "sql_completed": buffered[1],
+        "resource_samples": buffered[2],
+    });
+    snapshot["metadata"]["writer_queue_unit"] = json!("batches");
+    snapshot
 }
+
+fn trace_event(span: TraceRecord, capture_state: &str) -> Value {
+    let mut args = json!({ "span_id": span.id, "capture_state": capture_state });
+    if let Some(parent_id) = span.parent_id {
+        args["parent_id"] = json!(parent_id);
+    }
+    if let Some(status) = span.status {
+        args["status"] = json!(status);
+    }
+    if let Some(active_us) = span.active_us {
+        args["active_us"] = json!(active_us);
+    }
+    if span.kind != SpanKind::Operation
+        && let Value::Object(details) = span.detail.export()
+    {
+        args.as_object_mut()
+            .expect("span args object")
+            .extend(details);
+    }
+    for (name, value) in WORK_FIELDS.into_iter().zip(span.work) {
+        if let Some(value) = value {
+            args[name] = json!(value);
+        }
+    }
+    if span.sql.query_count > 0 {
+        args["sql_query_count"] = json!(span.sql.query_count);
+        args["sql_query_duration_us"] = json!(span.sql.query_duration_us);
+    }
+    if span.sql.pool_acquire_count > 0 {
+        args["sql_pool_acquire_count"] = json!(span.sql.pool_acquire_count);
+        args["sql_pool_acquire_duration_us"] = json!(span.sql.pool_acquire_duration_us);
+    }
+    let mut event = json!({
+        "name": span.name,
+        "cat": if span.kind == SpanKind::Operation { "stravia.perf" } else { "stravia.sql" },
+        "ph": if span.finished.is_some() { "X" } else { "B" },
+        "ts": timestamp(span.started),
+        "pid": 1,
+        "tid": span.id,
+        "args": args,
+    });
+    if let Some(finished) = span.finished {
+        event["dur"] = json!(micros(finished.saturating_duration_since(span.started)));
+    }
+    event
+}
+
+fn sample_events(sample: ResourceSample) -> Vec<Value> {
+    let mut events = Vec::new();
+    let ts = timestamp(sample.at);
+    let mut process = serde_json::Map::new();
+    if let Some(rss) = sample.rss_bytes {
+        process.insert("rss_bytes".into(), json!(rss));
+    }
+    if let Some(cpu) = sample.cpu_percent {
+        process.insert("cpu_percent".into(), json!(cpu));
+    }
+    if !process.is_empty() {
+        events.push(json!({"name":"process","cat":"stravia.resources","ph":"C",
+                "pid":1,"tid":0,"ts":ts,"args":process}));
+    }
+    for point in sample.resources {
+        let mut args = json!({"items":point.items,"logical_bytes":point.logical_bytes});
+        if let Some(at) = point.observed_at_unix_ms {
+            args["observed_at_unix_ms"] = json!(at);
+        }
+        if let Some(age) = point.observation_age_ms {
+            args["observation_age_ms"] = json!(age);
+        }
+        events.push(json!({"name":format!("{}.{}",point.resource,point.domain),
+                "cat":"stravia.resources","ph":"C","pid":1,"tid":0,"ts":ts,"args":args}));
+    }
+    for pool in sample.pools {
+        let mut args = json!({"observation_age_us":ts.saturating_sub(pool.observed_at_us)});
+        if let Some(value) = pool.size {
+            args["size"] = json!(value);
+        }
+        if let Some(value) = pool.idle {
+            args["idle"] = json!(value);
+        }
+        if let Some(value) = pool.waiting {
+            args["instrumented_waiting"] = json!(value);
+        }
+        if let Some(value) = pool.failed {
+            args["instrumented_failed"] = json!(value);
+        }
+        if let Some(value) = pool.cancelled {
+            args["instrumented_cancelled"] = json!(value);
+        }
+        events.push(
+            json!({"name":format!("sql_pool.{}.{}",pool.backend,pool.pool),
+                "cat":"stravia.resources","ph":"C","pid":1,"tid":0,"ts":ts,"args":args}),
+        );
+    }
+    events.push(
+        json!({"name":"debug.epoch","cat":"stravia.resources","ph":"C",
+            "pid":1,"tid":0,"ts":ts,"args":{"epoch":sample.epoch}}),
+    );
+
+    events
+}
+
 struct ProcessSampler {
     system: System,
     warmed_epoch: Option<u64>,
@@ -531,11 +569,12 @@ pub(crate) fn bind_debug(debug: &Arc<AtomicBool>) {
 }
 
 pub(crate) fn set_debug(debug: &AtomicBool, enabled: bool) {
-    // 切换与 span 创建/结束及指标写入串行；旧会话仅保留不完整的时间线，
-    // 即使随后重开，也绝不把旧 span 算入新会话的指标。
+    // 切换与 span 创建/结束及指标写入串行；旧会话历史立即撤销，
+    // 随后重开也绝不把旧 span 算入新会话的时间线或指标。
     let _sources = sources().write();
     if debug.swap(enabled, Ordering::AcqRel) != enabled {
-        TIMELINE.lock().invalidate();
+        let mut timeline = TIMELINE.lock();
+        timeline.invalidate();
         EPOCH.fetch_add(1, Ordering::AcqRel);
     }
 }
@@ -642,8 +681,8 @@ impl Visit for StatusVisitor {
 }
 
 /// 静态 span 名称是唯一 operation 标签；仅接受状态和工作量数值白名单。
-/// 内存上限默认活动 1024 + 已结束 10000 条，可用 STRAVIA_PERF_TRACE_ACTIVE_CAPACITY
-/// 与 STRAVIA_PERF_TRACE_COMPLETED_CAPACITY 在进程启动时调整；满额的活动 span 不导出也不记指标。
+/// 活动 span、有界历史缓冲和短写队列驻留内存；溢出历史写入本轮匿名临时文件。
+/// STRAVIA_PERF_TRACE_ACTIVE_CAPACITY 保护活动并发；满额的活动 span 不导出也不记指标。
 pub struct PerformanceLayer;
 
 impl<S> Layer<S> for PerformanceLayer
@@ -1024,7 +1063,7 @@ fn sample_process() {
             resources,
             pools,
         });
-        for point in &state.samples.back().expect("just sampled").resources {
+        for point in &state.current_resources {
             gauge!("stravia_managed_resource_items", "resource" => point.resource, "domain" => point.domain).set(point.items as f64);
             gauge!("stravia_managed_resource_logical_bytes", "resource" => point.resource, "domain" => point.domain).set(point.logical_bytes as f64);
         }
@@ -1167,7 +1206,6 @@ mod tests {
                 drop(explicit);
                 parent.record("status", "completed");
                 drop(parent);
-                set_debug(&debug, false);
             });
         });
         handle.run_upkeep();
@@ -1311,7 +1349,6 @@ mod tests {
             .expect("second poll");
             drop(future);
             drop(future_span);
-            set_debug(&debug, false);
         });
         let snapshot = timeline_snapshot();
         for name in ["test.concurrent", "test.async_polls"] {
@@ -1350,7 +1387,6 @@ mod tests {
                     drop(child);
                 }
                 drop(parent);
-                set_debug(&debug, false);
             },
         );
         let trace = timeline_snapshot();
@@ -1415,15 +1451,9 @@ mod tests {
             }
 
             set_debug(&debug, false);
-            let frozen = timeline_snapshot();
-            assert_counts(&frozen, 0, 2, 2);
-            for name in ["test.capture.old", "sql.query"] {
-                let span = event(&frozen, name);
-                assert_eq!(span["args"]["capture_state"], "frozen");
-                assert_eq!(span["ph"], "B");
-                assert!(span.get("dur").is_none());
-                assert!(span["args"].get("status").is_none());
-            }
+            let closed = timeline_snapshot();
+            assert_counts(&closed, 0, 0, 0);
+            assert!(closed["traceEvents"].as_array().unwrap().is_empty());
             set_debug(&debug, true);
             old.record("status", "completed");
             old_sql.record("status", "error");
@@ -1434,7 +1464,7 @@ mod tests {
             );
             let reopened = timeline_snapshot();
             assert_ne!(reopened["metadata"]["debug_epoch"], epoch);
-            assert_counts(&reopened, 1, 2, 2);
+            assert_counts(&reopened, 1, 0, 0);
             assert_eq!(
                 event(&reopened, "test.capture.current")["args"]["capture_state"],
                 "active"
@@ -1447,9 +1477,15 @@ mod tests {
                 target: "stravia::perf", "test.capture.cancelled", status = "cancelled"
             ));
             let finished = timeline_snapshot();
-            assert_counts(&finished, 0, 2, 2);
+            assert_counts(&finished, 0, 0, 0);
             for name in ["test.capture.old", "sql.query"] {
-                assert_eq!(event(&finished, name), event(&frozen, name));
+                assert!(
+                    !finished["traceEvents"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|event| event["name"] == name)
+                );
             }
             for (name, status) in [
                 ("test.capture.current", "completed"),
@@ -1479,76 +1515,56 @@ mod tests {
             let active = (0..ACTIVE_CAPACITY)
                 .map(|_| tracing::info_span!(target: "stravia::perf", "test.holding"))
                 .collect::<Vec<_>>();
-            let over = tracing::info_span!(target: "stravia::perf", "test.overflow_active");
-            drop(over);
+            drop(tracing::info_span!(target: "stravia::perf", "test.overflow_active"));
+            let holding = timeline_snapshot();
+            assert_eq!(holding["metadata"]["active_spans"], ACTIVE_CAPACITY);
+            assert_eq!(holding["metadata"]["dropped_active"], 1);
             set_debug(&debug, false);
-            let frozen = timeline_snapshot();
-            assert_eq!(
-                frozen["metadata"]["incomplete"].as_u64(),
-                Some(ACTIVE_CAPACITY as u64)
-            );
-            assert_eq!(frozen["metadata"]["dropped_active"], 1);
-            assert_eq!(
-                frozen["traceEvents"].as_array().unwrap().len(),
-                ACTIVE_CAPACITY
-            );
             assert!(
-                frozen["traceEvents"]
+                timeline_snapshot()["traceEvents"]
                     .as_array()
                     .unwrap()
-                    .iter()
-                    .all(|event| event["ph"] == "B" && event.get("dur").is_none())
-            );
-            drop(active);
-            assert_eq!(
-                timeline_snapshot()["traceEvents"],
-                frozen["traceEvents"],
-                "disabled capture must not change retained events"
+                    .is_empty()
             );
             set_debug(&debug, true);
+            drop(active);
             for _ in 0..COMPLETED_CAPACITY + 20 {
-                let span = tracing::info_span!(target: "stravia::perf", "test.completed_buffer",
-                    status = "completed");
-                drop(span);
+                drop(
+                    tracing::info_span!(target: "stravia::perf", "test.completed_buffer", status = "completed"),
+                );
             }
+            let snapshot = timeline_snapshot();
+            assert_eq!(
+                snapshot["metadata"]["capacity"]["completed"],
+                COMPLETED_CAPACITY
+            );
+            assert_eq!(
+                snapshot["metadata"]["spilled_completed"],
+                COMPLETED_CAPACITY
+            );
+            assert_eq!(snapshot["metadata"]["dropped_completed"], 0);
+            assert_eq!(snapshot["metadata"]["dropped_active"], 0);
+            assert_eq!(snapshot["metadata"]["storage_status"], "ready");
+            assert_eq!(snapshot["metadata"]["incomplete"], 0);
+            assert_eq!(snapshot["metadata"]["frozen_total"], 0);
+            assert_eq!(
+                snapshot["traceEvents"].as_array().unwrap().len(),
+                COMPLETED_CAPACITY + 20
+            );
+            assert_eq!(TIMELINE.lock().completed.len(), 20);
             set_debug(&debug, false);
+            let closed = timeline_snapshot();
+            assert!(closed["traceEvents"].as_array().unwrap().is_empty());
+            assert_eq!(closed["metadata"]["spilled_completed"], 0);
+            assert_eq!(closed["metadata"]["storage_errors"], 0);
+            set_debug(&debug, true);
+            assert!(
+                timeline_snapshot()["traceEvents"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
+            );
         });
-        let snapshot = timeline_snapshot();
-        assert_eq!(
-            snapshot["metadata"]["capacity"]["active"].as_u64(),
-            Some(ACTIVE_CAPACITY as u64)
-        );
-        assert_eq!(
-            snapshot["metadata"]["capacity"]["completed"].as_u64(),
-            Some(COMPLETED_CAPACITY as u64)
-        );
-        assert_eq!(
-            snapshot["metadata"]["dropped_completed"].as_u64(),
-            Some((ACTIVE_CAPACITY + 20) as u64)
-        );
-        assert_eq!(snapshot["metadata"]["incomplete"], 0);
-        assert_eq!(snapshot["metadata"]["active_spans"], 0);
-        assert_eq!(snapshot["metadata"]["frozen_spans"], 0);
-        assert_eq!(
-            snapshot["metadata"]["frozen_total"].as_u64(),
-            Some(ACTIVE_CAPACITY as u64)
-        );
-        assert_eq!(
-            snapshot["metadata"]["incomplete_total"].as_u64(),
-            Some(ACTIVE_CAPACITY as u64)
-        );
-        assert_eq!(
-            snapshot["traceEvents"].as_array().unwrap().len(),
-            COMPLETED_CAPACITY
-        );
-        assert_eq!(snapshot["displayTimeUnit"], "ms");
-        assert!(
-            snapshot["traceEvents"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .all(|event| event["ph"] == "X" && event["dur"].as_u64().is_some())
-        );
     }
 
     fn emit_sql_span() {
@@ -1557,6 +1573,85 @@ mod tests {
             backend = "SQLite", pool = "main", execution_scope = "driver",
             summary = "SELECT password", db.statement = "SELECT password FROM vault",
         );
+    }
+
+    #[test]
+    fn sql_history_exceeds_memory_capacity_and_keeps_ended_parent_flows() {
+        if !isolated_with_env(
+            "sql_history_exceeds_memory_capacity_and_keeps_ended_parent_flows",
+            &[(COMPLETED_CAPACITY_ENV, "1")],
+        ) {
+            return;
+        }
+        let debug = Arc::new(AtomicBool::new(true));
+        bind_debug(&debug);
+        tracing::subscriber::with_default(subscriber(), || {
+            let parent = tracing::info_span!(target: "stravia::perf", "test.disk.parent");
+            let context = parent.in_scope(current_context);
+            drop(parent);
+            drop(tracing::info_span!(target: "stravia::perf", "test.disk.displace"));
+            for index in 0..2 * SQL_COMPLETED_CAPACITY + 40 {
+                let child = tracing::info_span!(target: "stravia::sql", parent: None, "sql.query",
+                    causal_parent_id=context.span_id(), causal_epoch=context.epoch(),
+                    backend="SQLite", pool="main", status="completed",
+                    db.statement="SELECT private_disk_value");
+                drop(child);
+                if index + 1 == SQL_COMPLETED_CAPACITY {
+                    assert!(TIMELINE.lock().sql_completed.is_empty());
+                    let first_batch = timeline_snapshot();
+                    assert_eq!(
+                        first_batch["metadata"]["spilled_sql_completed"],
+                        SQL_COMPLETED_CAPACITY
+                    );
+                    assert_eq!(
+                        first_batch["traceEvents"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .filter(|event| event["name"] == "sql.query" && event["ph"] == "X")
+                            .count(),
+                        SQL_COMPLETED_CAPACITY
+                    );
+                }
+            }
+            let snapshot = timeline_snapshot();
+            let events = snapshot["traceEvents"].as_array().unwrap();
+            let queries = events
+                .iter()
+                .filter(|event| event["name"] == "sql.query" && event["ph"] == "X")
+                .collect::<Vec<_>>();
+            assert_eq!(queries.len(), 2 * SQL_COMPLETED_CAPACITY + 40);
+            assert!(
+                queries
+                    .iter()
+                    .all(|event| event["args"]["parent_id"] == context.span_id())
+            );
+            assert!(
+                events
+                    .iter()
+                    .any(|event| event["ph"] == "s" && event["tid"] == context.span_id())
+            );
+            assert!(
+                events
+                    .iter()
+                    .any(|event| event["name"] == "test.disk.parent" && event["ph"] == "X")
+            );
+            assert_eq!(snapshot["metadata"]["spilled_completed"], 2);
+            assert_eq!(
+                snapshot["metadata"]["spilled_sql_completed"],
+                2 * SQL_COMPLETED_CAPACITY
+            );
+            assert_eq!(TIMELINE.lock().sql_completed.len(), 40);
+            assert_eq!(snapshot["metadata"]["dropped_sql_completed"], 0);
+            assert!(!snapshot.to_string().contains("private_disk_value"));
+            set_debug(&debug, false);
+            assert!(
+                timeline_snapshot()["traceEvents"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
+            );
+        });
     }
 
     #[test]
@@ -1611,7 +1706,6 @@ mod tests {
             // span 外提交，因为 worker 会先回复 ping，再释放 ping 自己捕获的 span。
             connection.ping().await.unwrap();
             drop(connection);
-            set_debug(&debug, false);
             pool.close().await;
         });
         let trace = timeline_snapshot();
@@ -1705,8 +1799,6 @@ mod tests {
                     record_generation_cache_access(false);
                 });
                 drop(current);
-                set_debug(&debug, false);
-                record_generation_cache_access(false);
             });
         });
         handle.run_upkeep();
@@ -1729,20 +1821,16 @@ mod tests {
         assert_eq!(current["args"]["node_count"], 3);
         assert_eq!(current["args"]["reference_count"], 7);
         assert!(current["args"].get("candidate_count").is_none());
-        let stale = events
-            .iter()
-            .find(|event| event["name"] == "test.stale_sql")
-            .unwrap();
-        assert!(stale["args"].get("sql_query_count").is_none());
+        assert!(!events.iter().any(|event| event["name"] == "test.stale_sql"));
         let serialized = snapshot.to_string();
         assert!(!serialized.contains("919191"));
         assert!(!serialized.contains("private-count"));
     }
 
     #[test]
-    fn resource_history_retains_transitions_and_bounds_its_window() {
+    fn resource_history_spills_transitions_and_clears_with_debug() {
         if !isolated_with_env(
-            "resource_history_retains_transitions_and_bounds_its_window",
+            "resource_history_spills_transitions_and_clears_with_debug",
             &[(RESOURCE_CAPACITY_ENV, "2")],
         ) {
             return;
@@ -1763,16 +1851,24 @@ mod tests {
             .iter()
             .filter(|event| event["name"] == "test_resource.retained")
             .collect::<Vec<_>>();
-        assert_eq!(samples.len(), 2);
-        assert_eq!(samples[0]["args"]["items"], 1);
-        assert_eq!(samples[0]["args"]["logical_bytes"], 1024);
-        assert_eq!(samples[1]["args"]["items"], 0);
-        assert_eq!(samples[1]["args"]["logical_bytes"], 0);
+        assert_eq!(samples.len(), 3);
+        assert_eq!(samples[0]["args"]["items"], 2);
+        assert_eq!(samples[0]["args"]["logical_bytes"], 4096);
+        assert_eq!(samples[1]["args"]["items"], 1);
+        assert_eq!(samples[1]["args"]["logical_bytes"], 1024);
+        assert_eq!(samples[2]["args"]["items"], 0);
+        assert_eq!(samples[2]["args"]["logical_bytes"], 0);
         assert!(samples[0]["ts"].as_u64().unwrap() <= samples[1]["ts"].as_u64().unwrap());
-        assert_eq!(snapshot["metadata"]["dropped_resource_samples"], 1);
+        assert_eq!(snapshot["metadata"]["dropped_resource_samples"], 0);
+        assert_eq!(snapshot["metadata"]["spilled_resource_samples"], 2);
         set_debug(&debug, false);
         sample_process();
-        assert_eq!(timeline_snapshot()["traceEvents"], snapshot["traceEvents"]);
+        assert!(
+            timeline_snapshot()["traceEvents"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
         set_debug(&debug, true);
         sample_process();
         let reopened = timeline_snapshot();
@@ -1851,7 +1947,7 @@ mod tests {
                     .iter()
                     .filter(|event| event["name"] == "sql.query" && event["ph"] == "X")
                     .count(),
-                1
+                0
             );
             assert!(
                 events
