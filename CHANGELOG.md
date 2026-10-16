@@ -2,11 +2,7 @@
 
 ## Unreleased
 
-### Fixed
-
-- Fixed OpenAI Codex requests failing with `Open Responses SSE sequence_number N does not match N-1`. Codex now numbers `response.metadata` events in the stream sequence; Stravia previously dropped them before validation and treated the gap as a corrupt stream.
-
-## [0.5.0] - 2026-10-16
+## [0.5.1] - 2026-10-16
 
 ### Added
 
@@ -56,6 +52,7 @@
 
 ### Fixed
 
+- Fixed OpenAI Codex requests failing with `Open Responses SSE sequence_number N does not match N-1`. Numbered `response.metadata` events now advance stream sequence validation without emitting output deltas; Codex WebSocket responses use the shared decoder so these events reach the parser. Rebuild and re-import the standalone `openai-codex` component.
 - Aligned workspace Rust formatting with the pinned Rust 1.99.0 toolchain so CI static checks pass the formatting gate; runtime behavior is unchanged.
 - Codex WebSocket continuation now reuses the matching connection across client tool-result turns instead of reporting a local `continuation_unavailable` and replaying full history every time. Handshakes use stable thread correlation; changing turn metadata and same-turn routing state stay in each `response.create` message. HTTP correlation and the host's credential, account, Principal, Target, and exact-tip checks are unchanged. Rebuild and re-import the standalone `openai-codex` component.
 - Expired observation cleanup no longer holds one unbounded deletion transaction that can block SQLite History Marker writes and fail an active response with `database is locked`. SQLite/PostgreSQL migration `0020` adds missing cleanup foreign-key indexes and ordered expiry indexes; retention now commits bounded batches and invalidates their live state immediately, preserving completed progress if a later batch fails. Existing lock timeouts, active-record eligibility, manual-clear protection, and durable usage totals are unchanged. Back up existing databases before upgrading.
