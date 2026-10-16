@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Fixed
+
+- Fixed OpenAI Codex requests failing with `Open Responses SSE sequence_number N does not match N-1`. Codex now numbers `response.metadata` events in the stream sequence; Stravia previously dropped them before validation and treated the gap as a corrupt stream.
+
 ## [0.5.0] - 2026-10-16
 
 ### Added

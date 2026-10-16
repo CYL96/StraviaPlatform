@@ -45,6 +45,8 @@ pub(super) const DATED_EVENT_TYPES: &[&str] = &[
 // OpenAI's rolling Responses transport adds aliases and hosted-tool events while Stravia
 // continues to expose the fixed 2026-04-24 protocol to its own clients.
 const ROLLING_RESPONSES_EVENT_TYPES: &[&str] = &[
+    // 上游会给它分配 sequence_number；必须由解析器消费，否则会在序号上留下空洞。
+    "response.metadata",
     "response.reasoning_text.delta",
     "response.reasoning_text.done",
     "response.image_generation_call.in_progress",
@@ -992,7 +994,12 @@ impl ResponsesStreamParser {
             );
         }
         self.next_sequence_number = self.next_sequence_number.saturating_add(1);
-        if !self.started && !matches!(event, "response.queued" | "response.created" | "error") {
+        if !self.started
+            && !matches!(
+                event,
+                "response.queued" | "response.created" | "response.metadata" | "error"
+            )
+        {
             anyhow::bail!("Open Responses SSE emitted '{event}' before response.created");
         }
         if matches!(
@@ -1059,7 +1066,7 @@ impl ResponsesStreamParser {
                 self.started = true;
                 deltas.push(AiStreamDelta::MessageStart { id, model });
             }
-            "response.in_progress" => {}
+            "response.in_progress" | "response.metadata" => {}
             "response.output_text.delta" => {
                 let (output_index, content_index) =
                     self.require_open_content_part_type(payload, "output_text", event)?;

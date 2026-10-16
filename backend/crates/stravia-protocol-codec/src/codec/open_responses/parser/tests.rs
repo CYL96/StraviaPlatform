@@ -424,6 +424,34 @@ fn stream_accepts_openai_responses_events_without_sequence_numbers() {
 }
 
 #[test]
+fn stream_consumes_sequence_number_of_rolling_response_metadata() {
+    let sse = [
+        sse_event(
+            "response.created",
+            r#"{"type":"response.created","sequence_number":0,"response":{"id":"resp_1","model":"gpt-6.1-sol","status":"in_progress"}}"#,
+        ),
+        sse_event(
+            "response.metadata",
+            r#"{"type":"response.metadata","sequence_number":1,"response_id":"resp_1","metadata":{"openai_chatgpt_moderation_metadata":{}}}"#,
+        ),
+        sse_event(
+            "response.output_item.added",
+            r#"{"type":"response.output_item.added","sequence_number":2,"output_index":0,"item":{"type":"reasoning","id":"rs_1","summary":[],"content":[]}}"#,
+        ),
+    ]
+    .concat();
+
+    let deltas = ResponsesStreamParser::new()
+        .parse_chunk(&sse)
+        .expect("response.metadata owns a sequence number and emits no delta");
+    assert!(
+        deltas
+            .iter()
+            .all(|delta| !matches!(delta, AiStreamDelta::ThinkingDeltaWithMetadata { .. }))
+    );
+}
+
+#[test]
 fn stream_accepts_rolling_reasoning_text_events() {
     let sse = [
             sse_event(

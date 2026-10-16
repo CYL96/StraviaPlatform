@@ -467,26 +467,6 @@ pub fn decode_ai_response_websocket_with_error_classifier(
         host,
         protocol,
         connection,
-        false,
-        preserve_upstream_errors,
-        continuation_requested,
-        classify_error,
-    )
-}
-
-pub fn decode_codex_ai_response_websocket_with_error_classifier(
-    host: &GuestHost,
-    protocol: &str,
-    connection: stravia_vendor_sdk::WsConnection,
-    preserve_upstream_errors: bool,
-    continuation_requested: bool,
-    classify_error: impl Fn(&serde_json::Value, bool) -> Option<PluginError>,
-) -> Result<AiResponse, PluginError> {
-    decode_normalized_websocket(
-        host,
-        protocol,
-        connection,
-        true,
         preserve_upstream_errors,
         continuation_requested,
         classify_error,
@@ -497,7 +477,6 @@ fn decode_normalized_websocket(
     host: &GuestHost,
     protocol: &str,
     connection: stravia_vendor_sdk::WsConnection,
-    drop_response_metadata: bool,
     preserve_upstream_errors: bool,
     continuation_requested: bool,
     classify_error: impl Fn(&serde_json::Value, bool) -> Option<PluginError>,
@@ -580,10 +559,9 @@ fn decode_normalized_websocket(
                     "inference WebSocket connection limit reached",
                 ));
             }
-            if original_type.starts_with("codex.")
-                || original_type.starts_with("responsesapi.")
-                || (drop_response_metadata && original_type == "response.metadata")
-            {
+            // 这两类私有事件不带 sequence_number，丢弃不会影响序号连续性；
+            // response.metadata 带序号，必须交给解码器。
+            if original_type.starts_with("codex.") || original_type.starts_with("responsesapi.") {
                 continue;
             }
             if original_type.starts_with("response.") {

@@ -681,7 +681,7 @@ pub(super) fn infer_websocket(
             |_| invalid("Codex WebSocket request could not be encoded"),
         )?))?;
 
-    stravia_vendor_common::common::decode_codex_ai_response_websocket_with_error_classifier(
+    stravia_vendor_common::common::decode_ai_response_websocket_with_error_classifier(
         host,
         &OPEN_RESPONSES_2026_04_24.to_string(),
         connection,
