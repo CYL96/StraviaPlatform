@@ -128,8 +128,45 @@ impl SqlTurnChainStore {
          AND r.content_id = turn_chain_contents.id)";
         match self {
             Self::Sqlite(pool, gate) => {
-                let _write_gate = gate.lock().await;
-                sqlx::query(DELETE).execute(pool).await?;
+                let mut cursor: Option<(String, i64)> = None;
+                loop {
+                    // 候选扫描不持写锁；沿 (principal, id) 覆盖索引推进，避免反复扫描活内容。
+                    let mut candidates = {
+                        let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+                            "SELECT principal, id FROM turn_chain_contents WHERE NOT EXISTS \
+                             (SELECT 1 FROM turn_chain_node_contents r \
+                              WHERE r.principal = turn_chain_contents.principal \
+                              AND r.content_id = turn_chain_contents.id)",
+                        );
+                        if let Some((principal, id)) = &cursor {
+                            query
+                                .push(" AND (principal, id) > (")
+                                .push_bind(principal)
+                                .push(",")
+                                .push_bind(*id)
+                                .push(")");
+                        }
+                        query.push(" ORDER BY principal, id LIMIT 400");
+                        query
+                            .build_query_as::<(String, i64)>()
+                            .fetch_all(pool)
+                            .await?
+                    };
+                    let Some(last) = candidates.pop() else {
+                        break;
+                    };
+                    // 读取候选后可能已有新引用，必须在同一条 DELETE 中重新检查。
+                    let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(DELETE);
+                    query.push(" AND id IN (");
+                    let mut ids = query.separated(",");
+                    for (_, id) in candidates {
+                        ids.push_bind(id);
+                    }
+                    ids.push_bind(last.1).push_unseparated(")");
+                    let _write_gate = gate.lock().await;
+                    query.build().execute(pool).await?;
+                    cursor = Some(last);
+                }
             }
             Self::Postgres(pool) => {
                 let mut transaction = pool.begin().await?;

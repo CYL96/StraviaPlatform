@@ -752,6 +752,78 @@ async fn optimization_sqlite_history_restore_ignores_unrelated_references() {
 }
 
 #[tokio::test]
+async fn sqlite_content_gc_releases_writer_within_transaction_budget() {
+    let pool = crate::test_support::migrated_sqlite_pool().await.unwrap();
+    let store = SqlTurnChainStore::sqlite(pool.clone(), Arc::new(tokio::sync::Mutex::new(())));
+    let owner = Principal::new("gc-budget-owner");
+    let live = TurnNodeId::response();
+    let expected = json!({"effective_system": "live system ".repeat(100)});
+    store
+        .commit(TurnCommit {
+            id: live.clone(),
+            kind: TurnNodeKind::Response,
+            parent_id: None,
+            principal: owner.clone(),
+            payload_version: 6,
+            payload: expected.clone(),
+            idle_ttl: Duration::from_secs(600),
+            reusable_prefix: None,
+        })
+        .await
+        .unwrap();
+    sqlx::query(
+        "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<5000) \
+         INSERT INTO turn_chain_contents(principal,content_key,content) \
+         SELECT CASE WHEN i%2=0 THEN ? ELSE ? END, 'orphan-' || i, zeroblob(4096) FROM n",
+    )
+    .bind(owner.continuation_key())
+    .bind(Principal::new("gc-budget-other").continuation_key())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // 通过提交重置 VM 预算，拒绝整轮 GC 只在结尾释放写锁；不依赖机器速度。
+    const TICKS_PER_TRANSACTION: u32 = 100;
+    let ticks = Arc::new(AtomicU32::new(0));
+    {
+        let mut connection = pool.acquire().await.unwrap();
+        let mut handle = connection.lock_handle().await.unwrap();
+        let progress_ticks = ticks.clone();
+        handle.set_progress_handler(1000, move || {
+            progress_ticks.fetch_add(1, Ordering::Relaxed) < TICKS_PER_TRANSACTION
+        });
+        handle.set_commit_hook(move || {
+            ticks.store(0, Ordering::Relaxed);
+            true
+        });
+    }
+    let result = store.sweep_expired().await;
+    {
+        let mut connection = pool.acquire().await.unwrap();
+        let mut handle = connection.lock_handle().await.unwrap();
+        handle.remove_progress_handler();
+        handle.remove_commit_hook();
+    }
+    assert_eq!(result.expect("GC must yield the SQLite writer"), 0);
+    assert_eq!(
+        scalar(
+            &store,
+            "SELECT COUNT(*) FROM turn_chain_contents WHERE content_key LIKE 'orphan-%'"
+        )
+        .await,
+        0,
+    );
+    assert_eq!(
+        store
+            .materialize(&owner, TurnNodeKind::Response, &live)
+            .await
+            .unwrap()[0]
+            .payload,
+        expected,
+    );
+}
+
+#[tokio::test]
 async fn structural_history_postgres_contract_when_configured() {
     let Some(url) = std::env::var("DB_URL")
         .ok()

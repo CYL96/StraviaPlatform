@@ -11,6 +11,7 @@
 
 - Historical Route destinations whose model aliases resolve through the saved service inventory can now be explicitly reconfigured for a supported output without replacing their original aliases or scheduling settings.
 - Interaction Observation now links a request resumed after client-side compaction to the turn it actually continues, instead of an earlier turn whose retained answer happened to be longer. Among matching delivered sources, the one ending latest in the replayed history wins; reasoning replayed with unchanged encrypted content or signature no longer cuts off the final turn, while changed or missing opaque state still blocks the match. Only newly admitted requests are affected; existing Observations are not regrouped. See [Interaction Observation](docs/design/interaction-observation.md).
+- SQLite Turn Chain content cleanup now selects orphan candidates outside the write lock and deletes them in bounded transactions, reducing contention that can fail History Marker writes with `database is locked`. Deletion atomically rechecks references; live history, expiry rules, lock timeouts, and PostgreSQL behavior are unchanged. No database migration is required.
 - CI now reuses successful complete checks for the exact same commit across `dev`, `main`, and Release, or waits for an existing automatic CI run instead of starting another full test matrix. PR merge checks and explicit manual/cache-warm runs remain independent; failed, cancelled, partial, or unavailable evidence cannot authorize a release.
 
 ## [0.5.1] - 2026-10-16
