@@ -131,9 +131,12 @@ impl Gateway {
         reason.map(str::to_owned)
     }
 
-    pub(super) async fn start_provider_model_sync(&self) -> anyhow::Result<()> {
+    pub(super) async fn start_provider_model_sync(
+        &self,
+        started_at: tokio::time::Instant,
+    ) -> anyhow::Result<()> {
         let startup = self.storage.providers().list().await?;
-        let mut interval = tokio::time::interval(Duration::from_secs(60 * 60));
+        let mut interval = tokio::time::interval_at(started_at, Duration::from_secs(60 * 60));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let gw = self.background_clone();
         self.lifecycle.spawn(async move {

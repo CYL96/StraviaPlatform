@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Changed
+
+- Automatic and manual model discovery now share one fixed 60-second budget per provider configuration, covering credential preparation, all discovery pages and publication-fence acquisition. Different providers remain concurrent; joining an active check does not restart its budget. Slower discoveries now fail earlier while retaining the last confirmed inventory; optional catalog enrichment and inventory reconciliation remain outside this budget.
+- Periodic model checks and allowance sampling now share one monotonic startup origin: models are checked immediately and every 60 minutes, while allowance sampling starts after 35 minutes and repeats every 30 minutes. Restarting resets the schedule. Only planned periodic starts are staggered; work may overlap, and manual actions, save-time sync and allowance-reset recovery remain immediate. The allowance read timeout stays at 30 seconds.
+
 ### Fixed
 
 - CI now reuses successful complete checks for the exact same commit across `dev`, `main`, and Release, or waits for an existing automatic CI run instead of starting another full test matrix. PR merge checks and explicit manual/cache-warm runs remain independent; failed, cancelled, partial, or unavailable evidence cannot authorize a release.

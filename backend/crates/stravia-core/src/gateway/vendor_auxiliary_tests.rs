@@ -72,6 +72,40 @@ impl LocalResponse {
     }
 }
 
+async fn write_local_response(
+    socket: &mut (impl AsyncWrite + Unpin),
+    response: LocalResponse,
+) -> io::Result<()> {
+    if let Some(release) = response.release {
+        release.notified().await;
+    }
+    let head = format!(
+        "HTTP/1.1 {}\r\ncontent-type: {}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        response.status,
+        response.content_type,
+        response.body.len()
+    );
+    socket.write_all(head.as_bytes()).await?;
+    socket.write_all(&response.body).await
+}
+
+// 使用真实时间限制测试等待，并持续yield，避免暂停的Tokio时钟自动推进。
+async fn with_real_time_limit<F: Future>(future: F) -> anyhow::Result<F::Output> {
+    let until = std::time::Instant::now() + Duration::from_secs(10);
+    tokio::pin!(future);
+    loop {
+        anyhow::ensure!(
+            std::time::Instant::now() < until,
+            "loopback operation exceeded ten seconds of real time"
+        );
+        tokio::select! {
+            biased;
+            result = &mut future => return Ok(result),
+            _ = tokio::task::yield_now() => {}
+        }
+    }
+}
+
 struct LoopbackOnlyResolver {
     address: SocketAddr,
 }
@@ -129,18 +163,12 @@ async fn local_tls_server(
                 .map_err(|_| anyhow::anyhow!("request observer dropped"))?;
             let reply = response(&request);
             observed.push(request);
-            if let Some(release) = reply.release {
-                release.notified().await;
-            }
-            let head = format!(
-                "HTTP/1.1 {}\r\ncontent-type: {}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-                reply.status,
-                reply.content_type,
-                reply.body.len()
-            );
-            // A cancelled OAuth exchange may close its socket before the deliberately late reply.
-            if socket.write_all(head.as_bytes()).await.is_ok() {
-                let _ = socket.write_all(&reply.body).await;
+            // 取消或超时可能在fixture释放响应前关闭客户端连接。
+            if let Err(error) = write_local_response(&mut socket, reply).await {
+                tracing::debug!(
+                    ?error,
+                    "local TLS fixture client closed before reply completed"
+                );
             }
         }
         Ok(observed)
@@ -674,6 +702,390 @@ async fn guard_save_after_suspension_submission_gets_successor_evidence() -> any
 }
 
 #[tokio::test]
+async fn gateway_background_discovery_and_allowance_keep_distinct_phases_and_stop_on_shutdown()
+-> anyhow::Result<()> {
+    let first_sample = Arc::new(Notify::new());
+    let first_release = Arc::clone(&first_sample);
+    // 后台任务在构造时捕获HTTP客户端；使用字面量loopback地址而非替换前台客户端。
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let base_url = format!("http://{}", listener.local_addr()?);
+    let (request_tx, mut requests) = mpsc::unbounded_channel();
+    let server_task = tokio::spawn(async move {
+        let mut first_allowance = true;
+        for _ in 0..5 {
+            let (mut socket, _) = listener.accept().await?;
+            let request = read_http_request(&mut socket).await?;
+            if request.path != "/oauth/exchange" {
+                request_tx
+                    .send(request.clone())
+                    .map_err(|_| anyhow::anyhow!("request observer dropped"))?;
+            }
+            let response = match request.path.as_str() {
+                "/oauth/exchange" => LocalResponse::json(json!({
+                    "access_token": "schedule-token",
+                    "refresh_token": "schedule-refresh-token",
+                    "expires_at_unix_ms": 4_102_444_800_000_i64
+                })),
+                "/allowance" => {
+                    if first_allowance {
+                        first_allowance = false;
+                        let mut response =
+                            LocalResponse::json(json!({"error": "temporarily unavailable"}));
+                        response.status = "503 Service Unavailable";
+                        response.release = Some(Arc::clone(&first_release));
+                        response
+                    } else {
+                        LocalResponse::json(json!({"remaining": "7.25"}))
+                    }
+                }
+                "/models" => LocalResponse::json(json!({
+                    "models": [{"id": "scheduled-model", "display_name": "Scheduled Model", "family": "management", "selector": "management-selector"}],
+                    "next_cursor": null
+                })),
+                path => panic!("unexpected scheduled upstream request: {path}"),
+            };
+            write_local_response(&mut socket, response).await?;
+        }
+        Ok::<(), anyhow::Error>(())
+    });
+    tokio::time::pause();
+    let clock_guard = tokio::spawn(async {
+        loop {
+            tokio::task::yield_now().await;
+        }
+    });
+    let directory = tempfile::tempdir()?;
+    let gateway = Gateway::from_storage(
+        GatewayConfig {
+            data_dir: directory.path().to_path_buf(),
+            ..Default::default()
+        },
+        Arc::new(crate::storage::MemoryStorage::new(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )),
+    )
+    .await?;
+    let artifact = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../..")
+        .join("target/vendor-test-fixtures/management-v2.wasm");
+    let preview = gateway
+        .admin()
+        .preview_vendor_plugin(std::fs::read(&artifact)?)
+        .await?;
+    gateway
+        .admin()
+        .confirm_vendor_plugin(crate::plugin::ConfirmPluginUpdate {
+            preview_id: preview.id,
+            allow_data_discard: false,
+        })
+        .await?;
+    let authorization = gateway
+        .admin()
+        .init_oauth_session(
+            AuthSessionCandidate {
+                vendor_id: "fixture.management".into(),
+                channel: "default".into(),
+                provider_id: None,
+                base_url: base_url.clone(),
+                protocol: Some("fixture-management".into()),
+                options: BTreeMap::from([("workspace".into(), json!("schedule-workspace"))]),
+                credentials: BTreeMap::new(),
+                use_proxy: false,
+            },
+            OAuthSessionStartOptions {
+                callback_mode: OAuthCallbackMode::Manual,
+                redirect_uri: "http://127.0.0.1:18765/callback".into(),
+                listener_port: None,
+                fallback_reason: None,
+            },
+        )
+        .await?;
+    let state = query_parameter(
+        authorization
+            .auth_url
+            .as_deref()
+            .context("fixture authorization URL")?,
+        "state",
+    )?;
+    gateway
+        .admin()
+        .complete_oauth_session(
+            &authorization.session_id,
+            AuthCompletionInput {
+                input: AuthCompletionValue::CallbackUrl {
+                    value: format!(
+                        "{}?code=fixture-code&state={state}",
+                        authorization.redirect_uri
+                    ),
+                },
+            },
+        )
+        .await?;
+    let provider = gateway
+        .admin()
+        .create_provider_with_oauth_session(
+            &authorization.session_id,
+            CreateProvider {
+                name: Some("Scheduled management maintenance".into()),
+                source: ProviderSourceInput::Custom {
+                    vendor: "fixture.management".into(),
+                    channel: "default".into(),
+                    protocol: Some("fixture-management".into()),
+                    base_url,
+                    models_source: None,
+                    static_models: None,
+                },
+                credential: ProviderCredentialInput::None,
+                vendor_options: BTreeMap::from([("workspace".into(), json!("schedule-workspace"))])
+                    .into_iter()
+                    .collect(),
+                use_proxy: false,
+            },
+        )
+        .await?;
+    // 构造前固定调度时钟，guard只阻止自动跳时，不改变产品std::Instant预算。
+    // 先推进首个毫秒，唤醒timer wheel中启动即到期的维护任务。
+    tokio::time::advance(Duration::from_millis(1)).await;
+    let result = async {
+        // 无请求窗口仅为有界佐证；主要以60分钟模型往返、库存发布后的请求顺序验证错峰。
+        let settle = || async {
+            let until = std::time::Instant::now() + Duration::from_millis(100);
+            while std::time::Instant::now() < until {
+                tokio::task::yield_now().await;
+            }
+        };
+        async fn next_request(
+            requests: &mut mpsc::UnboundedReceiver<ObservedRequest>,
+        ) -> anyhow::Result<ObservedRequest> {
+            with_real_time_limit(requests.recv())
+                .await?
+                .context("scheduled loopback request observer closed")
+        }
+        settle().await;
+        tokio::time::advance(Duration::from_secs(29 * 60)).await;
+        settle().await;
+        assert!(
+            requests.try_recv().is_err(),
+            "no sampling before 30 minutes"
+        );
+        tokio::time::advance(Duration::from_secs(60)).await;
+        settle().await;
+        assert!(
+            requests.try_recv().is_err(),
+            "allowance sampling must wait until the 35-minute phase"
+        );
+        tokio::time::advance(Duration::from_secs(5 * 60)).await;
+        assert_eq!(
+            next_request(&mut requests)
+                .await
+                .context("35-minute allowance phase must issue its first request")?
+                .path,
+            "/allowance"
+        );
+        let admin = gateway.admin();
+        let pending = admin.get_provider_allowance(&provider.id);
+        tokio::pin!(pending);
+        // 先经公开API加入被fixture阻塞的采样，再释放503，避免错误后另起刷新。
+        tokio::select! {
+            biased;
+            _ = &mut pending => panic!("withheld first sample must still be pending"),
+            _ = std::future::ready(()) => {}
+        }
+        first_sample.notify_one();
+        let failed = with_real_time_limit(&mut pending)
+            .await
+            .context("failed scheduled sample was not published")??
+            .expect("failed allowance sample");
+        assert_eq!(failed.status, ProviderAllowanceStatus::Error);
+        assert!(failed.error.is_some());
+        assert!(failed.allowances.is_empty());
+        tokio::time::advance(Duration::from_secs(25 * 60)).await;
+        assert_eq!(
+            next_request(&mut requests)
+                .await
+                .context("60-minute model phase must discover inventory")?
+                .path,
+            "/models"
+        );
+        with_real_time_limit(async {
+            loop {
+                let inventory = gateway.admin().list_provider_models(&provider.id).await?;
+                if inventory
+                    .models
+                    .iter()
+                    .any(|model| model.id == "scheduled-model")
+                {
+                    return Ok::<(), anyhow::Error>(());
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .context("scheduled discovery result was not published")??;
+        settle().await;
+        assert!(
+            requests.try_recv().is_err(),
+            "60-minute model discovery must not trigger allowance sampling"
+        );
+        tokio::time::advance(Duration::from_secs(5 * 60)).await;
+        assert_eq!(
+            next_request(&mut requests)
+                .await
+                .context("65-minute allowance phase must issue its second request")?
+                .path,
+            "/allowance"
+        );
+        let admin = gateway.admin();
+        let snapshot = with_real_time_limit(admin.get_provider_allowance(&provider.id))
+            .await
+            .context("scheduled allowance result was not published")??
+            .expect("scheduled allowance result");
+        assert_eq!(snapshot.status, ProviderAllowanceStatus::Fresh);
+        let remaining = snapshot.allowances[0]
+            .remaining
+            .as_ref()
+            .expect("sampled balance");
+        assert_eq!(remaining.value, 7.25);
+        assert_eq!(remaining.unit, "requests");
+        assert_eq!(remaining.currency, None);
+        settle().await;
+        gateway.shutdown().await;
+        tokio::time::advance(Duration::from_secs(2 * 60 * 60)).await;
+        settle().await;
+        assert!(
+            requests.try_recv().is_err(),
+            "shutdown must cancel future maintenance"
+        );
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    gateway.shutdown().await;
+    server_task.abort();
+    clock_guard.abort();
+    tokio::time::resume();
+    result
+}
+
+#[tokio::test]
+async fn paginated_discovery_exhausts_one_minute_without_replacing_inventory() -> anyhow::Result<()>
+{
+    let first_page = Arc::new(Notify::new());
+    let second_page = Arc::new(Notify::new());
+    let first_release = Arc::clone(&first_page);
+    let second_release = Arc::clone(&second_page);
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let server_calls = Arc::clone(&calls);
+    let mut server = local_tls_server(3, move |request| {
+        let call = server_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(request.method, "GET");
+        match call {
+            0 => {
+                assert_eq!(request.path, "/v1/models");
+                LocalResponse::json(json!({"data": [{"id": "confirmed-model"}]}))
+            }
+            1 => {
+                assert_eq!(request.path, "/v1/models");
+                let mut response = LocalResponse::json(json!({
+                    "data": [{"id": "unconfirmed-first-page"}],
+                    "next_cursor": "second-page"
+                }));
+                response.release = Some(Arc::clone(&first_release));
+                response
+            }
+            2 => {
+                assert_eq!(request.path, "/v1/models?after=second-page");
+                let mut response = LocalResponse::json(json!({
+                    "data": [{"id": "unconfirmed-second-page"}]
+                }));
+                response.release = Some(Arc::clone(&second_release));
+                response
+            }
+            _ => unreachable!("unexpected discovery request"),
+        }
+    })
+    .await?;
+    let (_directory, gateway) = gateway_for(&server, &[]).await?;
+    let provider = create_vendor_provider(
+        &gateway,
+        "Custom shared pagination budget",
+        "custom",
+        "default",
+        "openai-compatible",
+        "https://api.deepseek.com",
+        ProviderCredentialInput::ApiKey {
+            value: "deepseek-pagination-secret".into(),
+        },
+    )
+    .await?;
+    let confirmed = gateway.admin().sync_provider_models(&provider.id).await?;
+    assert_eq!(
+        confirmed.outcome,
+        crate::provider_models::ModelChangeOutcome::Success
+    );
+    let before = gateway.admin().list_provider_models(&provider.id).await?;
+    assert_eq!(before.models.len(), 1);
+    assert_eq!(before.models[0].id, "confirmed-model");
+    server
+        .requests
+        .recv()
+        .await
+        .expect("confirmed discovery request");
+
+    let sync_gateway = gateway.clone();
+    let provider_id = provider.id.clone();
+    let started_at = std::time::Instant::now();
+    let mut sync = tokio::spawn(async move {
+        sync_gateway
+            .admin()
+            .sync_provider_models(&provider_id)
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(10), server.requests.recv())
+        .await?
+        .expect("first discovery page request");
+    // 首页消耗真实31秒；第二页只能使用同一次60秒预算的剩余部分，不能重计时。
+    tokio::time::sleep(Duration::from_secs(31)).await;
+    first_page.notify_one();
+    tokio::time::timeout(Duration::from_secs(10), server.requests.recv())
+        .await?
+        .expect("second discovery page request");
+    let completed = tokio::time::timeout(Duration::from_secs(35), &mut sync).await;
+    let elapsed = started_at.elapsed();
+    // 无论同步完成或超时，都释放本地fixture，避免响应任务挂起。
+    second_page.notify_one();
+    server.task.await??;
+    let error = completed
+        .context("paginated discovery must fail within its single 60-second budget")??
+        .expect_err("an unfinished final page must be an explicit discovery failure");
+    let failure = error
+        .downcast_ref::<crate::provider_models::ProviderModelSyncFailure>()
+        .context("admin API must expose a persisted sync failure summary")?;
+    assert_eq!(
+        failure.summary.outcome,
+        crate::provider_models::ModelChangeOutcome::Failure
+    );
+    assert!(
+        elapsed >= Duration::from_secs(60),
+        "discovery must retain its full one-minute budget"
+    );
+    let state = gateway
+        .admin()
+        .provider_model_sync_state(&provider.id)
+        .await?;
+    assert_eq!(state.last_check.as_ref(), Some(&failure.summary));
+    let after = gateway.admin().list_provider_models(&provider.id).await?;
+    assert_eq!(
+        serde_json::to_value(&after.models)?,
+        serde_json::to_value(&before.models)?
+    );
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+    gateway.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn devin_slow_model_discovery_publishes_the_confirmed_inventory() -> anyhow::Result<()> {
     let release = Arc::new(Notify::new());
     let server_release = Arc::clone(&release);
@@ -727,7 +1139,9 @@ async fn devin_slow_model_discovery_publishes_the_confirmed_inventory() -> anyho
             devin_oauth_provider("Devin slow discovery"),
         )
         .await?;
-    gateway.start_provider_model_sync().await?;
+    gateway
+        .start_provider_model_sync(tokio::time::Instant::now())
+        .await?;
     let request = tokio::time::timeout(Duration::from_secs(10), server.requests.recv())
         .await?
         .expect("Devin discovery request");
