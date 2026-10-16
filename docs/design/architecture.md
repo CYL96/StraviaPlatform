@@ -868,7 +868,7 @@ Route ID 存于 `models.model_id`，客户端请求中的 `model` 值以大小�
 
 `PUT /api/v1/provider-allowances/{provider_id}/guards` 用 `{ keys: string[] }` 替换守护集合，本地提交后返回 `{ keys: string[], target: ProviderAllowanceTarget }`：`keys` 为排序去重后的确认集合，`target` 包含已提交的暂停投影、可选缓存快照与后台读取状态。有效且启用的 Provider 在响应前注册合并并发的强制后台读取，响应不等待上游；普通单项 GET 优先等待已注册读取，完成后返回新的额度证据，否则沿用 TTL 缓存。缓存不存在时 `target.snapshot` 缺省，不伪造成功读取；保存本身不改变快照数值、读取时间或缓存 TTL。非空且无首尾空白的 key 去重保存，允许当前缺失的账户级 key，不接受当前快照中仅存在于模型级额度的 key；Provider 不存在为 404，不支持守护或 key 不合法为 400。额度快照附加 `guard_supported`、账户条目的 `guarded`、`missing_guarded_keys` 与 `suspension`；Provider 读投影附加 `allowance_suspension`，Route Target 运行态附加 `allowance_suspended`。
 
-保存守护、连接配置变更、OAuth 账号重新绑定、Provider 重新启用、手动刷新以及 Gateway 启动时的已暂停且启用 Provider 都复用既有合并并发的刷新路径。已知最早 `reset_at` 在进程内重建单次定时读取，不直接恢复，也不在仍耗尽时追加重试；其余沿用 30 分钟采样与 180 秒成功 TTL。重建定时计划时的存储错误记录 warning，生命周期任务等待状态变更或既有采样周期后继续，不因一次错误永久退出。Provider 禁用或凭据失效期间不读取额度，持久化暂停保留。暂停决策写失败只记 warning，不改变原额度读取结果。完整领域约束见 [ADR-0078](../adr/0078-suspend-provider-routing-on-guarded-allowance-exhaustion.md)。
+保存守护、连接配置变更、OAuth 账号重新绑定、Provider 重新启用、手动刷新以及 Gateway 启动时的已暂停且启用 Provider 都复用既有合并并发的刷新路径。已知最早 `reset_at` 在进程内重建单次定时读取，不直接恢复，也不在仍耗尽时追加重试；其余常规采样在 Gateway 后台维护启动后第 35 分钟首次执行，此后每 30 分钟一次，与模型检查共用单调时钟起点并在重启后重新计时；180 秒成功 TTL 与单次额度读取的 30 秒预算不变。重建定时计划时的存储错误记录 warning，生命周期任务等待状态变更或既有采样周期后继续，不因一次错误永久退出。Provider 禁用或凭据失效期间不读取额度，持久化暂停保留。暂停决策写失败只记 warning，不改变原额度读取结果。完整领域约束见 [ADR-0078](../adr/0078-suspend-provider-routing-on-guarded-allowance-exhaustion.md)。
 
 额度页的 Provider Allowance 读取编排由 `frontend/stravia-webui/src/lib/provider-allowance-read.ts` 拥有。该 module 通过现有 HTTP adapter 与 TanStack Query 的 `QueryObserver` 集中管理查询资格、凭据失效记忆、手动刷新、守护保存与确认快照发布；继续使用共享 `QueryClient`、既有查询键、重试规则与 180 秒轮询，不另建缓存或计时器。`.svelte.ts` 壳只镜像快照并连接组件生命周期，页面和测试使用同一操作 interface；搜索、筛选、摘要、时间轴与展开偏好仍属于页面或既有纯 module，不进入读取编排。
 
@@ -1018,13 +1018,13 @@ WebUI 的 `frontend/stravia-webui/src/lib/provider-model-editing.ts` 是 Provide
 
 ### 9.4 后台清单维护与模型变更记录
 
-Gateway 启动时检查已保存且符合条件的 Provider，此后每小时检查一次。自动同步偏好缺省开启；已停用、已知凭据失效、插件不可用或 channel 不支持 ModelDiscovery 的连接暂停，恢复后在正常周期重新参与。新连接保留保存后立即同步的管理流程。后台任务属于 GatewayLifecycle，不依赖管理浏览器、Desktop 窗口或托盘可见性；完全退出协作取消插件网络子任务。不增加失败快速重试、可配置频率或跨实例调度锁。
+Gateway 后台维护共用启动时记录的单调时钟起点，重启后重新计时。模型检查在启动时立即执行，此后每 60 分钟检查一次；额度常规采样首次在第 35 分钟执行，此后每 30 分钟执行一次。错峰只约束这两类周期任务的计划启动时间，允许执行重叠，不增加互斥等待；手动刷新、新连接保存后同步与额度恢复检查不延迟。模型检查只处理已保存且符合条件的 Provider。自动同步偏好缺省开启；已停用、已知凭据失效、插件不可用或 channel 不支持 ModelDiscovery 的连接暂停，恢复后在正常周期重新参与。新连接保留保存后立即同步的管理流程。后台任务属于 GatewayLifecycle，不依赖管理浏览器、Desktop 窗口或托盘可见性；完全退出协作取消插件网络子任务。不增加失败快速重试、可配置频率或跨实例调度锁。
 
 Server/Desktop 关闭时先停止接收新请求并通过 `Gateway::request_shutdown` 取消后台任务，再排空 HTTP，最后通过 `Gateway::shutdown` 等待任务结束并关闭观测与缓存。不能把取消放在 HTTP 排空之后：手动同步请求可能正在等待同一发现任务，形成互相等待。请求取消本身不提前关闭仍供在途请求使用的观测与缓存。
 
 每个实例内同一 Provider 的手动与自动同步单飞。手动请求加入正在执行的后台检查时返回同一个已确认结果、记录身份和 `automatic_sync` 来源；其他连接独立执行。关闭自动偏好只阻止后续自动启动，不撤销已开始的操作。来源发现、Vendor publication fence、连接快照与模型 revision 复检沿用 Core 的 Route module；过期发现明确失败，不覆盖人工值或透明重试。
 
-模型发现的凭据准备与全部 discovery 分页共用 120 秒的固定 deadline；自动与手动同步使用相同预算，不按页重新计时，也不增加失败重试。该预算只覆盖账号清单发现，不包含后续可选目录富化及库存协调的独立工作。超时仍明确失败并保留上次确认的库存，不用静态清单代替未完成的上游响应。
+每个 Provider 配置实例的模型发现独享 60 秒固定 deadline，凭据准备、全部 discovery 分页与发布围栏取得共用剩余预算；自动与手动同步使用相同预算，不按页重新计时，手动加入在途同步也不重新起表，不增加失败重试。该预算不包含取得发布围栏后可选目录富化及库存协调的独立工作。超时仍明确失败并保留上次确认的库存，不用静态清单代替未完成的上游响应。
 
 变更事实由 Core 在协调时生成。同步库存、检查摘要和成功变更批次在同一个存储事务中提交；手动添加及 Selection Policy 修改也与独立记录原子提交，重复设置相同策略不制造记录。普通人工规格编辑、re-import 和内部插件字段变化不进入此时间线。失败 discovery、空清单、非法或不完整响应保留上次有效库存；失败历史仅在存储确认后可查询，历史保存失败显式报告且不终止其他请求。提交后的插件恢复写入失败返回 `partial_success`，保留已提交的模型事实、原记录身份和差异，不宣称整次回滚。
 

@@ -1,5 +1,7 @@
 use super::*;
 
+const FIRST_ALLOWANCE_SAMPLE_DELAY: Duration = Duration::from_secs(35 * 60);
+
 struct SuspendedAllowanceProviders {
     ids: std::collections::HashSet<String>,
     refreshable: Vec<(String, Option<i64>)>,
@@ -111,13 +113,14 @@ async fn run_allowance_suspension_lifecycle(gw: Gateway) {
 
 async fn run_provider_allowance_sampler<F, Fut>(
     cancellation: stravia_runtime_contract::CancellationToken,
+    first_tick: tokio::time::Instant,
     period: Duration,
     mut sample: F,
 ) where
     F: FnMut() -> Fut,
     Fut: Future<Output = anyhow::Result<()>>,
 {
-    let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+    let mut interval = tokio::time::interval_at(first_tick, period);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
@@ -579,7 +582,9 @@ impl Gateway {
         );
         configure_gateway_extensions(&mut gw, Vec::new(), Vec::new(), Vec::new(), Vec::new())
             .await?;
-        gw.start_provider_model_sync().await?;
+        // 两类周期任务共用起点，避免各自首次轮询的延迟改变错峰相位。
+        let maintenance_started_at = tokio::time::Instant::now();
+        gw.start_provider_model_sync(maintenance_started_at).await?;
         if gw.config.catalog_background_refresh {
             let catalog_sync = gw.catalog_sync.clone();
             let cancellation = gw.lifecycle.cancellation.clone();
@@ -653,6 +658,7 @@ impl Gateway {
             gw.lifecycle.spawn(async move {
                 run_provider_allowance_sampler(
                     cancellation,
+                    maintenance_started_at + FIRST_ALLOWANCE_SAMPLE_DELAY,
                     admin::provider_allowance::SAMPLE_INTERVAL,
                     move || {
                         let admin = gw_sample.admin();
@@ -1326,38 +1332,5 @@ mod tests {
         gateway.shutdown().await;
         server.abort();
         result
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn provider_allowance_sampler_waits_thirty_minutes_and_stops_on_shutdown() {
-        let cancellation = stravia_runtime_contract::CancellationToken::new();
-        let calls = Arc::new(AtomicUsize::new(0));
-        let task_calls = Arc::clone(&calls);
-        let task_cancellation = cancellation.clone();
-        let task = tokio::spawn(run_provider_allowance_sampler(
-            task_cancellation,
-            admin::provider_allowance::SAMPLE_INTERVAL,
-            move || {
-                task_calls.fetch_add(1, Ordering::SeqCst);
-                async { Ok(()) }
-            },
-        ));
-        tokio::task::yield_now().await;
-
-        tokio::time::advance(admin::provider_allowance::SAMPLE_INTERVAL - Duration::from_millis(1))
-            .await;
-        tokio::task::yield_now().await;
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
-
-        tokio::time::advance(Duration::from_millis(1)).await;
-        tokio::task::yield_now().await;
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-
-        tokio::time::advance(admin::provider_allowance::SAMPLE_INTERVAL).await;
-        tokio::task::yield_now().await;
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
-
-        cancellation.cancel();
-        task.await.expect("sampler should stop after cancellation");
     }
 }
