@@ -452,8 +452,8 @@ writer 在每批提交后立即失效对应的实时状态和归属索引；后�
 ### 7.1 开关
 
 - 唯一 Debug 开关位于设置页「诊断」，同时控制性能指标采集与原始 Wire 捕获；请求记录页不再提供启停或清除 Debug 数据入口，仍保留已有 Trace 查看及 Bundle 导出。
-- 关闭立即停止新的性能样本；Wire 捕获继续遵循下述准入快照契约，不中断在途 Run，不删除已有 Trace。普通 Observation 不受影响。
-- 设置页可下载 Prometheus 文本性能快照（`GET /api/v1/performance/metrics`）及 Chrome Trace JSON 时间线（`GET /api/v1/performance/timeline`）。两者均要求管理员鉴权，以禁止缓存的附件返回，不另开监听端口。关闭 Debug 后仍能下载本进程已有数据；进程重启后不保留。清除 Debug 数据仍仅清除 Wire Trace，不重置性能指标或时间线。
+- 关闭立即停止新的性能样本，并清空本次性能会话的内存缓冲与临时文件；需要时间线时须先导出再关闭。Wire 捕获继续遵循下述准入快照契约，不中断在途 Run，不删除已有 Trace。普通 Observation 不受影响。
+- 设置页可下载 Prometheus 文本性能快照（`GET /api/v1/performance/metrics`）及 Chrome Trace JSON 时间线（`GET /api/v1/performance/timeline`）。两者均要求管理员鉴权，以禁止缓存的附件返回，不另开监听端口。关闭 Debug 后仍可下载本进程累计指标，但时间线为空；重启后不会恢复上次性能会话。清除 Debug 数据仍仅清除 Wire Trace，不重置性能指标或当前性能会话。
 - Desktop 下载沿用宿主默认保存位置；设置页等待原生下载完成后提示实际文件路径，取消或失败不报告成功。Web 下载仍交由浏览器处理，管理员鉴权与附件格式不变。
 - 性能指标包含静态命名操作与关键等待耗时、按操作和池角色归因的 SQL driver 查询／连接获取结果，以及每五秒采样的宿主 RSS／CPU、活动推理、观察队列、派生缓存和 Wire 逻辑占用。CPU 在开启后的首个采样点不输出缺少差分基线的读数，多核 CPU 百分比可以超过 100%。不计入浏览器子进程或远端数据库内存；托管资源记账不等于实际堆占用。
 - SQL 采集位于统一池／连接／事务执行边界，不要求业务查询逐处增加包装。性能导出不包含 SQL 正文、绑定参数、数据库错误 Display、请求正文或动态业务身份标签；查询模板用 SHA-256 标识，结果限定为 driver 边界，失败和取消不冒充成功。关闭再开启期间尚未完成的旧 span 及旧队列命令的后代不进入新周期。
@@ -466,26 +466,32 @@ writer 在每批提交后立即失效对应的实时状态和归属索引；后�
 
 #### 7.1.1 统一性能 span 与时间线
 
-命名操作统一使用 `tracing` 的 `stravia::perf` target。`PerformanceLayer` 从同一个 span 生成耗时直方图与有界时间线，不再维护独立手写 Timer。覆盖请求根、路由选择、Model Turn、Vendor、Target Attempt／首 token、Agent／工具、客户端交付、历史物化与观察写入。
+命名操作统一使用 `tracing` 的 `stravia::perf` target。`PerformanceLayer` 从同一个 span 生成耗时直方图与采用有界内存缓冲的会话时间线，不再维护独立手写 Timer。覆盖请求根、路由选择、Model Turn、Vendor、Target Attempt／首 token、Agent／工具、客户端交付、历史物化与观察写入。
 
 常规异步函数使用 `#[tracing::instrument(target = "stravia::perf", name = "router.select", skip_all, fields(status))]` 这类静态声明；局部 future、独立任务通过 `.instrument(span)` 传播上下文。不得跨 `.await` 保留 `span.enter()` guard。响应体、WebSocket 与后台 producer 必须持有对应 span，直到真实生命周期结束；有非性能中间 span 时，仍关联最近的性能祖先。
 
 操作 span 只保留静态操作名、内部生成的 span／parent ID、时间、白名单状态，以及 `node_count`、`reference_count`、`candidate_count`、`event_count` 四个非负整数工作量字段；SQL span 另外接收下节列出的诊断白名单。忽略其他字段，不使用 `ret`／`err` 自动记录业务值。操作默认终态为 `closed`，仅表示 span 生命周期结束；业务代码在已知结果时显式记录 `completed`、`error`、`cancelled` 或 `abandoned`。不能把函数返回、future 被丢弃或父 span 关闭自动解释为成功。
 
-时间线的保留区分别有界，容量均可在进程启动时调整：
+时间线的活动区及三类内存批次缓冲分别有界，容量均可在进程启动时调整；这些容量不是整个会话的保留条数，也不按分钟截断历史：
 
-|保留区|默认容量|环境变量|
+|内存区域|默认容量|环境变量|
 |---|---|---|
 |活动 span，含操作、查询与 acquire|1,024|`STRAVIA_PERF_TRACE_ACTIVE_CAPACITY`|
-|已结束操作|10,000|`STRAVIA_PERF_TRACE_COMPLETED_CAPACITY`|
-|已结束 SQL query／acquire 合计|2,048|`STRAVIA_PERF_SQL_COMPLETED_CAPACITY`|
-|资源采样帧|720，连续采集约一小时|`STRAVIA_PERF_RESOURCE_CAPACITY`|
+|已结束操作批次|10,000|`STRAVIA_PERF_TRACE_COMPLETED_CAPACITY`|
+|已结束 SQL query／acquire 批次合计|2,048|`STRAVIA_PERF_SQL_COMPLETED_CAPACITY`|
+|资源采样帧批次|720，约每小时写出一批|`STRAVIA_PERF_RESOURCE_CAPACITY`|
 
-活动区满时拒收新 span（相应耗时也不入直方图），结束区与资源区满时各自淘汰最旧记录；SQL 明细不会挤掉已结束的业务操作。JSON `metadata.capacity`、`dropped_active`、`dropped_completed`、`dropped_sql_completed`、`dropped_resource_samples` 显式描述容量与丢弃数，不承诺完整请求树。采集状态计数取自同一份加锁快照：`active_spans` 是活动 map 中的当前 span 数；`frozen_spans` 是操作与 SQL 保留区中因关闭 Debug 冻结、尚未被淘汰的记录数；`frozen_total` 是历史冻结累计数，记录被淘汰后也不减少。兼容字段语义不变：`incomplete = active_spans + frozen_spans`，`incomplete_total = frozen_total + active_spans`。旧字段不能再用作采集丢失判据，也不能仅因存在 `B` 事件就拒收导出；应结合目标请求的 span／parent ID 因果树、真实采集状态、保留窗口与丢弃计数判断证据是否完整，其他请求仍活动并不意味着目标请求缺失。关闭 Debug 将活动记录冻结为未完成记录；随后关闭的旧 span 不补写终态或直方图，重新开启只接收新周期的数据。旧队列上下文即使没有 parent ID，也保留原 epoch；拒收标记会传播至命令后续的业务和 SQL span，而不是将其重新收为无归属的根。
+已结束操作、SQL 明细、资源帧各自积累，达到容量即将整个批次的所有权交给后台 writer，立即换成空缓冲继续采集；后台顺序追加写入匿名临时文件，写完释放该批次及其容器分配，不保留最近 N 条的环形窗口。后台待写队列最多容纳四个批次，另有一个正在写入的批次；业务线程不等待磁盘，不在时间线锁内执行文件 I/O。慢盘导致队列满、writer 不可用或写入失败时，按实际丢失的记录数增加相应 `dropped_*`，失败另计 `storage_errors`，不回退为无界内存积压。活动区满仍拒收新 span（相应耗时也不入直方图）。SQL 明细不会挤掉已结束的业务操作。
 
-导出使用标准 Chrome Trace 事件，每条 span 的 `args.capture_state` 固定为三种值之一：活动 map 快照为 `active`、关闭 Debug 后保留的未完成记录为 `frozen`，二者均为 `ph=B` 且不输出 `dur`；正常记录到生命周期结束的 span 为 `finished`、`ph=X`，并输出实际墙钟 `dur`，不伪造冻结记录的结束时间。`capture_state` 与业务 `args.status` 独立：`finished` 不代表成功，`error`、`cancelled` 等已记录结果仍保持原值，默认 `closed` 也不代表成功；活动或冻结记录不补造业务终态。可见父子间附带 flow；资源曲线使用带时间戳的 `C` counter。每个 span 使用合成 track，`tid` 不是操作系统线程。可导入 Perfetto 或 Chrome trace viewer 查看墙钟时长与异步因果关联；因果 parent 不保证时间包含关系，也不代表请求独占成本。`active_us` 仅表示 span 被 enter 的区间并集（重入或并发 enter 不重复累加），不是 CPU 时间，未 enter 的 span 不输出该值。
+导出以会话 epoch 和批次序号截取一致快照，合并已写入文件、后台已接收但尚未写完、以及当前未满内存批次，避免遗漏或重复；HTTP 适配层在阻塞任务中等待文件读取。正常采集的历史只驻留于有界缓冲或临时文件；导出时仍会暂时在内存构造完整 JSON，不保证导出峰值内存固定。磁盘占用随会话增长，不设时间或总条数保留设置。临时文件由操作系统在最后一个句柄关闭时自动删除，包括进程异常退出；关闭 Debug 会使旧 writer 任务失效并释放文件，新开启只接收新 epoch。随后结束的旧 span 不补写终态或直方图；旧队列上下文即使没有 parent ID，也保留原 epoch，其拒收标记传播至后续业务和 SQL span。
 
-`metadata.schema_version=2` 同时提供应用版本、进程 PID、系统／架构／逻辑 CPU 数、时钟原点、导出时间、保留起点、当前 Debug epoch、采样间隔、帧数及各项观测口径；不包含主机名、启动参数或数据库连接串。进程 CPU／RSS 是全局采样，不能归因到单个 span，也不能保证捕获短于采样周期的峰值。
+`metadata.schema_version=3`、`storage=memory_and_temporary_file` 描述这一会话存储模型。`capacity` 报告活动区、三类批次和 `writer_queue` 容量，`writer_queue_unit=batches` 明确队列以批次计；`buffered` 报告当前三类未满缓冲的记录数；`spilled_completed`、`spilled_sql_completed`、`spilled_resource_samples` 报告成功写入文件的记录数。`storage_status` 为 `ready`、`error` 或 `unavailable`，配合 `storage_errors` 与四项 `dropped_*` 判断真实损失；成功写盘不是丢弃，不承诺在错误或拒收时仍有完整请求树。采集状态计数取自一致快照：`active_spans` 是当前活动 map 数；关闭时不再保留冻结记录，`frozen_spans`、`frozen_total` 均为零，`incomplete`、`incomplete_total` 等于当前活动数。其他请求仍活动不意味着目标请求缺失，不能仅因存在 `B` 事件就拒收导出，应核对目标 span／parent ID 因果树和真实损失。
+
+写盘计数是 writer 处理导出时的会话累计；等待导出期间新写入、超过快照水位的批次不进入本次事件列表，但可能计入写盘累计。因此并发采集时不能用 `spilled_* + buffered` 直接推导本次导出的事件数。
+
+导出使用标准 Chrome Trace 事件：活动 map 快照的 `args.capture_state=active`、`ph=B`，不输出 `dur`；记录到生命周期结束的 span 为 `finished`、`ph=X`，并输出实际墙钟 `dur`。`capture_state` 与业务 `args.status` 独立：`finished` 不代表成功，`error`、`cancelled` 等已记录结果仍保持原值，默认 `closed` 也不代表成功；活动记录不补造业务终态。可见父子间附带 flow；资源曲线使用带时间戳的 `C` counter。每个 span 使用合成 track，`tid` 不是操作系统线程。可导入 Perfetto 或 Chrome trace viewer 查看墙钟时长与异步因果关联；因果 parent 不保证时间包含关系，也不代表请求独占成本。`active_us` 仅表示 span 被 enter 的区间并集（重入或并发 enter 不重复累加），不是 CPU 时间，未 enter 的 span 不输出该值。
+
+元数据还提供应用版本、进程 PID、系统／架构／逻辑 CPU 数、时钟原点、导出时间、保留起点、当前 Debug epoch、采样间隔、帧数及各项观测口径；不包含主机名、启动参数或数据库连接串。进程 CPU／RSS 是全局采样，不能归因到单个 span，也不能保证捕获短于采样周期的峰值。释放批次内存也不保证 allocator 立即将 RSS 归还操作系统。
 
 `stravia_managed_resource_items` 与 `stravia_managed_resource_logical_bytes` 按静态 `resource`／`domain` 分组，并随同一采样帧进入时间线：
 
@@ -541,15 +547,15 @@ SQL 只计入最近的业务操作，不重复累加到祖先或 SQL 自身记�
 
 `stravia_generation_materialization_cache_access_total{result="hit"|"miss"}` 统计普通物化与含 Item Reference 的父节点恢复对 Generation Materialization Cache 的访问。物化对象和按 ingress 隔离的祖先引用目录现共用[统一派生缓存](architecture.md#统一派生缓存与-server-配置)：Memory / SQLite 使用 TinyUFO，PostgreSQL 使用 Redis。普通父节点恢复命中缓存后不再读链；含 Item Reference 时，若对应 ingress 的引用目录也命中则不再读链，否则仍需读取祖先历史构造目录。物化 hit 本身不证明目录 hit。请求准备阶段的有界发现工作区只复用节点与解码材料，不计入该跨请求缓存的 hit/miss 或记账字节；应结合 `generation_chain.history.load` 与底层 `turn_chain.materialize` 的次数及 SQL 归因验证实际减少的读取，不能把 `candidate_count` 当作逐一核验次数。直接调用底层 Turn Chain 物化不会经过该缓存，因此不能仅凭命中率推断底层读取次数。逻辑缓存记账不等于进程或 Redis 实际内存。
 
-调查时，在同一进程、同一段复现操作前后各导出一次 metrics，按 `operation` 比较 `_count` 和 `_sum` 差值，并在操作完成后立即导出 timeline。交给 AI 分析时先核对 PID、版本、epoch、保留时间、丢弃数、`active`／`frozen` 采集状态及因果链完整性，再判断证据覆盖范围：
+调查时，在同一进程、同一 Debug 会话、同一段复现操作前后各导出一次 metrics，按 `operation` 比较 `_count` 和 `_sum` 差值，并在操作完成后、关闭 Debug 前导出 timeline。交给 AI 分析时先核对 PID、版本、epoch、会话时间、存储状态、错误与丢弃数、活动采集状态及因果链完整性，再判断证据覆盖范围：
 
 - 延迟：先区分准入、写协调器、池 acquire、上游响应头和后台队列等待；按业务操作、查询指纹、结果与行数检查高频小查询或慢查询。查询模板与业务源码需要受控对照；指纹不替代 SQL 审查、数据库锁图或执行计划。
 - 内存：将 RSS 与活动请求、队列、缓存、Wire 各自的 items／逻辑字节曲线对齐。逻辑资源下降但 RSS 未降既不能证明泄漏，也不能证明没有泄漏；allocator、映射、未计账对象和真实保留链需专项抓取。
 - CPU：将进程 CPU 曲线与等待／处理阶段对齐，只能判断复现窗口与可疑阶段；不能将 span 墙钟、`active_us` 或 SQL 累计耗时当成 CPU 栈。函数热点和分配栈使用下节专项流程。
 
-用工作量字段区分大批次与过多小批次，用因果关系识别重复物化，但不将后台 SQL 重复算作同步请求成本。指标是累计值，关闭或清除 Debug 数据不会归零；有界 timeline 与累计 metrics 也不覆盖相同时间窗口，不能直接相除推导每请求查询量。缺失采样、被淘汰的 SQL、未知祖先或陈旧远端快照必须明确为证据缺口，不能解读成零成本或零占用。
+用工作量字段区分大批次与过多小批次，用因果关系识别重复物化，但不将后台 SQL 重复算作同步请求成本。指标是进程累计值，关闭或清除 Debug 数据不会归零；会话 timeline 与累计 metrics 不一定覆盖相同时间窗口，不能直接相除推导每请求查询量。缺失采样、丢弃的 SQL、未知祖先或陈旧远端快照必须明确为证据缺口，不能解读成零成本或零占用。
 
-`tests/common/measure_history_paths.py` 对真实 Server 使用隔离数据库与 loopback 上游，分别报告新建或持续连接的 `connect_ms`、不含连接建立的 `http_request_ms` 和总 `latency_ms`；普通模式、连接模式及 SharedCache 容量必须在前后对照中一致。专用进程默认用 `--trace-completed-capacity 20000` 同时配置操作与 SQL 明细保留区，不改变产品默认值；结束记录淘汰、活动拒收、不完整 span 或缺少完整请求根/子树证据时，报告仍判无效，不能为通过比较而忽略这些标记。历史重建只有完整的独立 `observation.*` 根，或经过 `observation.command.process` 且因果祖先完整时，才单列为后台观测工作，不混入请求同步路径；未知根、缺失祖先或环仍判为归属不完整。正常完整投影场景与将独立测试 Principal 的派生投影置为未知的共享祖先诊断场景分别报告；后者只验证保守回退的读取复用，不代表正常数据的收益。内容、父节点、拒绝时无父关系和完整压缩窗口是正确性依据，候选数量与读链次数只作工作量证据。
+`tests/common/measure_history_paths.py` 对真实 Server 使用隔离数据库与 loopback 上游，分别报告新建或持续连接的 `connect_ms`、不含连接建立的 `http_request_ms` 和总 `latency_ms`；普通模式、连接模式及 SharedCache 容量必须在前后对照中一致。专用进程默认用 `--trace-completed-capacity 20000` 同时配置操作与 SQL 内存批次，不改变产品默认值，成功写盘不判为证据损失。前后快照必须为 schema 3、Debug 开启、同一 epoch 且存储状态 `ready`；存储已有错误或错误增长、实际记录丢失、活动拒收、不完整 span 或缺少完整请求根/子树证据时，报告仍判无效，不能为通过比较而忽略这些标记。历史重建只有完整的独立 `observation.*` 根，或经过 `observation.command.process` 且因果祖先完整时，才单列为后台观测工作，不混入请求同步路径；未知根、缺失祖先或环仍判为归属不完整。正常完整投影场景与将独立测试 Principal 的派生投影置为未知的共享祖先诊断场景分别报告；后者只验证保守回退的读取复用，不代表正常数据的收益。内容、父节点、拒绝时无父关系和完整压缩窗口是正确性依据，候选数量与读链次数只作工作量证据。
 
 #### 7.1.3 CPU 与堆专项抓取
 

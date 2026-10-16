@@ -401,9 +401,10 @@ def attach_performance_snapshot(row, before, snapshot):
         stage_counts[event["name"]] = stage_counts.get(event["name"], 0) + 1
     row["performance_stage_counts"] = stage_counts
     metadata_fields = ("dropped_active", "dropped_completed", "dropped_sql_completed", "dropped_resource_samples",
-                       "incomplete", "incomplete_total", "active_spans", "frozen_spans", "frozen_total")
+                       "incomplete", "incomplete_total", "active_spans", "frozen_spans", "frozen_total",
+                       "storage_errors", "debug_epoch")
     loss_fields = ("dropped_active", "dropped_completed", "dropped_sql_completed", "dropped_resource_samples",
-                   "frozen_spans", "frozen_total")
+                   "frozen_spans", "frozen_total", "storage_errors")
     row["trace_metadata_before"] = {key: before.get("metadata", {}).get(key) for key in metadata_fields}
     row["trace_metadata_after"] = {key: snapshot.get("metadata", {}).get(key) for key in metadata_fields}
     row["trace_metadata_valid"] = all(
@@ -413,6 +414,14 @@ def attach_performance_snapshot(row, before, snapshot):
         and row["trace_metadata_after"][key] >= 0
         and (key not in loss_fields or row["trace_metadata_after"][key] <= row["trace_metadata_before"][key])
         for key in metadata_fields
+    )
+    row["trace_metadata_valid"] = (
+        row["trace_metadata_valid"]
+        and row["trace_metadata_before"]["debug_epoch"] == row["trace_metadata_after"]["debug_epoch"]
+        and all(value.get("metadata", {}).get("schema_version") == 3
+                and value.get("metadata", {}).get("storage_status") == "ready"
+                and value.get("metadata", {}).get("debug_enabled") is True
+                for value in (before, snapshot))
     )
     prior_all = {trace_key(event) for event in before.get("traceEvents", [])}
     fresh_incomplete = [event["name"] for event in snapshot.get("traceEvents", [])
@@ -614,7 +623,7 @@ def finalize_validity(result, args):
     if any(not row.get("performance_spans") for row in rows):
         result["failure_reasons"].append("missing per-request performance spans")
     if any(not row.get("trace_metadata_valid") for row in rows):
-        result["failure_reasons"].append("trace metadata missing, dropped/frozen spans, invalid causal chains or unfinished request spans")
+        result["failure_reasons"].append("trace metadata missing, changed Debug session, storage failure, dropped/frozen spans, invalid causal chains or unfinished request spans")
     if any(not row.get("request_span_valid") for row in rows):
         result["failure_reasons"].append("request trace lacks exactly one completed inference root or routing/history spans are outside its subtree")
     if result["rss_peak_bytes"] is None:
@@ -642,7 +651,7 @@ def main():
                         help="Inference socket lifetime; connect_ms is separate from http_request_ms")
     parser.add_argument("--psql", default="psql", help="PostgreSQL-only test fixture executable; no Python DB driver required")
     parser.add_argument("--trace-completed-capacity", type=int, default=20000,
-                        help="Dedicated server completed-span retention; dropping remains invalid")
+                        help="Dedicated server completed-span memory buffers; overflow spills to temporary files and actual loss remains invalid")
     parser.add_argument("--sample-interval", type=float, default=.05)
     args = parser.parse_args()
     if args.repetitions < 1 or args.rounds < 2 or args.candidates < 2 or args.prompt_bytes < 128 or args.sample_interval <= 0:

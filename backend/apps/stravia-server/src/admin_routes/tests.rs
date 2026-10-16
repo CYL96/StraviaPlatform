@@ -39,7 +39,7 @@ async fn status_reports_the_running_server_version() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn performance_export_requires_admin_and_remains_available_after_debug_is_disabled()
+async fn performance_export_requires_admin_and_clears_session_after_debug_is_disabled()
 -> anyhow::Result<()> {
     assert!(stravia_core::performance::init_metrics());
     let directory = tempfile::tempdir()?;
@@ -85,7 +85,6 @@ async fn performance_export_requires_admin_and_remains_available_after_debug_is_
         drop(guard);
         drop(span);
     });
-    gateway.admin().set_observation_debug(false);
     let tokens = auth.login_native().await?;
     let request = |path| {
         Request::get(path)
@@ -131,12 +130,36 @@ async fn performance_export_requires_admin_and_remains_available_after_debug_is_
                 .iter()
                 .find(|event| event["name"] == "test.admin_export")
         })
-        .expect("finished span remains downloadable after Debug is disabled");
+        .expect("finished span is downloadable during its Debug session");
     assert_eq!(event["ph"], "X");
     assert_eq!(event["args"]["status"], "completed");
     assert!(event["ts"].is_number());
     assert!(event["dur"].is_number());
     assert!(!String::from_utf8(timeline_body.to_vec())?.contains("must not leak"));
+    let disabled = app
+        .clone()
+        .oneshot(
+            Request::put("/api/v1/observations/debug")
+                .header("authorization", format!("Bearer {}", tokens.access_token))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"enabled":false}"#))?,
+        )
+        .await?;
+    assert_eq!(disabled.status(), StatusCode::OK);
+    let cleared = app
+        .clone()
+        .oneshot(request("/api/v1/performance/timeline")?)
+        .await?;
+    assert_eq!(cleared.status(), StatusCode::OK);
+    let cleared: serde_json::Value =
+        serde_json::from_slice(&to_bytes(cleared.into_body(), usize::MAX).await?)?;
+    assert_eq!(cleared["traceEvents"], serde_json::json!([]));
+    assert_eq!(cleared["metadata"]["active_spans"], 0);
+    assert_eq!(cleared["metadata"]["resource_sample_count"], 0);
+    let metrics = app.oneshot(request("/api/v1/performance/metrics")?).await?;
+    assert_eq!(metrics.status(), StatusCode::OK);
+    let metrics = String::from_utf8(to_bytes(metrics.into_body(), usize::MAX).await?.to_vec())?;
+    assert!(metrics.contains("operation=\"test.admin_export\""));
     gateway.shutdown().await;
     Ok(())
 }
