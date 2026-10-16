@@ -2996,6 +2996,10 @@ fn dated_stream_metadata_preserves_text_and_omits_unsupported_metadata() {
     let (_, mut encoder) = pair.stream().unwrap().into_parts();
     let events = encoder
         .encode_deltas(&[
+            AiStreamDelta::MessageStart {
+                id: "chat-pad-metadata".into(),
+                model: "logical-model".into(),
+            },
             AiStreamDelta::TextDeltaWithMetadata {
                 text: "answer".into(),
                 logprobs: vec![json!({"token":"answer"})],
@@ -3011,10 +3015,28 @@ fn dated_stream_metadata_preserves_text_and_omits_unsupported_metadata() {
             },
         ])
         .unwrap();
-    assert!(events.iter().any(|event| event.data.contains("answer")));
-    assert!(events.iter().any(|event| event.data.contains("summary")));
-    assert!(events.iter().any(|event| event.data.contains("logprobs")));
-    assert!(events.iter().all(|event| !event.data.contains("pad")));
+    let chunks: Vec<Value> = events
+        .iter()
+        .map(|event| serde_json::from_str(&event.data).expect("Chat chunk JSON"))
+        .collect();
+    let text = chunks
+        .iter()
+        .find(|chunk| chunk["choices"][0]["delta"]["content"] == "answer")
+        .expect("preserved text delta");
+    assert_eq!(
+        text["choices"][0]["logprobs"]["content"],
+        json!([{"token": "answer"}])
+    );
+    assert!(
+        chunks
+            .iter()
+            .any(|chunk| chunk["choices"][0]["delta"]["reasoning_content"] == "summary")
+    );
+    for chunk in &chunks {
+        assert!(chunk.get("obfuscation").is_none());
+        assert!(chunk["choices"][0].get("obfuscation").is_none());
+        assert!(chunk["choices"][0]["delta"].get("obfuscation").is_none());
+    }
 }
 
 #[test]

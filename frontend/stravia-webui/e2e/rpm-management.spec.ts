@@ -267,6 +267,7 @@ test('real management persists root and destination RPM limits and queue setting
   })
   await api<Route>(page, '/models', 'POST', {
     model_id: 'rpm-browser-model',
+    output_modality: 'text',
     targets: [
       {
         provider_id: provider.id,
@@ -325,8 +326,19 @@ test('real management persists root and destination RPM limits and queue setting
   await queue.locator('#rpm-total-wait').fill('9000')
   await queue.locator('#rpm-queue-capacity').fill('16')
   const saveQueue = queue.locator('button[type="submit"]')
-  await saveQueue.click()
-  await expect(saveQueue).toBeDisabled()
+  const saveQueueSettings = async () => {
+    const [response] = await Promise.all([
+      page.waitForResponse(
+        (response) =>
+          new URL(response.url()).pathname === '/api/v1/settings/rpm_admission' &&
+          response.request().method() === 'PUT',
+      ),
+      saveQueue.click(),
+    ])
+    expect(response.ok()).toBe(true)
+    await expect(saveQueue).toBeDisabled()
+  }
+  await saveQueueSettings()
   expect(await readRpm()).toMatchObject({ preferred_wait_ms: 1500, total_wait_ms: 9000, queue_capacity: 16 })
   await page.reload()
   await expect(queue.locator('#rpm-preferred-wait')).toHaveValue('1500')
@@ -354,8 +366,7 @@ test('real management persists root and destination RPM limits and queue setting
   await expect(rpmTrigger).toHaveAccessibleName('RPM limit for rpm-upstream: 30 RPM')
   await goto('/settings')
   await queue.locator('#rpm-total-wait').fill('10000')
-  await saveQueue.click()
-  await expect(saveQueue).toBeDisabled()
+  await saveQueueSettings()
   expect(await readDestination()).toEqual({ provider_id: provider.id, model: 'rpm-upstream', rpm_limit: 30 })
   await goto(catalogUrl)
   await rpmTrigger.click()
@@ -464,8 +475,7 @@ test('real management persists root and destination RPM limits and queue setting
   await goto('/settings')
   await expect(queue.locator('#rpm-queue-capacity')).toHaveValue('16')
   await queue.locator('#rpm-queue-capacity').fill('24')
-  await saveQueue.click()
-  await expect(saveQueue).toBeDisabled()
+  await saveQueueSettings()
   await page.reload()
   await expect(queue.locator('#rpm-queue-capacity')).toHaveValue('24')
   expect((await readRpm()).queue_capacity).toBe(24)
