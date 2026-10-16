@@ -455,8 +455,8 @@ writer 在每批提交后立即失效对应的实时状态和归属索引；后�
 - 关闭立即停止新的性能样本；Wire 捕获继续遵循下述准入快照契约，不中断在途 Run，不删除已有 Trace。普通 Observation 不受影响。
 - 设置页可下载 Prometheus 文本性能快照（`GET /api/v1/performance/metrics`）及 Chrome Trace JSON 时间线（`GET /api/v1/performance/timeline`）。两者均要求管理员鉴权，以禁止缓存的附件返回，不另开监听端口。关闭 Debug 后仍能下载本进程已有数据；进程重启后不保留。清除 Debug 数据仍仅清除 Wire Trace，不重置性能指标或时间线。
 - Desktop 下载沿用宿主默认保存位置；设置页等待原生下载完成后提示实际文件路径，取消或失败不报告成功。Web 下载仍交由浏览器处理，管理员鉴权与附件格式不变。
-- 性能指标包含静态命名操作耗时、按操作归因的 SQLx 查询与成功获取连接的耗时分布、观察写入队列深度、历史物化缓存记账字节及 hit/miss 次数，以及每五秒采样的宿主进程 RSS／CPU。CPU 在开启后的首个采样点不输出缺少差分基线的读数，多核 CPU 百分比可以超过 100%。不计入浏览器子进程或远端数据库内存；缓存记账容量不等于实际堆占用。
-- SQLx 指标只读取数值，不导出 SQL 文本、参数、请求正文或动态身份标签。查询事件不能说明成功／失败或所属连接池；连接获取耗时包含建连和健康检查，超时失败不在成功样本中。关闭再开启期间尚未完成的 span 不写入新启用周期。
+- 性能指标包含静态命名操作与关键等待耗时、按操作和池角色归因的 SQL driver 查询／连接获取结果，以及每五秒采样的宿主 RSS／CPU、活动推理、观察队列、派生缓存和 Wire 逻辑占用。CPU 在开启后的首个采样点不输出缺少差分基线的读数，多核 CPU 百分比可以超过 100%。不计入浏览器子进程或远端数据库内存；托管资源记账不等于实际堆占用。
+- SQL 采集位于统一池／连接／事务执行边界，不要求业务查询逐处增加包装。性能导出不包含 SQL 正文、绑定参数、数据库错误 Display、请求正文或动态业务身份标签；查询模板用 SHA-256 标识，结果限定为 driver 边界，失败和取消不冒充成功。关闭再开启期间尚未完成的旧 span 及旧队列命令的后代不进入新周期。
 - 开关是当前 Gateway 进程的原子运行态；默认关闭，重启后关闭；
 - 每次开启都显示确认：除 HTTP `Authorization` header 值外，Trace 会原样保存其他 header、URL、body、提示词、工具参数、业务数据与媒体；关闭后已有 Trace 仍按保留期存在；
 - 开启状态下提供「清除 Debug 数据」操作，删除全部已保留 Trace，不影响开关与请求记录；
@@ -470,30 +470,59 @@ writer 在每批提交后立即失效对应的实时状态和归属索引；后�
 
 常规异步函数使用 `#[tracing::instrument(target = "stravia::perf", name = "router.select", skip_all, fields(status))]` 这类静态声明；局部 future、独立任务通过 `.instrument(span)` 传播上下文。不得跨 `.await` 保留 `span.enter()` guard。响应体、WebSocket 与后台 producer 必须持有对应 span，直到真实生命周期结束；有非性能中间 span 时，仍关联最近的性能祖先。
 
-Layer 只保留静态操作名、内部生成的 span／parent ID、时间、白名单状态，以及 `node_count`、`reference_count`、`candidate_count`、`event_count` 四个非负整数工作量字段；忽略其他 span 字段，不使用 `ret`／`err` 自动记录业务值。默认终态为 `closed`，仅表示 span 生命周期结束；业务代码在已知结果时显式记录 `completed`、`error`、`cancelled` 或 `abandoned`。不能把函数返回、future 被丢弃或父 span 关闭自动解释为成功。
+操作 span 只保留静态操作名、内部生成的 span／parent ID、时间、白名单状态，以及 `node_count`、`reference_count`、`candidate_count`、`event_count` 四个非负整数工作量字段；SQL span 另外接收下节列出的诊断白名单。忽略其他字段，不使用 `ret`／`err` 自动记录业务值。操作默认终态为 `closed`，仅表示 span 生命周期结束；业务代码在已知结果时显式记录 `completed`、`error`、`cancelled` 或 `abandoned`。不能把函数返回、future 被丢弃或父 span 关闭自动解释为成功。
 
-时间线默认保留 1,024 个活动 span 与 10,000 个结束记录，可用 `STRAVIA_PERF_TRACE_ACTIVE_CAPACITY` 与 `STRAVIA_PERF_TRACE_COMPLETED_CAPACITY` 环境变量在进程启动时调整；活动区满时拒收新 span（相应耗时也不入直方图），结束区满时淘汰最旧记录。JSON `metadata.capacity`、`dropped_active`、`dropped_completed`、`incomplete` 与 `incomplete_total` 显式描述容量、丢弃数、当前导出的未完成记录数，以及历史冻结计数加当前活动 span 数，不承诺完整请求树。这些计数不能区分仍活动的 span 与 Debug 关闭时冻结的 span。关闭 Debug 将活动记录冻结为未完成记录；随后关闭的旧 span 不补写终态或直方图，重新开启只接收新周期的数据。
+时间线的保留区分别有界，容量均可在进程启动时调整：
 
-导出使用标准 Chrome Trace 事件：已结束 span 为 `X`，未结束或被 Debug 关闭截断的 span 只有 `B`，不伪造结束时间；可见父子间附带 flow。每个 span 使用合成 track，`tid` 不是操作系统线程。可导入 Perfetto 或 Chrome trace viewer 查看墙钟时长与父子关联；`active_us` 仅表示 span 被 enter 的区间并集（重入或并发 enter 不重复累加），不是 CPU 时间，未 enter 的 span 不输出该值。该时间线不是 CPU／堆 profiler；进程 CPU／RSS 仍是独立全局采样，不能归因到单个 span。
+|保留区|默认容量|环境变量|
+|---|---|---|
+|活动 span，含操作、查询与 acquire|1,024|`STRAVIA_PERF_TRACE_ACTIVE_CAPACITY`|
+|已结束操作|10,000|`STRAVIA_PERF_TRACE_COMPLETED_CAPACITY`|
+|已结束 SQL query／acquire 合计|2,048|`STRAVIA_PERF_SQL_COMPLETED_CAPACITY`|
+|资源采样帧|720，连续采集约一小时|`STRAVIA_PERF_RESOURCE_CAPACITY`|
+
+活动区满时拒收新 span（相应耗时也不入直方图），结束区与资源区满时各自淘汰最旧记录；SQL 明细不会挤掉已结束的业务操作。JSON `metadata.capacity`、`dropped_active`、`dropped_completed`、`dropped_sql_completed`、`dropped_resource_samples` 显式描述容量与丢弃数，不承诺完整请求树。采集状态计数取自同一份加锁快照：`active_spans` 是活动 map 中的当前 span 数；`frozen_spans` 是操作与 SQL 保留区中因关闭 Debug 冻结、尚未被淘汰的记录数；`frozen_total` 是历史冻结累计数，记录被淘汰后也不减少。兼容字段语义不变：`incomplete = active_spans + frozen_spans`，`incomplete_total = frozen_total + active_spans`。旧字段不能再用作采集丢失判据，也不能仅因存在 `B` 事件就拒收导出；应结合目标请求的 span／parent ID 因果树、真实采集状态、保留窗口与丢弃计数判断证据是否完整，其他请求仍活动并不意味着目标请求缺失。关闭 Debug 将活动记录冻结为未完成记录；随后关闭的旧 span 不补写终态或直方图，重新开启只接收新周期的数据。旧队列上下文即使没有 parent ID，也保留原 epoch；拒收标记会传播至命令后续的业务和 SQL span，而不是将其重新收为无归属的根。
+
+导出使用标准 Chrome Trace 事件，每条 span 的 `args.capture_state` 固定为三种值之一：活动 map 快照为 `active`、关闭 Debug 后保留的未完成记录为 `frozen`，二者均为 `ph=B` 且不输出 `dur`；正常记录到生命周期结束的 span 为 `finished`、`ph=X`，并输出实际墙钟 `dur`，不伪造冻结记录的结束时间。`capture_state` 与业务 `args.status` 独立：`finished` 不代表成功，`error`、`cancelled` 等已记录结果仍保持原值，默认 `closed` 也不代表成功；活动或冻结记录不补造业务终态。可见父子间附带 flow；资源曲线使用带时间戳的 `C` counter。每个 span 使用合成 track，`tid` 不是操作系统线程。可导入 Perfetto 或 Chrome trace viewer 查看墙钟时长与异步因果关联；因果 parent 不保证时间包含关系，也不代表请求独占成本。`active_us` 仅表示 span 被 enter 的区间并集（重入或并发 enter 不重复累加），不是 CPU 时间，未 enter 的 span 不输出该值。
+
+`metadata.schema_version=2` 同时提供应用版本、进程 PID、系统／架构／逻辑 CPU 数、时钟原点、导出时间、保留起点、当前 Debug epoch、采样间隔、帧数及各项观测口径；不包含主机名、启动参数或数据库连接串。进程 CPU／RSS 是全局采样，不能归因到单个 span，也不能保证捕获短于采样周期的峰值。
+
+`stravia_managed_resource_items` 与 `stravia_managed_resource_logical_bytes` 按静态 `resource`／`domain` 分组，并随同一采样帧进入时间线：
+
+- `requests.inference_run`：已进入推理执行、尚未结束交付的数量，包括等待上游的请求；失败、取消和交付流丢弃都会释放。不统计每个 HTTP 管理请求，也不估算请求堆字节。
+- `observation_queue.observation`：真实已入队、未出队的命令及逻辑字节；不含等待容量的 producer 或仅预留的槽位。合并文本更新字节，拒收、出队和 receiver 关闭释放记账，不复制或序列化正文来计数。
+- `runtime_cache_local_estimate.<domain>`：按既有 KiB 准入权重计账、仍由本地缓存条目持有的资源；包含已过期条目及 TinyUFO 移除后等待 epoch GC 的节点，直到条目最终释放才减少，因此可暂时超过准入预算。调用方独立持有的共享值不计为额外缓存占用。
+- `runtime_cache_remote_observed_logical.remote_total`：最近一次成功 Redis 命令返回的逻辑条目数／预算字节及观测时间、年龄；数量、字节和时间作为同一份回复整体提交与读取，复用已有 Lua 回复，不新增 RTT 或扫描。并发回复可能乱序，远端 TTL 和惰性过期不会主动刷新这个值，不能当作 Redis 实时内存或宿主 RSS。
+- `wire_queued_payload`、`wire_writing_payload`、`wire_encoding_payload`、`wire_encoded_buffer`、`wire_dedup_payload` 的 `observation` domain：分别区分捕获排队、写入、临时编码、编码缓冲和段内去重保留；错误、清理、换段与释放跟随真实所有权。
+
+这些字节来自已有长度或预算，不含完整 allocator、容器容量和所有共享关系，不能相加重建 RSS。观测源消失后的下一帧补零，只表示当前托管／可见源的记账结束；不能据此断言远端 Redis namespace 已被删除或 allocator 已归还内存。该时间线仍不是 CPU／堆 profiler。
+
+关键等待与后续处理分开记录：`sqlite.write_gate.wait` 是宿主 SQLite 写协调器等待，不是数据库引擎锁；`rpm.candidate.wait` 是候选准入等待；`upstream.send_admission.wait` 和 `upstream.http.response_headers.wait` 分别覆盖出站准入及发送至收到响应头。`observation.queue.wait` 从真正入队计到出队，不包含等待队列容量；`observation.command.process` 表示后台处理。队列只复制内部 ID／epoch，不保存请求 span，因此请求可以先结束，后台通过因果边关联；同批 SQL 不能据此均摊为每个请求的独占成本。
 
 #### 7.1.2 查询次数与调用来源
 
-`stravia_sql_query_duration_seconds` 和 `stravia_sql_pool_acquire_duration_seconds` 使用静态 `operation` 标签，取事件所属的最近一层性能 span；没有可归因的性能上下文时标记为 `unattributed`。不再输出无标签的并行总量，全部操作的 `_count` 求和即当前累计总次数。SQLite worker 传播调用侧 span，因此异步线程上的查询仍归属于发起它的操作；关联旧 Debug 周期 span 的延迟事件不会计入新周期。
+工作区 `sqlx` 依赖统一指向 `stravia-sql`。业务保持正常的 query／QueryBuilder、池、连接和事务写法，不在每处执行表达式添加 `observe(...)`。查询构造、驱动、原生事务嵌套及 Drop 回滚仍由上游 SQLx 承担；集中边界发出 `stravia::sql` 的 `sql.query`、`sql.pool.acquire` span，关闭 Debug 时直接委托原生执行，不计算指纹或增加诊断 future／stream box。
 
-这里的查询次数是 SQLx 查询日志事件数，不是 SELECT 次数、网络往返数或数据库引擎执行的全部语句数。读、写和失败执行都可能产生事件；SQLite 原生事务控制和连接健康检查不一定产生查询事件，多语句执行也不能据此拆成逐条语句。成功获取连接的 `_count` 单独计数，不应与查询次数相加。`stravia_operation_duration_seconds_count` 则是操作调用次数，操作可以执行零条或多条 SQL。
+`stravia_sql_query_duration_seconds` 和 `stravia_sql_pool_acquire_duration_seconds` 使用静态 `operation`、`backend`、`pool`、`status` 标签，归于最近的业务性能操作；没有可归因上下文时标记 `unattributed`。没有按查询 ID、源码路径或业务身份建立 Prometheus 标签。全部操作和状态的 `_count` 求和是本进程已记录的累计次数，不存在另一个无标签并行总量。查询在 driver 终态到达时立即收口，不等待 SQLite worker 释放克隆的 span；旧周期延迟结果不补入新周期。
+
+这里的查询次数是进入受采集 driver 执行边界的调用次数，不是 SELECT 数、网络往返数或引擎执行的全部语句数；多语句不能按该次数拆成逐条语句。`completed` 是 driver 返回或流被完整消费，`error` 是 driver 错误，未完成的 future／stream 被丢弃为 `cancelled`。流式耗时包括消费生命周期与背压，不是数据库服务器执行时间；QueryAs／Scalar 后续行映射错误和外层 `RowNotFound` 不冒充 driver 错误。原生迁移器、初始化 callback、健康检查及驱动内部事务控制语句不在应用查询覆盖承诺内。连接获取单独统计成功、失败和取消，耗时包含建连和健康检查，不应与 query 次数相加。`stravia_operation_duration_seconds_count` 则是业务操作次数，一个操作可以执行零条或多条 SQL。
+
+SQL 明细记录模板实际 UTF-8 字节的 SHA-256 `query_id`（`query_identity=sha256_template`），不规范化空白或 SQL 字面量，不读取绑定值。相同模板的不同参数可聚合，动态构造的不同模板可以有不同 ID。driver 读取 SQL 之前就拒绝参数时可能没有 ID；模板指纹不是自动源码索引，`source_scope=unavailable` 明确不提供虚构的业务文件位置。还可包含 driver 的 `rows_returned`／`rows_affected`、静态错误分类及白名单格式的 SQLite 数值错误码／PostgreSQL SQLSTATE；不保存错误消息、SQL 正文或绑定值。
+
+池诊断导出 size、idle、受采集 acquire 的 waiting、累计失败和取消。`stravia_sql_pool_size`／`stravia_sql_pool_idle` 是被采样实例；waiting／失败／取消按 SQLite 或 PostgreSQL × `main`／`artifact_lock`／`unregistered` 固定角色聚合，不能当作某实例或引擎内部的全部等待者。主池每五秒采样，其他池可能只有最近 acquire 的观测值，曲线附带年龄，不能默认为实时。累计计数仅覆盖进入采集分支的调用，包含跨开关边界结束的调用，不因关闭或清除 Debug 数据归零。
 
 时间线中每个 span 的 `args` 可包含：
 
 |字段|含义|
 |---|---|
-|`sql_query_count` / `sql_query_duration_us`|直属 SQLx 查询事件数及其累计耗时；没有查询事件时省略|
-|`sql_pool_acquire_count` / `sql_pool_acquire_duration_us`|直属成功连接获取次数及其累计耗时；没有事件时省略|
+|`sql_query_count` / `sql_query_duration_us`|直属 driver 查询调用数及其累计耗时，包含已记录的错误和取消；没有调用时省略|
+|`sql_pool_acquire_count` / `sql_pool_acquire_duration_us`|直属 acquire 调用数及其累计耗时，包含已记录的错误和取消；没有调用时省略|
 |`node_count`|本次底层操作处理的节点数；`turn_chain.ancestor.select` 记录实际从 SQL 读取的新后缀节点数，不含请求上下文命中的祖先|
 |`reference_count`|内容写入的引用条目数；不能据此推断读取的外置内容行数|
 |`candidate_count`|前缀查询返回或对应发现阶段已统计的候选数；未完成统计时可能省略|
 |`event_count`|`observation.writer.persist_events` 收到的事件批量大小，包含随后可能被过滤掉的事件|
 
-SQL 事件只计入最近的 span，不重复累加到祖先。父 span 的直属计数为零不表示整条请求没有 SQL；分析请求总量需要沿子树汇总，且必须检查记录淘汰和不完整标记。SQL 耗时是事件耗时之和，并发时可超过 span 墙钟时长，不是 CPU 时间。不会为每条 SQL 创建时间线记录，也不输出 SQL 文本、参数、Principal、Run 或节点身份作为指标标签。
+SQL 只计入最近的业务操作，不重复累加到祖先或 SQL 自身记录。父操作直属计数为零不表示整条请求没有 SQL；分析总量需要汇总业务操作子树，并检查淘汰、不完整标记及后台因果边界。SQL 耗时是各调用时长之和，并发时可超过操作墙钟，不是 CPU 时间。每次受采集 query／acquire 都有独立有界明细，不能再把明细与操作上的累计计数相加。
 
 用于区分查询来源的主要操作：
 
@@ -512,9 +541,58 @@ SQL 事件只计入最近的 span，不重复累加到祖先。父 span 的直�
 
 `stravia_generation_materialization_cache_access_total{result="hit"|"miss"}` 统计普通物化与含 Item Reference 的父节点恢复对 Generation Materialization Cache 的访问。物化对象和按 ingress 隔离的祖先引用目录现共用[统一派生缓存](architecture.md#统一派生缓存与-server-配置)：Memory / SQLite 使用 TinyUFO，PostgreSQL 使用 Redis。普通父节点恢复命中缓存后不再读链；含 Item Reference 时，若对应 ingress 的引用目录也命中则不再读链，否则仍需读取祖先历史构造目录。物化 hit 本身不证明目录 hit。请求准备阶段的有界发现工作区只复用节点与解码材料，不计入该跨请求缓存的 hit/miss 或记账字节；应结合 `generation_chain.history.load` 与底层 `turn_chain.materialize` 的次数及 SQL 归因验证实际减少的读取，不能把 `candidate_count` 当作逐一核验次数。直接调用底层 Turn Chain 物化不会经过该缓存，因此不能仅凭命中率推断底层读取次数。逻辑缓存记账不等于进程或 Redis 实际内存。
 
-调查时，在同一进程、同一段复现操作前后各导出一次 metrics，按 `operation` 比较 `_count` 和 `_sum` 差值，并在操作完成后立即导出 timeline。先按查询次数判断高频来源，再按耗时判断慢路径；用工作量字段区分大批次与过多小批次，用父子关系识别重复物化。指标是累计值，关闭或清除 Debug 数据不会归零；有界 timeline 与累计 metrics 也不覆盖相同时间窗口，不能直接相除推导每请求查询量。
+调查时，在同一进程、同一段复现操作前后各导出一次 metrics，按 `operation` 比较 `_count` 和 `_sum` 差值，并在操作完成后立即导出 timeline。交给 AI 分析时先核对 PID、版本、epoch、保留时间、丢弃数、`active`／`frozen` 采集状态及因果链完整性，再判断证据覆盖范围：
 
-`tests/common/measure_history_paths.py` 对真实 Server 使用隔离数据库与 loopback 上游，分别报告新建或持续连接的 `connect_ms`、不含连接建立的 `http_request_ms` 和总 `latency_ms`；普通模式、连接模式及 SharedCache 容量必须在前后对照中一致。专用进程默认用 `--trace-completed-capacity 20000`，不改变产品默认值；结束记录淘汰、活动拒收、不完整 span 或缺少完整请求根/子树证据时，报告仍判无效，不能为通过比较而忽略这些标记。完整且明确归属于独立 `observation.*` 根的历史重建单列为观测工作，不混入 Inference Run 子树；未知根、缺失祖先或环仍判为归属不完整。正常完整投影场景与将独立测试 Principal 的派生投影置为未知的共享祖先诊断场景分别报告；后者只验证保守回退的读取复用，不代表正常数据的收益。内容、父节点、拒绝时无父关系和完整压缩窗口是正确性依据，候选数量与读链次数只作工作量证据。
+- 延迟：先区分准入、写协调器、池 acquire、上游响应头和后台队列等待；按业务操作、查询指纹、结果与行数检查高频小查询或慢查询。查询模板与业务源码需要受控对照；指纹不替代 SQL 审查、数据库锁图或执行计划。
+- 内存：将 RSS 与活动请求、队列、缓存、Wire 各自的 items／逻辑字节曲线对齐。逻辑资源下降但 RSS 未降既不能证明泄漏，也不能证明没有泄漏；allocator、映射、未计账对象和真实保留链需专项抓取。
+- CPU：将进程 CPU 曲线与等待／处理阶段对齐，只能判断复现窗口与可疑阶段；不能将 span 墙钟、`active_us` 或 SQL 累计耗时当成 CPU 栈。函数热点和分配栈使用下节专项流程。
+
+用工作量字段区分大批次与过多小批次，用因果关系识别重复物化，但不将后台 SQL 重复算作同步请求成本。指标是累计值，关闭或清除 Debug 数据不会归零；有界 timeline 与累计 metrics 也不覆盖相同时间窗口，不能直接相除推导每请求查询量。缺失采样、被淘汰的 SQL、未知祖先或陈旧远端快照必须明确为证据缺口，不能解读成零成本或零占用。
+
+`tests/common/measure_history_paths.py` 对真实 Server 使用隔离数据库与 loopback 上游，分别报告新建或持续连接的 `connect_ms`、不含连接建立的 `http_request_ms` 和总 `latency_ms`；普通模式、连接模式及 SharedCache 容量必须在前后对照中一致。专用进程默认用 `--trace-completed-capacity 20000` 同时配置操作与 SQL 明细保留区，不改变产品默认值；结束记录淘汰、活动拒收、不完整 span 或缺少完整请求根/子树证据时，报告仍判无效，不能为通过比较而忽略这些标记。历史重建只有完整的独立 `observation.*` 根，或经过 `observation.command.process` 且因果祖先完整时，才单列为后台观测工作，不混入请求同步路径；未知根、缺失祖先或环仍判为归属不完整。正常完整投影场景与将独立测试 Principal 的派生投影置为未知的共享祖先诊断场景分别报告；后者只验证保守回退的读取复用，不代表正常数据的收益。内容、父节点、拒绝时无父关系和完整压缩窗口是正确性依据，候选数量与读链次数只作工作量证据。
+
+#### 7.1.3 CPU 与堆专项抓取
+
+性能时间线用于定位慢阶段、连接等待、重复查询和托管资源增长，不能替代采样 profiler。`active_us` 不是 CPU 时间，RSS 上升也不能单独证明泄漏。需要函数热点或未释放分配栈时，另行抓取系统 profiler 数据；Debug 开关不会自动启动 profiler、提升权限或修改系统配置。
+
+以下是 Windows WPR／WPA 的人工复现流程。先安装 Windows Performance Toolkit，保留复现时完全匹配的 EXE／PDB；开发构建保留调试符号，生产构建若没有匹配符号，只能得到受限调用栈。CPU 采样和堆采集分开进行，先完成一次再开始另一次。
+
+开始前取得操作者授权，确认目标进程、复现窗口、输出位置与磁盘余量。WPR 会采集系统级事件，不是仅采集 Stravia；ETL 可能包含其他进程、路径和敏感信息，不受 Debug Wire 的脱敏规则保护。仅在隔离复现场景使用，不自动抓取或上传生产数据。下面采用 file mode，文件会持续增长，短时间复现完成后立即停止。先运行 `wpr -status`；若已有其他人的录制，不覆盖或取消它。
+
+在管理员 PowerShell 中开始 CPU 采样，随后在另一个终端复现目标操作：
+
+```powershell
+wpr -status
+wpr -start CPU -filemode
+```
+
+复现完成后立即结束自己的录制：
+
+```powershell
+wpr -stop "$env:TEMP\stravia-cpu.etl"
+```
+
+在 WPA 中打开 ETL，按性能时间线中的 `metadata.process_id`、复现时间范围筛选目标 PID，在 CPU Usage (Sampled) 中分析采样调用栈。若重启过进程，使用本次复现对应的 PID；不能把机器总 CPU 或其他同名实例归因到该请求。WPR 的 `CPU` 默认详细配置包含采样栈，不能假定 `CPU.light` 也包含函数调用栈。
+
+堆抓取会通过 IFEO 修改机器级、按可执行文件名生效的持久设置，影响之后启动的同名进程，不能靠不同数据目录隔离。必须另行确认管理员授权、精确文件名和影响范围；不要对仍在服务的共享实例直接启用或重启。以下命令针对 `stravia-server.exe`，Desktop 必须明确替换成实际目标文件名。
+
+先关闭隔离测试实例，在管理员 PowerShell 中启用目标的堆跟踪并开始录制：
+
+```powershell
+wpr -HeapTracingConfig stravia-server.exe enable
+wpr -start Heap -filemode
+```
+
+随后启动新的隔离实例，执行同一组可控请求并让请求完成、队列排空。完成后停止录制并撤销 IFEO 设置：
+
+```powershell
+wpr -stop "$env:TEMP\stravia-heap.etl"
+wpr -HeapTracingConfig stravia-server.exe disable
+```
+
+即使复现或保存失败，也要撤销本次启用的 IFEO 设置，并处理自己开启的录制，不能取消来源不明的系统会话。在 WPA 中按目标 PID 比较未释放分配及其分配栈，结合缓存／队列／Wire 的逻辑占用判断保留来源；堆事件不覆盖所有 allocator、映射文件、VirtualAlloc 或 Wasm 线性内存，不能把没有堆记录解释为没有内存增长。向 AI 提供经人工审查的热点／分配统计及匹配时间线，而不是直接上传未经审查的完整 ETL。
+
+命令依据：[WPR 命令行选项](https://learn.microsoft.com/en-us/windows-hardware/test/wpt/wpr-command-line-options)、[Recording for Heap Analysis](https://learn.microsoft.com/en-us/windows-hardware/test/wpt/recording-for-heap-analysis)。内置导出是跨平台的；这里的专项采集流程仅适用于 Windows，不声称已提供跨平台的内置 CPU／heap profiler。
 
 ### 7.2 脱敏
 

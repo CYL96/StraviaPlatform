@@ -7753,12 +7753,12 @@ dependencies = [
  "serde_core",
  "serde_json",
  "sha2 0.11.0",
- "sqlx",
  "stable_deref_trait",
  "stravia-credential-protection",
  "stravia-media",
  "stravia-protocol-codec",
  "stravia-runtime-contract",
+ "stravia-sql",
  "stravia-vendor-runtime",
  "stravia-vendor-sdk",
  "stravia-web-access",
@@ -7796,8 +7796,8 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
- "sqlx",
  "stravia-runtime-contract",
+ "stravia-sql",
  "thiserror 2.0.21",
  "tiktoken-rs",
  "tokio",
@@ -7857,8 +7857,8 @@ dependencies = [
  "serde",
  "serde_json",
  "shellexpand",
- "sqlx",
  "stravia-core",
+ "stravia-sql",
  "tempfile",
  "tokio",
  "toml 1.1.6+spec-1.1.0",
@@ -7884,8 +7884,8 @@ dependencies = [
  "parking_lot",
  "serde",
  "serde_json",
- "sqlx",
  "stravia-runtime-contract",
+ "stravia-sql",
  "stravia-web-access",
  "thiserror 2.0.21",
  "tokio",
@@ -7950,11 +7950,11 @@ dependencies = [
  "serde",
  "serde_json",
  "shellexpand",
- "sqlx",
  "stravia-core",
  "stravia-credential-protection",
  "stravia-media",
  "stravia-runtime-contract",
+ "stravia-sql",
  "stravia-web-search",
  "tempfile",
  "tokio",
@@ -7972,6 +7972,20 @@ dependencies = [
  "windows-core 0.61.2",
  "windows-sys 0.61.2",
  "winnow 1.0.4",
+]
+
+[[package]]
+name = "stravia-sql"
+version = "0.5.1"
+dependencies = [
+ "futures",
+ "log",
+ "sha2 0.11.0",
+ "sqlx",
+ "sqlx-core",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

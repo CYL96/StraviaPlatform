@@ -93,7 +93,6 @@ pub(crate) async fn inject_postgres(
 
 /// Produce real SQLITE_FULL in a bounded in-memory database, not the runtime pool.
 pub(crate) async fn inject_sqlite(boundary: &str) -> Result<(), sqlx::Error> {
-    use sqlx::Connection;
     let Some(fault) = configured_fault() else {
         return Ok(());
     };

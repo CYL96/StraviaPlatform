@@ -392,7 +392,7 @@ async fn sqlite_upgrade_keeps_existing_services_without_inventing_history() -> a
             .cloned()
             .collect(),
     );
-    prefix.run(&pool).await?;
+    prefix.run(pool.migration_pool()).await?;
     let storage: DynStorage = Arc::new(SqliteStorage::from_pool(pool.clone()));
     let existing = storage
         .providers()
@@ -467,7 +467,7 @@ async fn postgres_admin_history_preserves_batches_and_retention() -> anyhow::Res
                 .cloned()
                 .collect(),
         );
-        prefix.run(&pool).await?;
+        prefix.run(pool.migration_pool()).await?;
         let mut storage_url = url::Url::parse(&url)?;
         storage_url
             .query_pairs_mut()

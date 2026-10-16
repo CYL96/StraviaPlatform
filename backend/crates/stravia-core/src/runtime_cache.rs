@@ -2,7 +2,7 @@
 
 use std::{
     any::Any,
-    collections::hash_map::DefaultHasher,
+    collections::{HashMap, hash_map::DefaultHasher},
     hash::{Hash, Hasher},
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -11,6 +11,8 @@ use std::{
 use parking_lot::Mutex;
 use serde::{Serialize, de::DeserializeOwned};
 use tinyufo::TinyUfo;
+
+use crate::performance::{ResourceLease, ResourceUsage};
 
 const KIB: usize = 1024;
 const ENTRY_OVERHEAD: usize = 256;
@@ -33,7 +35,7 @@ enum Backend {
 struct LocalCache {
     entries: TinyUfo<u64, Arc<LocalEntry>>,
     // 上游 put/remove 权重更新不是单次原子操作；仅串行 mutation，读取不加锁。
-    mutation: Mutex<()>,
+    mutation: Mutex<HashMap<&'static str, ResourceUsage>>,
     capacity_bytes: usize,
 }
 
@@ -42,6 +44,8 @@ struct LocalEntry {
     key: Box<str>,
     value: Arc<dyn Any + Send + Sync>,
     expires_at: Instant,
+    // Admission weight is a rounded logical estimate, not allocator/RSS usage.
+    _usage: ResourceLease,
 }
 
 struct RedisCache {
@@ -51,6 +55,12 @@ struct RedisCache {
     get: redis::Script,
     put: redis::Script,
     remove: redis::Script,
+    // Last received successful server-side atomic snapshot, not host memory or a
+    // live TTL gauge. Bytes are the stored entry weights (excluding fixed base
+    // overhead); items include lazily expired entries still occupying that budget.
+    // Concurrent responses can arrive out of execution order; idle container TTL
+    // expiration is observed only by a later operation.
+    observed_usage: ResourceUsage,
 }
 
 impl RuntimeCache {
@@ -59,7 +69,7 @@ impl RuntimeCache {
         Self {
             backend: Backend::Local(Arc::new(LocalCache {
                 entries: TinyUfo::new_compact(units, units.clamp(1, 65_536)),
-                mutation: Mutex::new(()),
+                mutation: Mutex::new(HashMap::new()),
                 capacity_bytes,
             })),
         }
@@ -87,6 +97,10 @@ impl RuntimeCache {
                 get: redis::Script::new(REDIS_GET),
                 put: redis::Script::new(REDIS_PUT),
                 remove: redis::Script::new(REDIS_REMOVE),
+                observed_usage: ResourceUsage::new(
+                    "runtime_cache_remote_observed_logical",
+                    "remote_total",
+                ),
             })),
         })
     }
@@ -114,23 +128,31 @@ impl RuntimeCache {
                 for key in &cache.keys {
                     invocation.key(key);
                 }
-                let result: redis::RedisResult<Option<Vec<u8>>> = invocation
+                let result: redis::RedisResult<(Option<Vec<u8>>, u64, u64)> = invocation
                     .arg(redis_field(domain, key))
                     .invoke_async(&mut connection)
                     .await;
-                match result {
-                    Ok(Some(payload)) => match serde_json::from_slice::<T>(&payload) {
+                let payload = match result {
+                    Ok((payload, items, bytes)) => {
+                        cache
+                            .observed_usage
+                            .set_observed(items, bytes, SystemTime::now());
+                        payload
+                    }
+                    Err(_) => {
+                        warn("get", domain);
+                        return None;
+                    }
+                };
+                match payload {
+                    Some(payload) => match serde_json::from_slice::<T>(&payload) {
                         Ok(value) => Some(Arc::new(value)),
                         Err(_) => {
                             warn("decode", domain);
                             None
                         }
                     },
-                    Ok(None) => None,
-                    Err(_) => {
-                        warn("get", domain);
-                        None
-                    }
+                    None => None,
                 }
             }
         }
@@ -198,13 +220,17 @@ impl RuntimeCache {
                 let Some(expires_at) = Instant::now().checked_add(ttl) else {
                     return;
                 };
+                let mut domains = cache.mutation.lock();
+                let usage = domains
+                    .entry(domain)
+                    .or_insert_with(|| ResourceUsage::new("runtime_cache_local_estimate", domain));
                 let entry = Arc::new(LocalEntry {
                     domain,
                     key: key.into(),
                     value,
                     expires_at,
+                    _usage: usage.lease(1, (weight * KIB) as u64),
                 });
-                let _guard = cache.mutation.lock();
                 cache
                     .entries
                     .put(local_hash(domain, key), entry, weight as u16);
@@ -240,7 +266,7 @@ impl RuntimeCache {
                 for key in &cache.keys {
                     invocation.key(key);
                 }
-                let result: redis::RedisResult<i64> = invocation
+                let result: redis::RedisResult<(i64, u64, u64)> = invocation
                     .arg(field)
                     .arg(payload)
                     .arg(weight)
@@ -248,8 +274,13 @@ impl RuntimeCache {
                     .arg(expiry_millis as u64)
                     .invoke_async(&mut connection)
                     .await;
-                if result.is_err() {
-                    warn("put", domain);
+                match result {
+                    Ok((_, items, bytes)) => {
+                        cache
+                            .observed_usage
+                            .set_observed(items, bytes, SystemTime::now());
+                    }
+                    Err(_) => warn("put", domain),
                 }
             }
         }
@@ -273,12 +304,17 @@ impl RuntimeCache {
                 for key in &cache.keys {
                     invocation.key(key);
                 }
-                let result: redis::RedisResult<i64> = invocation
+                let result: redis::RedisResult<(i64, u64, u64)> = invocation
                     .arg(redis_field(domain, key))
                     .invoke_async(&mut connection)
                     .await;
-                if result.is_err() {
-                    warn("remove", domain);
+                match result {
+                    Ok((_, items, bytes)) => {
+                        cache
+                            .observed_usage
+                            .set_observed(items, bytes, SystemTime::now());
+                    }
+                    Err(_) => warn("remove", domain),
                 }
             }
         }
@@ -292,8 +328,9 @@ impl RuntimeCache {
                 .arg(&cache.keys)
                 .query_async(&mut connection)
                 .await;
-            if result.is_err() {
-                warn("shutdown", "runtime");
+            match result {
+                Ok(_) => cache.observed_usage.set_observed(0, 0, SystemTime::now()),
+                Err(_) => warn("shutdown", "runtime"),
             }
         }
     }
@@ -332,6 +369,7 @@ fn warn(operation: &'static str, domain: &str) {
 // field 过期可保守占预算；下一次读取/淘汰会释放。容器 TTL 等于最大 field 到期时间，
 // 不活跃实例的 payload 和全部索引最终一起消失。逻辑 TTL 不被容器 TTL 延长。
 const REDIS_GET: &str = r#"
+local function get()
 local expiry = tonumber(redis.call('ZSCORE', KEYS[3], ARGV[1]))
 if not expiry then return false end
 local t = redis.call('TIME')
@@ -346,6 +384,9 @@ if expiry <= now then
     return false
 end
 return redis.call('HGET', KEYS[1], ARGV[1])
+end
+local payload = get()
+return {payload, redis.call('HLEN', KEYS[1]), tonumber(redis.call('GET', KEYS[5])) or 0}
 "#;
 
 const REDIS_REMOVE: &str = r#"
@@ -356,7 +397,7 @@ redis.call('ZREM', KEYS[3], ARGV[1])
 redis.call('ZREM', KEYS[4], ARGV[1])
 if redis.call('EXISTS', KEYS[5]) == 1 then redis.call('DECRBY', KEYS[5], weight) end
 if redis.call('ZCARD', KEYS[3]) == 0 then redis.call('DEL', unpack(KEYS)) end
-return weight
+return {weight, redis.call('HLEN', KEYS[1]), tonumber(redis.call('GET', KEYS[5])) or 0}
 "#;
 
 const REDIS_PUT: &str = r#"
@@ -401,7 +442,7 @@ if not ok then
     redis.call('DEL', unpack(KEYS))
     return redis.error_reply('runtime cache write failed')
 end
-return result
+return {result, redis.call('HLEN', KEYS[1]), tonumber(redis.call('GET', KEYS[5])) or 0}
 "#;
 
 #[cfg(test)]
@@ -491,6 +532,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_accounting_follows_shared_cache_owner_lifetime() {
+        let cache = RuntimeCache::tinyufo(KIB);
+        let shared = cache.clone();
+        let value = Arc::new(String::from("retained"));
+        cache.put("generation", "a", value.clone(), 8, TTL).await;
+        let Backend::Local(local) = &cache.backend else {
+            unreachable!()
+        };
+        let usage = local.mutation.lock()["generation"].clone();
+        assert_eq!(usage.totals(), (1, KIB as u64));
+        drop(cache);
+        assert_eq!(
+            shared.get::<String>("generation", "a").await.as_deref(),
+            Some(value.as_ref())
+        );
+        assert_eq!(usage.totals(), (1, KIB as u64));
+        // 单个共享 owner 的退出不能提前归零；最后一个 owner 释放仍在索引中的值。
+        // 已移除节点的 epoch GC 时机不属于即时释放契约。
+        drop(shared);
+        assert_eq!(Arc::strong_count(&value), 1);
+        assert_eq!(usage.totals(), (0, 0));
+    }
+
+    #[tokio::test]
     async fn local_expiry_and_hash_collision_are_misses() {
         let cache = RuntimeCache::tinyufo(4 * KIB);
         let Backend::Local(local) = &cache.backend else {
@@ -504,6 +569,8 @@ mod tests {
                 key: "collision".into(),
                 value: Arc::new(9u64),
                 expires_at: Instant::now() + TTL,
+                _usage: ResourceUsage::new("runtime_cache_local_estimate", "generation")
+                    .lease(1, KIB as u64),
             }),
             1,
         );
@@ -517,6 +584,8 @@ mod tests {
                 key: "requested".into(),
                 value: Arc::new(9u64),
                 expires_at: Instant::now() - Duration::from_secs(1),
+                _usage: ResourceUsage::new("runtime_cache_local_estimate", "generation")
+                    .lease(1, KIB as u64),
             }),
             1,
         );

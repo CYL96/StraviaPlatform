@@ -32,7 +32,9 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls-no-p
 reqwest-websocket = "0.6"
 tungstenite = { version = "0.28", default-features = false }
 tower-http = { version = "0.6.11", features = ["cors", "trace"] }
-sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite-bundled", "postgres", "tls-rustls", "migrate", "macros", "rust_decimal", "json"] }
+sqlx = { package = "stravia-sql", path = "backend/crates/stravia-sql" }
+sqlx-native = { package = "sqlx", version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite-bundled", "postgres", "tls-rustls", "migrate", "macros", "rust_decimal", "json"] }
+sqlx-core = { version = "=0.9.0", default-features = false }
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 semver = { version = "1", features = ["serde"] }

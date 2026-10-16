@@ -1910,7 +1910,7 @@ async fn sqlite_0007_upgrade_and_generation_v3_rebuild_find_existing_history() {
     let data_dir = tempfile::tempdir().unwrap();
     let pool = crate::db::init_pool(data_dir.path()).await.unwrap();
     let migrator = sqlx::migrate!("./migrations/sqlite");
-    migrator.run_to(7, &pool).await.unwrap();
+    migrator.run_to(7, pool.migration_pool()).await.unwrap();
     assert!(
         expected
             .namespace

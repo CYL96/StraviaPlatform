@@ -95,6 +95,11 @@ fn unadorned_text_exceeds_budget(item: &AiItem, budget: usize) -> bool {
 }
 
 impl Window {
+    /// Existing bounded capture length, not an allocation/heap measurement.
+    pub(super) fn logical_bytes(&self) -> usize {
+        self.bytes
+    }
+
     pub(super) fn capture(items: &[AiItem]) -> Option<Self> {
         let start = items
             .iter()

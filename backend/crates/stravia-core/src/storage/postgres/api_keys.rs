@@ -172,10 +172,8 @@ impl AuthAccessStore for PostgresAuthAccessStore {
         bool,
         bool,
         bool,
-    ),
-            >(
-    "SELECT id, name, is_enabled, to_char(expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS expires_at, rpm_limit, transparent_injection_enabled, inject_media_understanding, inject_web_search, inject_media_generation FROM api_keys WHERE token = $1",
-            )
+            ),
+            >("SELECT id, name, is_enabled, to_char(expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS expires_at, rpm_limit, transparent_injection_enabled, inject_media_understanding, inject_web_search, inject_media_generation FROM api_keys WHERE token = $1")
             .bind(raw_key)
             .fetch_optional(&self.pool)
             .await?;

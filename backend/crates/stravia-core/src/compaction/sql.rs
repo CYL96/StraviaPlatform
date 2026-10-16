@@ -1,5 +1,4 @@
 use super::*;
-use sqlx::Connection;
 
 #[derive(Clone)]
 pub(super) enum Store {

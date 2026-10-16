@@ -1,6 +1,6 @@
 use anyhow::{Context, ensure};
 use reqwest::StatusCode;
-use sqlx::{Connection, postgres::PgPoolOptions};
+use sqlx::postgres::PgPoolOptions;
 use std::env;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -208,7 +208,7 @@ async fn prepare_usage_upgrade_fixture(fixture: &str) -> anyhow::Result<()> {
                     .cloned()
                     .collect(),
             );
-            prefix.run(&pool).await?;
+            prefix.run(pool.migration_pool()).await?;
             if fixture == "retained" {
                 sqlx::raw_sql(RETAINED_USAGE_FIXTURE).execute(&pool).await?;
             }
@@ -228,7 +228,7 @@ async fn prepare_usage_upgrade_fixture(fixture: &str) -> anyhow::Result<()> {
                     .cloned()
                     .collect(),
             );
-            prefix.run(&pool).await?;
+            prefix.run(pool.migration_pool()).await?;
             if fixture == "retained" {
                 sqlx::raw_sql(RETAINED_USAGE_FIXTURE).execute(&pool).await?;
             }

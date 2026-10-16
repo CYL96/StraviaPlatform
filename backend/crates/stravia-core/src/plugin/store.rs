@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-use sqlx::Connection;
+
 use tokio::sync::RwLock;
 
 use crate::db::models::Provider;

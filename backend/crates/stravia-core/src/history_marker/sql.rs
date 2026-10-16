@@ -1,6 +1,6 @@
 use super::*;
 
-use sqlx::{Connection, FromRow};
+use sqlx::FromRow;
 
 #[derive(Clone)]
 pub enum SqlHistoryMarkerStore {

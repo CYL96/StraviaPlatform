@@ -8,8 +8,7 @@ use std::{
 use anyhow::{Context, Result, bail, ensure};
 use clap::{Parser, ValueEnum};
 use sqlx::{
-    Connection, PgConnection, PgPool, migrate::Migrator, postgres::PgConnectOptions,
-    sqlite::SqlitePoolOptions,
+    PgConnection, PgPool, migrate::Migrator, postgres::PgConnectOptions, sqlite::SqlitePoolOptions,
 };
 
 #[derive(Parser)]

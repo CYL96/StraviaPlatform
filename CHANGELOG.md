@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Added
+
+- Debug performance exports now include bounded timestamped host CPU/RSS and managed-resource histories for active inference, observation queues, local and last-observed Redis cache usage, Wire buffers, and SQL pools, with explicit capacities, drops, epochs, freshness, and measurement limits. Explicit `active` / `frozen` / `finished` capture states and separate live/frozen counts distinguish in-flight work from truncated records; legacy incomplete totals no longer imply data loss.
+- SQL diagnostics are collected centrally through shared pool, connection, and transaction handles without wrapping individual queries. Timelines include template fingerprints, driver outcomes, safe error codes, row counts, and successful, failed, or cancelled acquisition timings; SQL text, bind values, and formatted database errors remain excluded.
+- Split key admission, write-gate, upstream-header, and observation-queue waits from processing, and link background commands to their originating Debug epoch without retaining request spans. Documented explicit Windows CPU/heap profiling workflows; performance timelines are still not CPU or heap profiles.
+
 ### Fixed
 
 - CI now reuses successful complete checks for the exact same commit across `dev`, `main`, and Release, or waits for an existing automatic CI run instead of starting another full test matrix. PR merge checks and explicit manual/cache-warm runs remain independent; failed, cancelled, partial, or unavailable evidence cannot authorize a release.

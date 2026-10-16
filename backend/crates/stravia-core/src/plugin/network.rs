@@ -26,6 +26,7 @@ use tokio::sync::{Mutex, MutexGuard, Notify};
 use tokio::task::{AbortHandle, JoinHandle};
 use tower::ServiceExt as _;
 use tower_http::decompression::{Decompression, DecompressionBody};
+use tracing::Instrument as _;
 
 use crate::interaction_observation::{RunEvent, RunObserver};
 
@@ -300,7 +301,12 @@ impl VendorNetwork {
     async fn admit_send(&self) -> Result<(), HostFailure> {
         self.ensure_current()?;
         if let Some(admission) = &self.send_admission {
-            admission.acquire().await?;
+            admission
+                .acquire()
+                .instrument(tracing::info_span!(
+                    target: "stravia::perf", "upstream.send_admission.wait"
+                ))
+                .await?;
         }
         Ok(())
     }
@@ -431,16 +437,19 @@ impl VendorNetwork {
         let sending = network.clone();
         // The task owns the operation lease only while the imported response
         // resource exists. Resource drop aborts the task before version drain.
-        let task = tokio::spawn(async move {
-            let response = sending
-                .send_http(method, url, headers, Bytes::from(request.body))
-                .await?;
-            Ok(if decode {
-                UpstreamResponse::decoded(response).await
-            } else {
-                UpstreamResponse::Plain(response)
-            })
-        });
+        let task = tokio::spawn(
+            async move {
+                let response = sending
+                    .send_http(method, url, headers, Bytes::from(request.body))
+                    .await?;
+                Ok(if decode {
+                    UpstreamResponse::decoded(response).await
+                } else {
+                    UpstreamResponse::Plain(response)
+                })
+            }
+            .in_current_span(),
+        );
         let abort = task.abort_handle();
         Ok(Arc::new(PendingHttp {
             network,
@@ -470,11 +479,13 @@ impl VendorNetwork {
                 },
                 || bytes_value(&body),
             );
-            let response = tokio::select! {
-                _ = self.cancelled() => return Err(cancelled()),
+            let response = async { tokio::select! {
+                _ = self.cancelled() => Err(cancelled()),
                 result = self.http.request(method.clone(), url.clone())
-                    .headers(headers.clone()).body(body.clone()).send() => result.map_err(transport_failure)?,
-            };
+                    .headers(headers.clone()).body(body.clone()).send() => result.map_err(transport_failure),
+            }}.instrument(tracing::info_span!(
+                target: "stravia::perf", "upstream.http.response_headers.wait"
+            )).await?;
             let status = response.status().as_u16();
             self.wire(
                 WireDiagnostic {

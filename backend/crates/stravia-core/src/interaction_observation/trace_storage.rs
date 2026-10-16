@@ -7,13 +7,28 @@ use std::path::Path;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use crate::performance::{ResourceLease, ResourceUsage};
+
 const CACHE_BYTES: usize = 8 * 1024 * 1024;
 
-#[derive(Default)]
 pub(super) struct Encoder {
     metadata: HashMap<[u8; 32], (Vec<u8>, u64)>,
     payloads: HashMap<[u8; 32], (Vec<u8>, u64)>,
     bytes: usize,
+    usage: ResourceLease,
+}
+
+impl Default for Encoder {
+    fn default() -> Self {
+        static USAGE: std::sync::LazyLock<ResourceUsage> =
+            std::sync::LazyLock::new(|| ResourceUsage::new("wire_dedup_payload", "observation"));
+        Self {
+            metadata: HashMap::new(),
+            payloads: HashMap::new(),
+            bytes: 0,
+            usage: USAGE.lease(0, 0),
+        }
+    }
 }
 
 impl Encoder {
@@ -34,6 +49,7 @@ impl Encoder {
             self.metadata.clear();
             self.payloads.clear();
             self.bytes = 0;
+            self.usage.resize(0, 0);
         }
         let mut stored =
             serde_json::json!({"trace_storage":1,"sequence":sequence,"recorded_at":recorded_at});
@@ -72,6 +88,12 @@ impl Encoder {
         if self.bytes.saturating_add(bytes.len()) <= CACHE_BYTES && !cache.contains_key(&hash) {
             self.bytes += bytes.len();
             cache.insert(hash, (bytes, offset));
+            // Payload lengths already computed for the cache budget; excludes
+            // hash-table capacity and allocator overhead.
+            self.usage.resize(
+                (self.metadata.len() + self.payloads.len()) as u64,
+                self.bytes as u64,
+            );
         }
         None
     }
@@ -198,6 +220,37 @@ pub(super) fn optimize_segment(path: &Path) -> io::Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_reset_and_oversized_inline_records_keep_references_valid() -> io::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("segment.jsonl");
+        let small = serde_json::json!({
+            "sequence": 1, "recorded_at": 1, "layer": "wire",
+            "payload": "repeat".repeat(100)
+        });
+        let oversized = serde_json::json!({
+            "sequence": 2, "recorded_at": 2, "layer": "wire",
+            "payload": "x".repeat(CACHE_BYTES + 1)
+        });
+        let records = [&small, &small, &oversized, &small, &small];
+        let mut encoder = Encoder::default();
+        let mut file = File::create(&path)?;
+        let mut offset = 0;
+        for record in records {
+            let encoded = encoder.encode(&serde_json::to_vec(record)?, offset)?;
+            file.write_all(&encoded)?;
+            offset += encoded.len() as u64;
+        }
+        drop(file);
+        let mut restored = Vec::new();
+        visit(&path, offset, |record| {
+            restored.push(record);
+            Ok(())
+        })?;
+        assert_eq!(restored, records.into_iter().cloned().collect::<Vec<_>>());
+        Ok(())
+    }
 
     #[test]
     fn encoded_segment_round_trips_and_legacy_records_are_rejected() -> io::Result<()> {

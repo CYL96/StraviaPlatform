@@ -84,7 +84,8 @@ impl LocalArtifactStore {
 
     pub fn postgres(pool: PgPool, root: impl Into<PathBuf>) -> Self {
         let lock_pool = sqlx::postgres::PgPoolOptions::new()
-            .connect_lazy_with((*pool.connect_options()).clone());
+            .connect_lazy_with((*pool.connect_options()).clone())
+            .named("artifact_lock");
         Self {
             database: ArtifactDatabase::Postgres(pool),
             lock_pool: Some(lock_pool),

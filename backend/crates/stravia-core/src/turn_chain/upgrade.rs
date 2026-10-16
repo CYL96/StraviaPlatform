@@ -2,7 +2,7 @@
 use super::content;
 use anyhow::{Context, ensure};
 use serde_json::Value;
-use sqlx::Connection;
+
 use std::collections::HashMap;
 
 type LegacyRef = (String, String, String);
@@ -173,14 +173,14 @@ macro_rules! converter {
 }
 converter!(
     convert_history_sqlite,
-    sqlx::SqliteConnection,
+    sqlx::SqliteConnection<'_>,
     sqlx::Sqlite,
     put_sqlite_prepared,
     "SELECT EXISTS(SELECT 1 FROM pragma_table_info('turn_chain_nodes') WHERE name = 'legacy_payload')"
 );
 converter!(
     convert_history_postgres,
-    sqlx::PgConnection,
+    sqlx::PgConnection<'_>,
     sqlx::Postgres,
     put_postgres_prepared,
     "SELECT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'turn_chain_nodes' AND column_name = 'legacy_payload')"
@@ -190,19 +190,21 @@ converter!(
 mod tests {
     use super::*;
 
-    async fn fixture() -> anyhow::Result<sqlx::SqliteConnection> {
+    async fn fixture() -> anyhow::Result<sqlx::SqliteConnection<'static>> {
         let mut connection = sqlx::SqliteConnection::connect("sqlite::memory:").await?;
-        sqlx::raw_sql(
-            "CREATE TABLE turn_chain_nodes (id TEXT PRIMARY KEY, principal TEXT NOT NULL, storage_format INTEGER NOT NULL, legacy_payload TEXT, payload BLOB);
-             CREATE TABLE turn_chain_legacy_refs (node_id TEXT, principal TEXT, path TEXT, content_key TEXT);
-             CREATE TABLE turn_chain_legacy_contents (principal TEXT, content_key TEXT, content TEXT, PRIMARY KEY(principal, content_key));
-             CREATE TABLE turn_chain_contents (id INTEGER PRIMARY KEY, principal TEXT, content_key TEXT, content BLOB, UNIQUE(principal, content_key));
-             CREATE TABLE turn_chain_node_contents (node_id TEXT, principal TEXT, content_id INTEGER, PRIMARY KEY(node_id, content_id));"
-        ).execute(&mut connection).await?;
+        sqlx::raw_sql("CREATE TABLE turn_chain_nodes (id TEXT PRIMARY KEY, principal TEXT NOT NULL, storage_format INTEGER NOT NULL, legacy_payload TEXT, payload BLOB);
+         CREATE TABLE turn_chain_legacy_refs (node_id TEXT, principal TEXT, path TEXT, content_key TEXT);
+         CREATE TABLE turn_chain_legacy_contents (principal TEXT, content_key TEXT, content TEXT, PRIMARY KEY(principal, content_key));
+         CREATE TABLE turn_chain_contents (id INTEGER PRIMARY KEY, principal TEXT, content_key TEXT, content BLOB, UNIQUE(principal, content_key));
+         CREATE TABLE turn_chain_node_contents (node_id TEXT, principal TEXT, content_id INTEGER, PRIMARY KEY(node_id, content_id));")
+            .execute(&mut connection).await?;
         Ok(connection)
     }
 
-    async fn restored(connection: &mut sqlx::SqliteConnection, id: &str) -> anyhow::Result<Value> {
+    async fn restored(
+        connection: &mut sqlx::SqliteConnection<'_>,
+        id: &str,
+    ) -> anyhow::Result<Value> {
         let (principal, bytes): (String, Vec<u8>) =
             sqlx::query_as("SELECT principal, payload FROM turn_chain_nodes WHERE id = $1")
                 .bind(id)

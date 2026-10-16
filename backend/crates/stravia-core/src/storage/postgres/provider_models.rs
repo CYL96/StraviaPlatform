@@ -530,7 +530,7 @@ impl ProviderModelStore for PostgresStorage {
 }
 
 async fn load_sync_state(
-    connection: &mut PgConnection,
+    connection: &mut PgConnection<'_>,
     provider_id: &str,
 ) -> anyhow::Result<ProviderModelSyncState> {
     let row = sqlx::query_as::<_, (bool, bool, Option<String>)>("SELECT automatic_sync, has_successful_sync, last_check FROM provider_model_sync_state WHERE provider_id = $1")
@@ -564,24 +564,29 @@ async fn insert_change(
     record: &ModelChangeRecord,
 ) -> anyhow::Result<()> {
     sqlx::query("INSERT INTO model_changes (id, provider_id, checked_at, source, record_json) VALUES ($1, $2, $3, $4, $5)")
-        .bind(&record.id).bind(&record.provider_id).bind(&record.checked_at)
-        .bind(record.source.as_str())
-        .bind(serde_json::to_string(record)?).execute(&mut **tx).await?;
+    .bind(&record.id)
+    .bind(&record.provider_id)
+    .bind(&record.checked_at)
+    .bind(record.source.as_str())
+    .bind(serde_json::to_string(record)?)
+    .execute(&mut **tx).await?;
     for item in &record.changes {
         let name_key = item.name.to_lowercase();
         let model_id_key = item.model_id.to_lowercase();
         for kind in &item.types {
             sqlx::query("INSERT INTO model_change_items (record_id, name_key, model_id_key, change_type) VALUES ($1, $2, $3, $4)")
-                .bind(&record.id).bind(&name_key).bind(&model_id_key)
-                .bind(kind.as_str())
-                .execute(&mut **tx).await?;
+            .bind(&record.id)
+            .bind(&name_key)
+            .bind(&model_id_key)
+            .bind(kind.as_str())
+            .execute(&mut **tx).await?;
         }
     }
     Ok(())
 }
 
 async fn get_record(
-    conn: &mut PgConnection,
+    conn: &mut PgConnection<'_>,
     provider_id: &str,
     model_id: &str,
 ) -> anyhow::Result<Option<ProviderModelRecord>> {
@@ -604,7 +609,7 @@ async fn get_record(
 }
 
 async fn load_rules_for_provider(
-    conn: &mut PgConnection,
+    conn: &mut PgConnection<'_>,
     provider_id: &str,
 ) -> anyhow::Result<BTreeMap<String, Vec<ProviderModelCostRule>>> {
     let rows = sqlx::query_as::<_, CostRuleRow>(
@@ -627,7 +632,7 @@ async fn load_rules_for_provider(
 }
 
 async fn load_rules_for_model(
-    conn: &mut PgConnection,
+    conn: &mut PgConnection<'_>,
     provider_id: &str,
     model_id: &str,
 ) -> anyhow::Result<Vec<ProviderModelCostRule>> {

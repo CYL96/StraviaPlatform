@@ -5,7 +5,7 @@ use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, bail, ensure};
 use clap::Args;
-use sqlx::{Connection, SqliteConnection, sqlite::SqliteConnectOptions};
+use sqlx::{SqliteConnection, sqlite::SqliteConnectOptions};
 
 #[derive(Args)]
 pub struct MigrateDataArgs {

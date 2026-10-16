@@ -20,14 +20,34 @@ use tracing::{
 };
 use tracing_subscriber::{Layer, layer::Context, registry::LookupSpan};
 
+mod resources;
+mod sql;
+pub(crate) use resources::{ResourceLease, ResourceUsage};
+use sql::{PoolPoint, SpanKind, SqlDetails};
+
+#[derive(Clone)]
+struct ResourceSample {
+    at: Instant,
+    epoch: u64,
+    rss_bytes: Option<u64>,
+    cpu_percent: Option<f64>,
+    resources: Vec<resources::ResourcePoint>,
+    pools: Vec<PoolPoint>,
+}
+
 static DEBUG_SOURCES: LazyLock<RwLock<Vec<Weak<AtomicBool>>>> =
     LazyLock::new(|| RwLock::new(Vec::new()));
 static EPOCH: AtomicU64 = AtomicU64::new(0);
 static RECORDER: OnceLock<Option<PrometheusHandle>> = OnceLock::new();
 const ACTIVE_CAPACITY: usize = 1024;
 const COMPLETED_CAPACITY: usize = 10_000;
+const RESOURCE_CAPACITY: usize = 720;
+const SQL_COMPLETED_CAPACITY: usize = 2048;
+const SAMPLE_INTERVAL: Duration = Duration::from_secs(5);
 const ACTIVE_CAPACITY_ENV: &str = "STRAVIA_PERF_TRACE_ACTIVE_CAPACITY";
 const COMPLETED_CAPACITY_ENV: &str = "STRAVIA_PERF_TRACE_COMPLETED_CAPACITY";
+const RESOURCE_CAPACITY_ENV: &str = "STRAVIA_PERF_RESOURCE_CAPACITY";
+const SQL_COMPLETED_CAPACITY_ENV: &str = "STRAVIA_PERF_SQL_COMPLETED_CAPACITY";
 static NEXT_SPAN_ID: AtomicU64 = AtomicU64::new(1);
 static TIMELINE: LazyLock<Mutex<Timeline>> = LazyLock::new(|| Mutex::new(Timeline::default()));
 
@@ -62,6 +82,42 @@ fn micros(duration: Duration) -> u64 {
 struct PerfSpan {
     id: u64,
     epoch: u64,
+    operation: &'static str,
+    owner_id: u64,
+}
+
+/// 只复制内部身份，不保留 tracing Span，后台排队不能延长请求生命周期。
+#[derive(Clone, Copy, Default)]
+pub(crate) struct PerfContext {
+    span_id: u64,
+    epoch: u64,
+}
+
+impl PerfContext {
+    pub(crate) fn span_id(self) -> u64 {
+        self.span_id
+    }
+    pub(crate) fn epoch(self) -> u64 {
+        self.epoch
+    }
+}
+
+pub(crate) fn current_context() -> PerfContext {
+    tracing::Span::current()
+        .with_subscriber(|(id, dispatch)| {
+            let registry = dispatch.downcast_ref::<tracing_subscriber::Registry>()?;
+            registry.span(id)?.scope().find_map(|span| {
+                span.extensions().get::<PerfSpan>().map(|perf| PerfContext {
+                    span_id: perf.id,
+                    epoch: perf.epoch,
+                })
+            })
+        })
+        .flatten()
+        .unwrap_or_else(|| PerfContext {
+            span_id: 0,
+            epoch: EPOCH.load(Ordering::Acquire),
+        })
 }
 
 const WORK_FIELDS: [&str; 4] = [
@@ -91,6 +147,10 @@ struct ActiveSpan {
     status: Option<&'static str>,
     work: [Option<u64>; 4],
     sql: SqlActivity,
+    detail: SqlDetails,
+    kind: SpanKind,
+    operation: &'static str,
+    owner_id: u64,
 }
 
 #[derive(Clone)]
@@ -104,6 +164,8 @@ struct TraceRecord {
     status: Option<&'static str>,
     work: [Option<u64>; 4],
     sql: SqlActivity,
+    detail: SqlDetails,
+    kind: SpanKind,
 }
 
 impl ActiveSpan {
@@ -123,7 +185,16 @@ impl ActiveSpan {
             status: finished.map(|_| self.status.unwrap_or("closed")),
             work: self.work,
             sql: self.sql,
+            detail: self.detail.clone(),
+            kind: self.kind,
         }
+    }
+
+    fn into_record(mut self, finished: Option<Instant>) -> TraceRecord {
+        let detail = std::mem::take(&mut self.detail);
+        let mut record = self.record(finished);
+        record.detail = detail;
+        record
     }
 }
 
@@ -135,6 +206,13 @@ struct Timeline {
     dropped_active: u64,
     dropped_completed: u64,
     incomplete: u64,
+    sql_completed: VecDeque<TraceRecord>,
+    sql_capacity: usize,
+    dropped_sql: u64,
+    samples: VecDeque<ResourceSample>,
+    resource_capacity: usize,
+    dropped_resources: u64,
+    pools: HashMap<(&'static str, &'static str), PoolPoint>,
 }
 
 impl Default for Timeline {
@@ -147,12 +225,27 @@ impl Default for Timeline {
             dropped_active: 0,
             dropped_completed: 0,
             incomplete: 0,
+            sql_completed: VecDeque::default(),
+            sql_capacity: env_capacity(SQL_COMPLETED_CAPACITY_ENV, SQL_COMPLETED_CAPACITY),
+            dropped_sql: 0,
+            samples: VecDeque::default(),
+            resource_capacity: env_capacity(RESOURCE_CAPACITY_ENV, RESOURCE_CAPACITY),
+            dropped_resources: 0,
+            pools: HashMap::default(),
         }
     }
 }
 
 impl Timeline {
     fn push(&mut self, record: TraceRecord) {
+        if record.kind != SpanKind::Operation {
+            if self.sql_completed.len() == self.sql_capacity {
+                self.sql_completed.pop_front();
+                self.dropped_sql += 1;
+            }
+            self.sql_completed.push_back(record);
+            return;
+        }
         if self.completed.len() == self.completed_capacity {
             self.completed.pop_front();
             self.dropped_completed += 1;
@@ -163,8 +256,33 @@ impl Timeline {
     fn invalidate(&mut self) {
         for (_, span) in std::mem::take(&mut self.active) {
             self.incomplete += 1;
-            self.push(span.record(None));
+            self.push(span.into_record(None));
         }
+    }
+
+    fn push_sample(&mut self, mut sample: ResourceSample) {
+        // 资源所有者退出后显式给零；不能留下最后一次非零占用误导分析。
+        if let Some(previous) = self.samples.back() {
+            for old in &previous.resources {
+                if !sample
+                    .resources
+                    .iter()
+                    .any(|point| point.resource == old.resource && point.domain == old.domain)
+                {
+                    let mut retired = old.clone();
+                    retired.items = 0;
+                    retired.logical_bytes = 0;
+                    retired.observed_at_unix_ms = None;
+                    retired.observation_age_ms = None;
+                    sample.resources.push(retired);
+                }
+            }
+        }
+        if self.samples.len() == self.resource_capacity {
+            self.samples.pop_front();
+            self.dropped_resources += 1;
+        }
+        self.samples.push_back(sample);
     }
 }
 
@@ -178,11 +296,21 @@ pub fn timeline_snapshot() -> Value {
         completed_capacity,
         dropped_active,
         dropped_completed,
-        incomplete_total,
+        frozen_total,
+        samples,
+        resource_capacity,
+        dropped_resources,
+        sql_capacity,
+        dropped_sql,
     ) = {
         let state = TIMELINE.lock();
         (
-            state.completed.iter().cloned().collect::<Vec<_>>(),
+            state
+                .completed
+                .iter()
+                .chain(&state.sql_completed)
+                .cloned()
+                .collect::<Vec<_>>(),
             state
                 .active
                 .values()
@@ -192,22 +320,46 @@ pub fn timeline_snapshot() -> Value {
             state.completed_capacity,
             state.dropped_active,
             state.dropped_completed,
-            state.incomplete + state.active.len() as u64,
+            state.incomplete,
+            state.samples.iter().cloned().collect::<Vec<_>>(),
+            state.resource_capacity,
+            state.dropped_resources,
+            state.sql_capacity,
+            state.dropped_sql,
         )
     };
-    let incomplete = records
+    let active_spans = live.len();
+    let frozen_spans = records
         .iter()
         .filter(|record| record.finished.is_none())
-        .count()
-        + live.len();
-    let mut records = records.into_iter().chain(live).collect::<Vec<_>>();
-    records.sort_unstable_by_key(|record| record.started);
+        .count();
+    // 来源决定采集状态：活动 map 的快照不是冻结记录，不在采集热路径存储额外状态。
+    let mut records = records
+        .into_iter()
+        .map(|record| {
+            let capture_state = if record.finished.is_some() {
+                "finished"
+            } else {
+                "frozen"
+            };
+            (record, capture_state)
+        })
+        .chain(live.into_iter().map(|record| (record, "active")))
+        .collect::<Vec<_>>();
+    records.sort_unstable_by_key(|(record, _)| record.started);
+    let retained_from = records
+        .first()
+        .map(|(record, _)| record.started)
+        .into_iter()
+        .chain(samples.first().map(|sample| sample.at))
+        .min();
+    let exported_at = Instant::now();
     let present = records
         .iter()
-        .map(|record| record.id)
+        .map(|(record, _)| record.id)
         .collect::<HashSet<_>>();
     let mut events = Vec::with_capacity(records.len() * 3);
-    for span in records {
+    for (span, capture_state) in records {
         if let Some(parent_id) = span.parent_id.filter(|parent| present.contains(parent)) {
             // Chrome flow 箭头关联合成 track，不暗示异步子任务运行在父任务的 CPU 线程。
             let flow = json!({"name":"parent","cat":"stravia.perf","ph":"s","ts":timestamp(span.started),
@@ -218,7 +370,7 @@ pub fn timeline_snapshot() -> Value {
                 "pid":1,"tid":span.id,"id":span.id,"bp":"s"}),
             );
         }
-        let mut args = json!({ "span_id": span.id });
+        let mut args = json!({ "span_id": span.id, "capture_state": capture_state });
         if let Some(parent_id) = span.parent_id {
             args["parent_id"] = json!(parent_id);
         }
@@ -227,6 +379,13 @@ pub fn timeline_snapshot() -> Value {
         }
         if let Some(active_us) = span.active_us {
             args["active_us"] = json!(active_us);
+        }
+        if span.kind != SpanKind::Operation
+            && let Value::Object(details) = span.detail.export()
+        {
+            args.as_object_mut()
+                .expect("span args object")
+                .extend(details);
         }
         for (name, value) in WORK_FIELDS.into_iter().zip(span.work) {
             if let Some(value) = value {
@@ -243,7 +402,7 @@ pub fn timeline_snapshot() -> Value {
         }
         let mut event = json!({
             "name": span.name,
-            "cat": "stravia.perf",
+            "cat": if span.kind == SpanKind::Operation { "stravia.perf" } else { "stravia.sql" },
             "ph": if span.finished.is_some() { "X" } else { "B" },
             "ts": timestamp(span.started),
             "pid": 1,
@@ -255,16 +414,96 @@ pub fn timeline_snapshot() -> Value {
         }
         events.push(event);
     }
+    let resource_sample_count = samples.len();
+    for sample in samples {
+        let ts = timestamp(sample.at);
+        let mut process = serde_json::Map::new();
+        if let Some(rss) = sample.rss_bytes {
+            process.insert("rss_bytes".into(), json!(rss));
+        }
+        if let Some(cpu) = sample.cpu_percent {
+            process.insert("cpu_percent".into(), json!(cpu));
+        }
+        if !process.is_empty() {
+            events.push(json!({"name":"process","cat":"stravia.resources","ph":"C",
+                "pid":1,"tid":0,"ts":ts,"args":process}));
+        }
+        for point in sample.resources {
+            let mut args = json!({"items":point.items,"logical_bytes":point.logical_bytes});
+            if let Some(at) = point.observed_at_unix_ms {
+                args["observed_at_unix_ms"] = json!(at);
+            }
+            if let Some(age) = point.observation_age_ms {
+                args["observation_age_ms"] = json!(age);
+            }
+            events.push(json!({"name":format!("{}.{}",point.resource,point.domain),
+                "cat":"stravia.resources","ph":"C","pid":1,"tid":0,"ts":ts,"args":args}));
+        }
+        for pool in sample.pools {
+            let mut args = json!({"observation_age_us":ts.saturating_sub(pool.observed_at_us)});
+            if let Some(value) = pool.size {
+                args["size"] = json!(value);
+            }
+            if let Some(value) = pool.idle {
+                args["idle"] = json!(value);
+            }
+            if let Some(value) = pool.waiting {
+                args["instrumented_waiting"] = json!(value);
+            }
+            if let Some(value) = pool.failed {
+                args["instrumented_failed"] = json!(value);
+            }
+            if let Some(value) = pool.cancelled {
+                args["instrumented_cancelled"] = json!(value);
+            }
+            events.push(
+                json!({"name":format!("sql_pool.{}.{}",pool.backend,pool.pool),
+                "cat":"stravia.resources","ph":"C","pid":1,"tid":0,"ts":ts,"args":args}),
+            );
+        }
+        events.push(
+            json!({"name":"debug.epoch","cat":"stravia.resources","ph":"C",
+            "pid":1,"tid":0,"ts":ts,"args":{"epoch":sample.epoch}}),
+        );
+    }
     json!({
         "traceEvents": events,
         "displayTimeUnit": "ms",
         "metadata": {
-            "capacity": { "active": active_capacity, "completed": completed_capacity },
+            "schema_version": 2,
+            "application_version": env!("CARGO_PKG_VERSION"),
+            "process_id":std::process::id(),
+            "clock_origin_unix_us":CLOCK.1,
+            "host": {"os":std::env::consts::OS,"arch":std::env::consts::ARCH,
+                "logical_cpus":std::thread::available_parallelism().ok().map(|count|count.get())},
+            "exported_at_unix_us":timestamp(exported_at),
+            "retained_from_unix_us":retained_from.map(timestamp),
+            "debug_enabled":enabled(),
+            "debug_epoch":EPOCH.load(Ordering::Acquire),
+            "sample_interval_ms":SAMPLE_INTERVAL.as_millis(),
+            "resource_sample_count":resource_sample_count,
+            "capacity": { "active": active_capacity, "completed": completed_capacity,
+                "sql_completed":sql_capacity,"resource_samples":resource_capacity },
             "dropped_active": dropped_active,
             "dropped_completed": dropped_completed,
-            "incomplete": incomplete,
-            "incomplete_total": incomplete_total,
+            "dropped_sql_completed":dropped_sql,
+            "dropped_resource_samples":dropped_resources,
+            "incomplete": active_spans + frozen_spans,
+            "incomplete_total": frozen_total + active_spans as u64,
+            "active_spans": active_spans,
+            "frozen_spans": frozen_spans,
+            "frozen_total": frozen_total,
             "track": "synthetic span tracks; tid is not a CPU thread",
+            "parent_relation":"async causal relationship, not timing containment or exclusive request cost",
+            "resource_bytes": "logical managed-resource estimates, not allocator measurements",
+            "process_scope":"host only; browser/WebView child processes and remote databases excluded",
+            "cpu_percent_scale":"100 percent is one fully utilized logical CPU; may exceed 100",
+            "sql_scope":"driver outcome; row-mapping errors and driver-internal control statements excluded",
+            "sql_duration_scope":"client future/stream lifetime; streaming includes consumption and backpressure, not server time",
+            "sql_query_id_scope":"SHA-256 of unnormalized SQL template; no SQL text or bind values",
+            "sql_source_scope":"unavailable; no automatic mapping from query fingerprint to application source",
+            "pool_waiting_scope":"instrumented acquisitions; driver-internal waits excluded",
+            "remote_cache_scope":"last received successful command snapshot; response order and remote TTL are not live gauges",
         }
     })
 }
@@ -313,6 +552,10 @@ pub fn enabled() -> bool {
     any_enabled(&sources().read())
 }
 
+pub(crate) fn is_performance_target(target: &str) -> bool {
+    matches!(target, "stravia::perf" | "stravia::sql")
+}
+
 /// 每个进程仅安装一次 recorder，不随 Gateway 或 HTTP listener 重装。
 /// 其他代码先安装全局 recorder 时返回 false。
 pub fn init_metrics() -> bool {
@@ -353,6 +596,9 @@ pub fn init_metrics() -> bool {
 struct StatusVisitor {
     status: Option<&'static str>,
     work: [Option<u64>; 4],
+    detail: SqlDetails,
+    causal_parent_id: u64,
+    causal_epoch: Option<u64>,
 }
 
 impl Visit for StatusVisitor {
@@ -362,7 +608,18 @@ impl Visit for StatusVisitor {
             "reference_count" => 1,
             "candidate_count" => 2,
             "event_count" => 3,
-            _ => return,
+            "causal_parent_id" => {
+                self.causal_parent_id = value;
+                return;
+            }
+            "causal_epoch" => {
+                self.causal_epoch = Some(value);
+                return;
+            }
+            _ => {
+                self.detail.record_u64(field, value);
+                return;
+            }
         };
         self.work[index] = Some(value);
     }
@@ -376,6 +633,8 @@ impl Visit for StatusVisitor {
                 "abandoned" => Some("abandoned"),
                 _ => None,
             };
+        } else {
+            self.detail.record_str(field, value);
         }
     }
 
@@ -392,9 +651,10 @@ where
     S: Subscriber + for<'lookup> LookupSpan<'lookup>,
 {
     fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, ctx: Context<'_, S>) {
-        if attrs.metadata().target() != "stravia::perf" {
+        let Some(kind) = SpanKind::from_target(attrs.metadata().target(), attrs.metadata().name())
+        else {
             return;
-        }
+        };
         let sources = sources().read();
         if !any_enabled(&sources) {
             return;
@@ -408,20 +668,37 @@ where
                 None
             }
         });
-        let parent_id = parent.and_then(|parent| ctx.span(parent)).and_then(|span| {
+        let parent_context = parent.and_then(|parent| ctx.span(parent)).and_then(|span| {
             // 业务日志 span 可能夹在两级 perf span 之间，沿真实 tracing 父链
             // 找最近的 perf 祖先，而不是把非 perf span 误当成根。
             span.scope().find_map(|ancestor| {
                 ancestor
                     .extensions()
                     .get::<PerfSpan>()
-                    .filter(|perf| perf.epoch == epoch)
-                    .map(|perf| perf.id)
+                    .map(|perf| (perf.id, perf.operation, perf.owner_id, perf.epoch))
             })
         });
         let mut status = StatusVisitor::default();
         attrs.record(&mut status);
         let Some(span) = ctx.span(id) else { return };
+        let rejected_epoch = parent_context
+            .filter(|parent| parent.3 != epoch)
+            .map(|parent| parent.3)
+            .or_else(|| status.causal_epoch.filter(|causal| *causal != epoch));
+        if let Some(epoch) = rejected_epoch {
+            // 拒收的命令仍会执行业务；保留旧周期标记，防止其后代被误收成新周期根。
+            span.extensions_mut().insert(PerfSpan {
+                id: 0,
+                epoch,
+                operation: attrs.metadata().name(),
+                owner_id: 0,
+            });
+            return;
+        }
+        let parent_id = parent_context.map(|parent| parent.0).or_else(|| {
+            (status.causal_parent_id != 0 && status.causal_epoch == Some(epoch))
+                .then_some(status.causal_parent_id)
+        });
         let mut state = TIMELINE.lock();
         if state.active.len() == state.active_capacity {
             state.dropped_active += 1;
@@ -429,6 +706,11 @@ where
         }
         let _ = &*CLOCK;
         let span_id = NEXT_SPAN_ID.fetch_add(1, Ordering::Relaxed);
+        let (operation, owner_id) = if kind == SpanKind::Operation {
+            (attrs.metadata().name(), span_id)
+        } else {
+            parent_context.map_or(("unattributed", 0), |parent| (parent.1, parent.2))
+        };
         let started = Instant::now();
         state.active.insert(
             span_id,
@@ -444,10 +726,18 @@ where
                 status: status.status,
                 work: status.work,
                 sql: SqlActivity::default(),
+                detail: status.detail,
+                kind,
+                operation,
+                owner_id,
             },
         );
-        span.extensions_mut()
-            .insert(PerfSpan { id: span_id, epoch });
+        span.extensions_mut().insert(PerfSpan {
+            id: span_id,
+            epoch,
+            operation,
+            owner_id,
+        });
     }
 
     fn on_record(&self, id: &Id, values: &Record<'_>, ctx: Context<'_, S>) {
@@ -462,15 +752,42 @@ where
         }
         let mut status = StatusVisitor::default();
         values.record(&mut status);
-        if let Some(active) = TIMELINE.lock().active.get_mut(&perf.id) {
+        let mut state = TIMELINE.lock();
+        let mut finished = false;
+        if let Some(active) = state.active.get_mut(&perf.id) {
             if let Some(status) = status.status {
                 active.status = Some(status);
+                finished = active.kind != SpanKind::Operation;
             }
             for (current, value) in active.work.iter_mut().zip(status.work) {
                 if value.is_some() {
                     *current = value;
                 }
             }
+            active.detail.merge(status.detail);
+        }
+        drop(state);
+        if finished {
+            finish_span(perf.id, Instant::now());
+        }
+    }
+
+    fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+        if event.metadata().target() != "stravia::sql" {
+            return;
+        }
+        let mut fields = StatusVisitor::default();
+        event.record(&mut fields);
+        let guard = sources().read();
+        if !any_enabled(&guard) {
+            return;
+        }
+        if let Some(point) = fields.detail.pool_point(timestamp(Instant::now())) {
+            record_pool_metrics(&point);
+            TIMELINE
+                .lock()
+                .pools
+                .insert((point.backend, point.pool), point);
         }
     }
 
@@ -524,18 +841,101 @@ where
         if !any_enabled(&sources) || perf.epoch != EPOCH.load(Ordering::Acquire) {
             return;
         }
-        let mut state = TIMELINE.lock();
-        let Some(active) = state.active.remove(&perf.id) else {
-            return;
-        };
-        let finished = Instant::now();
-        let record = active.record(Some(finished));
-        let status = record.status.expect("completed trace has status");
-        state.push(record);
-        drop(state);
-        histogram!("stravia_operation_duration_seconds", "operation" => active.name, "status" => status)
-            .record(finished.saturating_duration_since(active.started).as_secs_f64());
+        finish_span(perf.id, Instant::now());
     }
+}
+
+fn finish_span(id: u64, finished: Instant) {
+    let mut state = TIMELINE.lock();
+    let Some(active) = state.active.remove(&id) else {
+        return;
+    };
+    let status = active.status.unwrap_or("closed");
+    let duration = finished.saturating_duration_since(active.started);
+    if active.kind != SpanKind::Operation {
+        if let Some(owner) = state.active.get_mut(&active.owner_id) {
+            if active.kind == SpanKind::Query {
+                owner.sql.query_count += 1;
+                owner.sql.query_duration_us =
+                    owner.sql.query_duration_us.saturating_add(micros(duration));
+            } else {
+                owner.sql.pool_acquire_count += 1;
+                owner.sql.pool_acquire_duration_us = owner
+                    .sql
+                    .pool_acquire_duration_us
+                    .saturating_add(micros(duration));
+            }
+        }
+        if let Some(point) = active.detail.pool_point(timestamp(finished)) {
+            record_pool_metrics(&point);
+            state.pools.insert((point.backend, point.pool), point);
+        }
+    }
+    let kind = active.kind;
+    let name = active.name;
+    let operation = active.operation;
+    let backend = active.detail.backend.unwrap_or("unknown");
+    let pool = active.detail.pool.unwrap_or("unregistered");
+    state.push(active.into_record(Some(finished)));
+    drop(state);
+    match kind {
+        SpanKind::Operation => histogram!("stravia_operation_duration_seconds", "operation" => name, "status" => status)
+            .record(duration.as_secs_f64()),
+        SpanKind::Query => histogram!("stravia_sql_query_duration_seconds", "operation" => operation,
+            "backend" => backend, "pool" => pool,
+            "status" => status).record(duration.as_secs_f64()),
+        SpanKind::Acquire => histogram!("stravia_sql_pool_acquire_duration_seconds", "operation" => operation,
+            "backend" => backend, "pool" => pool,
+            "status" => status).record(duration.as_secs_f64()),
+    }
+}
+
+fn record_pool_metrics(point: &PoolPoint) {
+    if let Some(value) = point.size {
+        gauge!("stravia_sql_pool_size", "backend"=>point.backend, "pool"=>point.pool)
+            .set(value as f64);
+    }
+    if let Some(value) = point.idle {
+        gauge!("stravia_sql_pool_idle", "backend"=>point.backend, "pool"=>point.pool)
+            .set(value as f64);
+    }
+    if let Some(value) = point.waiting {
+        gauge!("stravia_sql_pool_instrumented_waiting", "backend"=>point.backend, "pool"=>point.pool).set(value as f64);
+    }
+    if let Some(value) = point.failed {
+        counter!("stravia_sql_pool_acquire_failed_total", "backend"=>point.backend, "pool"=>point.pool).absolute(value);
+    }
+    if let Some(value) = point.cancelled {
+        counter!("stravia_sql_pool_acquire_cancelled_total", "backend"=>point.backend, "pool"=>point.pool).absolute(value);
+    }
+}
+
+pub(crate) fn record_wait(
+    operation: &'static str,
+    context: PerfContext,
+    started: Instant,
+    status: &'static str,
+) {
+    let guard = sources().read();
+    if !any_enabled(&guard) || context.epoch != EPOCH.load(Ordering::Acquire) {
+        return;
+    }
+    let finished = Instant::now();
+    TIMELINE.lock().push(TraceRecord {
+        name: operation,
+        id: NEXT_SPAN_ID.fetch_add(1, Ordering::Relaxed),
+        parent_id: (context.span_id != 0).then_some(context.span_id),
+        started,
+        finished: Some(finished),
+        active_us: None,
+        status: Some(status),
+        work: [None; 4],
+        sql: SqlActivity::default(),
+        detail: SqlDetails::default(),
+        kind: SpanKind::Operation,
+    });
+    histogram!("stravia_operation_duration_seconds", "operation" => operation, "status" => status)
+        .record(finished.saturating_duration_since(started).as_secs_f64());
 }
 
 pub(crate) fn record_observation_queue_depth(depth: usize) {
@@ -558,12 +958,23 @@ pub(crate) fn record_generation_cache_access(hit: bool) {
 
 /// 每五秒清理直方图并采样进程。每个 Gateway 持有自己的任务，在关停时中止；
 /// 正常运行时只有一个 Gateway，测试中多个 Gateway 仍共享唯一 recorder。
-pub(crate) fn spawn_upkeep() -> Option<tokio::task::JoinHandle<()>> {
+pub(crate) fn spawn_upkeep(
+    sqlite: Option<sqlx::SqlitePool>,
+    postgres: Option<sqlx::PgPool>,
+) -> Option<tokio::task::JoinHandle<()>> {
     let handle = RECORDER.get()?.as_ref()?.clone();
     Some(tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(5));
+        let mut interval = tokio::time::interval(SAMPLE_INTERVAL);
         loop {
             interval.tick().await;
+            if enabled() {
+                if let Some(pool) = &sqlite {
+                    sqlx::sample_pool(pool, "main");
+                }
+                if let Some(pool) = &postgres {
+                    sqlx::sample_pool(pool, "main");
+                }
+            }
             sample_process();
             handle.run_upkeep();
         }
@@ -590,14 +1001,33 @@ fn sample_process() {
     );
     let guard = sources().read();
     if any_enabled(&guard) && epoch == EPOCH.load(Ordering::Acquire) {
+        let mut rss_bytes = None;
+        let mut cpu_percent = None;
         if let Some(process) = sampler.system.process(pid) {
+            rss_bytes = Some(process.memory());
             gauge!("stravia_process_rss_bytes").set(process.memory() as f64);
             // 首个样本没有可比较的上次 CPU 读数，不能输出伪造的 0。
             if sampler.warmed_epoch == Some(epoch) {
+                cpu_percent = Some(f64::from(process.cpu_usage()));
                 gauge!("stravia_process_cpu_percent").set(f64::from(process.cpu_usage()));
             }
         }
         sampler.warmed_epoch = Some(epoch);
+        let resources = resources::snapshot();
+        let mut state = TIMELINE.lock();
+        let pools = state.pools.values().cloned().collect();
+        state.push_sample(ResourceSample {
+            at: Instant::now(),
+            epoch,
+            rss_bytes,
+            cpu_percent,
+            resources,
+            pools,
+        });
+        for point in &state.samples.back().expect("just sampled").resources {
+            gauge!("stravia_managed_resource_items", "resource" => point.resource, "domain" => point.domain).set(point.items as f64);
+            gauge!("stravia_managed_resource_logical_bytes", "resource" => point.resource, "domain" => point.domain).set(point.logical_bytes as f64);
+        }
     }
 }
 
@@ -609,106 +1039,22 @@ pub fn metrics_snapshot() -> Option<String> {
     Some(handle.render())
 }
 
-/// SQLx 事件只读取数值；绝不访问 `summary`、`db.statement` 或其他 SQL 字段。
-#[derive(Default)]
-struct ElapsedVisitor {
-    elapsed_secs: Option<f64>,
-    acquired_after_secs: Option<f64>,
-}
-
-impl Visit for ElapsedVisitor {
-    fn record_f64(&mut self, field: &Field, value: f64) {
-        match field.name() {
-            "elapsed_secs" => self.elapsed_secs = Some(value),
-            "acquired_after_secs" => self.acquired_after_secs = Some(value),
-            _ => {}
-        }
-    }
-
-    fn record_debug(&mut self, _field: &Field, _value: &dyn std::fmt::Debug) {}
-}
-
-pub fn is_sqlx_metric_target(target: &str) -> bool {
-    matches!(target, "sqlx::query" | "sqlx::pool::acquire")
-}
-
-/// 在日志初始化时安装目标过滤；SQL 不进入 fmt layers。
-pub struct SqlxMetricsLayer;
-
-impl<S: Subscriber + for<'lookup> LookupSpan<'lookup>> Layer<S> for SqlxMetricsLayer {
-    fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
-        let target = event.metadata().target();
-        if !is_sqlx_metric_target(target) {
-            return;
-        }
-        let epoch = EPOCH.load(Ordering::Acquire);
-        let mut values = ElapsedVisitor::default();
-        event.record(&mut values);
-        let guard = sources().read();
-        if !any_enabled(&guard) || EPOCH.load(Ordering::Acquire) != epoch {
-            return;
-        }
-        let owner = ctx.event_scope(event).and_then(|mut scope| {
-            scope.find_map(|span| {
-                span.extensions()
-                    .get::<PerfSpan>()
-                    .map(|perf| (perf.id, perf.epoch, span.metadata().name()))
-            })
-        });
-        // SQLite worker 会跨线程持有提交查询时的 span；重开 Debug 后不能
-        // 把旧周期尚未完成的查询计入新周期，也不能回退为 unattributed。
-        if owner.is_some_and(|(_, span_epoch, _)| span_epoch != epoch) {
-            return;
-        }
-        let operation = owner.map_or("unattributed", |(_, _, name)| name);
-        if target == "sqlx::query" {
-            if let Some(value) = values
-                .elapsed_secs
-                .filter(|value| value.is_finite() && *value >= 0.0)
-            {
-                histogram!("stravia_sql_query_duration_seconds", "operation" => operation)
-                    .record(value);
-                if let Some((id, _, _)) = owner
-                    && let Some(active) = TIMELINE.lock().active.get_mut(&id)
-                {
-                    active.sql.query_count += 1;
-                    active.sql.query_duration_us = active
-                        .sql
-                        .query_duration_us
-                        .saturating_add((value * 1_000_000.0) as u64);
-                }
-            }
-        } else if let Some(value) = values
-            .acquired_after_secs
-            .filter(|value| value.is_finite() && *value >= 0.0)
-        {
-            histogram!("stravia_sql_pool_acquire_duration_seconds", "operation" => operation)
-                .record(value);
-            if let Some((id, _, _)) = owner
-                && let Some(active) = TIMELINE.lock().active.get_mut(&id)
-            {
-                active.sql.pool_acquire_count += 1;
-                active.sql.pool_acquire_duration_us = active
-                    .sql
-                    .pool_acquire_duration_us
-                    .saturating_add((value * 1_000_000.0) as u64);
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::future::Future;
     use std::sync::Barrier;
-    use tracing::{Instrument, Level, subscriber::Interest};
+    use tracing::{Instrument, subscriber::Interest};
     use tracing_subscriber::{filter::dynamic_filter_fn, layer::SubscriberExt};
 
     struct OtherSpans;
     impl<S: Subscriber> Layer<S> for OtherSpans {}
 
     fn isolated(name: &str) -> bool {
+        isolated_with_env(name, &[])
+    }
+
+    fn isolated_with_env(name: &str, env: &[(&str, &str)]) -> bool {
         if std::env::var("STRAVIA_PERFORMANCE_TEST_CHILD")
             .ok()
             .as_deref()
@@ -718,6 +1064,7 @@ mod tests {
                 .arg("--exact")
                 .arg(format!("performance::tests::{name}"))
                 .env("STRAVIA_PERFORMANCE_TEST_CHILD", name)
+                .envs(env.iter().copied())
                 .output()
                 .expect("isolated performance regression");
             assert!(
@@ -732,40 +1079,50 @@ mod tests {
     }
 
     fn subscriber() -> impl Subscriber + Send + Sync {
-        tracing_subscriber::registry()
-            .with(
-                PerformanceLayer.with_filter(
-                    dynamic_filter_fn(|meta, _ctx| meta.target() == "stravia::perf" && enabled())
-                        .with_callsite_filter(|meta| {
-                            if meta.target() == "stravia::perf" {
-                                Interest::sometimes()
-                            } else {
-                                Interest::never()
-                            }
-                        }),
-                ),
-            )
-            .with(
-                SqlxMetricsLayer.with_filter(
-                    dynamic_filter_fn(|meta, _ctx| {
-                        (is_sqlx_metric_target(meta.target()) || meta.target() == "stravia::perf")
-                            && enabled()
-                    })
+        tracing_subscriber::registry().with(
+            PerformanceLayer.with_filter(
+                dynamic_filter_fn(|meta, _ctx| is_performance_target(meta.target()) && enabled())
                     .with_callsite_filter(|meta| {
-                        if is_sqlx_metric_target(meta.target()) || meta.target() == "stravia::perf"
-                        {
+                        if is_performance_target(meta.target()) {
                             Interest::sometimes()
                         } else {
                             Interest::never()
                         }
                     }),
-                ),
-            )
+            ),
+        )
     }
 
     fn emit_reused_callsite() {
         let span = tracing::info_span!(target: "stravia::perf", "test.reused", status = tracing::field::Empty);
         span.record("status", "completed");
+    }
+
+    fn sample_value(output: &str, metric: &str, labels: &[(&str, &str)]) -> f64 {
+        output
+            .lines()
+            .find_map(|line| {
+                let (key, value) = line.rsplit_once(' ')?;
+                let (name, actual) = key.split_once('{')?;
+                let actual = actual.strip_suffix('}')?;
+                if name != metric || actual.split(',').count() != labels.len() {
+                    return None;
+                }
+                let matches = labels.iter().all(|(expected_key, expected_value)| {
+                    actual.split(',').any(|label| {
+                        let Some((key, value)) = label.split_once('=') else {
+                            return false;
+                        };
+                        key == *expected_key
+                            && value
+                                .strip_prefix('"')
+                                .and_then(|value| value.strip_suffix('"'))
+                                == Some(*expected_value)
+                    })
+                });
+                matches.then(|| value.parse().expect("numeric metric sample"))
+            })
+            .expect("metric and complete static label set")
     }
 
     #[test]
@@ -783,12 +1140,12 @@ mod tests {
         metrics::with_local_recorder(&recorder, || {
             tracing::subscriber::with_default(subscriber(), || {
                 emit_reused_callsite();
-                emit_sql_event();
+                emit_sql_span();
                 set_debug(&debug, true);
                 let stale = tracing::info_span!(target: "stravia::perf", "test.old_session");
-                emit_sql_event();
+                emit_sql_span();
                 set_debug(&debug, false);
-                emit_sql_event();
+                emit_sql_span();
                 drop(stale);
                 set_debug(&debug, true);
                 emit_reused_callsite();
@@ -816,13 +1173,33 @@ mod tests {
         handle.run_upkeep();
         let output = handle.render();
         assert!(output.contains("stravia_sql_query_duration_seconds_bucket"));
-        assert!(
-            output
-                .contains("stravia_sql_query_duration_seconds_count{operation=\"unattributed\"} 1")
+        assert_eq!(
+            sample_value(
+                &output,
+                "stravia_sql_query_duration_seconds_count",
+                &[
+                    ("backend", "sqlite"),
+                    ("operation", "unattributed"),
+                    ("pool", "main"),
+                    ("status", "completed")
+                ]
+            ),
+            1.0
         );
-        assert!(output.contains("operation=\"test.reused\",status=\"completed\""));
-        assert!(output.contains("operation=\"test.child\",status=\"error\""));
-        assert!(output.contains("operation=\"test.explicit_child\",status=\"closed\""));
+        for (operation, status) in [
+            ("test.reused", "completed"),
+            ("test.child", "error"),
+            ("test.explicit_child", "closed"),
+        ] {
+            assert_eq!(
+                sample_value(
+                    &output,
+                    "stravia_operation_duration_seconds_count",
+                    &[("operation", operation), ("status", status)]
+                ),
+                1.0
+            );
+        }
         assert!(!output.contains("test.old_session"));
         assert!(!output.contains("SELECT"));
         assert!(!output.contains("password"));
@@ -995,6 +1372,103 @@ mod tests {
     }
 
     #[test]
+    fn timeline_capture_state_tracks_lifecycle_independently_of_business_status() {
+        if !isolated("timeline_capture_state_tracks_lifecycle_independently_of_business_status") {
+            return;
+        }
+        let debug = Arc::new(AtomicBool::new(true));
+        bind_debug(&debug);
+        let event = |snapshot: &Value, name: &str| {
+            snapshot["traceEvents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|event| event["name"] == name && event["args"]["span_id"].is_u64())
+                .unwrap()
+                .clone()
+        };
+        let assert_counts = |snapshot: &Value, active: u64, frozen: u64, total: u64| {
+            let metadata = &snapshot["metadata"];
+            assert_eq!(metadata["active_spans"], active);
+            assert_eq!(metadata["frozen_spans"], frozen);
+            assert_eq!(metadata["frozen_total"], total);
+            assert_eq!(metadata["incomplete"], active + frozen);
+            assert_eq!(metadata["incomplete_total"], total + active);
+        };
+        tracing::subscriber::with_default(subscriber(), || {
+            let old = tracing::info_span!(
+                target: "stravia::perf", "test.capture.old", status = tracing::field::Empty
+            );
+            let old_sql = tracing::info_span!(
+                target: "stravia::sql", "sql.query", status = tracing::field::Empty,
+                backend = "sqlite", pool = "main",
+                db.statement = "SELECT private_capture_input", error = "private_capture_error"
+            );
+            let active = timeline_snapshot();
+            let epoch = active["metadata"]["debug_epoch"].clone();
+            assert_counts(&active, 2, 0, 0);
+            for name in ["test.capture.old", "sql.query"] {
+                let span = event(&active, name);
+                assert_eq!(span["args"]["capture_state"], "active");
+                assert_eq!(span["ph"], "B");
+                assert!(span.get("dur").is_none());
+            }
+
+            set_debug(&debug, false);
+            let frozen = timeline_snapshot();
+            assert_counts(&frozen, 0, 2, 2);
+            for name in ["test.capture.old", "sql.query"] {
+                let span = event(&frozen, name);
+                assert_eq!(span["args"]["capture_state"], "frozen");
+                assert_eq!(span["ph"], "B");
+                assert!(span.get("dur").is_none());
+                assert!(span["args"].get("status").is_none());
+            }
+            set_debug(&debug, true);
+            old.record("status", "completed");
+            old_sql.record("status", "error");
+            drop(old_sql);
+            drop(old);
+            let current = tracing::info_span!(
+                target: "stravia::perf", "test.capture.current", status = "completed"
+            );
+            let reopened = timeline_snapshot();
+            assert_ne!(reopened["metadata"]["debug_epoch"], epoch);
+            assert_counts(&reopened, 1, 2, 2);
+            assert_eq!(
+                event(&reopened, "test.capture.current")["args"]["capture_state"],
+                "active"
+            );
+            drop(current);
+            drop(tracing::info_span!(
+                target: "stravia::perf", "test.capture.error", status = "error"
+            ));
+            drop(tracing::info_span!(
+                target: "stravia::perf", "test.capture.cancelled", status = "cancelled"
+            ));
+            let finished = timeline_snapshot();
+            assert_counts(&finished, 0, 2, 2);
+            for name in ["test.capture.old", "sql.query"] {
+                assert_eq!(event(&finished, name), event(&frozen, name));
+            }
+            for (name, status) in [
+                ("test.capture.current", "completed"),
+                ("test.capture.error", "error"),
+                ("test.capture.cancelled", "cancelled"),
+            ] {
+                let span = event(&finished, name);
+                assert_eq!(span["args"]["capture_state"], "finished");
+                assert_eq!(span["args"]["status"], status);
+                assert_eq!(span["ph"], "X");
+                assert!(span["dur"].is_u64());
+            }
+            let output = finished.to_string();
+            assert!(!output.contains("private_capture_input"));
+            assert!(!output.contains("private_capture_error"));
+        });
+    }
+
+    #[test]
     fn bounded_timeline_preserves_incomplete_spans_and_reports_overflow() {
         if !isolated("bounded_timeline_preserves_incomplete_spans_and_reports_overflow") {
             return;
@@ -1027,9 +1501,9 @@ mod tests {
             );
             drop(active);
             assert_eq!(
-                timeline_snapshot(),
-                frozen,
-                "disabled snapshot must stay frozen"
+                timeline_snapshot()["traceEvents"],
+                frozen["traceEvents"],
+                "disabled capture must not change retained events"
             );
             set_debug(&debug, true);
             for _ in 0..COMPLETED_CAPACITY + 20 {
@@ -1053,6 +1527,12 @@ mod tests {
             Some((ACTIVE_CAPACITY + 20) as u64)
         );
         assert_eq!(snapshot["metadata"]["incomplete"], 0);
+        assert_eq!(snapshot["metadata"]["active_spans"], 0);
+        assert_eq!(snapshot["metadata"]["frozen_spans"], 0);
+        assert_eq!(
+            snapshot["metadata"]["frozen_total"].as_u64(),
+            Some(ACTIVE_CAPACITY as u64)
+        );
         assert_eq!(
             snapshot["metadata"]["incomplete_total"].as_u64(),
             Some(ACTIVE_CAPACITY as u64)
@@ -1071,11 +1551,11 @@ mod tests {
         );
     }
 
-    fn emit_sql_event() {
-        tracing::event!(
-            target: "sqlx::query", Level::DEBUG,
+    fn emit_sql_span() {
+        let _span = tracing::info_span!(
+            target: "stravia::sql", "sql.query", status = "completed",
+            backend = "SQLite", pool = "main", execution_scope = "driver",
             summary = "SELECT password", db.statement = "SELECT password FROM vault",
-            elapsed_secs = 0.025_f64,
         );
     }
 
@@ -1129,7 +1609,7 @@ mod tests {
             .await;
             // 同一连接的 FIFO ping 排空先前 Execute 持有的 span；必须在被测
             // span 外提交，因为 worker 会先回复 ping，再释放 ping 自己捕获的 span。
-            sqlx::Connection::ping(&mut *connection).await.unwrap();
+            connection.ping().await.unwrap();
             drop(connection);
             set_debug(&debug, false);
             pool.close().await;
@@ -1149,11 +1629,35 @@ mod tests {
         assert_eq!(child["args"]["sql_query_count"], 2);
         assert_eq!(child["args"]["node_count"], 2);
         assert_eq!(child["args"]["parent_id"], parent["args"]["span_id"]);
+        let queries = events
+            .iter()
+            .filter(|event| event["name"] == "sql.query" && event["ph"] == "X")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            queries
+                .iter()
+                .filter(|event| event["args"]["query_id"]
+                    == "66cbb3a40d4bbd150b75825ad291a6545399f3098fc1079e4d8b5bb061a6a481")
+                .count(),
+            2
+        );
+        assert!(queries.iter().any(|event| event["args"]["query_id"]
+            == "9fb5dfe333b3d38fe20dcecafcfaa65044e2cef57463deb2501603376c71252a"));
         let metrics = metrics_snapshot().unwrap();
         for (operation, count) in [("test.sqlite.parent", 1), ("test.sqlite.child", 2)] {
-            assert!(metrics.contains(&format!(
-                "stravia_sql_query_duration_seconds_count{{operation=\"{operation}\"}} {count}\n"
-            )));
+            assert_eq!(
+                sample_value(
+                    &metrics,
+                    "stravia_sql_query_duration_seconds_count",
+                    &[
+                        ("backend", "sqlite"),
+                        ("operation", operation),
+                        ("pool", "main"),
+                        ("status", "completed")
+                    ]
+                ),
+                f64::from(count)
+            );
         }
         assert!(!metrics.contains("operation=\"unattributed\""));
         for output in [metrics, trace.to_string()] {
@@ -1183,7 +1687,7 @@ mod tests {
                 let stale = tracing::info_span!(target: "stravia::perf", "test.stale_sql");
                 set_debug(&debug, false);
                 set_debug(&debug, true);
-                stale.in_scope(emit_sql_event);
+                stale.in_scope(emit_sql_span);
                 drop(stale);
                 let current = tracing::info_span!(
                     target: "stravia::perf", "test.current_sql",
@@ -1191,9 +1695,10 @@ mod tests {
                     secret_number = 919191_u64, candidate_count = "private-count"
                 );
                 current.in_scope(|| {
-                    emit_sql_event();
-                    tracing::event!(target: "sqlx::pool::acquire", Level::DEBUG,
-                        acquired_after_secs = 0.002_f64);
+                    emit_sql_span();
+                    let acquire = tracing::info_span!(target: "stravia::sql", "sql.pool.acquire",
+                        backend = "SQLite", pool = "main", status = "completed");
+                    drop(acquire);
                     current.record("reference_count", 7_u64);
                     current.record("node_count", -1_i64);
                     record_generation_cache_access(true);
@@ -1220,9 +1725,7 @@ mod tests {
             .find(|event| event["name"] == "test.current_sql")
             .unwrap();
         assert_eq!(current["args"]["sql_query_count"], 1);
-        assert_eq!(current["args"]["sql_query_duration_us"], 25_000);
         assert_eq!(current["args"]["sql_pool_acquire_count"], 1);
-        assert_eq!(current["args"]["sql_pool_acquire_duration_us"], 2_000);
         assert_eq!(current["args"]["node_count"], 3);
         assert_eq!(current["args"]["reference_count"], 7);
         assert!(current["args"].get("candidate_count").is_none());
@@ -1234,5 +1737,127 @@ mod tests {
         let serialized = snapshot.to_string();
         assert!(!serialized.contains("919191"));
         assert!(!serialized.contains("private-count"));
+    }
+
+    #[test]
+    fn resource_history_retains_transitions_and_bounds_its_window() {
+        if !isolated_with_env(
+            "resource_history_retains_transitions_and_bounds_its_window",
+            &[(RESOURCE_CAPACITY_ENV, "2")],
+        ) {
+            return;
+        }
+        let debug = Arc::new(AtomicBool::new(true));
+        bind_debug(&debug);
+        let usage = ResourceUsage::new("test_resource", "retained");
+        let mut lease = usage.lease(2, 4096);
+        sample_process();
+        lease.resize(1, 1024);
+        sample_process();
+        drop(lease);
+        sample_process();
+        let snapshot = timeline_snapshot();
+        let samples = snapshot["traceEvents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|event| event["name"] == "test_resource.retained")
+            .collect::<Vec<_>>();
+        assert_eq!(samples.len(), 2);
+        assert_eq!(samples[0]["args"]["items"], 1);
+        assert_eq!(samples[0]["args"]["logical_bytes"], 1024);
+        assert_eq!(samples[1]["args"]["items"], 0);
+        assert_eq!(samples[1]["args"]["logical_bytes"], 0);
+        assert!(samples[0]["ts"].as_u64().unwrap() <= samples[1]["ts"].as_u64().unwrap());
+        assert_eq!(snapshot["metadata"]["dropped_resource_samples"], 1);
+        set_debug(&debug, false);
+        sample_process();
+        assert_eq!(timeline_snapshot()["traceEvents"], snapshot["traceEvents"]);
+        set_debug(&debug, true);
+        sample_process();
+        let reopened = timeline_snapshot();
+        let processes = reopened["traceEvents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|event| event["name"] == "process")
+            .collect::<Vec<_>>();
+        assert!(
+            processes.last().unwrap()["args"]
+                .get("cpu_percent")
+                .is_none(),
+            "reopened collection must establish a new CPU baseline"
+        );
+    }
+
+    #[test]
+    fn queued_context_does_not_extend_parent_and_rejects_reopened_epoch() {
+        if !isolated("queued_context_does_not_extend_parent_and_rejects_reopened_epoch") {
+            return;
+        }
+        let debug = Arc::new(AtomicBool::new(true));
+        bind_debug(&debug);
+        tracing::subscriber::with_default(subscriber(), || {
+            let parent = tracing::info_span!(target: "stravia::perf", "test.queue.origin");
+            let context = parent.in_scope(current_context);
+            drop(parent);
+            let before = timeline_snapshot();
+            assert!(
+                before["traceEvents"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|event| event["name"] == "test.queue.origin" && event["ph"] == "X")
+            );
+            record_wait("test.queue.residence", context, Instant::now(), "completed");
+            let child = tracing::info_span!(target: "stravia::perf", parent: None, "test.queue.process",
+                causal_parent_id=context.span_id(), causal_epoch=context.epoch());
+            child.in_scope(emit_sql_span);
+            drop(child);
+            let snapshot = timeline_snapshot();
+            let child = snapshot["traceEvents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|event| event["name"] == "test.queue.process")
+                .unwrap();
+            assert_eq!(child["args"]["parent_id"], context.span_id());
+            let unparented = current_context();
+            assert_eq!(unparented.span_id(), 0);
+            set_debug(&debug, false);
+            set_debug(&debug, true);
+            record_wait("test.queue.stale", context, Instant::now(), "completed");
+            let stale = tracing::info_span!(target: "stravia::perf", parent: None, "test.queue.stale_process",
+                causal_parent_id=context.span_id(), causal_epoch=context.epoch());
+            stale.in_scope(|| {
+                let nested =
+                    tracing::info_span!(target: "stravia::perf", "test.queue.stale_nested");
+                nested.in_scope(emit_sql_span);
+            });
+            drop(stale);
+            let stale = tracing::info_span!(target: "stravia::perf", parent: None, "test.queue.stale_unparented",
+                causal_parent_id=unparented.span_id(), causal_epoch=unparented.epoch());
+            stale.in_scope(emit_sql_span);
+            drop(stale);
+            let fresh = current_context();
+            let fresh = tracing::info_span!(target: "stravia::perf", parent: None, "test.queue.fresh_unparented",
+                causal_parent_id=fresh.span_id(), causal_epoch=fresh.epoch());
+            drop(fresh);
+            let snapshot = timeline_snapshot();
+            assert!(!snapshot.to_string().contains("test.queue.stale"));
+            let events = snapshot["traceEvents"].as_array().unwrap();
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event["name"] == "sql.query" && event["ph"] == "X")
+                    .count(),
+                1
+            );
+            assert!(
+                events
+                    .iter()
+                    .any(|event| event["name"] == "test.queue.fresh_unparented")
+            );
+        });
     }
 }

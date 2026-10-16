@@ -87,7 +87,7 @@ impl PostgresRouteStore {
 /// Load Route rows together with their Targets on an existing connection, so a
 /// caller transaction reads the same snapshot it is about to commit.
 pub(super) async fn load_routes(
-    conn: &mut sqlx::PgConnection,
+    conn: &mut sqlx::PgConnection<'_>,
     active_only: bool,
 ) -> anyhow::Result<Vec<RouteConfig>> {
     let where_clause = if active_only { " WHERE is_enabled" } else { "" };
@@ -111,12 +111,10 @@ pub(super) async fn load_routes(
 }
 
 async fn load_targets(
-    conn: &mut sqlx::PgConnection,
+    conn: &mut sqlx::PgConnection<'_>,
     route_storage_id: &str,
 ) -> anyhow::Result<Vec<TargetConfig>> {
-    Ok(sqlx::query_as::<_, TargetRow>(
-        "SELECT id, model_id, provider_id, model, enabled, priority, first_token_timeout_ms, target_retry_budget, target_cooldown_ms, to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS created_at, thinking_level_map FROM model_backends WHERE model_id = $1 ORDER BY priority DESC, created_at ASC",
-    )
+    Ok(sqlx::query_as::<_, TargetRow>("SELECT id, model_id, provider_id, model, enabled, priority, first_token_timeout_ms, target_retry_budget, target_cooldown_ms, to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS created_at, thinking_level_map FROM model_backends WHERE model_id = $1 ORDER BY priority DESC, created_at ASC")
     .bind(route_storage_id)
     .fetch_all(&mut *conn)
     .await?
@@ -126,14 +124,14 @@ async fn load_targets(
 }
 
 pub(super) async fn load_route(
-    conn: &mut sqlx::PgConnection,
+    conn: &mut sqlx::PgConnection<'_>,
     route_id: &str,
 ) -> anyhow::Result<Option<RouteConfig>> {
     let route = sqlx::query_as::<_, RouteRow>(
         "SELECT id, model_id, display_name, default_thinking_level, balance, \
-         is_enabled, \
-         to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS created_at \
-         FROM models WHERE model_id = $1",
+     is_enabled, \
+     to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS created_at \
+     FROM models WHERE model_id = $1",
     )
     .bind(route_id)
     .fetch_optional(&mut *conn)
@@ -150,7 +148,7 @@ pub(super) async fn load_route(
 /// 调用方已在事务中按 models → model_backends 顺序阻止并发 Route 写入；
 /// 此处读取最新绑定（含禁用项），只更新 Generated 行，不重建 Target。
 pub(super) async fn refresh_generated_target_maps(
-    conn: &mut sqlx::PgConnection,
+    conn: &mut sqlx::PgConnection<'_>,
     provider_id: &str,
     provider_model_id: &str,
     metadata: &crate::provider_models::ProviderModelMetadata,
