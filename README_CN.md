@@ -74,11 +74,13 @@ docker run --rm \
 
 也可从 Releases 下载对应平台压缩包（请先对照 `SHA256SUMS` 校验）。
 
+**已有实例升级：** 先停机并备份完整数据目录及外部数据库。路由输出用途迁移会使 **全部历史 Route 在逐条重新配置前不可执行**，SQLite 与 PostgreSQL 相同。见[升级与恢复说明](docs/design/media-generation.md#4-route-与-codex-接入)；回退须恢复备份。
+
 **首次启动（两种形态相同）：**
 
 1. 打开 <http://127.0.0.1:23471/setup>，输入控制台打印的一次性设置令牌。选择 SQLite 或 PostgreSQL，创建管理员。选择 PostgreSQL 必须在首次设置前配置 Redis，见[缓存与 Server 配置](docs/design/architecture.md#统一派生缓存与-server-配置)。
 2. **添加提供商** —— API Key 或 OAuth 通道（Codex、Claude 订阅、Grok device flow、Devin）。Stravia 会同步可用模型清单。
-3. **添加模型** —— 选择上游模型 ID；Model ID 即客户端调用的路由。
+3. **添加模型** —— 选择文字或图片输出用途，再选择匹配的上游模型；Model ID 即客户端调用的路由。
 4. **创建 API Key**，然后打开**接入客户端** —— Stravia 为 Claude Code、Codex CLI、Gemini CLI 或 OpenCode 生成可直接应用的 provider 补丁；桌面端可直接写入客户端配置。
 
 之后即可通过任意受支持协议调用：
@@ -125,7 +127,7 @@ OpenAI（含 Codex OAuth）· Anthropic（API Key；Claude Pro/Max 订阅 OAuth 
 
 #### 图片生成
 
-在 **高级功能 → 媒体生成** 中绑定已保存且所有启用目标均支持图片生成的 Route，再开启能力。内置 Codex OAuth 与纯图片插件使用同一 Route 机制；实际可用性仍取决于上游账号和模型支持。
+在 **高级功能 → 媒体生成** 中绑定已保存且有合格图片生成目标的图片输出 Route，再开启能力。内置 Codex OAuth 与纯图片插件使用同一 Route 机制；实际可用性仍取决于上游账号和模型支持。
 
 具体可用性取决于上游账号和模型支持；尺寸偏好不保证精确输出，重试可能额外消耗额度。配置、调用示例和限制见[媒体生成文档](docs/design/media-generation.md)。
 

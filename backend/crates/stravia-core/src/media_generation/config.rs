@@ -73,6 +73,21 @@ pub(crate) async fn validate_route(
 }
 
 async fn validate_targets(gateway: &Gateway, route: &RouteConfig) -> Result<(), GenerationError> {
+    match route.output_modality {
+        Some(crate::db::models::RouteOutputModality::Image) => {}
+        Some(crate::db::models::RouteOutputModality::Text) => {
+            return Err(GenerationError::new(
+                "media_generation_route_output_modality_mismatch",
+                "Select a Route configured for image output",
+            ));
+        }
+        None => {
+            return Err(GenerationError::new(
+                "route_output_modality_unconfigured",
+                "Select and save image output to reconfigure this Route",
+            ));
+        }
+    }
     if !route.is_enabled {
         return Err(GenerationError::new(
             "media_generation_route_disabled",
@@ -83,6 +98,29 @@ async fn validate_targets(gateway: &Gateway, route: &RouteConfig) -> Result<(), 
         return Err(GenerationError::new(
             "media_generation_targets_missing",
             "The selected Route needs an enabled Target",
+        ));
+    }
+    let mut matching = false;
+    for target in route.targets.iter().filter(|target| target.enabled) {
+        if gateway
+            .storage
+            .provider_models()
+            .find(target.provider_id().as_str(), target.model().as_str())
+            .await?
+            .is_some_and(|model| {
+                model
+                    .metadata
+                    .supports_route_output_modality(crate::db::models::RouteOutputModality::Image)
+            })
+        {
+            matching = true;
+            break;
+        }
+    }
+    if !matching {
+        return Err(GenerationError::new(
+            "media_generation_targets_output_modality_mismatch",
+            "The selected Route has no enabled image-output Target; repair the registered model output",
         ));
     }
     gateway
@@ -138,6 +176,7 @@ pub(crate) async fn save(
     gateway: &Gateway,
     config: MediaGenerationConfig,
 ) -> Result<MediaGenerationConfigView, GenerationError> {
+    let _mutation = gateway.route_media_mutation.lock().await;
     // 配置失效不能阻止关闭能力；保留原绑定供管理员修复，不接受新无效绑定。
     let disabling = !config.enabled && load(gateway).await?.image.route_id == config.image.route_id;
     if !disabling && (config.enabled || config.image.route_id.is_some()) {

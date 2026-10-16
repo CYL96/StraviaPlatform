@@ -126,6 +126,7 @@ def _create_connection(
             "metadata": {
                 "id": "fixture-model",
                 "name": "Fixture model",
+                "modalities": {"input": ["text"], "output": ["text"]},
             },
         },
     )
@@ -136,6 +137,7 @@ def _create_connection(
         "/api/v1/models",
         {
             "model_id": model_id,
+            "output_modality": "text",
             "display_name": f"{name} route",
             "targets": [{"provider_id": provider_id, "model": "fixture-model"}],
         },

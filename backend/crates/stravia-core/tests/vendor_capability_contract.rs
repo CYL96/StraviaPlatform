@@ -531,6 +531,7 @@ async fn create_route(
     route_id: &str,
     targets: Vec<(&stravia_core::db::models::Provider, &str, i32)>,
     target_retry_budget: i32,
+    output_modality: stravia_core::db::models::RouteOutputModality,
 ) -> anyhow::Result<stravia_core::db::models::RouteConfig> {
     for (provider, model, _) in &targets {
         if gateway
@@ -563,6 +564,7 @@ async fn create_route(
     gateway
         .admin()
         .create_model(CreateRoute {
+            output_modality,
             model_id: route_id.into(),
             display_name: Some(route_id.into()),
             balance: Some("latency_preference".into()),
@@ -771,6 +773,7 @@ async fn model_search_targets_enforce_complete_report_contracts() -> anyhow::Res
         "model-search",
         vec![(&provider, "research-model", 10)],
         0,
+        stravia_core::db::models::RouteOutputModality::Text,
     )
     .await?;
     configure_external_search(&harness.gateway, &model_route.model_id).await?;
@@ -817,6 +820,7 @@ async fn model_search_targets_enforce_complete_report_contracts() -> anyhow::Res
                 metadata: json!({
                     "id":"image-metadata-only",
                     "name":"Not a Search Model",
+                    "modalities":{"input":["text"],"output":["text"]},
                     "capabilities":["media_image"]
                 }),
                 template_id: None,
@@ -828,6 +832,7 @@ async fn model_search_targets_enforce_complete_report_contracts() -> anyhow::Res
         "ineligible-model-search",
         vec![(&provider, "image-metadata-only", 10)],
         0,
+        stravia_core::db::models::RouteOutputModality::Text,
     )
     .await?;
     let current = harness.gateway.admin().get_web_search_config().await?;
@@ -952,6 +957,7 @@ async fn external_search_half_open_probe_sends_once_and_recovers_the_target() ->
         .gateway
         .admin()
         .create_model(CreateRoute {
+            output_modality: stravia_core::db::models::RouteOutputModality::Text,
             model_id: "half-open-search".into(),
             display_name: None,
             balance: None,
@@ -1071,7 +1077,14 @@ async fn external_search_retry_after_outside_window() -> anyhow::Result<()> {
         if backup {
             targets.push((&fallback, "research-model", 10));
         }
-        let route = create_route(&harness.gateway, "retry-window-search", targets, 5).await?;
+        let route = create_route(
+            &harness.gateway,
+            "retry-window-search",
+            targets,
+            5,
+            stravia_core::db::models::RouteOutputModality::Text,
+        )
+        .await?;
         configure_external_search(&harness.gateway, &route.model_id).await?;
         let (entered, release, responded) = limited
             .push_retry_barrier(
@@ -1152,6 +1165,7 @@ async fn external_search_switches_only_retryable_started_failures() -> anyhow::R
             (&fallback, "research-model", 10),
         ],
         0,
+        stravia_core::db::models::RouteOutputModality::Text,
     )
     .await?;
     configure_external_search(&harness.gateway, &route.model_id).await?;
@@ -1198,6 +1212,7 @@ async fn external_search_switches_only_retryable_started_failures() -> anyhow::R
         "search-parameter-error",
         vec![(&parameter_provider, "research-model", 10)],
         3,
+        stravia_core::db::models::RouteOutputModality::Text,
     )
     .await?;
     configure_external_search(&harness.gateway, &parameter_route.model_id).await?;
@@ -1239,6 +1254,7 @@ async fn external_search_switches_only_retryable_started_failures() -> anyhow::R
         "search-deadline",
         vec![(&deadline_provider, "research-model", 10)],
         3,
+        stravia_core::db::models::RouteOutputModality::Text,
     )
     .await?;
     configure_external_search(&harness.gateway, &deadline_route.model_id).await?;
@@ -1291,6 +1307,7 @@ async fn external_search_switches_only_retryable_started_failures() -> anyhow::R
         "search-cancellation",
         vec![(&cancellation_provider, "research-model", 10)],
         3,
+        stravia_core::db::models::RouteOutputModality::Text,
     )
     .await?;
     configure_external_search(&harness.gateway, &cancellation_route.model_id).await?;
@@ -1351,6 +1368,7 @@ async fn pure_image_vendor_stores_real_owned_png_and_cannot_chat() -> anyhow::Re
         "pure-image-route",
         vec![(&provider, "image-only-model", 10)],
         0,
+        stravia_core::db::models::RouteOutputModality::Image,
     )
     .await?;
     let client = harness.connect().await;
@@ -1380,6 +1398,7 @@ async fn pure_image_vendor_stores_real_owned_png_and_cannot_chat() -> anyhow::Re
             (&search_only_provider, "search-only-model", 10),
         ],
         0,
+        stravia_core::db::models::RouteOutputModality::Image,
     )
     .await?;
     assert!(
@@ -1512,7 +1531,7 @@ async fn mixed_capability_channel_keeps_image_only_models_out_of_chat() -> anyho
         (
             "image-output-only",
             json!(["image_output"]),
-            json!({"input":["text","image"],"output":["image"]}),
+            json!({"input":["text","image"],"output":["text","image"]}),
         ),
     ] {
         harness
@@ -1555,6 +1574,7 @@ async fn mixed_capability_channel_keeps_image_only_models_out_of_chat() -> anyho
         "mixed-channel-image-only",
         vec![(&provider, "media-image-only", 10)],
         0,
+        stravia_core::db::models::RouteOutputModality::Image,
     )
     .await?;
     let failover_route = create_route(
@@ -1565,8 +1585,30 @@ async fn mixed_capability_channel_keeps_image_only_models_out_of_chat() -> anyho
             (&provider, "legacy-text-model", 10),
         ],
         0,
+        stravia_core::db::models::RouteOutputModality::Text,
     )
     .await?;
+    // The binding was valid when saved; a later specification change makes
+    // this target image-only while retaining its original binding.
+    let detail = harness
+        .gateway
+        .admin()
+        .get_provider_model(&provider.id, "image-output-only")
+        .await?;
+    let mut metadata = serde_json::to_value(&detail.metadata)?;
+    metadata["modalities"]["output"] = json!(["image"]);
+    harness
+        .gateway
+        .admin()
+        .update_provider_model(
+            &provider.id,
+            "image-output-only",
+            stravia_core::provider_models::UpdateProviderModel {
+                metadata,
+                revision: detail.revision,
+            },
+        )
+        .await?;
     harness
         .gateway
         .admin()
@@ -1651,6 +1693,7 @@ async fn compatible_update_keeps_search_and_image_retries_on_the_pinned_componen
         "pinned-retry-search",
         vec![(&provider, "research-model", 10)],
         1,
+        stravia_core::db::models::RouteOutputModality::Text,
     )
     .await?;
     let image_route = create_route(
@@ -1658,6 +1701,7 @@ async fn compatible_update_keeps_search_and_image_retries_on_the_pinned_componen
         "pinned-retry-image",
         vec![(&provider, "multi-image", 10)],
         1,
+        stravia_core::db::models::RouteOutputModality::Image,
     )
     .await?;
     configure_external_search(&harness.gateway, &search_route.model_id).await?;
@@ -1789,6 +1833,7 @@ async fn compatible_update_keeps_search_and_image_failover_on_the_supplier_compo
             (&fallback, "research-model", 10),
         ],
         0,
+        stravia_core::db::models::RouteOutputModality::Text,
     )
     .await?;
     let image_route = create_route(
@@ -1799,6 +1844,7 @@ async fn compatible_update_keeps_search_and_image_failover_on_the_supplier_compo
             (&fallback, "multi-image", 10),
         ],
         0,
+        stravia_core::db::models::RouteOutputModality::Image,
     )
     .await?;
     configure_external_search(&harness.gateway, &search_route.model_id).await?;
@@ -1925,6 +1971,7 @@ async fn incompatible_update_cancels_search_and_image_retry_backoff_without_repl
         "cancelled-retry-search",
         vec![(&provider, "research-model", 10)],
         1,
+        stravia_core::db::models::RouteOutputModality::Text,
     )
     .await?;
     let image_route = create_route(
@@ -1932,6 +1979,7 @@ async fn incompatible_update_cancels_search_and_image_retry_backoff_without_repl
         "cancelled-retry-image",
         vec![(&provider, "multi-image", 10)],
         1,
+        stravia_core::db::models::RouteOutputModality::Image,
     )
     .await?;
     configure_external_search(&harness.gateway, &search_route.model_id).await?;
@@ -2073,6 +2121,7 @@ async fn compatible_capability_removal_preserves_inflight_result_and_binding() -
         "capability-removal-search",
         vec![(&provider, "research-model", 10)],
         0,
+        stravia_core::db::models::RouteOutputModality::Text,
     )
     .await?;
     configure_external_search(&harness.gateway, &route.model_id).await?;
@@ -2183,6 +2232,7 @@ async fn incompatible_update_cancels_late_inference_search_and_image_without_har
         "updating-search",
         vec![(&updating_provider, "research-model", 10)],
         0,
+        stravia_core::db::models::RouteOutputModality::Text,
     )
     .await?;
     let image_route = create_route(
@@ -2190,6 +2240,7 @@ async fn incompatible_update_cancels_late_inference_search_and_image_without_har
         "updating-image",
         vec![(&updating_provider, "multi-image", 10)],
         0,
+        stravia_core::db::models::RouteOutputModality::Image,
     )
     .await?;
     let other_route = create_route(
@@ -2197,6 +2248,7 @@ async fn incompatible_update_cancels_late_inference_search_and_image_without_har
         "independent-search",
         vec![(&other_provider, "research-model", 10)],
         0,
+        stravia_core::db::models::RouteOutputModality::Text,
     )
     .await?;
     configure_external_search(&harness.gateway, &search_route.model_id).await?;
@@ -2445,6 +2497,7 @@ async fn newer_builtin_removes_bound_search_and_media_without_confirmation_or_re
         "previous-builtin-search",
         vec![(&provider, "research-model", 10)],
         0,
+        stravia_core::db::models::RouteOutputModality::Text,
     )
     .await?;
     let image_route = create_route(
@@ -2452,6 +2505,7 @@ async fn newer_builtin_removes_bound_search_and_media_without_confirmation_or_re
         "previous-builtin-image",
         vec![(&provider, "fixture-image", 10)],
         0,
+        stravia_core::db::models::RouteOutputModality::Image,
     )
     .await?;
     configure_external_search(&first, &search_route.model_id).await?;
@@ -2658,6 +2712,7 @@ async fn dedicated_profile_wholly_replaces_base_and_never_falls_back_when_its_ar
         "deepseek-base-inference",
         vec![(&preexisting, "deepseek-v4", 10)],
         0,
+        stravia_core::db::models::RouteOutputModality::Text,
     )
     .await?;
     let key = gateway
@@ -2717,6 +2772,7 @@ async fn dedicated_profile_wholly_replaces_base_and_never_falls_back_when_its_ar
         "deepseek-dedicated-search",
         vec![(&dedicated_provider, "research-model", 10)],
         0,
+        stravia_core::db::models::RouteOutputModality::Text,
     )
     .await?;
     configure_external_search(&gateway, &search_route.model_id).await?;
@@ -2843,6 +2899,7 @@ async fn dedicated_profile_wholly_replaces_base_and_never_falls_back_when_its_ar
         "unaffected-base-inference",
         vec![(&openai, "gpt-test", 10)],
         0,
+        stravia_core::db::models::RouteOutputModality::Text,
     )
     .await?;
     let openai_key = restarted
@@ -2970,7 +3027,7 @@ async fn manually_installed_codex_component_reuses_one_connection_for_search_and
             "name": "GPT-5.4",
             "tool_call": true,
             "temperature": true,
-            "modalities": { "input": ["text"], "output": ["text"] },
+            "modalities": { "input": ["text"], "output": ["text", "image"] },
             "limit": { "context": 272000, "output": 128000 },
             "cost": { "input": 2.5, "output": 15.0 }
           }
@@ -2986,10 +3043,19 @@ async fn manually_installed_codex_component_reuses_one_connection_for_search_and
         "codex-multi-capability",
         vec![(&provider, "gpt-5.4", 10)],
         0,
+        stravia_core::db::models::RouteOutputModality::Text,
+    )
+    .await?;
+    let image_route = create_route(
+        &harness.gateway,
+        "codex-image-capability",
+        vec![(&provider, "gpt-5.4", 10)],
+        0,
+        stravia_core::db::models::RouteOutputModality::Image,
     )
     .await?;
     configure_external_search(&harness.gateway, &route.model_id).await?;
-    configure_image_generation(&harness.gateway, &route.model_id).await?;
+    configure_image_generation(&harness.gateway, &image_route.model_id).await?;
     harness
         .gateway
         .admin()
@@ -3624,6 +3690,7 @@ async fn manually_installed_codex_component_continues_client_tool_results_on_one
         "codex-client-tool-continuation",
         vec![(&provider, "gpt-5.4", 10)],
         0,
+        stravia_core::db::models::RouteOutputModality::Text,
     )
     .await?;
     harness

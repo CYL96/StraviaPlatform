@@ -30,6 +30,8 @@ describe('Connect clients', () => {
   test('uses Route capabilities and falls back to Route ID for display', () => {
     const route = {
       id: 'route',
+      output_modality: 'text',
+      image_generation_bound: false,
       model_id: 'shared-model',
       display_name: 'Shared Model',
       balance: 'traffic_equalization',
@@ -46,6 +48,7 @@ describe('Connect clients', () => {
 
     expect(defineClientModel(route)).toEqual({
       modelId: 'shared-model',
+      outputModality: 'text',
       displayName: 'Shared Model',
       supportedThinkingLevels: ['off', 'low', 'high'],
       supportsImageInput: true,

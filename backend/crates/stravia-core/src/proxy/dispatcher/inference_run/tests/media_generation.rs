@@ -279,7 +279,7 @@ async fn generation_http_fixture(
                     "attachment": true,
                     "tool_call": true,
                     "capabilities": ["media_image"],
-                    "modalities": {"input": ["text", "image"], "output": ["text"]}
+                    "modalities": {"input": ["text", "image"], "output": ["text", "image"]}
                 }),
                 template_id: None,
             },
@@ -289,6 +289,7 @@ async fn generation_http_fixture(
     let generation_route = gateway
         .admin()
         .create_model(CreateRoute {
+            output_modality: crate::db::models::RouteOutputModality::Image,
             model_id: "local-image-generation".into(),
             display_name: Some("Local image generation".into()),
             balance: None,

@@ -1,6 +1,6 @@
 import * as m from '$lib/paraglide/messages.js'
 import { effectiveModelDisplayName } from '$lib/logical-model'
-import type { ApiKey, Route, ThinkingLevel } from '$lib/types'
+import type { ApiKey, Route, RouteOutputModality, ThinkingLevel } from '$lib/types'
 
 export type CodeLanguage = 'python' | 'typescript' | 'curl'
 export type GatewayProtocol = 'openai-compatible' | 'open-responses' | 'anthropic-messages' | 'google-gemini'
@@ -26,6 +26,7 @@ export interface ClaudeModelMappings {
 
 export interface ClientModelDefinition {
   modelId: string
+  outputModality: RouteOutputModality | null
   displayName: string
   supportedThinkingLevels: readonly ThinkingLevel[]
   supportsImageInput: boolean
@@ -90,6 +91,7 @@ export const CLI_TOOLS: ReadonlyArray<{
 export function defineClientModel(model: Route): ClientModelDefinition {
   return {
     modelId: model.model_id,
+    outputModality: model.output_modality,
     displayName: effectiveModelDisplayName(model),
     supportedThinkingLevels: [...new Set(model.supported_thinking_levels ?? [])],
     supportsImageInput: model.supports_image_input ?? false,

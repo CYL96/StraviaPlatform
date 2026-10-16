@@ -7,6 +7,8 @@ struct TargetModelProjection {
     name: Option<String>,
     context_window: Option<u64>,
     supports_image_input: bool,
+    supports_text_output: bool,
+    supports_image_output: bool,
 }
 
 /// Runtime cooldown/probe projection for one persisted Target of a Route.
@@ -143,6 +145,7 @@ impl RouteModule<'_> {
             .put(PutRoute {
                 id: None,
                 model_id: route_id.into(),
+                output_modality: Some(input.output_modality),
                 display_name,
                 selection_strategy,
                 is_enabled: true,
@@ -187,6 +190,7 @@ impl RouteModule<'_> {
             .put(PutRoute {
                 id: Some(current.id),
                 model_id: next_route_id.into(),
+                output_modality: input.output_modality.or(current.output_modality),
                 display_name,
                 selection_strategy,
                 is_enabled: input.is_enabled.unwrap_or(current.is_enabled),
@@ -226,10 +230,18 @@ impl RouteModule<'_> {
         routes: &mut [RouteConfig],
     ) -> anyhow::Result<()> {
         let mut projections = BTreeMap::<String, TargetModelProjection>::new();
+        let image_route_id = crate::media_generation::config::load(self.gw)
+            .await?
+            .image
+            .route_id;
 
         // 已禁用 Target 也投影展示名，便于管理面识别；能力汇总仍只统计已启用 Target。
         for route in &mut *routes {
+            route.image_generation_bound =
+                image_route_id.as_deref() == Some(route.model_id.as_str());
             for target in &mut route.targets {
+                target.output_modality_mismatch = true;
+                target.route_output_modalities.clear();
                 let model = target.model().as_str();
                 let key = format!("{}\u{0}{model}", target.provider_id());
                 if !projections.contains_key(&key) {
@@ -257,12 +269,42 @@ impl RouteModule<'_> {
                                 .input
                                 .iter()
                                 .any(|modality| modality == "image"),
+                            supports_text_output: record.metadata.supports_route_output_modality(
+                                crate::db::models::RouteOutputModality::Text,
+                            ),
+                            supports_image_output: record.metadata.supports_route_output_modality(
+                                crate::db::models::RouteOutputModality::Image,
+                            ),
                         },
                     );
                 }
                 target.model_name = projections
                     .get(&key)
                     .and_then(|projection| projection.name.clone());
+                if let Some(projection) = projections.get(&key) {
+                    if projection.supports_text_output {
+                        target
+                            .route_output_modalities
+                            .push(crate::db::models::RouteOutputModality::Text);
+                    }
+                    if projection.supports_image_output {
+                        target
+                            .route_output_modalities
+                            .push(crate::db::models::RouteOutputModality::Image);
+                    }
+                }
+                target.output_modality_mismatch = route.output_modality.is_none_or(|modality| {
+                    !projections
+                        .get(&key)
+                        .is_some_and(|projection| match modality {
+                            crate::db::models::RouteOutputModality::Text => {
+                                projection.supports_text_output
+                            }
+                            crate::db::models::RouteOutputModality::Image => {
+                                projection.supports_image_output
+                            }
+                        })
+                });
             }
         }
 

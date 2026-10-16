@@ -25,6 +25,7 @@ interface CreatedResource {
 
 interface CreatedRoute extends CreatedResource {
   model_id: string
+  output_modality: 'text' | 'image'
 }
 
 async function adminRequest(serverPort: number, path: string, init?: RequestInit): Promise<unknown> {
@@ -58,7 +59,10 @@ function createdRoute(value: unknown): CreatedRoute {
   if (typeof value !== 'object' || value === null || !('model_id' in value) || typeof value.model_id !== 'string') {
     throw new Error('Route response did not include a model_id')
   }
-  return { ...resource, model_id: value.model_id }
+  if (!('output_modality' in value) || (value.output_modality !== 'text' && value.output_modality !== 'image')) {
+    throw new Error('Route response did not include its configured output modality')
+  }
+  return { ...resource, model_id: value.model_id, output_modality: value.output_modality }
 }
 
 interface DesktopAdminSession {
@@ -124,6 +128,119 @@ describe('Stravia desktop smoke', () => {
   before(async () => {
     await browser.tauri.switchWindow('main')
     await $('a[href="/vendor-plugins"]').waitForExist({ timeout: 180_000 })
+  })
+
+  it('creates an image route through the real editor and enforces Core modality errors', async () => {
+    await browser.execute(() => localStorage.setItem('stravia-locale', 'en-US'))
+    await refreshDesktop()
+    const port = (await browser.tauri.execute(({ core }) => core.invoke('get_server_port'))) as number
+    const suffix = Date.now().toString(36)
+    const modelId = `native-modality-${suffix}`
+    const provider = createdResource(
+      await adminRequest(port, '/providers', {
+        method: 'POST',
+        body: JSON.stringify({
+          name: `Native modality ${suffix}`,
+          source: {
+            type: 'custom',
+            vendor: 'custom',
+            channel: 'default',
+            protocol: 'open-responses',
+            base_url: 'https://native-modality.invalid',
+          },
+          credential: { type: 'none' },
+          use_proxy: false,
+        }),
+      }),
+      'Provider',
+    )
+    let route: CreatedRoute | undefined
+    try {
+      for (const [id, output] of [
+        ['dual', ['text', 'image']],
+        ['vision', ['text']],
+      ] as const) {
+        await adminRequest(port, `/providers/${provider.id}/models`, {
+          method: 'POST',
+          body: JSON.stringify({ model_id: id, metadata: { id, modalities: { input: ['text', 'image'], output } } }),
+        })
+      }
+      const session = (await browser.tauri.execute(({ core }) =>
+        core.invoke('get_admin_session'),
+      )) as DesktopAdminSession
+      const invalidRequests = [
+        { targets: [{ provider_id: provider.id, model: 'vision' }] },
+        { output_modality: null, targets: [{ provider_id: provider.id, model: 'vision' }] },
+        { output_modality: 'audio', targets: [{ provider_id: provider.id, model: 'vision' }] },
+        { output_modality: 'image', targets: [{ provider_id: provider.id, model: 'vision' }] },
+      ]
+      for (const input of invalidRequests) {
+        // Fetch inside the actual WebView using its native authenticated management listener.
+        const rejected = await browser.execute(
+          async (port, token, input, modelId) => {
+            const response = await fetch(`http://127.0.0.1:${port}/api/v1/models`, {
+              method: 'POST',
+              headers: { Authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+              body: JSON.stringify({ model_id: modelId, ...input }),
+            })
+            return { status: response.status, body: await response.text() }
+          },
+          port,
+          session.access_token,
+          input,
+          modelId,
+        )
+        if (input.output_modality === 'image') {
+          expect(rejected.status).toBe(200)
+          const envelope = JSON.parse(rejected.body) as { error: string }
+          expect(typeof envelope.error).toBe('string')
+          const error = JSON.parse(envelope.error) as {
+            code: string
+            params: { provider_id: string; model_id: string; output_modality: string }
+          }
+          expect(error.code).toBe('ROUTE_OUTPUT_MODALITY_MISMATCH')
+          expect(error.params.provider_id).toBe(provider.id)
+          expect(error.params.model_id).toBe('vision')
+          expect(error.params.output_modality).toBe('image')
+        } else {
+          expect(rejected.status).toBeGreaterThanOrEqual(400)
+          expect(rejected.status).toBeLessThan(500)
+        }
+      }
+      const routesAfterRejection = (await adminRequest(port, '/models')) as { model_id: string }[]
+      expect(routesAfterRejection.some((route) => route.model_id === modelId)).toBe(false)
+      const editorUrl = new URL('/models/new', await browser.getUrl())
+      editorUrl.searchParams.set('provider', provider.id)
+      editorUrl.searchParams.set('model', 'dual')
+      await browser.url(editorUrl.href)
+      await $('#route-model-id').waitForDisplayed()
+      await expect($('[data-slot="target-card"][data-enabled="true"]')).toHaveText(expect.stringContaining('dual'))
+      await expect($('[data-slot="target-card"][data-enabled="true"]')).toHaveText(
+        expect.stringContaining(`Native modality ${suffix}`),
+      )
+      await expect($('input[name="route-output-modality"][value="text"]')).toBeSelected()
+      await $('#route-model-id').setValue(modelId)
+      await $('input[name="route-output-modality"][value="image"]').click()
+      await expect($('input[name="route-output-modality"][value="image"]')).toBeSelected()
+      await $('button=Save model').click()
+      await browser.waitUntil(async () => new URL(await browser.getUrl()).pathname === '/models', {
+        timeoutMsg: 'native route editor did not finish saving the chosen image modality',
+      })
+      route = createdRoute(await adminRequest(port, `/models/${encodeURIComponent(modelId)}`))
+      expect(route.output_modality).toBe('image')
+      await $(`a[href="/models/${encodeURIComponent(modelId)}"]`).click()
+      await $('input[name="route-output-modality"][value="image"]').waitForDisplayed()
+      await expect($('input[name="route-output-modality"][value="image"]')).toBeSelected()
+    } finally {
+      const modelsLink = await $('a[href="/models"]')
+      if (await modelsLink.isExisting()) {
+        await modelsLink.click()
+        const discard = await $('button=Discard changes')
+        if (await discard.isDisplayed()) await discard.click()
+      }
+      if (route) await adminRequest(port, `/models/${encodeURIComponent(route.model_id)}`, { method: 'DELETE' })
+      await adminRequest(port, `/providers/${provider.id}`, { method: 'DELETE' })
+    }
   })
 
   it('switches and closes real selected scopes and zero-output diagnostics through native authenticated HTTP', async () => {
@@ -214,13 +331,17 @@ describe('Stravia desktop smoke', () => {
       serviceId = service.id
       await adminRequest(port, `/providers/${service.id}/models`, {
         method: 'POST',
-        body: JSON.stringify({ model_id: 'synthetic', metadata: { name: 'Native observation model' } }),
+        body: JSON.stringify({
+          model_id: 'synthetic',
+          metadata: { name: 'Native observation model', modalities: { input: ['text'], output: ['text'] } },
+        }),
       })
       const route = createdResource(
         await adminRequest(port, '/models', {
           method: 'POST',
           body: JSON.stringify({
             model_id: `native-observation-${suffix}`,
+            output_modality: 'text',
             display_name: 'Native observation',
             targets: [{ provider_id: service.id, model: 'synthetic' }],
           }),
@@ -589,6 +710,7 @@ describe('Stravia desktop smoke', () => {
           method: 'POST',
           body: JSON.stringify({
             model_id: `native-chat-${suffix}`,
+            output_modality: 'text',
             display_name: `Native chat ${suffix}`,
             targets: [{ provider_id: service.id, model: 'native-visual' }],
           }),
@@ -965,7 +1087,10 @@ describe('Stravia desktop smoke', () => {
       )
       await adminRequest(serverPort, `/providers/${provider.id}/models`, {
         method: 'POST',
-        body: JSON.stringify({ model_id: modelId, metadata: { id: modelId, name: 'Desktop Smoke Model' } }),
+        body: JSON.stringify({
+          model_id: modelId,
+          metadata: { id: modelId, name: 'Desktop Smoke Model', modalities: { input: ['text'], output: ['text'] } },
+        }),
       })
       route = createdRoute(
         await adminRequest(serverPort, '/models/bind', {
@@ -973,6 +1098,7 @@ describe('Stravia desktop smoke', () => {
           body: JSON.stringify({ provider_id: provider.id, provider_model_id: modelId }),
         }),
       )
+      expect(route.output_modality).toBe('text')
       apiKey = createdResource(
         await adminRequest(serverPort, '/api-keys', {
           method: 'POST',

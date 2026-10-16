@@ -634,6 +634,7 @@ async fn provider_models_persist_direct_edits_and_cost_rules() -> anyhow::Result
         let route = gw
             .admin()
             .create_model(CreateRoute {
+                output_modality: stravia_core::db::models::RouteOutputModality::Text,
                 model_id: route_id.into(),
                 display_name: None,
                 balance: None,
@@ -879,6 +880,7 @@ async fn manual_provider_models_are_partial_and_do_not_mutate_routes() -> anyhow
                 metadata: serde_json::json!({
                     "id": "private/model",
                     "name": "Private Model",
+                    "modalities": {"input": ["text"], "output": ["text"]},
                     "reasoning_efforts": ["none", "low", "medium", "high", "xhigh"],
                     "vendor_extension": {"mode": "private"},
                     "snapshot_state": {"type": "imported", "source": {"type": "discovery"}}
@@ -897,6 +899,7 @@ async fn manual_provider_models_are_partial_and_do_not_mutate_routes() -> anyhow
     let route = gw
         .admin()
         .create_model(CreateRoute {
+            output_modality: stravia_core::db::models::RouteOutputModality::Text,
             model_id: "private-route".to_string(),
             display_name: None,
             balance: Some("traffic_equalization".to_string()),
@@ -1384,6 +1387,7 @@ async fn copy_provider_can_copy_matching_route_targets_to_copied_provider() -> a
     let source_route = gw
         .admin()
         .create_model(CreateRoute {
+            output_modality: stravia_core::db::models::RouteOutputModality::Text,
             model_id: "source-model".to_string(),
             display_name: None,
             balance: Some("traffic_equalization".to_string()),
@@ -1486,6 +1490,7 @@ async fn copy_provider_does_not_append_targets_by_default() -> anyhow::Result<()
 
     gw.admin()
         .create_model(CreateRoute {
+            output_modality: stravia_core::db::models::RouteOutputModality::Text,
             model_id: "no-route-copy-model".to_string(),
             display_name: None,
             balance: None,
@@ -2123,6 +2128,7 @@ async fn add_manual_provider_model(
                 metadata: serde_json::json!({
                     "id": model_id,
                     "name": model_id,
+                    "modalities": {"input": ["text"], "output": ["text"]},
                 }),
                 template_id: None,
             },
@@ -2153,6 +2159,7 @@ async fn config_epoch_starts_at_zero_and_increments_on_model_create() -> anyhow:
     add_manual_provider_model(&gw, &provider.id, "gpt-4").await?;
     gw.admin()
         .create_model(CreateRoute {
+            output_modality: stravia_core::db::models::RouteOutputModality::Text,
             model_id: "epoch-test-model".to_string(),
             display_name: None,
             balance: Some("traffic_equalization".to_string()),
@@ -2200,6 +2207,7 @@ async fn config_epoch_increments_on_model_update_and_delete() -> anyhow::Result<
     let model = gw
         .admin()
         .create_model(CreateRoute {
+            output_modality: stravia_core::db::models::RouteOutputModality::Text,
             model_id: "epoch-update-model".to_string(),
             display_name: None,
             balance: Some("traffic_equalization".to_string()),

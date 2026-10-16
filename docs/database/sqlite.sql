@@ -240,7 +240,8 @@ CREATE TABLE models (
     priority     INTEGER DEFAULT 0,
     created_at   TEXT NOT NULL DEFAULT (datetime('now')),
     display_name TEXT
-, default_thinking_level TEXT);
+, default_thinking_level TEXT, output_modality TEXT
+    CHECK (output_modality IS NULL OR output_modality IN ('text', 'image')));
 
 CREATE TABLE native_compaction_sources (
     record_id TEXT NOT NULL REFERENCES native_compactions(id) ON DELETE CASCADE,

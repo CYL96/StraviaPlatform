@@ -710,6 +710,22 @@ fn execute_inner(
                     }
                     Ok(_) if !attempts.retry_current() => break,
                     Ok(mut prepared) => {
+                        if !gateway
+                            .route_target_output_matches(
+                                &route.model_id,
+                                target.provider_id().as_str(),
+                                target.model().as_str(),
+                            )
+                            .await
+                            .map_err(|error| {
+                                ModelTurnError::new(
+                                    "route_output_modality_unavailable",
+                                    error.to_string(),
+                                )
+                            })?
+                        {
+                            break;
+                        }
                         sent = Some(prepared.sent.clone());
                         prepared.first_token_timed_out = (target.first_token_timeout_ms != 0
                             && input.observer.is_some())
@@ -758,7 +774,10 @@ fn execute_inner(
                     attempts.skip_current();
                     continue 'targets;
                 }
-                if failure.error.code == "target_ineligible" {
+                if matches!(
+                    failure.error.code.as_str(),
+                    "target_ineligible" | "target_output_modality_mismatch"
+                ) {
                     if !sent
                         .as_ref()
                         .is_some_and(|sent| sent.load(Ordering::Acquire))
@@ -902,12 +921,16 @@ async fn select_with_rpm(
                     "route_scheduling_unavailable",
                     format!("Route scheduling snapshot is unavailable: {source}"),
                 ),
+                crate::router::SelectionError::UnconfiguredRoute => ModelTurnError::new(
+                    "route_output_modality_unconfigured",
+                    "Select and save an output modality to reconfigure this Route",
+                ),
                 crate::router::SelectionError::MediaPlanExhausted => ModelTurnError::new(
                     "input_modality_unsupported",
                     "No eligible Target remains for the fixed Media routing plan",
                 ),
                 crate::router::SelectionError::NoEligibleTarget => {
-                    ModelTurnError::new("model_unavailable", "Model has no configured Target")
+                    ModelTurnError::new("model_unavailable", "Model has no eligible Target")
                 }
                 crate::router::SelectionError::MixedAllowanceExclusions => {
                     super::mixed_allowance_exclusions_error()

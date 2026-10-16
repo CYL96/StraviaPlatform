@@ -1,5 +1,5 @@
 import type { ProviderOAuthStatus } from './oauth'
-import type { ThinkingLevelMapping } from './route'
+import type { RouteOutputModality, ThinkingLevelMapping } from './route'
 
 export interface Provider {
   id: string
@@ -124,6 +124,7 @@ export interface ProviderModelMetadata extends ModelSpecification {
 
 export interface ProviderModelSummary {
   id: string
+  route_output_modalities: RouteOutputModality[]
   name: string
   available: boolean
   source_kind: ProviderModelSourceKind
@@ -139,6 +140,7 @@ export interface ProviderModelList {
 
 export interface ProviderModelDetail {
   id: string
+  route_output_modalities: RouteOutputModality[]
   available: boolean
   source_kind: ProviderModelSourceKind
   can_reimport: boolean

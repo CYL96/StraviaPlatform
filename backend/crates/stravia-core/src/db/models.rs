@@ -136,11 +136,32 @@ pub struct UpsertOAuthCredential {
     pub meta: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, sqlx::Type)]
+#[serde(rename_all = "snake_case")]
+#[sqlx(type_name = "text", rename_all = "snake_case")]
+pub enum RouteOutputModality {
+    Text,
+    Image,
+}
+
+impl RouteOutputModality {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Image => "image",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RouteConfig {
     pub id: super::identity::RouteKey,
     pub model_id: super::identity::RouteId,
     pub display_name: Option<String>,
+    /// `None` identifies a historical Route awaiting explicit reconfiguration.
+    pub output_modality: Option<RouteOutputModality>,
+    /// Read-only management projection; never persisted with the Route.
+    pub image_generation_bound: bool,
     /// 客户端未表达任何推理意图时应用的 Canonical Thinking Level；
     /// `None` 表示不加控制，由上游模型自行决定。
     pub default_thinking_level: Option<String>,
@@ -199,6 +220,8 @@ pub struct RouteView<'a> {
     pub id: &'a str,
     pub model_id: &'a str,
     pub display_name: Option<&'a str>,
+    pub output_modality: Option<RouteOutputModality>,
+    pub image_generation_bound: bool,
     pub default_thinking_level: Option<&'a str>,
     pub balance: &'a str,
     pub target_provider: &'a str,
@@ -226,6 +249,8 @@ impl<'a> From<&'a RouteConfig> for RouteView<'a> {
             id: &route.id,
             model_id: &route.model_id,
             display_name: route.display_name.as_deref(),
+            output_modality: route.output_modality,
+            image_generation_bound: route.image_generation_bound,
             default_thinking_level: route.default_thinking_level.as_deref(),
             balance: &route.balance,
             target_provider: primary.map_or("", |target| target.provider_id().as_str()),
@@ -270,6 +295,11 @@ pub struct TargetConfig {
     /// 管理面读取时从 Provider Model 快照投影的展示名；不持久化，存储层读出时为 `None`，
     /// 快照缺失或未登记名称时也为 `None`，由展示方回退到上游模型 ID。
     pub model_name: Option<String>,
+    /// Read-only management projection; storage loads default to `false`.
+    pub output_modality_mismatch: bool,
+    /// Raw output declarations resolved for this saved Target, independent of availability.
+    /// Read-only management projection; storage loads leave this empty.
+    pub route_output_modalities: Vec<RouteOutputModality>,
 }
 
 impl TargetConfig {
@@ -289,6 +319,8 @@ pub struct TargetView<'a> {
     pub provider_id: &'a str,
     pub model: &'a str,
     pub model_name: Option<&'a str>,
+    pub output_modality_mismatch: bool,
+    pub route_output_modalities: &'a [RouteOutputModality],
     pub enabled: bool,
     pub priority: i32,
     pub first_token_timeout_ms: i64,
@@ -306,6 +338,8 @@ impl<'a> From<&'a TargetConfig> for TargetView<'a> {
             provider_id: target.provider_id().as_str(),
             model: target.model().as_str(),
             model_name: target.model_name.as_deref(),
+            output_modality_mismatch: target.output_modality_mismatch,
+            route_output_modalities: &target.route_output_modalities,
             enabled: target.enabled,
             priority: target.priority,
             first_token_timeout_ms: target.first_token_timeout_ms,
@@ -526,6 +560,12 @@ pub struct UpdateRoute {
         skip_serializing_if = "Option::is_none",
         deserialize_with = "deserialize_present"
     )]
+    pub output_modality: Option<RouteOutputModality>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present"
+    )]
     pub model_id: Option<String>,
     #[serde(
         default,
@@ -562,6 +602,7 @@ pub struct UpdateRoute {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreateRoute {
+    pub output_modality: RouteOutputModality,
     pub model_id: String,
     #[serde(default)]
     pub display_name: Option<String>,
@@ -588,6 +629,7 @@ pub struct CreateTarget {
 
 #[derive(Debug, Clone)]
 pub struct PutRoute {
+    pub output_modality: Option<RouteOutputModality>,
     pub id: Option<super::identity::RouteKey>,
     pub model_id: super::identity::RouteId,
     pub display_name: Option<String>,

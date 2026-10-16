@@ -142,10 +142,11 @@ test('real Chromium selects, switches and closes native HTTP observation scopes'
     })
     await api(`/providers/${service.id}/models`, 'POST', {
       model_id: 'synthetic',
-      metadata: { name: 'Browser synthetic model' },
+      metadata: { name: 'Browser synthetic model', modalities: { input: ['text'], output: ['text'] } },
     })
     const model = await api('/models', 'POST', {
       model_id: 'browser-synthetic',
+      output_modality: 'text',
       display_name: 'Browser synthetic',
       targets: [{ provider_id: service.id, model: 'synthetic' }],
     })

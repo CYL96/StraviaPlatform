@@ -61,13 +61,14 @@ def _create_route(
     status, body = http_request(
         "POST",
         f"{env['admin']}/api/v1/providers/{provider_id}/models",
-        payload={"model_id": "gpt-4o-mini", "metadata": {"name": name}},
+        payload={"model_id": "gpt-4o-mini", "metadata": {"name": name, "modalities": {"input": ["text"], "output": ["text"]}}},
         headers=env["auth"],
     )
     assert status == 201, body
 
     route_payload: dict[str, Any] = {
         "model_id": name,
+        "output_modality": "text",
         "display_name": f"{name} display",
         "targets": [{"provider_id": provider_id, "model": "gpt-4o-mini"}],
     }

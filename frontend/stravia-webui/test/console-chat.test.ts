@@ -41,6 +41,8 @@ function key(id = 'key-a', overrides: Partial<ConsoleApiKey> = {}): ConsoleApiKe
 function model(id = 'route-a', overrides: Partial<Route> = {}): Route {
   return {
     id,
+    output_modality: 'text',
+    image_generation_bound: false,
     model_id: id === 'route-a' ? 'model-a' : 'model-b',
     balance: 'traffic_equalization',
     target_provider: 'provider',
@@ -51,6 +53,8 @@ function model(id = 'route-a', overrides: Partial<Route> = {}): Route {
     targets: [
       {
         id: 'target',
+        output_modality_mismatch: false,
+        route_output_modalities: ['text'],
         model_id: id,
         provider_id: 'provider',
         model: 'upstream',

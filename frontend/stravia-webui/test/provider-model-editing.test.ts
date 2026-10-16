@@ -10,6 +10,7 @@ import type { PreparedProviderModel, ProviderModelDetail } from '../src/lib/type
 function detail(id = 'A', revision = 1): ProviderModelDetail {
   return {
     id,
+    route_output_modalities: ['text'],
     revision,
     available: true,
     source_kind: 'manual',

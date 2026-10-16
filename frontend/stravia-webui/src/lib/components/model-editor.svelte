@@ -82,6 +82,7 @@ const initialModel = untrack(() => model)
 const queryClient = useQueryClient()
 let form = $state({
   modelId: initialModel?.model_id ?? '',
+  outputModality: initialModel ? (initialModel.output_modality ?? null) : 'text',
   displayName: initialModel?.display_name ?? '',
   balance: initialModel?.balance ?? 'traffic_equalization',
   enabled: initialModel?.is_enabled ?? true,
@@ -91,6 +92,7 @@ let targets = $state<RouteTargetForm[]>(
   untrack(() => createRouteTargetForms(initialModel, initialProviderId, initialModelId)),
 )
 let saving = $state(false)
+let saveError = $state('')
 let initialized = $state(false)
 let targetEditorOpen = $state(false)
 let targetEditorTarget = $state<RouteTargetForm>()
@@ -224,11 +226,32 @@ $effect(() => {
 })
 
 function modelCandidates(target: RouteTargetForm): ProviderModelSummary[] {
-  return target.inventory.filter((item) => {
-    const keepExisting = target.persisted && item.id === target.model
-    return item.available || keepExisting
-  })
+  return target.inventory.filter(
+    (item) => form.outputModality !== null && item.route_output_modalities?.includes(form.outputModality),
+  )
 }
+
+function targetModalityMismatch(target: RouteTargetForm): boolean {
+  if (!form.outputModality || !target.model || target.loading) return false
+  const savedTarget = initialModel?.targets.find(
+    (item) =>
+      target.persisted &&
+      item.id === target.id &&
+      item.provider_id === target.providerId &&
+      item.model === target.model,
+  )
+  if (savedTarget) {
+    return !savedTarget.route_output_modalities.includes(form.outputModality)
+  }
+  const summary = selectedSummary(target)
+  if (summary) return !summary.route_output_modalities?.includes(form.outputModality)
+  return false
+}
+
+const modalityBlockers = $derived(targets.filter(targetModalityMismatch))
+const imageBindingBlocksSwitch = $derived(
+  Boolean(initialModel?.image_generation_bound && form.outputModality === 'text'),
+)
 
 function selectedSummary(target: RouteTargetForm): ProviderModelSummary | undefined {
   return target.inventory.find((item) => item.id === target.model)
@@ -409,6 +432,7 @@ function targetModelIdentity(
 
 function targetIssueLabels(target: RouteTargetForm, summary: ProviderModelSummary | undefined): string[] {
   const labels: string[] = []
+  if (targetModalityMismatch(target)) labels.push(m.route_output_mismatch())
   if (target.persisted && summary && !summary.available) labels.push(m.model_editor_model_no_longer_available())
   if (unwritableThinkingLevels(target).length > 0) labels.push(m.model_editor_thinking_map_unwritable())
   return labels
@@ -621,6 +645,20 @@ async function regenerateThinkingMap(target: RouteTargetForm): Promise<void> {
 }
 
 async function saveModel(): Promise<void> {
+  saveError = ''
+  if (!form.outputModality) {
+    saveError = m.route_output_reconfigure()
+    return
+  }
+  if (imageBindingBlocksSwitch) {
+    saveError = m.route_output_unlink_first()
+    return
+  }
+  const modalityChanged = initialModel?.output_modality !== form.outputModality
+  if (modalityChanged && modalityBlockers.length > 0) {
+    saveError = m.route_output_blockers()
+    return
+  }
   const targetsChanged = !initialModel || JSON.stringify(draftSnapshot().targets) !== JSON.stringify(savedDraft.targets)
   const result = targetsChanged ? buildRouteTargets(targets) : undefined
   if (result?.error && result.error !== 'incomplete-target' && result.error !== 'no-enabled-target') {
@@ -661,6 +699,7 @@ async function saveModel(): Promise<void> {
 
     const input = {
       model_id: form.modelId.trim(),
+      output_modality: form.outputModality,
       display_name: form.displayName.trim() || null,
       balance: form.balance,
       default_thinking_level:
@@ -669,6 +708,7 @@ async function saveModel(): Promise<void> {
     if (initialModel) {
       await admin.models.update(initialModel.model_id, {
         ...input,
+        ...(modalityChanged ? {} : { output_modality: undefined }),
         is_enabled: form.enabled,
         ...(targetsChanged ? { targets: cleanTargets! } : {}),
       })
@@ -698,6 +738,7 @@ async function saveModel(): Promise<void> {
     onSaved?.()
     if (!onSaved) await goto(resolve('/models'))
   } catch (error) {
+    saveError = localizeBackendErrorMessage(error)
     toast.error(localizeBackendErrorMessage(error))
     const failed = unrepresentableThinkingTarget(error)
     const target = failed
@@ -774,6 +815,40 @@ async function saveModel(): Promise<void> {
         </div>
       </div>
       <Field.Group class="grid gap-4 md:grid-cols-4">
+        <Field.Field orientation="vertical" class="md:col-span-4">
+          <fieldset class="min-w-0">
+            <legend class="mb-2 text-sm font-medium">{m.route_output_label()}</legend>
+            <div class="flex flex-wrap gap-4">
+              {#each ['text', 'image'] as modality (modality)}
+                <label class="flex min-h-10 items-center gap-2">
+                  <input type="radio" name="route-output-modality" value={modality} bind:group={form.outputModality} />
+                  {modality === 'text' ? m.route_output_text() : m.route_output_image()}
+                </label>
+              {/each}
+            </div>
+          </fieldset>
+          {#if initialModel && !initialModel.output_modality}
+            <p class="text-sm text-warning" role="status">{m.route_output_reconfigure()}</p>
+          {/if}
+          {#if imageBindingBlocksSwitch}
+            <p class="text-sm text-warning" role="status">
+              {m.route_output_unlink_first()}
+              <a class="underline underline-offset-2" href={resolve('/media-generation')}
+                >{m.route_output_open_media()}</a>
+            </p>
+          {/if}
+          {#if modalityBlockers.length > 0}
+            <div class="text-sm text-warning" role="status">
+              <p>{m.route_output_blockers()}</p>
+              <ul class="list-inside list-disc">
+                {#each modalityBlockers as target (target.key)}
+                  <li>{targetProviderLabel(target)} · {target.model}</li>
+                {/each}
+              </ul>
+            </div>
+          {/if}
+          {#if saveError}<p class="text-sm text-destructive" role="alert">{saveError}</p>{/if}
+        </Field.Field>
         <Field.Field orientation="vertical" class="md:col-span-2">
           <Field.Label for="route-model-id">{m.model_editor_model_id()}</Field.Label>
           <ModelIdCombobox
@@ -1197,6 +1272,9 @@ async function saveModel(): Promise<void> {
                       searchAriaLabel={m.model_editor_search_models_destination_value({ index: index + 1 })}
                       disabled={!target.providerId || target.loading}
                       onSelect={(value: string) => void selectModel(target, value)} />
+                    {#if target.providerId && !target.loading && modelCandidates(target).length === 0}
+                      <p class="text-sm text-warning" role="status">{m.route_output_no_candidates()}</p>
+                    {/if}
                   {/if}
                 </Field.Field>
               </Field.Group>

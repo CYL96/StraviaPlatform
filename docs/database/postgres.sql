@@ -1169,8 +1169,10 @@ CREATE TABLE public.models (
     created_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
     display_name text,
     default_thinking_level text,
+    output_modality text,
     CONSTRAINT models_balance_contract CHECK ((balance = ANY (ARRAY['traffic_equalization'::text, 'latency_preference'::text]))),
-    CONSTRAINT models_default_thinking_level_contract CHECK (((default_thinking_level IS NULL) OR (default_thinking_level = ANY (ARRAY['off'::text, 'minimal'::text, 'low'::text, 'medium'::text, 'high'::text, 'xhigh'::text, 'max'::text]))))
+    CONSTRAINT models_default_thinking_level_contract CHECK (((default_thinking_level IS NULL) OR (default_thinking_level = ANY (ARRAY['off'::text, 'minimal'::text, 'low'::text, 'medium'::text, 'high'::text, 'xhigh'::text, 'max'::text])))),
+    CONSTRAINT models_output_modality_check CHECK (((output_modality IS NULL) OR (output_modality = ANY (ARRAY['text'::text, 'image'::text]))))
 );
 
 

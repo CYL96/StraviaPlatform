@@ -74,11 +74,13 @@ docker run --rm \
 
 Alternatively, download a platform archive from Releases (verify against `SHA256SUMS`).
 
+**Upgrading an existing instance:** Stop and back up the complete data directory and any external database first. The Route output-purpose migration makes **all historical Routes nonexecutable until individually reconfigured**, on both SQLite and PostgreSQL. See [upgrade and recovery](docs/design/media-generation.md#4-route-与-codex-接入); rollback requires restoring the backup.
+
 **First run (both):**
 
 1. Open <http://127.0.0.1:23471/setup> and paste the one-time setup token printed to the console. Pick SQLite or PostgreSQL and create the administrator. PostgreSQL requires Redis configured before setup; see [cache and Server configuration](docs/design/architecture.md#统一派生缓存与-server-配置).
 2. **Add a provider** — API key or OAuth channel (Codex, Claude subscription, Grok device flow, Devin). Stravia syncs the available model inventory.
-3. **Add a model** — select upstream model IDs; the Model ID is the route clients call.
+3. **Add a model** — choose text or image output, then select matching upstream models; the Model ID is the route clients call.
 4. **Create an API key**, then open **Connect clients** — Stravia generates a ready-to-apply provider patch for Claude Code, Codex CLI, Gemini CLI, or OpenCode; the desktop app can write the config for you.
 
 Then call it through any supported protocol:
@@ -125,7 +127,7 @@ When an upstream service is temporarily unavailable, Stravia retries or switches
 
 #### Image generation
 
-In **Advanced Features → Media Generation**, bind a saved Route whose enabled targets support image generation, then enable the capability. Bundled Codex OAuth and image-only plugins use the same Route mechanism; actual availability remains subject to upstream account and model support.
+In **Advanced Features → Media Generation**, bind a saved image-output Route with eligible image-generation targets, then enable the capability. Bundled Codex OAuth and image-only plugins use the same Route mechanism; actual availability remains subject to upstream account and model support.
 
 Availability depends on upstream account and model support. Size preferences do not guarantee exact dimensions, and retries may consume additional quota. See the [Media Generation documentation](docs/design/media-generation.md) for configuration, examples, and limits.
 

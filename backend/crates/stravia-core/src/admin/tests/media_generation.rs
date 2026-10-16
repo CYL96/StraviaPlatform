@@ -129,7 +129,7 @@ impl GenerationRouteFixture {
                             "id": CODEX_MODEL,
                             "name": "Local test model",
                             "capabilities": ["media_image"],
-                            "modalities": {"input": ["text", "image"], "output": ["text"]}
+                            "modalities": {"input": ["text", "image"], "output": ["text", "image"]}
                         }),
                         template_id: None,
                     },
@@ -155,6 +155,7 @@ impl GenerationRouteFixture {
         self.gateway
             .admin()
             .create_model(CreateRoute {
+                output_modality: crate::db::models::RouteOutputModality::Image,
                 model_id: model_id.into(),
                 display_name: Some("Image Route".into()),
                 balance: Some("latency_preference".into()),
@@ -320,6 +321,181 @@ async fn route_qualification_is_atomic_and_a_stale_binding_can_be_disabled() -> 
     );
     let persisted_disabled = admin.get_media_generation_config().await?;
     assert!(!persisted_disabled.config.enabled);
+    assert_eq!(fixture.upstream_calls.load(Ordering::SeqCst), 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn image_reference_blocks_text_even_when_disabled_until_explicitly_cleared()
+-> anyhow::Result<()> {
+    let fixture = GenerationRouteFixture::new().await?;
+    let admin = fixture.gateway.admin();
+    let route = fixture.create_route("referenced-image", false).await?;
+    admin
+        .update_media_generation_config(GenerationRouteFixture::config(&route, false))
+        .await?;
+    let error = admin
+        .update_model(
+            &route.model_id,
+            UpdateRoute {
+                output_modality: Some(crate::db::models::RouteOutputModality::Text),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("disabled image generation still holds its Route reference");
+    assert!(error.to_string().contains("ROUTE_IMAGE_GENERATION_BOUND"));
+    assert_eq!(
+        admin.get_model(&route.model_id).await?.output_modality,
+        Some(crate::db::models::RouteOutputModality::Image)
+    );
+
+    let cleared = admin
+        .update_media_generation_config(MediaGenerationConfig {
+            enabled: false,
+            image: ImageGenerationConfig { route_id: None },
+        })
+        .await?;
+    assert!(!cleared.config.enabled);
+    assert!(cleared.config.image.route_id.is_none());
+    admin
+        .update_model(
+            &route.model_id,
+            UpdateRoute {
+                output_modality: Some(crate::db::models::RouteOutputModality::Text),
+                ..Default::default()
+            },
+        )
+        .await?;
+    assert!(
+        admin
+            .list_eligible_media_generation_routes()
+            .await?
+            .iter()
+            .all(|candidate| candidate.id != route.model_id.as_str())
+    );
+    let error = admin
+        .update_media_generation_config(GenerationRouteFixture::config(&route, true))
+        .await
+        .expect_err("a text-output Route cannot be bound as image generation");
+    assert_eq!(
+        error.code,
+        "media_generation_route_output_modality_mismatch"
+    );
+    assert_eq!(fixture.upstream_calls.load(Ordering::SeqCst), 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn modality_filter_excludes_only_mismatches_before_real_adapter_validation()
+-> anyhow::Result<()> {
+    let fixture = GenerationRouteFixture::new().await?;
+    let admin = fixture.gateway.admin();
+    let route = fixture.create_route("filtered-image", true).await?;
+    let provider_id = &fixture.incompatible_provider.id;
+    let model = admin.get_provider_model(provider_id, CODEX_MODEL).await?;
+    let mut metadata = serde_json::to_value(model.metadata)?;
+    metadata["modalities"]["output"] = json!(["text"]);
+    admin
+        .update_provider_model(
+            provider_id,
+            CODEX_MODEL,
+            crate::provider_models::UpdateProviderModel {
+                metadata,
+                revision: model.revision,
+            },
+        )
+        .await?;
+    let saved = admin
+        .update_media_generation_config(GenerationRouteFixture::config(&route, true))
+        .await?;
+    assert!(
+        saved.validation.valid,
+        "mismatched incompatible Target is excluded before adapter validation"
+    );
+    let retained = admin.get_model(&route.model_id).await?;
+    assert_eq!(retained.targets.len(), 2);
+    assert!(
+        retained
+            .targets
+            .iter()
+            .find(|target| target.provider_id().as_str() == provider_id)
+            .unwrap()
+            .output_modality_mismatch
+    );
+
+    let model = admin.get_provider_model(provider_id, CODEX_MODEL).await?;
+    let mut metadata = serde_json::to_value(model.metadata)?;
+    metadata["modalities"]["output"] = json!(["text", "image"]);
+    admin
+        .update_provider_model(
+            provider_id,
+            CODEX_MODEL,
+            crate::provider_models::UpdateProviderModel {
+                metadata,
+                revision: model.revision,
+            },
+        )
+        .await?;
+    let invalid = admin.get_media_generation_config().await?;
+    assert_eq!(
+        invalid.validation.code,
+        Some("media_generation_target_incompatible")
+    );
+    for provider_id in [
+        &fixture.compatible_provider.id,
+        &fixture.incompatible_provider.id,
+    ] {
+        let model = admin.get_provider_model(provider_id, CODEX_MODEL).await?;
+        let mut metadata = serde_json::to_value(model.metadata)?;
+        metadata["modalities"]["output"] = json!(["text"]);
+        admin
+            .update_provider_model(
+                provider_id,
+                CODEX_MODEL,
+                crate::provider_models::UpdateProviderModel {
+                    metadata,
+                    revision: model.revision,
+                },
+            )
+            .await?;
+    }
+    let drifted = admin.get_media_generation_config().await?;
+    assert!(!drifted.validation.valid);
+    assert_eq!(
+        drifted.validation.code,
+        Some("media_generation_targets_output_modality_mismatch")
+    );
+    assert!(
+        admin
+            .list_eligible_media_generation_routes()
+            .await?
+            .iter()
+            .all(|candidate| candidate.id != route.model_id.as_str())
+    );
+    let error = admin
+        .update_media_generation_config(GenerationRouteFixture::config(&route, true))
+        .await
+        .expect_err("enabled Targets with output drift cannot qualify an image Route");
+    assert_eq!(
+        error.code,
+        "media_generation_targets_output_modality_mismatch"
+    );
+    let disabled = admin
+        .update_media_generation_config(GenerationRouteFixture::config(&route, false))
+        .await?;
+    assert!(!disabled.config.enabled);
+    assert_eq!(
+        disabled.config.image.route_id.as_deref(),
+        Some("filtered-image")
+    );
+    let cleared = admin
+        .update_media_generation_config(MediaGenerationConfig {
+            enabled: false,
+            image: ImageGenerationConfig { route_id: None },
+        })
+        .await?;
+    assert!(cleared.config.image.route_id.is_none());
     assert_eq!(fixture.upstream_calls.load(Ordering::SeqCst), 0);
     Ok(())
 }

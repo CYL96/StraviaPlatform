@@ -52,7 +52,7 @@ def _model_probe_endpoint(*, forward: bool = False):
                     connection.close()
             else:
                 status = 503 if selected.path == "/failure" else 200
-                body = json.dumps({"data": [{"id": "probe-model"}]}).encode()
+                body = json.dumps({"data": [{"id": "probe-model", "modalities": {"input": ["text"], "output": ["text"]}}]}).encode()
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -509,7 +509,7 @@ def _create_provider(env: dict[str, str], name: str) -> str:
         f"{env['admin']}/api/v1/providers/{provider_id}/models",
         payload={
             "model_id": "gpt-4o-mini",
-            "metadata": {"id": "gpt-4o-mini", "name": "GPT-4o mini"},
+            "metadata": {"id": "gpt-4o-mini", "name": "GPT-4o mini", "modalities": {"input": ["text"], "output": ["text"]}},
         },
         headers=env["auth"],
     )
@@ -527,6 +527,7 @@ def _create_model(
 ) -> str:
     payload: dict[str, Any] = {
         "model_id": model_id,
+        "output_modality": "text",
         "targets": [{"provider_id": provider_id, "model": target_model}],
     }
     if display_name is not None:
@@ -560,7 +561,7 @@ def test_rpm_burst_rejection_and_shared_destination_limit(admin_env: dict[str, A
         )
         status, body = http_request(
             "POST", f"{admin_env['admin']}/api/v1/providers/{provider}/models",
-            payload={"model_id": "probe-model", "metadata": {"id": "probe-model"}},
+            payload={"model_id": "probe-model", "metadata": {"id": "probe-model", "modalities": {"input": ["text"], "output": ["text"]}}},
             headers=admin_env["auth"],
         )
         assert status == 201, body
@@ -988,6 +989,7 @@ def test_model_crud(admin_env: dict[str, str]) -> None:
         f"{admin_env['admin']}/api/v1/models",
         payload={
             "name": "legacy-model",
+            "output_modality": "text",
             "targets": [{"provider_id": provider_id, "model": "gpt-4o-mini"}],
         },
         headers=admin_env["auth"],

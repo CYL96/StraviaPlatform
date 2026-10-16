@@ -107,6 +107,16 @@ impl MediaHost for GatewayHost {
                 code: error.stable_code().into(),
                 message: error.message(),
             })?;
+        if route.output_modality.is_none() {
+            return Err(MediaAuthorizationError {
+                status: 503,
+                code: "route_output_modality_unconfigured".into(),
+                message: format!(
+                    "Route {} has no configured output modality; select and save an output modality to reconfigure this Route",
+                    route.model_id
+                ),
+            });
+        }
         Ok(Some(route_metadata(&self.0, &route).await))
     }
     async fn active_route(&self, id: &str) -> Option<MediaRoute> {
@@ -140,7 +150,7 @@ pub(crate) async fn route_metadata(
     route: &crate::db::models::RouteConfig,
 ) -> MediaRoute {
     let mut targets = Vec::with_capacity(route.targets.len());
-    for target in &route.targets {
+    for target in route.targets.iter().filter(|target| target.enabled) {
         let metadata = gateway
             .storage
             .provider_models()
@@ -149,6 +159,13 @@ pub(crate) async fn route_metadata(
             .ok()
             .flatten()
             .map(|record| record.metadata);
+        if let Some(modality) = route.output_modality
+            && !metadata
+                .as_ref()
+                .is_some_and(|metadata| metadata.supports_route_output_modality(modality))
+        {
+            continue;
+        }
         targets.push(MediaTarget {
             provider_id: target.provider_id().clone().into(),
             model: target.model().clone().into(),

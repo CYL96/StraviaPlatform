@@ -141,11 +141,11 @@ def provision(session, port, suffix):
             "credential": {"type": "api_key", "value": "local-test-credential"}, "vendor_options": {},
         })
         admin(session, "POST", f"/api/v1/providers/{provider['id']}/models", {
-            "model_id": "native-model", "metadata": {"name": "Native benchmark", "reasoning_efforts": ["none", "low", "medium", "high"], "limit": {"context": 100000}},
+            "model_id": "native-model", "metadata": {"name": "Native benchmark", "modalities": {"input": ["text"], "output": ["text"]}, "reasoning_efforts": ["none", "low", "medium", "high"], "limit": {"context": 100000}},
         }, 201)
         targets.append({"provider_id": provider["id"], "model": "native-model", "enabled": True, "priority": index, "target_retry_budget": 0})
     model = "history-" + suffix
-    route = admin(session, "POST", "/api/v1/models", {"model_id": model, "targets": targets})
+    route = admin(session, "POST", "/api/v1/models", {"model_id": model, "output_modality": "text", "targets": targets})
     key = admin(session, "POST", "/api/v1/api-keys", {"name": model, "model_ids": [route["id"]]})["key"]
     return model, route["id"], key
 

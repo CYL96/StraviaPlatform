@@ -146,7 +146,7 @@ def _configure_proxy_routes(
             status, body = http_request(
                 "POST",
                 f"{admin_base}/api/v1/providers/{provider_ids[protocol]}/models",
-                payload={"model_id": replay_model, "metadata": {}},
+                payload={"model_id": replay_model, "metadata": {"modalities": {"input": ["text"], "output": ["text"]}}},
                 headers=admin_headers,
             )
             assert status == 201, f"create replay provider model failed: {status} {body}"
@@ -160,6 +160,7 @@ def _configure_proxy_routes(
                 f"{admin_base}/api/v1/models",
                 payload={
                     "model_id": replay_model,
+                    "output_modality": "text",
                     "targets": [{"provider_id": provider_ids[protocol], "model": replay_model}],
                 },
                 headers=admin_headers,

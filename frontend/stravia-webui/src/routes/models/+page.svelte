@@ -233,6 +233,20 @@ async function deleteModel(): Promise<void> {
 
 {#snippet modelDisplayNameCell(context: DataTableCellContext<Route>)}
   <span class="block truncate font-medium">{effectiveModelDisplayName(context.row.original)}</span>
+  {@render outputState(context.row.original)}
+{/snippet}
+
+{#snippet outputState(model: Route)}
+  <span class={['block text-xs', !model.output_modality && 'text-warning']}>
+    {model.output_modality === 'image'
+      ? m.route_output_image()
+      : model.output_modality === 'text'
+        ? m.route_output_text()
+        : m.route_output_reconfigure()}
+  </span>
+  {#if model.targets.some((target) => target.output_modality_mismatch)}
+    <span class="block text-xs text-warning">{m.route_output_mismatch()}</span>
+  {/if}
 {/snippet}
 
 {#snippet modelIdCell(context: DataTableCellContext<Route>)}
@@ -344,6 +358,7 @@ async function deleteModel(): Promise<void> {
                 {effectiveModelDisplayName(model)}
               </a>
               <TechnicalValue value={model.model_id} copyable />
+              {@render outputState(model)}
               <p class="mt-1 text-xs text-muted-foreground">
                 {m.model_specification_context()}:
                 <span class="font-technical tabular-nums">

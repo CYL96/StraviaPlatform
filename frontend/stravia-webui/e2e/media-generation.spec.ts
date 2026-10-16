@@ -6,6 +6,49 @@ test.beforeEach(async ({ page }) => {
   await prepareApp(page)
 })
 
+for (const locale of ['en-US', 'zh-CN'] as const) {
+  test(`invalid historical media reference can be disabled and unlinked (${locale}, 320px)`, async ({ page }) => {
+    await page.addInitScript((language) => localStorage.setItem('stravia-locale', language), locale)
+    await page.setViewportSize({ width: 320, height: 780 })
+    const zh = locale === 'zh-CN'
+    let config = { enabled: true, image: { route_id: 'historical-image-route' as string | null } }
+    const writes: (typeof config)[] = []
+    await page.route('**/api/v1/media-generation/config', async (route) => {
+      if (route.request().method() === 'PUT') {
+        config = route.request().postDataJSON()
+        writes.push(structuredClone(config))
+      }
+      await route.fulfill({
+        json: {
+          data: {
+            config,
+            validation: {
+              valid: false,
+              code: 'route_output_modality_unconfigured',
+              message: 'Route requires reconfiguration.',
+            },
+          },
+        },
+      })
+    })
+    await page.route('**/api/v1/media-generation/eligible-routes', (route) => route.fulfill({ json: { data: [] } }))
+    await page.goto('/media-generation')
+    await expect(page.getByText(/historical-image-route/).first()).toBeVisible()
+    await page.getByRole('switch', { name: zh ? '启用媒体生成' : 'Enable media generation' }).click()
+    await expect.poll(() => writes.length).toBe(1)
+    expect(writes[0]).toEqual({ enabled: false, image: { route_id: 'historical-image-route' } })
+    await page
+      .getByRole('button', { name: zh ? '解除路由引用并关闭' : 'Unlink route and disable', exact: true })
+      .click()
+    await expect.poll(() => writes.length).toBe(2)
+    expect(writes[1]).toEqual({ enabled: false, image: { route_id: null } })
+    await expect(
+      page.getByRole('button', { name: zh ? '解除路由引用并关闭' : 'Unlink route and disable', exact: true }),
+    ).toHaveCount(0)
+    await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true)
+  })
+}
+
 test('media generation saves its gate independently from a route draft and recovers from a rejected route', async ({
   page,
 }) => {

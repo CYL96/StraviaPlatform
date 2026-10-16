@@ -119,7 +119,7 @@ async fn continuation_recovery_discards_failed_operation_metadata() {
             &provider.id,
             "fixture-model",
             CreateManualProviderModel {
-                metadata: serde_json::json!({"id":"fixture-model","name":"Fixture model"}),
+                metadata: serde_json::json!({"id":"fixture-model","name":"Fixture model","modalities":{"input":["text"],"output":["text"]}}),
                 template_id: None,
             },
         )
@@ -127,6 +127,7 @@ async fn continuation_recovery_discards_failed_operation_metadata() {
         .unwrap();
     let model = admin
         .create_model(CreateRoute {
+            output_modality: crate::db::models::RouteOutputModality::Text,
             model_id: "zdr-model".into(),
             display_name: None,
             balance: None,

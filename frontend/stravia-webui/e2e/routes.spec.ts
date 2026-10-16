@@ -4,6 +4,236 @@ import { prepareApp } from './prepare-app'
 
 const thinkingLevels = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const
 
+for (const locale of ['en-US', 'zh-CN'] as const) {
+  test(`route output repair preserves destinations and failed drafts (${locale}, 320px)`, async ({ page }) => {
+    await page.addInitScript((language) => localStorage.setItem('stravia-locale', language), locale)
+    await page.setViewportSize({ width: 320, height: 800 })
+    const zh = locale === 'zh-CN'
+    const service = {
+      id: 'modality-provider',
+      name: 'Modality service',
+      protocol: 'openai-compatible',
+      base_url: 'https://example.invalid',
+      use_proxy: false,
+      is_enabled: true,
+      created_at: '',
+      updated_at: '',
+    }
+    const target = (model: string, enabled: boolean) => ({
+      id: model,
+      provider_id: service.id,
+      model_id: 'legacy',
+      model,
+      enabled,
+      priority: 17,
+      first_token_timeout_ms: 45000,
+      target_retry_budget: 2,
+      target_cooldown_ms: 91000,
+      thinking_level_map: [],
+      output_modality_mismatch: false,
+      route_output_modalities: model === 'dual' ? ['text', 'image'] : ['text'],
+      created_at: '',
+    })
+    const saved = {
+      id: 'legacy',
+      model_id: 'legacy',
+      display_name: 'Retained route',
+      balance: 'traffic_equalization',
+      output_modality: null,
+      image_generation_bound: false,
+      is_enabled: true,
+      supported_thinking_levels: [],
+      created_at: '',
+      targets: [target('dual', true), target('text-only', false)],
+    }
+    let attempts = 0
+    let body: Record<string, unknown> | undefined
+    await page.route('**/api/v1/providers', (route) => route.fulfill({ json: { data: [service] } }))
+    await page.route('**/api/v1/providers/modality-provider/models', (route) =>
+      route.fulfill({
+        json: {
+          data: {
+            models: [
+              {
+                id: 'dual',
+                name: 'Dual output',
+                available: true,
+                route_output_modalities: ['text', 'image'],
+                specification: {},
+              },
+              {
+                id: 'text-only',
+                name: 'Text only',
+                available: true,
+                route_output_modalities: ['text'],
+                specification: {},
+              },
+            ],
+          },
+        },
+      }),
+    )
+    await page.route('**/api/v1/models/legacy/target-statuses', (route) => route.fulfill({ json: { data: [] } }))
+    await page.route('**/api/v1/models/legacy', async (route) => {
+      if (route.request().method() === 'GET') {
+        await route.fulfill({ json: { data: saved } })
+      } else {
+        attempts++
+        body = route.request().postDataJSON()
+        if (attempts === 1)
+          await route.fulfill({ status: 400, json: { error: 'Configuration changed; review and save again.' } })
+        else await route.fulfill({ json: { data: { ...saved, ...body } } })
+      }
+    })
+
+    await page.goto('/models/new')
+    await expect(page.getByRole('radio', { name: zh ? '文字输出' : 'Text output', exact: true })).toBeChecked()
+    await page.goto('/models/legacy')
+    await expect(page.getByRole('radio', { checked: true })).toHaveCount(0)
+    await expect(
+      page.getByRole('status').filter({ hasText: zh ? '需要重新配置' : 'Reconfiguration required' }),
+    ).toBeVisible()
+    const image = page.getByRole('radio', { name: zh ? '图片输出' : 'Image output', exact: true })
+    await image.focus()
+    await page.keyboard.press('Space')
+    await expect(image).toBeChecked()
+    await expect(page.getByText(zh ? /以下请求目标/ : /These destinations/)).toBeVisible()
+    await page.getByRole('button', { name: zh ? '保存模型' : 'Save model', exact: true }).click()
+    expect(attempts).toBe(0)
+    // A disabled incompatible destination still blocks switching; remove it explicitly.
+    await page.getByRole('button', { name: zh ? '移除请求目标 2' : 'Remove destination 2', exact: true }).click()
+    await page.locator('#route-display-name').fill('Retained failure draft')
+    await page.getByRole('button', { name: zh ? '保存模型' : 'Save model', exact: true }).click()
+    await expect(page.getByRole('alert')).toContainText('Configuration changed')
+    await expect(image).toBeChecked()
+    await expect(page.locator('#route-display-name')).toHaveValue('Retained failure draft')
+    await expect(page.locator('[data-slot="target-card"]')).toHaveCount(1)
+    await page.getByRole('button', { name: zh ? '保存模型' : 'Save model', exact: true }).click()
+    await expect.poll(() => attempts).toBe(2)
+    expect(body?.output_modality).toBe('image')
+    expect(body?.targets).toEqual([
+      expect.objectContaining({
+        provider_id: service.id,
+        model: 'dual',
+        priority: 17,
+        first_token_timeout_ms: 45000,
+        target_retry_budget: 2,
+        target_cooldown_ms: 91000,
+      }),
+    ])
+    await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true)
+  })
+}
+
+test('historical model alias can repair output without replacing its destination or schedule', async ({ page }) => {
+  const service = {
+    id: 'alias-provider',
+    name: 'Alias service',
+    protocol: 'openai-compatible',
+    base_url: 'https://example.invalid',
+    use_proxy: false,
+    is_enabled: true,
+    created_at: '',
+    updated_at: '',
+  }
+  const destination = {
+    id: 'historical-target',
+    provider_id: service.id,
+    model_id: 'historical-alias',
+    model: 'GLM-4.6',
+    enabled: true,
+    priority: 17,
+    first_token_timeout_ms: 45000,
+    target_retry_budget: 2,
+    target_cooldown_ms: 91000,
+    thinking_level_map: [],
+    output_modality_mismatch: true,
+    route_output_modalities: ['text'],
+    created_at: '',
+  }
+  const saved = {
+    id: 'historical-alias',
+    model_id: 'historical-alias',
+    display_name: 'Historical alias',
+    balance: 'traffic_equalization',
+    output_modality: null,
+    image_generation_bound: false,
+    is_enabled: true,
+    supported_thinking_levels: [],
+    targets: [destination],
+  }
+  let body: Record<string, unknown> | undefined
+  let inventoryLoaded = false
+  await page.route('**/api/v1/providers', (route) => route.fulfill({ json: { data: [service] } }))
+  await page.route('**/api/v1/providers/alias-provider/models', async (route) => {
+    await route.fulfill({
+      json: {
+        data: {
+          models: [
+            {
+              id: 'zhipuai/glm-4.6',
+              name: 'GLM-4.6',
+              available: true,
+              route_output_modalities: ['text'],
+              specification: { modalities: { input: ['text'], output: ['text'] } },
+            },
+          ],
+        },
+      },
+    })
+    inventoryLoaded = true
+  })
+  await page.route('**/api/v1/models/historical-alias/target-statuses', (route) =>
+    route.fulfill({ json: { data: [] } }),
+  )
+  await page.route('**/api/v1/models/historical-alias', async (route) => {
+    if (route.request().method() === 'GET') await route.fulfill({ json: { data: saved } })
+    else {
+      body = route.request().postDataJSON()
+      await route.fulfill({ json: { data: { ...saved, ...body } } })
+    }
+  })
+
+  await page.goto('/models/historical-alias')
+  await expect.poll(() => inventoryLoaded).toBe(true)
+  await expect(page.getByRole('radio', { checked: true })).toHaveCount(0)
+  await expect(page.locator('[data-slot="target-card"]')).toHaveCount(1)
+  await page.getByRole('radio', { name: 'Text output', exact: true }).check()
+  await expect(page.getByText(/These destinations/)).toHaveCount(0)
+  await page.getByRole('button', { name: 'Save model', exact: true }).click()
+  await expect.poll(() => body).toBeDefined()
+  expect(body?.output_modality).toBe('text')
+  // An unchanged destination is omitted from PATCH, preserving its original alias,
+  // identity, priority, timeout, retry budget, cooldown and thinking mappings.
+  expect(body).not.toHaveProperty('targets')
+})
+
+test('image-bound route switching exposes a visible unlink path without losing its draft', async ({ page }) => {
+  const saved = {
+    id: 'bound-image',
+    model_id: 'bound-image',
+    display_name: 'Image route',
+    balance: 'traffic_equalization',
+    output_modality: 'image',
+    image_generation_bound: true,
+    is_enabled: true,
+    supported_thinking_levels: [],
+    targets: [],
+  }
+  await page.route('**/api/v1/models/bound-image', (route) => route.fulfill({ json: { data: saved } }))
+  await page.route('**/api/v1/models/bound-image/target-statuses', (route) => route.fulfill({ json: { data: [] } }))
+  await page.goto('/models/bound-image')
+  await page.getByRole('radio', { name: 'Text output', exact: true }).check()
+  await page.locator('#route-display-name').fill('Unsaved switch')
+  const recovery = page.getByRole('link', { name: 'Open media generation', exact: true })
+  await expect(recovery).toHaveAttribute('href', '/media-generation')
+  await expect(recovery).toBeVisible()
+  await page.getByRole('button', { name: 'Save model', exact: true }).click()
+  await expect(page.getByRole('alert')).toContainText('Clear that reference')
+  await expect(page.locator('#route-display-name')).toHaveValue('Unsaved switch')
+  await expect(page.getByRole('radio', { name: 'Text output', exact: true })).toBeChecked()
+})
+
 test('prefilled model metadata stays clean without erasing a user draft', async ({ page }) => {
   let holdDetails = false
   let releaseDetails!: () => void
@@ -42,6 +272,7 @@ test('prefilled model metadata stays clean without erasing a user draft', async 
               source_kind: 'discovered',
               snapshot_state: { type: 'unregistered' },
               selection_policy: 'auto',
+              route_output_modalities: ['text'],
               specification: { limit: null, modalities: null },
               revision: 1,
             },
@@ -130,6 +361,8 @@ test('Models table fits the desktop content width without horizontal scrolling',
           model_id: modelId,
           display_name: modelId === 'gpt-5.6-sol' ? 'GPT 5.6 Sol' : null,
           balance: 'weighted',
+          output_modality: 'text',
+          image_generation_bound: false,
           is_enabled: true,
           targets: [
             {
@@ -137,6 +370,7 @@ test('Models table fits the desktop content width without horizontal scrolling',
               model_id: modelId,
               provider_id: 'codex',
               model: modelId,
+              route_output_modalities: ['text'],
               enabled: true,
               priority: 1,
             },
@@ -147,6 +381,7 @@ test('Models table fits the desktop content width without horizontal scrolling',
                     model_id: modelId,
                     provider_id: 'codex',
                     model: 'disabled-shadow-model',
+                    route_output_modalities: ['text'],
                     enabled: false,
                     priority: 0,
                   },
@@ -199,6 +434,7 @@ test('Model destinations summarize the preferred layer across any number of laye
     provider_id: providerId,
     model,
     model_name: modelName,
+    route_output_modalities: ['text'],
     enabled: true,
     priority,
     thinking_level_map: [],
@@ -208,6 +444,8 @@ test('Model destinations summarize the preferred layer across any number of laye
     model_id: modelId,
     display_name: null,
     balance: 'traffic_equalization',
+    output_modality: 'text',
+    image_generation_bound: false,
     is_enabled: true,
     targets,
   })
@@ -289,6 +527,8 @@ test('Mobile model links preserve new-tab navigation and keep row actions indepe
             model_id: 'mobile-model',
             display_name: 'Mobile model',
             balance: 'traffic_equalization',
+            output_modality: 'text',
+            image_generation_bound: false,
             is_enabled: true,
             targets: [],
           },
@@ -333,6 +573,8 @@ test('Model Route curl always includes the selected API Key', async ({ page }) =
             model_id: 'gpt-5.4',
             display_name: 'GPT 5.4',
             balance: 'priority',
+            output_modality: 'text',
+            image_generation_bound: false,
             target_provider: 'provider',
             target_model: 'gpt-5.4',
             is_enabled: true,
@@ -371,6 +613,8 @@ test('Model Route editor omits API Key and payload toggles', async ({ page }) =>
     model_id: 'gpt-5.4',
     display_name: 'Team GPT',
     balance: 'priority',
+    output_modality: 'text',
+    image_generation_bound: false,
     target_provider: 'provider',
     target_model: 'gpt-5.4',
     is_enabled: true,
@@ -381,6 +625,7 @@ test('Model Route editor omits API Key and payload toggles', async ({ page }) =>
         model_id: 'model-gpt',
         provider_id: 'provider',
         model: 'gpt-5.4',
+        route_output_modalities: ['text'],
         weight: 100,
         priority: 1,
         created_at: '2026-08-17T00:00:00Z',
@@ -482,6 +727,8 @@ test('Model Route editor derives thinking levels and identifies blocking destina
     target_provider: 'provider',
     target_model: 'wide-model',
     is_enabled: true,
+    output_modality: 'text',
+    image_generation_bound: false,
     created_at: '2026-08-17T00:00:00Z',
     supported_thinking_levels: ['off', 'low', 'high', 'xhigh'],
     targets: [
@@ -490,6 +737,7 @@ test('Model Route editor derives thinking levels and identifies blocking destina
         model_id: 'thinking-route',
         provider_id: 'provider',
         model: 'wide-model',
+        route_output_modalities: ['text'],
         enabled: true,
         priority: 1,
         first_token_timeout_ms: 60_000,
@@ -503,6 +751,7 @@ test('Model Route editor derives thinking levels and identifies blocking destina
         model_id: 'thinking-route',
         provider_id: 'provider',
         model: 'narrow-model',
+        route_output_modalities: ['text'],
         enabled: true,
         priority: 2,
         first_token_timeout_ms: 60_000,
@@ -516,6 +765,7 @@ test('Model Route editor derives thinking levels and identifies blocking destina
         model_id: 'thinking-route',
         provider_id: 'provider',
         model: 'retired-model',
+        route_output_modalities: ['text'],
         enabled: false,
         priority: 3,
         first_token_timeout_ms: 60_000,
@@ -562,6 +812,8 @@ test('Model Route editor derives thinking levels and identifies blocking destina
           model_id: 'thinking-route',
           display_name: null,
           balance: 'priority',
+          output_modality: 'text',
+          image_generation_bound: false,
           target_provider: 'provider',
           target_model: 'wide-model',
           is_enabled: updateBody.is_enabled,
@@ -690,6 +942,7 @@ test('Route Builder loads Provider Models and edits priority-lane destinations i
     source_kind: 'discovered',
     snapshot_state: { type: 'imported', source: { type: 'discovery' } },
     selection_policy: 'auto',
+    route_output_modalities: ['text'],
     specification: {
       limit: { context: 1050000 },
       modalities: { input: ['image', 'pdf'], output: ['text'] },
@@ -697,8 +950,14 @@ test('Route Builder loads Provider Models and edits priority-lane destinations i
     },
     revision: 1,
   }
-  const unavailable = { ...available, id: 'gpt-unavailable', name: 'GPT Unavailable', available: false }
-  const imageModel = { ...available, id: 'image-model', name: 'Image Model' }
+  const unavailable = {
+    ...available,
+    id: 'gpt-unavailable',
+    name: 'GPT Unavailable',
+    available: false,
+    route_output_modalities: [],
+  }
+  const imageModel = { ...available, id: 'image-model', name: 'Image Model', route_output_modalities: ['image'] }
   let createAttempts = 0
   let createBody: Record<string, unknown> | undefined
   let disableBody: Record<string, unknown> | undefined
@@ -715,7 +974,7 @@ test('Route Builder loads Provider Models and edits priority-lane destinations i
       return
     }
     if (path.endsWith('/models')) {
-      await route.fulfill({ json: { data: { models: [available, unavailable] } } })
+      await route.fulfill({ json: { data: { models: [available, unavailable, imageModel] } } })
       return
     }
     if (path === '/providers/provider-a/model' && request.method() === 'GET') {
@@ -802,6 +1061,7 @@ test('Route Builder loads Provider Models and edits priority-lane destinations i
 
   await page.goto('/models/new')
   await expect(page.getByRole('heading', { name: 'Add model' })).toBeVisible()
+  await expect(page.getByRole('radio', { name: 'Text output', exact: true })).toBeChecked()
   const createRouteBreadcrumb = page.getByRole('navigation', { name: 'Breadcrumb' })
   await expect(createRouteBreadcrumb.getByRole('link', { name: 'Models' })).toHaveAttribute('href', '/models')
   await expect(createRouteBreadcrumb.getByText('Create', { exact: true })).toHaveAttribute('aria-current', 'page')
@@ -836,6 +1096,7 @@ test('Route Builder loads Provider Models and edits priority-lane destinations i
   await page.getByLabel('Destination 1 model', { exact: true }).click()
   await expect(page.getByRole('option', { name: /GPT Available.*gpt-available/ })).toBeVisible()
   await expect(page.getByRole('option', { name: /GPT Unavailable/ })).toHaveCount(0)
+  await expect(page.getByRole('option', { name: /Image Model/ })).toHaveCount(0)
   await page.getByRole('option', { name: /GPT Available.*gpt-available/ }).click()
   await expect(page.getByRole('button', { name: 'Confirm', exact: true })).toBeEnabled()
   const dialogSpecification = page.getByRole('dialog').getByRole('group', { name: 'Model specification' })
@@ -925,6 +1186,7 @@ test('Route Builder loads Provider Models and edits priority-lane destinations i
   await page.getByRole('button', { name: 'Save model' }).click()
   await expect.poll(() => createAttempts).toBe(2)
   expect(createBody?.model_id).toBe('gpt-5.4')
+  expect(createBody?.output_modality).toBe('text')
   expect(createBody?.display_name).toBeNull()
   expect(createBody?.targets).toEqual([
     expect.objectContaining({ provider_id: 'provider-b', model: 'gpt-available' }),
@@ -977,6 +1239,8 @@ test('Destination status reflects runtime state without overwriting the editor d
     target_provider: 'provider',
     target_model: 'upstream-model',
     is_enabled: true,
+    output_modality: 'text',
+    image_generation_bound: false,
     created_at: '2026-08-17T00:00:00Z',
     supported_thinking_levels: [],
     targets: [
@@ -985,6 +1249,7 @@ test('Destination status reflects runtime state without overwriting the editor d
         model_id: 'status-route',
         provider_id: 'provider',
         model: 'upstream-model',
+        route_output_modalities: ['text'],
         enabled: true,
         priority: 1,
         first_token_timeout_ms: 60_000,

@@ -20,6 +20,8 @@ function provider(id: string, overrides: Partial<Provider> = {}): Provider {
 function target(providerId: string, priority: number, overrides: Partial<Target> = {}): Target {
   return {
     id: `${providerId}-${priority}`,
+    output_modality_mismatch: false,
+    route_output_modalities: ['text'],
     model_id: 'route-id',
     provider_id: providerId,
     model: `model-${providerId}`,
@@ -37,6 +39,8 @@ function target(providerId: string, priority: number, overrides: Partial<Target>
 function route(targets: Target[]): Route {
   return {
     id: 'route-id',
+    output_modality: 'text',
+    image_generation_bound: false,
     model_id: 'route',
     balance: 'traffic_equalization',
     target_provider: '',
@@ -124,7 +128,12 @@ describe('summarizeRouteDestinations', () => {
     )
 
     expect(summary.preferred).toBeNull()
-    expect(summary.unavailableReasons).toEqual({ provider_disabled: 1, credential_invalid: 1, allowance_suspended: 1 })
+    expect(summary.unavailableReasons).toEqual({
+      provider_disabled: 1,
+      credential_invalid: 1,
+      allowance_suspended: 1,
+      output_modality_mismatch: 0,
+    })
     expect(routeDestinationSeverity(summary)).toBe(3)
   })
 })

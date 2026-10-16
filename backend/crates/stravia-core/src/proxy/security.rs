@@ -479,6 +479,8 @@ mod tests {
 
     fn protected_model() -> RouteConfig {
         RouteConfig {
+            output_modality: Some(crate::db::models::RouteOutputModality::Text),
+            image_generation_bound: false,
             id: "protected-model-id".into(),
             model_id: "protected-model".into(),
             display_name: None,

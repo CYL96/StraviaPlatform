@@ -1,3 +1,4 @@
+use crate::db::models::RouteOutputModality;
 use stravia_runtime_contract::thinking::ThinkingLevel;
 
 use super::*;
@@ -7,6 +8,7 @@ struct RouteRow {
     id: String,
     model_id: String,
     display_name: Option<String>,
+    output_modality: Option<RouteOutputModality>,
     default_thinking_level: Option<String>,
     balance: String,
     is_enabled: bool,
@@ -19,6 +21,8 @@ impl RouteRow {
             id: self.id.into(),
             model_id: self.model_id.into(),
             display_name: self.display_name,
+            output_modality: self.output_modality,
+            image_generation_bound: false,
             default_thinking_level: self.default_thinking_level,
             balance: self.balance,
             is_enabled: self.is_enabled,
@@ -63,6 +67,8 @@ impl TargetRow {
             created_at: self.created_at,
             thinking_level_map: self.thinking_level_map.0,
             model_name: None,
+            output_modality_mismatch: false,
+            route_output_modalities: Vec::new(),
         }
     }
 }
@@ -92,7 +98,7 @@ pub(super) async fn load_routes(
 ) -> anyhow::Result<Vec<RouteConfig>> {
     let where_clause = if active_only { " WHERE is_enabled" } else { "" };
     let sql = format!(
-        "SELECT id, model_id, display_name, default_thinking_level, balance, \
+        "SELECT id, model_id, display_name, output_modality, default_thinking_level, balance, \
          is_enabled, \
          to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS created_at \
          FROM models{where_clause} ORDER BY created_at DESC"
@@ -130,7 +136,7 @@ pub(super) async fn load_route(
     route_id: &str,
 ) -> anyhow::Result<Option<RouteConfig>> {
     let route = sqlx::query_as::<_, RouteRow>(
-        "SELECT id, model_id, display_name, default_thinking_level, balance, \
+        "SELECT id, model_id, display_name, output_modality, default_thinking_level, balance, \
          is_enabled, \
          to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS created_at \
          FROM models WHERE model_id = $1",
@@ -230,13 +236,14 @@ impl RouteStore for PostgresRouteStore {
 
         if route.id.is_some() {
             let updated = sqlx::query(
-                "UPDATE models SET model_id = $1, display_name = $2, balance = $3, is_enabled = $4, default_thinking_level = $5 WHERE id = $6",
+                "UPDATE models SET model_id = $1, display_name = $2, balance = $3, is_enabled = $4, default_thinking_level = $5, output_modality = $6 WHERE id = $7",
             )
             .bind(route.model_id.as_str().trim())
             .bind(route.display_name.as_deref())
             .bind(route.selection_strategy.trim())
             .bind(route.is_enabled)
             .bind(route.default_thinking_level.map(ThinkingLevel::as_str))
+            .bind(route.output_modality.map(RouteOutputModality::as_str))
             .bind(&route_storage_id)
             .execute(&mut *tx)
             .await?;
@@ -245,7 +252,7 @@ impl RouteStore for PostgresRouteStore {
             }
         } else {
             sqlx::query(
-                "INSERT INTO models (id, model_id, display_name, balance, is_enabled, default_thinking_level) VALUES ($1, $2, $3, $4, $5, $6)",
+                "INSERT INTO models (id, model_id, display_name, balance, is_enabled, default_thinking_level, output_modality) VALUES ($1, $2, $3, $4, $5, $6, $7)",
             )
             .bind(&route_storage_id)
             .bind(route.model_id.as_str().trim())
@@ -253,6 +260,7 @@ impl RouteStore for PostgresRouteStore {
             .bind(route.selection_strategy.trim())
             .bind(route.is_enabled)
             .bind(route.default_thinking_level.map(ThinkingLevel::as_str))
+            .bind(route.output_modality.map(RouteOutputModality::as_str))
             .execute(&mut *tx)
             .await?;
         }

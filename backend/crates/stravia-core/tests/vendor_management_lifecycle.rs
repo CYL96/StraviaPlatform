@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
+use anyhow::Context;
 use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::extract::{Request as AxumRequest, State};
@@ -338,8 +339,9 @@ async fn sync_models(
     provider_id: &str,
 ) -> anyhow::Result<()> {
     let gw = gateway.clone();
-    let provider_id = provider_id.to_owned();
-    let sync = tokio::spawn(async move { gw.admin().sync_provider_models(&provider_id).await });
+    let task_provider_id = provider_id.to_owned();
+    let sync =
+        tokio::spawn(async move { gw.admin().sync_provider_models(&task_provider_id).await });
     let request = upstream.next().await;
     assert_eq!(request.uri.path(), "/models");
     assert_eq!(request.operation(), "model_discovery");
@@ -357,6 +359,7 @@ async fn create_route(
     gateway
         .admin()
         .create_model(CreateRoute {
+            output_modality: stravia_core::db::models::RouteOutputModality::Text,
             model_id: route_id.into(),
             display_name: Some("Management Lifecycle Route".into()),
             balance: None,
@@ -791,6 +794,7 @@ async fn suspended_provider_fails_over_without_upstream_attempt_and_returns_afte
     let route = gateway
         .admin()
         .create_model(CreateRoute {
+            output_modality: stravia_core::db::models::RouteOutputModality::Text,
             model_id: "guard-failover".into(),
             display_name: None,
             balance: None,
@@ -945,8 +949,13 @@ async fn suspended_allowance_survives_restart_and_startup_read_confirms_recovery
     let mut discovery_replied = false;
     let mut allowance_replied = false;
     while !discovery_replied || !allowance_replied {
-        let request =
-            tokio::time::timeout(std::time::Duration::from_secs(10), upstream.next()).await?;
+        let request = tokio::time::timeout(std::time::Duration::from_secs(10), upstream.next())
+            .await
+            .with_context(|| {
+                format!(
+                    "waiting for startup requests: discovery_replied={discovery_replied}, allowance_replied={allowance_replied}"
+                )
+            })?;
         match request.operation() {
             "model_discovery" => {
                 assert!(!discovery_replied);
@@ -1003,8 +1012,13 @@ async fn suspended_allowance_survives_restart_and_startup_read_confirms_recovery
         UpstreamReply::allowance("50"),
     )
     .await?;
-    let work = tokio::spawn(invoke(router, token, route.model_id.into()));
-    let request = tokio::time::timeout(std::time::Duration::from_secs(10), upstream.next()).await?;
+    let mut work = tokio::spawn(invoke(router, token, route.model_id.into()));
+    let request = tokio::select! {
+        request = tokio::time::timeout(std::time::Duration::from_secs(10), upstream.next()) => {
+            request.context("waiting for recovered inference after startup and allowance recovery")?
+        },
+        result = &mut work => panic!("restarted recovered inference ended before reaching the upstream: {result:?}"),
+    };
     assert_eq!(request.operation(), "infer");
     request.reply(UpstreamReply::inference("restarted-and-recovered"));
     assert_eq!(work.await?.0, StatusCode::OK);

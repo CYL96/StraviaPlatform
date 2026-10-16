@@ -149,23 +149,21 @@ async fn registry_failure_gates_http_native_publication_and_standalone_compactio
             use_proxy: false,
         }).await.unwrap();
         admin.create_manual_provider_model(&provider.id, "upstream-model", CreateManualProviderModel {
-            metadata: json!({"id":"upstream-model","name":"upstream-model"}),
+            metadata: json!({"id":"upstream-model","name":"upstream-model","modalities":{"input":["text"],"output":["text"]}}),
             template_id: None,
         }).await.unwrap();
-        let route = admin.create_model(CreateRoute {
-            model_id: "native-publication".into(), display_name: None, balance: None,
-            targets: vec![crate::db::models::CreateTarget {
-                            provider_id: provider.id,
-                            model: "upstream-model".into(),
-                            enabled: true,
-                            priority: None,
-                            first_token_timeout_ms: None,
-                            target_retry_budget: None,
-                            target_cooldown_ms: None,
-                            thinking_level_map: Vec::new(),
-                        }],
-            default_thinking_level: None,
-        }).await.unwrap();
+        let route = admin.create_model(CreateRoute { output_modality: crate::db::models::RouteOutputModality::Text, model_id: "native-publication".into(), display_name: None, balance: None,
+        targets: vec![crate::db::models::CreateTarget {
+                        provider_id: provider.id,
+                        model: "upstream-model".into(),
+                        enabled: true,
+                        priority: None,
+                        first_token_timeout_ms: None,
+                        target_retry_budget: None,
+                        target_cooldown_ms: None,
+                        thinking_level_map: Vec::new(),
+                    }],
+        default_thinking_level: None, }).await.unwrap();
         let key = admin.create_api_key(CreateApiKey { key: None, name: "local publication client".into(), rpm_limit: None, expires_at: None, mcp_access_enabled: false, transparent_injection_enabled: false,
         inject_web_search: false, inject_media_generation: false, inject_media_understanding: false, model_ids: vec![route.id.into()], }).await.unwrap();
         sqlx::query("CREATE TRIGGER deny_native_publication BEFORE INSERT ON native_compactions BEGIN SELECT RAISE(ABORT, 'injected registration failure'); END")
@@ -329,25 +327,23 @@ async fn inbound_responses_websocket_preserves_native_compaction_and_replays_cur
             use_proxy: false,
         }).await.unwrap();
         admin.create_manual_provider_model(&provider.id, "upstream-model", CreateManualProviderModel {
-            metadata: json!({"id":"upstream-model","name":"upstream-model"}),
+            metadata: json!({"id":"upstream-model","name":"upstream-model","modalities":{"input":["text"],"output":["text"]}}),
             template_id: None,
         }).await.unwrap();
-        let route = admin.create_model(CreateRoute {
-            model_id: "native-ws".into(),
-            display_name: None,
-            balance: None,
-            targets: vec![crate::db::models::CreateTarget {
-                            provider_id: provider.id,
-                            model: "upstream-model".into(),
-                            enabled: true,
-                            priority: None,
-                            first_token_timeout_ms: None,
-                            target_retry_budget: None,
-                            target_cooldown_ms: None,
-                            thinking_level_map: Vec::new(),
-                        }],
-            default_thinking_level: None,
-        }).await.unwrap();
+        let route = admin.create_model(CreateRoute { output_modality: crate::db::models::RouteOutputModality::Text, model_id: "native-ws".into(),
+        display_name: None,
+        balance: None,
+        targets: vec![crate::db::models::CreateTarget {
+                        provider_id: provider.id,
+                        model: "upstream-model".into(),
+                        enabled: true,
+                        priority: None,
+                        first_token_timeout_ms: None,
+                        target_retry_budget: None,
+                        target_cooldown_ms: None,
+                        thinking_level_map: Vec::new(),
+                    }],
+        default_thinking_level: None, }).await.unwrap();
         let key = admin.create_api_key(CreateApiKey { key: None,
         name: "local ingress WebSocket".into(), rpm_limit: None, expires_at: None,
         mcp_access_enabled: false,

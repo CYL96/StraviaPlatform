@@ -177,6 +177,47 @@ export function localizeBackendErrorMessage(error: unknown, locale: Locale = get
       return m.backend_error_provider_name_conflict({ name }, options)
     case 'ROUTE_ID_CONFLICT':
       return m.backend_error_route_id_conflict({ route_id: extractRouteId(payload.params) }, options)
+    case 'ROUTE_NOT_FOUND': {
+      const message = m.backend_error_route_create_before_binding({}, options)
+      const route_id = extractRouteId(payload.params)
+      return route_id ? m.backend_error_route_context({ route_id, message }, options) : message
+    }
+    case 'ROUTE_OUTPUT_MODALITY_UNCONFIGURED':
+    case 'route_output_modality_unconfigured': {
+      const message = m.backend_error_route_output_modality_unconfigured({}, options)
+      const route_id = extractRouteId(payload.params)
+      return route_id ? m.backend_error_route_context({ route_id, message }, options) : message
+    }
+    case 'ROUTE_OUTPUT_MODALITY_UNREGISTERED': {
+      const provider_id = extractString(payload.params, 'provider_id')
+      const model_id = extractString(payload.params, 'model_id')
+      return provider_id && model_id
+        ? m.backend_error_route_output_modality_unregistered_target({ provider_id, model_id }, options)
+        : m.backend_error_route_output_modality_unregistered({}, options)
+    }
+    case 'ROUTE_OUTPUT_MODALITY_MISMATCH': {
+      const provider_id = extractString(payload.params, 'provider_id')
+      const model_id = extractString(payload.params, 'model_id')
+      const modality = extractString(payload.params, 'output_modality')
+      const output =
+        modality === 'image'
+          ? m.route_output_image({}, options)
+          : modality === 'text'
+            ? m.route_output_text({}, options)
+            : modality
+      return provider_id && model_id && output
+        ? m.backend_error_route_output_modality_mismatch_target({ provider_id, model_id, output }, options)
+        : m.backend_error_route_output_modality_mismatch({}, options)
+    }
+    case 'target_output_modality_mismatch':
+      return m.backend_error_route_output_modality_mismatch({}, options)
+    case 'ROUTE_IMAGE_GENERATION_BOUND': {
+      const message = m.backend_error_route_image_generation_bound({}, options)
+      const route_id = extractRouteId(payload.params)
+      return route_id ? m.backend_error_route_context({ route_id, message }, options) : message
+    }
+    case 'route_output_modality_unavailable':
+      return m.backend_error_route_output_modality_unavailable({}, options)
     case 'API_KEY_NAME_CONFLICT':
       return m.backend_error_api_key_name_conflict({ name }, options)
     case 'PROVIDER_IN_USE': {
@@ -274,8 +315,12 @@ export function localizeBackendErrorMessage(error: unknown, locale: Locale = get
       return m.media_generation_route_required({}, options)
     case 'media_generation_route_disabled':
       return m.media_generation_route_disabled({}, options)
+    case 'media_generation_route_output_modality_mismatch':
+      return m.media_generation_route_output_modality_mismatch({}, options)
     case 'media_generation_targets_missing':
       return m.media_generation_targets_missing({}, options)
+    case 'media_generation_targets_output_modality_mismatch':
+      return m.media_generation_targets_output_modality_mismatch({}, options)
     case 'media_generation_provider_missing':
       return m.media_generation_provider_missing({}, options)
     case 'media_generation_target_incompatible':

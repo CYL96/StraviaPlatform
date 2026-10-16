@@ -342,6 +342,10 @@ fn discover(
             capabilities: vec!["tools".into()],
             metadata: BTreeMap::from([
                 (
+                    "modalities".into(),
+                    serde_json::json!({ "input": ["text"], "output": ["text"] }),
+                ),
+                (
                     "provider".into(),
                     serde_json::json!({ "fixture_version": version }),
                 ),

@@ -77,6 +77,7 @@ mod tests {
                 crate::provider_models::CreateManualProviderModel {
                     metadata: serde_json::json!({
                         "id": "tool-model",
+                        "modalities": {"input": ["text"], "output": ["text"]},
                     }),
                     template_id: None,
                 },
@@ -85,6 +86,7 @@ mod tests {
             .expect("Provider Model");
         let model = admin
             .create_model(crate::db::models::CreateRoute {
+                output_modality: crate::db::models::RouteOutputModality::Text,
                 model_id: "Search Model".into(),
                 display_name: None,
                 balance: Some("traffic_equalization".into()),

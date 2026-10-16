@@ -213,6 +213,7 @@ def _create_media_route(env: dict[str, Any], name: str) -> tuple[str, str]:
         f"{env['admin']}/api/v1/models",
         payload={
             "model_id": name,
+            "output_modality": "text",
             "display_name": f"{name} display",
             "targets": [
                 {

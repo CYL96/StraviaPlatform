@@ -224,6 +224,7 @@ export class ProviderModelEditingController {
             available: true,
             source_kind: 'manual',
             can_reimport: false,
+            route_output_modalities: [],
             selection_policy: 'auto',
             revision: 0,
             created_at: '',
@@ -292,6 +293,7 @@ export class ProviderModelEditingController {
                 detail: {
                   ...detail,
                   available: saved.available,
+                  route_output_modalities: saved.route_output_modalities,
                   selection_policy: saved.selection_policy,
                   revision: saved.revision,
                 },

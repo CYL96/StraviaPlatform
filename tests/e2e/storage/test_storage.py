@@ -315,6 +315,7 @@ def test_postgres_installs_schema_and_reconnects_without_replacing_owner(
                         "metadata": {
                             "id": "gpt-4o-mini",
                             "name": "GPT-4o mini",
+                            "modalities": {"input": ["text"], "output": ["text"]},
                         },
                     },
                     headers=headers,
@@ -326,6 +327,7 @@ def test_postgres_installs_schema_and_reconnects_without_replacing_owner(
                     f"{admin_base}/api/v1/models",
                     payload={
                         "model_id": "postgres-server-e2e-model",
+                        "output_modality": "text",
                         "display_name": "PostgreSQL server E2E model",
                         "targets": [{"provider_id": provider_id, "model": "gpt-4o-mini"}],
                     },

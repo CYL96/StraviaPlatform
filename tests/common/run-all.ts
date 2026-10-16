@@ -148,6 +148,7 @@ const localIgnored: Record<string, true> = {
   "agent::artifact::tests::postgres_download_lifecycle_survives_reconstruction": true,
   "compaction::retention_tests::postgres_retention_contracts": true,
   postgres_admin_history_preserves_batches_and_retention: true,
+  postgres_upgrade_requires_explicit_route_reconfiguration_and_preserves_identity: true,
   "browser::tests::chrome_javascript_redirect_rebinds_readiness": true,
   "browser::tests::chrome_worlds_timeout_cancel_and_profile_cleanup": true,
   "browser::tests::chrome_google_challenges_stop_before_deadline": true,

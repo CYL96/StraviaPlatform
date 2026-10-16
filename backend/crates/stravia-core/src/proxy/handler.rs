@@ -142,6 +142,7 @@ mod tests {
                     metadata: serde_json::json!({
                         "id": "provider-model",
                         "name": "provider-model",
+                        "modalities": {"input": ["text"], "output": ["text"]},
                     }),
                     template_id: None,
                 },
@@ -149,6 +150,7 @@ mod tests {
             .await
             .expect("Provider Model");
         let create_model = |model_id: &str, display_name: Option<&str>| CreateRoute {
+            output_modality: crate::db::models::RouteOutputModality::Text,
             model_id: model_id.into(),
             display_name: display_name.map(ToOwned::to_owned),
             balance: Some("traffic_equalization".into()),
@@ -361,6 +363,8 @@ mod tests {
         let storage = std::sync::Arc::new(crate::storage::MemoryStorage::new(
             Vec::new(),
             vec![RouteConfig {
+                output_modality: Some(crate::db::models::RouteOutputModality::Text),
+                image_generation_bound: false,
                 id: "model-id".into(),
                 model_id: "model".into(),
                 display_name: None,

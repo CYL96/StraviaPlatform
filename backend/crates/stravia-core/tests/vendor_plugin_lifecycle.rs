@@ -291,6 +291,7 @@ async fn connection(
                 metadata: serde_json::json!({
                     "id": "fixture-model",
                     "name": "Fixture model",
+                    "modalities": {"input": ["text"], "output": ["text"]},
                     "tool_call": true
                 }),
                 template_id: None,
@@ -300,6 +301,7 @@ async fn connection(
     let route = gateway
         .admin()
         .create_model(CreateRoute {
+            output_modality: stravia_core::db::models::RouteOutputModality::Text,
             model_id: route_id.into(),
             display_name: None,
             balance: None,

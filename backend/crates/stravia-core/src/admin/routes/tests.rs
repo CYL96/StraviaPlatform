@@ -70,6 +70,676 @@ async fn route_fixture() -> anyhow::Result<(tempfile::TempDir, Gateway, Provider
     route_fixture_with_protocol("openai-compatible").await
 }
 
+fn modality_route_input(
+    route_id: &str,
+    provider_id: &str,
+    modality: crate::db::models::RouteOutputModality,
+    models: &[(&str, bool)],
+) -> CreateRoute {
+    serde_json::from_value(json!({
+        "model_id": route_id,
+        "output_modality": modality,
+        "targets": models.iter().map(|(model, enabled)| json!({
+            "provider_id": provider_id, "model": model, "enabled": enabled
+        })).collect::<Vec<_>>()
+    }))
+    .expect("valid Route test input")
+}
+
+async fn register_output_model(
+    admin: &AdminService,
+    provider_id: &str,
+    model_id: &str,
+    metadata: serde_json::Value,
+) -> anyhow::Result<()> {
+    admin
+        .create_manual_provider_model(
+            provider_id,
+            model_id,
+            CreateManualProviderModel {
+                template_id: None,
+                metadata,
+            },
+        )
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn route_candidates_and_writes_use_registered_outputs_not_read_fallbacks()
+-> anyhow::Result<()> {
+    use crate::db::models::RouteOutputModality::{Image, Text};
+    let (_dir, gateway, provider) = route_fixture().await?;
+    let admin = gateway.admin();
+    for (id, metadata, expected) in [
+        (
+            "text",
+            json!({"modalities":{"input":["image"],"output":["text"]}}),
+            vec![Text],
+        ),
+        (
+            "image",
+            json!({"modalities":{"input":["text"],"output":["image"]}}),
+            vec![Image],
+        ),
+        (
+            "dual",
+            json!({"modalities":{"input":["text"],"output":["text","image"]}}),
+            vec![Text, Image],
+        ),
+        ("missing", json!({}), vec![]),
+        ("null-modalities", json!({"modalities":null}), vec![]),
+        (
+            "missing-output",
+            json!({"modalities":{"input":["text"]}}),
+            vec![],
+        ),
+        (
+            "empty",
+            json!({"modalities":{"input":[],"output":[]}}),
+            vec![],
+        ),
+        (
+            "audio",
+            json!({"modalities":{"input":["text"],"output":["audio"]}}),
+            vec![],
+        ),
+    ] {
+        register_output_model(&admin, &provider.id, id, metadata).await?;
+        let detail = admin.get_provider_model(&provider.id, id).await?;
+        assert_eq!(detail.route_output_modalities, expected, "{id}");
+        let summary = admin
+            .list_provider_models(&provider.id)
+            .await?
+            .models
+            .into_iter()
+            .find(|model| model.id == id)
+            .expect("registered model");
+        assert_eq!(summary.route_output_modalities, expected, "{id}");
+        if id == "missing" {
+            assert_eq!(detail.metadata.effective_modalities().output, vec!["text"]);
+        }
+        for modality in [Text, Image] {
+            let result = admin
+                .create_model(modality_route_input(
+                    &format!("{id}-{}", modality.as_str()),
+                    &provider.id,
+                    modality,
+                    &[(id, true)],
+                ))
+                .await;
+            if expected.contains(&modality) {
+                assert_eq!(result?.output_modality, Some(modality));
+            } else {
+                assert!(
+                    result
+                        .expect_err("unregistered output cannot bind")
+                        .to_string()
+                        .contains("ROUTE_OUTPUT_MODALITY_MISMATCH"),
+                    "{id}"
+                );
+            }
+        }
+    }
+    let prepared = admin
+        .prepare_provider_model(&provider.id, "prepared", None)
+        .await?;
+    register_output_model(
+        &admin,
+        &provider.id,
+        "prepared",
+        prepared.metadata.to_value()?,
+    )
+    .await?;
+    admin
+        .create_model(modality_route_input(
+            "prepared",
+            &provider.id,
+            Text,
+            &[("prepared", true)],
+        ))
+        .await?;
+    let detail = admin.get_provider_model(&provider.id, "missing").await?;
+    admin
+        .update_provider_model_selection(
+            &provider.id,
+            "missing",
+            UpdateProviderModelSelection {
+                policy: ProviderModelSelectionPolicy::ForceEnabled,
+                revision: detail.revision,
+            },
+        )
+        .await?;
+    assert!(
+        admin
+            .get_provider_model(&provider.id, "missing")
+            .await?
+            .route_output_modalities
+            .is_empty()
+    );
+    let error = admin
+        .create_model(modality_route_input(
+            "forced-unknown",
+            &provider.id,
+            Text,
+            &[("missing", true)],
+        ))
+        .await
+        .expect_err("ForceEnabled cannot invent an output declaration");
+    assert!(error.to_string().contains("ROUTE_OUTPUT_MODALITY_MISMATCH"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn route_modality_switch_validates_disabled_targets_and_is_atomic() -> anyhow::Result<()> {
+    use crate::db::models::RouteOutputModality::{Image, Text};
+    let (_dir, gateway, provider) = route_fixture().await?;
+    let admin = gateway.admin();
+    for (id, outputs) in [
+        ("image", json!(["image"])),
+        ("dual", json!(["text", "image"])),
+    ] {
+        register_output_model(
+            &admin,
+            &provider.id,
+            id,
+            json!({"modalities":{"output":outputs}}),
+        )
+        .await?;
+    }
+    let original = admin
+        .create_model(modality_route_input(
+            "switch",
+            &provider.id,
+            Text,
+            &[("dual", true), ("upstream-model", false)],
+        ))
+        .await?;
+    let error = admin
+        .update_model(
+            "switch",
+            UpdateRoute {
+                output_modality: Some(Image),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("disabled incompatible Target must block switch");
+    assert!(error.to_string().contains("ROUTE_OUTPUT_MODALITY_MISMATCH"));
+    let unchanged = admin.get_model("switch").await?;
+    assert_eq!(
+        serde_json::to_value(&unchanged)?,
+        serde_json::to_value(&original)?
+    );
+    let retained_dual_id = original
+        .targets
+        .iter()
+        .find(|target| target.model().as_str() == "dual")
+        .expect("dual Target")
+        .id
+        .clone();
+    let replacement = modality_route_input(
+        "switch",
+        &provider.id,
+        Image,
+        &[("dual", true), ("image", false)],
+    );
+    let switched = admin
+        .update_model(
+            "switch",
+            UpdateRoute {
+                output_modality: Some(Image),
+                targets: Some(replacement.targets),
+                ..Default::default()
+            },
+        )
+        .await?;
+    assert_eq!(switched.id, original.id);
+    assert_eq!(switched.output_modality, Some(Image));
+    assert_eq!(
+        switched
+            .targets
+            .iter()
+            .find(|target| target.model().as_str() == "dual")
+            .expect("retained dual Target")
+            .id,
+        retained_dual_id
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn new_target_with_same_model_suffix_must_match_route_output() -> anyhow::Result<()> {
+    use crate::db::models::RouteOutputModality::Text;
+    let (_dir, gateway, provider) = route_fixture().await?;
+    let admin = gateway.admin();
+    for (model, outputs) in [("a/model", json!(["text"])), ("b/model", json!(["image"]))] {
+        register_output_model(
+            &admin,
+            &provider.id,
+            model,
+            json!({"modalities":{"output":outputs}}),
+        )
+        .await?;
+    }
+    let original = admin
+        .create_model(modality_route_input(
+            "same-suffix",
+            &provider.id,
+            Text,
+            &[("a/model", true)],
+        ))
+        .await?;
+    let mut proposed = route_targets_for_update(&original);
+    proposed
+        .extend(modality_route_input("unused", &provider.id, Text, &[("b/model", true)]).targets);
+    let error = admin
+        .update_model(
+            "same-suffix",
+            UpdateRoute {
+                targets: Some(proposed),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("a distinct registered model must not inherit a retained Target exemption");
+    assert!(error.to_string().contains("ROUTE_OUTPUT_MODALITY_MISMATCH"));
+    let persisted = admin.get_model("same-suffix").await?;
+    assert_eq!(persisted.output_modality, Some(Text));
+    assert_eq!(persisted.targets.len(), 1);
+    assert_eq!(persisted.targets[0].id, original.targets[0].id);
+    assert_eq!(
+        persisted.targets[0].provider_id(),
+        original.targets[0].provider_id()
+    );
+    assert_eq!(persisted.targets[0].model().as_str(), "a/model");
+    assert!(persisted.targets[0].enabled);
+    Ok(())
+}
+
+#[tokio::test]
+async fn unchanged_mismatch_is_retained_but_new_disabled_mismatch_is_rejected() -> anyhow::Result<()>
+{
+    use crate::db::models::RouteOutputModality::Text;
+    let (_dir, gateway, provider) = route_fixture().await?;
+    let admin = gateway.admin();
+    let route = admin
+        .create_model(modality_route_input(
+            "drift",
+            &provider.id,
+            Text,
+            &[("upstream-model", true)],
+        ))
+        .await?;
+    let detail = admin
+        .get_provider_model(&provider.id, "upstream-model")
+        .await?;
+    admin
+        .update_provider_model(
+            &provider.id,
+            "upstream-model",
+            crate::provider_models::UpdateProviderModel {
+                revision: detail.revision,
+                metadata: json!({"modalities":{"input":["text"],"output":["image"]}}),
+            },
+        )
+        .await?;
+    let drifted = admin.get_model("drift").await?;
+    assert_eq!(drifted.targets[0].id, route.targets[0].id);
+    assert!(drifted.targets[0].output_modality_mismatch);
+    let saved = admin
+        .update_model(
+            "drift",
+            UpdateRoute {
+                targets: Some(route_targets_for_update(&drifted)),
+                ..Default::default()
+            },
+        )
+        .await?;
+    assert!(saved.targets[0].output_modality_mismatch);
+    register_output_model(
+        &admin,
+        &provider.id,
+        "image",
+        json!({"modalities":{"output":["image"]}}),
+    )
+    .await?;
+    let mut proposed = route_targets_for_update(&saved);
+    proposed
+        .extend(modality_route_input("unused", &provider.id, Text, &[("image", false)]).targets);
+    let error = admin
+        .update_model(
+            "drift",
+            UpdateRoute {
+                targets: Some(proposed),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("new disabled Target must still match");
+    assert!(error.to_string().contains("ROUTE_OUTPUT_MODALITY_MISMATCH"));
+    assert_eq!(admin.get_model("drift").await?.targets.len(), 1);
+    let detail = admin
+        .get_provider_model(&provider.id, "upstream-model")
+        .await?;
+    admin
+        .update_provider_model(
+            &provider.id,
+            "upstream-model",
+            crate::provider_models::UpdateProviderModel {
+                revision: detail.revision,
+                metadata: json!({"modalities":{"output":["text"]}}),
+            },
+        )
+        .await?;
+    let repaired = admin.get_model("drift").await?;
+    assert_eq!(repaired.targets[0].id, route.targets[0].id);
+    assert!(!repaired.targets[0].output_modality_mismatch);
+    Ok(())
+}
+
+#[tokio::test]
+async fn one_click_modality_selection_and_duplicate_binding_revalidate_outputs()
+-> anyhow::Result<()> {
+    use crate::db::models::RouteOutputModality::{Image, Text};
+    let (_dir, gateway, provider) = route_fixture().await?;
+    let admin = gateway.admin();
+    let missing_route = admin
+        .bind_route(BindRouteInput {
+            route_id: Some("not-created".into()),
+            provider_id: provider.id.clone(),
+            provider_model_id: "upstream-model".into(),
+            priority: None,
+            first_token_timeout_ms: None,
+            target_retry_budget: None,
+            target_cooldown_ms: None,
+        })
+        .await
+        .expect_err("explicit binding cannot implicitly create a Route modality");
+    assert!(missing_route.to_string().contains("ROUTE_NOT_FOUND"));
+    for (id, outputs, expected) in [
+        ("text", json!(["text"]), Some(Text)),
+        ("dual", json!(["image", "text"]), Some(Text)),
+        ("image", json!(["image"]), Some(Image)),
+        ("audio", json!(["audio"]), None),
+    ] {
+        register_output_model(
+            &admin,
+            &provider.id,
+            id,
+            json!({"modalities":{"output":outputs}}),
+        )
+        .await?;
+        let result = admin
+            .bind_route(BindRouteInput {
+                route_id: None,
+                provider_id: provider.id.clone(),
+                provider_model_id: id.into(),
+                priority: None,
+                first_token_timeout_ms: None,
+                target_retry_budget: None,
+                target_cooldown_ms: None,
+            })
+            .await;
+        if let Some(expected) = expected {
+            assert_eq!(result?.output_modality, Some(expected));
+        } else {
+            assert!(
+                result
+                    .expect_err("unsupported output must not connect")
+                    .to_string()
+                    .contains("ROUTE_OUTPUT_MODALITY_UNREGISTERED")
+            );
+        }
+    }
+    let detail = admin.get_provider_model(&provider.id, "text").await?;
+    admin
+        .update_provider_model(
+            &provider.id,
+            "text",
+            crate::provider_models::UpdateProviderModel {
+                revision: detail.revision,
+                metadata: json!({"modalities":{"output":["image"]}}),
+            },
+        )
+        .await?;
+    let error = admin
+        .bind_route(BindRouteInput {
+            route_id: None,
+            provider_id: provider.id.clone(),
+            provider_model_id: "text".into(),
+            priority: None,
+            first_token_timeout_ms: None,
+            target_retry_budget: None,
+            target_cooldown_ms: None,
+        })
+        .await
+        .expect_err("duplicate binding cannot bypass output drift");
+    assert!(error.to_string().contains("ROUTE_OUTPUT_MODALITY_MISMATCH"));
+    assert_eq!(admin.get_model("text").await?.output_modality, Some(Text));
+    let connected = admin
+        .bind_route(BindRouteInput {
+            route_id: Some("image".into()),
+            provider_id: provider.id.clone(),
+            provider_model_id: "dual".into(),
+            priority: None,
+            first_token_timeout_ms: None,
+            target_retry_budget: None,
+            target_cooldown_ms: None,
+        })
+        .await?;
+    assert_eq!(connected.output_modality, Some(Image));
+    let error = admin
+        .bind_route(BindRouteInput {
+            route_id: Some("image".into()),
+            provider_id: provider.id.clone(),
+            provider_model_id: "upstream-model".into(),
+            priority: None,
+            first_token_timeout_ms: None,
+            target_retry_budget: None,
+            target_cooldown_ms: None,
+        })
+        .await
+        .expect_err("explicit bind must obey existing image route modality");
+    assert!(error.to_string().contains("ROUTE_OUTPUT_MODALITY_MISMATCH"));
+    assert_eq!(admin.get_model("image").await?.targets.len(), 2);
+    assert!(
+        admin
+            .list_models()
+            .await?
+            .iter()
+            .all(|route| route.model_id.as_str() != "audio")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn unconfigured_route_rejects_new_same_suffix_target_but_retains_legacy_alias()
+-> anyhow::Result<()> {
+    use crate::db::models::RouteOutputModality::Text;
+    let (_dir, gateway, provider) = route_fixture().await?;
+    let admin = gateway.admin();
+    for model in ["a/model", "b/model"] {
+        register_output_model(
+            &admin,
+            &provider.id,
+            model,
+            json!({"modalities":{"output":["text"]}}),
+        )
+        .await?;
+    }
+    let original = gateway
+        .storage
+        .routes()
+        .put(PutRoute {
+            id: None,
+            model_id: "unconfigured-same-suffix".into(),
+            output_modality: None,
+            display_name: None,
+            selection_strategy: "traffic_equalization".into(),
+            is_enabled: true,
+            targets: Some(
+                modality_route_input("unused", &provider.id, Text, &[("a/model", true)]).targets,
+            ),
+            default_thinking_level: None,
+        })
+        .await?;
+    let saved = admin
+        .update_model(
+            "unconfigured-same-suffix",
+            UpdateRoute {
+                display_name: Some(Some("Retained legacy Target".into())),
+                targets: Some(route_targets_for_update(&original)),
+                ..Default::default()
+            },
+        )
+        .await?;
+    assert!(saved.output_modality.is_none());
+    assert_eq!(saved.targets[0].id, original.targets[0].id);
+    assert_eq!(saved.targets[0].model().as_str(), "a/model");
+    let mut proposed = route_targets_for_update(&saved);
+    proposed
+        .extend(modality_route_input("unused", &provider.id, Text, &[("b/model", true)]).targets);
+    let error = admin
+        .update_model(
+            "unconfigured-same-suffix",
+            UpdateRoute {
+                targets: Some(proposed),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("a distinct same-suffix Target requires an explicit Route modality");
+    assert!(
+        error
+            .to_string()
+            .contains("ROUTE_OUTPUT_MODALITY_UNCONFIGURED")
+    );
+    let persisted = admin.get_model("unconfigured-same-suffix").await?;
+    assert!(persisted.output_modality.is_none());
+    assert_eq!(persisted.targets.len(), 1);
+    assert_eq!(persisted.targets[0].id, original.targets[0].id);
+    assert_eq!(persisted.targets[0].model().as_str(), "a/model");
+    Ok(())
+}
+
+#[tokio::test]
+async fn historical_route_requires_explicit_modality_and_disabled_image_reference_blocks_text()
+-> anyhow::Result<()> {
+    use crate::db::models::RouteOutputModality::{Image, Text};
+    let (_dir, gateway, provider) = route_fixture().await?;
+    let admin = gateway.admin();
+    register_output_model(
+        &admin,
+        &provider.id,
+        "dual",
+        json!({"modalities":{"output":["text","image"]}}),
+    )
+    .await?;
+    let route = gateway
+        .storage
+        .routes()
+        .put(PutRoute {
+            id: None,
+            model_id: "historical".into(),
+            output_modality: None,
+            display_name: Some("Legacy".into()),
+            selection_strategy: "traffic_equalization".into(),
+            is_enabled: false,
+            targets: Some(
+                modality_route_input("unused", &provider.id, Text, &[("dual", true)]).targets,
+            ),
+            default_thinking_level: None,
+        })
+        .await?;
+    for update in [
+        UpdateRoute {
+            is_enabled: Some(true),
+            ..Default::default()
+        },
+        UpdateRoute {
+            display_name: Some(Some("Still historical".into())),
+            ..Default::default()
+        },
+    ] {
+        assert!(
+            admin
+                .update_model("historical", update)
+                .await?
+                .output_modality
+                .is_none()
+        );
+    }
+    let error = admin
+        .bind_route(BindRouteInput {
+            route_id: Some("historical".into()),
+            provider_id: provider.id.clone(),
+            provider_model_id: "dual".into(),
+            priority: None,
+            first_token_timeout_ms: None,
+            target_retry_budget: None,
+            target_cooldown_ms: None,
+        })
+        .await
+        .expect_err("historical duplicate binding cannot recover route");
+    assert!(
+        error
+            .to_string()
+            .contains("ROUTE_OUTPUT_MODALITY_UNCONFIGURED")
+    );
+    gateway
+        .storage
+        .settings()
+        .set(
+            crate::media_generation::config::SETTINGS_KEY,
+            &json!({"enabled":false,"image":{"route_id":"historical"}}).to_string(),
+        )
+        .await?;
+    assert!(admin.get_model("historical").await?.image_generation_bound);
+    let error = admin
+        .update_model(
+            "historical",
+            UpdateRoute {
+                output_modality: Some(Text),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("disabled image generation still retains its reference");
+    assert!(error.to_string().contains("ROUTE_IMAGE_GENERATION_BOUND"));
+    let recovered = admin
+        .update_model(
+            "historical",
+            UpdateRoute {
+                output_modality: Some(Image),
+                is_enabled: Some(false),
+                ..Default::default()
+            },
+        )
+        .await?;
+    assert_eq!(recovered.id, route.id);
+    assert!(!recovered.is_enabled);
+    assert_eq!(recovered.targets[0].id, route.targets[0].id);
+    admin
+        .update_media_generation_config(crate::media_generation::MediaGenerationConfig {
+            enabled: false,
+            image: crate::media_generation::ImageGenerationConfig { route_id: None },
+        })
+        .await?;
+    let switched = admin
+        .update_model(
+            "historical",
+            UpdateRoute {
+                output_modality: Some(Text),
+                ..Default::default()
+            },
+        )
+        .await?;
+    assert_eq!(switched.output_modality, Some(Text));
+    assert!(!switched.image_generation_bound);
+    Ok(())
+}
+
 #[tokio::test]
 async fn missing_model_modalities_default_to_text_without_overriding_declarations()
 -> anyhow::Result<()> {
@@ -142,9 +812,44 @@ async fn missing_model_modalities_default_to_text_without_overriding_declaration
 }
 
 #[test]
+fn route_creation_requires_an_explicit_supported_output_modality() {
+    for modality in [
+        None,
+        Some(json!(null)),
+        Some(json!("")),
+        Some(json!("audio")),
+    ] {
+        let mut input = json!({
+            "model_id": "client-model",
+            "targets": [{"provider_id": "provider", "model": "upstream-model"}]
+        });
+        if let Some(modality) = modality {
+            input["output_modality"] = modality;
+        }
+        assert!(serde_json::from_value::<CreateRoute>(input).is_err());
+    }
+}
+
+#[test]
+fn route_output_modality_updates_reject_null_and_unknown_without_defaulting() {
+    let omitted = serde_json::from_value::<UpdateRoute>(json!({})).expect("ordinary patch");
+    assert!(omitted.output_modality.is_none());
+    for value in [json!(null), json!(""), json!("audio")] {
+        assert!(serde_json::from_value::<UpdateRoute>(json!({"output_modality":value})).is_err());
+    }
+    assert_eq!(
+        serde_json::from_value::<UpdateRoute>(json!({"output_modality":"image"}))
+            .expect("explicit modality")
+            .output_modality,
+        Some(crate::db::models::RouteOutputModality::Image)
+    );
+}
+
+#[test]
 fn route_wire_inputs_require_targets_and_reject_legacy_fields() {
     let current = serde_json::from_value::<CreateRoute>(json!({
         "model_id": "client-model",
+        "output_modality": "text",
         "display_name": "Friendly model",
         "targets": [{"provider_id": "provider", "model": "upstream-model"}]
     }));
@@ -274,6 +979,7 @@ async fn route_default_thinking_level_round_trips_and_updates() -> anyhow::Resul
     let admin = gateway.admin();
     let route = admin
         .create_model(CreateRoute {
+            output_modality: crate::db::models::RouteOutputModality::Text,
             model_id: "default-thinking-route".into(),
             display_name: None,
             balance: None,
@@ -354,7 +1060,7 @@ async fn route_configuration_supports_three_targets_priorities_and_failure_defau
                 model,
                 CreateManualProviderModel {
                     template_id: None,
-                    metadata: json!({"id": model, "name": model}),
+                    metadata: json!({"id": model, "name": model, "modalities": {"input": ["text"], "output": ["text"]}}),
                 },
             )
             .await?;
@@ -371,6 +1077,7 @@ async fn route_configuration_supports_three_targets_priorities_and_failure_defau
     };
     let route = admin
         .create_model(CreateRoute {
+            output_modality: crate::db::models::RouteOutputModality::Text,
             model_id: "layered-route".into(),
             display_name: None,
             balance: None,
@@ -396,6 +1103,7 @@ async fn route_configuration_supports_three_targets_priorities_and_failure_defau
     for valid in [-1, 100_001, i32::MIN, i32::MAX] {
         let route = admin
             .create_model(CreateRoute {
+                output_modality: crate::db::models::RouteOutputModality::Text,
                 model_id: format!("signed-priority-{valid}"),
                 display_name: None,
                 balance: Some("traffic_equalization".into()),
@@ -408,6 +1116,7 @@ async fn route_configuration_supports_three_targets_priorities_and_failure_defau
     }
     let invalid_strategy = admin
         .create_model(CreateRoute {
+            output_modality: crate::db::models::RouteOutputModality::Text,
             model_id: "invalid-strategy".into(),
             display_name: None,
             balance: Some("weighted_random".into()),
@@ -436,7 +1145,7 @@ async fn route_configuration_round_trips_disabled_targets_and_requires_one_enabl
             "standby-model",
             CreateManualProviderModel {
                 template_id: None,
-                metadata: json!({"id": "standby-model", "name": "Standby"}),
+                metadata: json!({"id": "standby-model", "name": "Standby", "modalities": {"input": ["text"], "output": ["text"]}}),
             },
         )
         .await?;
@@ -453,6 +1162,7 @@ async fn route_configuration_round_trips_disabled_targets_and_requires_one_enabl
 
     let route = admin
         .create_model(CreateRoute {
+            output_modality: crate::db::models::RouteOutputModality::Text,
             model_id: "enabled-and-standby".into(),
             display_name: None,
             balance: None,
@@ -486,6 +1196,7 @@ async fn route_configuration_round_trips_disabled_targets_and_requires_one_enabl
 
     let error = admin
         .create_model(CreateRoute {
+            output_modality: crate::db::models::RouteOutputModality::Text,
             model_id: "all-disabled".into(),
             display_name: None,
             balance: None,
@@ -509,7 +1220,7 @@ async fn listed_routes_project_provider_model_names_for_every_target() -> anyhow
             "standby-model",
             CreateManualProviderModel {
                 template_id: None,
-                metadata: json!({"id": "standby-model", "name": "Standby"}),
+                metadata: json!({"id": "standby-model", "name": "Standby", "modalities": {"input": ["text"], "output": ["text"]}}),
             },
         )
         .await?;
@@ -525,6 +1236,7 @@ async fn listed_routes_project_provider_model_names_for_every_target() -> anyhow
     };
     admin
         .create_model(CreateRoute {
+            output_modality: crate::db::models::RouteOutputModality::Text,
             model_id: "named-targets".into(),
             display_name: None,
             balance: None,
@@ -604,6 +1316,14 @@ async fn route_ids_are_compared_exactly_when_binding() -> anyhow::Result<()> {
     let routes = RouteModule::new(&admin.gw);
 
     for route_id in ["CaseRoute", "caseroute"] {
+        admin
+            .create_model(modality_route_input(
+                route_id,
+                &provider.id,
+                crate::db::models::RouteOutputModality::Text,
+                &[("upstream-model", true)],
+            ))
+            .await?;
         routes
             .bind(RouteBind::At {
                 route_id: route_id.into(),
@@ -662,6 +1382,7 @@ async fn target_models_match_inventory_by_segment_and_case() -> anyhow::Result<(
     // Target model 与清单 ID 仅在最右段与大小写上一致时也能命中
     let route = admin
         .create_model(CreateRoute {
+            output_modality: crate::db::models::RouteOutputModality::Text,
             model_id: "glm-4.6".into(),
             display_name: None,
             balance: None,
@@ -672,9 +1393,63 @@ async fn target_models_match_inventory_by_segment_and_case() -> anyhow::Result<(
         .await?;
     assert_eq!(route.targets.len(), 1);
     assert_eq!(route.targets[0].model().as_str(), "GLM-4.6");
+    assert_eq!(
+        route.targets[0].route_output_modalities,
+        vec![crate::db::models::RouteOutputModality::Text]
+    );
     // 能力元数据经宽松匹配解析成功
     assert_eq!(route.context_window, Some(131_072));
     assert!(!route.supports_image_input);
+
+    let mut historical_target = create_target("GLM-4.6");
+    historical_target.priority = Some(17);
+    historical_target.first_token_timeout_ms = Some(45_000);
+    historical_target.target_retry_budget = Some(2);
+    historical_target.target_cooldown_ms = Some(91_000);
+    let historical = gateway
+        .storage
+        .routes()
+        .put(PutRoute {
+            id: None,
+            model_id: "historical-glm".into(),
+            output_modality: None,
+            display_name: None,
+            selection_strategy: "traffic_equalization".into(),
+            is_enabled: true,
+            targets: Some(vec![historical_target]),
+            default_thinking_level: None,
+        })
+        .await?;
+    let projected = admin.get_model("historical-glm").await?;
+    assert!(projected.targets[0].output_modality_mismatch);
+    assert_eq!(
+        projected.targets[0].route_output_modalities,
+        vec![crate::db::models::RouteOutputModality::Text]
+    );
+    let repaired = admin
+        .update_model(
+            "historical-glm",
+            UpdateRoute {
+                output_modality: Some(crate::db::models::RouteOutputModality::Text),
+                ..Default::default()
+            },
+        )
+        .await?;
+    assert_eq!(repaired.targets.len(), 1);
+    let retained = &repaired.targets[0];
+    assert_eq!(retained.id, historical.targets[0].id);
+    assert_eq!(retained.provider_id(), historical.targets[0].provider_id());
+    assert_eq!(retained.model().as_str(), "GLM-4.6");
+    assert!(retained.enabled);
+    assert_eq!(retained.priority, 17);
+    assert_eq!(retained.first_token_timeout_ms, 45_000);
+    assert_eq!(retained.target_retry_budget, 2);
+    assert_eq!(retained.target_cooldown_ms, 91_000);
+    assert_eq!(
+        retained.thinking_level_map,
+        historical.targets[0].thinking_level_map
+    );
+    assert!(!retained.output_modality_mismatch);
     Ok(())
 }
 
@@ -689,7 +1464,7 @@ async fn ambiguous_inventory_segments_keep_target_errors_visible() -> anyhow::Re
                 model,
                 CreateManualProviderModel {
                     template_id: None,
-                    metadata: json!({ "id": model, "name": model }),
+                    metadata: json!({ "id": model, "name": model, "modalities": {"input": ["text"], "output": ["text"]} }),
                 },
             )
             .await?;
@@ -705,6 +1480,7 @@ async fn ambiguous_inventory_segments_keep_target_errors_visible() -> anyhow::Re
         thinking_level_map: Vec::new(),
     };
     let input = |target: CreateTarget| CreateRoute {
+        output_modality: crate::db::models::RouteOutputModality::Text,
         model_id: "gpt-4o-route".into(),
         display_name: None,
         balance: None,
@@ -735,6 +1511,14 @@ async fn bind_treats_case_variants_of_one_inventory_model_as_a_single_target() -
     let (_data_dir, gateway, provider) = route_fixture().await?;
     let admin = gateway.admin();
     let routes = RouteModule::new(&admin.gw);
+    admin
+        .create_model(modality_route_input(
+            "cased-route",
+            &provider.id,
+            crate::db::models::RouteOutputModality::Text,
+            &[("upstream-model", true)],
+        ))
+        .await?;
 
     for provider_model_id in ["upstream-model", "Upstream-Model"] {
         routes
@@ -761,16 +1545,13 @@ async fn route_get_uses_exact_route_id_and_never_storage_id() -> anyhow::Result<
     let (_data_dir, gateway, provider) = route_fixture().await?;
     let admin = gateway.admin();
     let routes = RouteModule::new(&admin.gw);
-    let route = routes
-        .bind(RouteBind::At {
-            route_id: "ExactRoute".into(),
-            provider_id: provider.id,
-            provider_model_id: "upstream-model".into(),
-            priority: 1,
-            first_token_timeout_ms: DEFAULT_FIRST_TOKEN_TIMEOUT_MS,
-            target_retry_budget: DEFAULT_TARGET_RETRY_BUDGET,
-            target_cooldown_ms: DEFAULT_TARGET_COOLDOWN_MS,
-        })
+    let route = admin
+        .create_model(modality_route_input(
+            "ExactRoute",
+            &provider.id,
+            crate::db::models::RouteOutputModality::Text,
+            &[("upstream-model", true)],
+        ))
         .await?;
 
     assert_eq!(routes.get("ExactRoute").await?.id, route.id);
@@ -787,16 +1568,13 @@ async fn route_get_uses_exact_route_id_and_never_storage_id() -> anyhow::Result<
 async fn target_statuses_use_exact_route_id_and_never_storage_id() -> anyhow::Result<()> {
     let (_data_dir, gateway, provider) = route_fixture().await?;
     let admin = gateway.admin();
-    let route = RouteModule::new(&admin.gw)
-        .bind(RouteBind::At {
-            route_id: "ExactRoute".into(),
-            provider_id: provider.id,
-            provider_model_id: "upstream-model".into(),
-            priority: 1,
-            first_token_timeout_ms: DEFAULT_FIRST_TOKEN_TIMEOUT_MS,
-            target_retry_budget: DEFAULT_TARGET_RETRY_BUDGET,
-            target_cooldown_ms: DEFAULT_TARGET_COOLDOWN_MS,
-        })
+    let route = admin
+        .create_model(modality_route_input(
+            "ExactRoute",
+            &provider.id,
+            crate::db::models::RouteOutputModality::Text,
+            &[("upstream-model", true)],
+        ))
         .await?;
 
     let statuses = admin.get_model_target_statuses("ExactRoute").await?;
@@ -821,6 +1599,7 @@ async fn route_display_name_is_optional_normalized_and_not_an_identity() -> anyh
     let (_data_dir, gateway, provider) = route_fixture().await?;
     let admin = gateway.admin();
     let create = |model_id: &str| CreateRoute {
+        output_modality: crate::db::models::RouteOutputModality::Text,
         model_id: model_id.into(),
         display_name: Some("  Shared label  ".into()),
         balance: Some("priority".into()),
@@ -890,6 +1669,24 @@ async fn unavailable_provider_model_cannot_be_bound_as_a_new_target() -> anyhow:
             },
         )
         .await?;
+    assert!(
+        admin
+            .get_provider_model(&provider.id, "upstream-model")
+            .await?
+            .route_output_modalities
+            .is_empty()
+    );
+    assert!(
+        admin
+            .list_provider_models(&provider.id)
+            .await?
+            .models
+            .into_iter()
+            .find(|model| model.id == "upstream-model")
+            .expect("registered model")
+            .route_output_modalities
+            .is_empty()
+    );
 
     let error = RouteModule::new(&admin.gw)
         .bind(RouteBind::OneClick {
@@ -902,6 +1699,7 @@ async fn unavailable_provider_model_cannot_be_bound_as_a_new_target() -> anyhow:
     assert!(error.to_string().contains("not available"));
     let change_error = admin
         .create_model(CreateRoute {
+            output_modality: crate::db::models::RouteOutputModality::Text,
             model_id: "manual-route".into(),
             display_name: None,
             balance: None,
@@ -932,6 +1730,7 @@ async fn missing_provider_model_cannot_be_added_as_a_new_target() -> anyhow::Res
 
     let error = admin
         .create_model(CreateRoute {
+            output_modality: crate::db::models::RouteOutputModality::Text,
             model_id: "missing-model-route".into(),
             display_name: None,
             balance: None,
@@ -992,6 +1791,7 @@ async fn route_generates_seven_rows_seeds_levels_and_resets_one_override() -> an
                 template_id: None,
                 metadata: json!({
                     "id": "effort-model",
+                    "modalities": {"input": ["text"], "output": ["text"]},
                     "reasoning_efforts": ["none", "low", "high", "max"]
                 }),
             },
@@ -999,6 +1799,7 @@ async fn route_generates_seven_rows_seeds_levels_and_resets_one_override() -> an
         .await?;
     let route = admin
         .create_model(CreateRoute {
+            output_modality: crate::db::models::RouteOutputModality::Text,
             model_id: "thinking-route".into(),
             display_name: None,
             balance: None,
@@ -1097,6 +1898,7 @@ async fn open_responses_accepts_max_effort_map() -> anyhow::Result<()> {
                 template_id: None,
                 metadata: json!({
                     "id": "max-effort-model",
+                    "modalities": {"input": ["text"], "output": ["text"]},
                     "reasoning_efforts": ["none", "max"]
                 }),
             },
@@ -1105,6 +1907,7 @@ async fn open_responses_accepts_max_effort_map() -> anyhow::Result<()> {
 
     let route = admin
         .create_model(CreateRoute {
+            output_modality: crate::db::models::RouteOutputModality::Text,
             model_id: "max-effort-route".into(),
             display_name: None,
             balance: None,
@@ -1181,6 +1984,7 @@ async fn create_toggle_route(
                 metadata: json!({
                     "id": model,
                     "capabilities": capabilities,
+                    "modalities": {"input": ["text"], "output": ["text"]},
                 }),
             },
         )
@@ -1188,6 +1992,7 @@ async fn create_toggle_route(
 
     admin
         .create_model(CreateRoute {
+            output_modality: crate::db::models::RouteOutputModality::Text,
             model_id: model.into(),
             display_name: None,
             balance: None,
@@ -1354,7 +2159,8 @@ async fn unknown_compatible_provider_still_rejects_submitted_toggle_controls() {
             CreateManualProviderModel {
                 template_id: None,
                 metadata: json!({
-                    "id": "custom-toggle-model"
+                    "id": "custom-toggle-model",
+                    "modalities": {"input": ["text"], "output": ["text"]}
                 }),
             },
         )
@@ -1364,6 +2170,7 @@ async fn unknown_compatible_provider_still_rejects_submitted_toggle_controls() {
     use stravia_runtime_contract::thinking::TargetThinkingControl;
     let error = admin
         .create_model(CreateRoute {
+            output_modality: crate::db::models::RouteOutputModality::Text,
             model_id: "submitted-toggle-route".into(),
             display_name: None,
             balance: None,
@@ -1451,6 +2258,7 @@ async fn gemini_accepts_generated_effort_maps() -> anyhow::Result<()> {
                 template_id: None,
                 metadata: json!({
                     "id": "gemini-effort-model",
+                    "modalities": {"input": ["text"], "output": ["text"]},
                     "reasoning_efforts": ["low", "high"]
                 }),
             },
@@ -1459,6 +2267,7 @@ async fn gemini_accepts_generated_effort_maps() -> anyhow::Result<()> {
 
     let route = admin
         .create_model(CreateRoute {
+            output_modality: crate::db::models::RouteOutputModality::Text,
             model_id: "gemini-thinking-route".into(),
             display_name: None,
             balance: None,
@@ -1525,6 +2334,7 @@ async fn supported_levels_are_the_union_of_enabled_targets() -> anyhow::Result<(
 
     let route = admin
         .create_model(CreateRoute {
+            output_modality: crate::db::models::RouteOutputModality::Text,
             model_id: "union-route".into(),
             display_name: None,
             balance: None,
@@ -1597,6 +2407,7 @@ async fn regenerate_updates_derived_supported_levels() -> anyhow::Result<()> {
                 template_id: None,
                 metadata: json!({
                     "id": "toggle-model",
+                    "modalities": {"input": ["text"], "output": ["text"]},
                     "reasoning_efforts": ["none", "medium"]
                 }),
             },
@@ -1604,6 +2415,7 @@ async fn regenerate_updates_derived_supported_levels() -> anyhow::Result<()> {
         .await?;
     let route = admin
         .create_model(CreateRoute {
+            output_modality: crate::db::models::RouteOutputModality::Text,
             model_id: "toggle-route".into(),
             display_name: None,
             balance: None,

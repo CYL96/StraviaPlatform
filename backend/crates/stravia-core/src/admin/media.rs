@@ -139,6 +139,7 @@ mod tests {
             .expect("text-only Provider Model");
         let model = admin
             .create_model(crate::db::models::CreateRoute {
+                output_modality: crate::db::models::RouteOutputModality::Text,
                 model_id: "Visual Route".into(),
                 display_name: None,
                 balance: Some("traffic_equalization".into()),
@@ -158,6 +159,7 @@ mod tests {
             .expect("Model");
         let mixed_model = admin
             .create_model(crate::db::models::CreateRoute {
+                output_modality: crate::db::models::RouteOutputModality::Text,
                 model_id: "Mixed Route".into(),
                 display_name: None,
                 balance: Some("traffic_equalization".into()),

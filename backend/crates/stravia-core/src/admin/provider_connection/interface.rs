@@ -679,6 +679,7 @@ mod tests {
                 CreateManualProviderModel {
                     metadata: json!({
                         "id": "disposable-model",
+                        "modalities": {"input": ["text"], "output": ["text"]},
                         "name": "Disposable Model"
                     }),
                     template_id: None,
@@ -740,7 +741,7 @@ mod tests {
                 &primary.id,
                 "primary-model",
                 CreateManualProviderModel {
-                    metadata: json!({"id": "primary-model", "name": "Primary Model"}),
+                    metadata: json!({"id": "primary-model", "name": "Primary Model", "modalities": {"input": ["text"], "output": ["text"]}}),
                     template_id: None,
                 },
             )
@@ -750,13 +751,14 @@ mod tests {
                 &fallback.id,
                 "fallback-model",
                 CreateManualProviderModel {
-                    metadata: json!({"id": "fallback-model", "name": "Fallback Model"}),
+                    metadata: json!({"id": "fallback-model", "name": "Fallback Model", "modalities": {"input": ["text"], "output": ["text"]}}),
                     template_id: None,
                 },
             )
             .await?;
         admin
             .create_model(CreateRoute {
+                output_modality: crate::db::models::RouteOutputModality::Text,
                 model_id: "durable-route".into(),
                 display_name: None,
                 balance: Some("traffic_equalization".into()),

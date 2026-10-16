@@ -279,7 +279,7 @@ async fn connection(gateway: &Gateway, base_url: &str) -> anyhow::Result<Connect
             &provider.id,
             "fixture-model",
             CreateManualProviderModel {
-                metadata: serde_json::json!({"id":"fixture-model", "name":"Fixture model"}),
+                metadata: serde_json::json!({"id":"fixture-model", "name":"Fixture model", "modalities":{"input":["text"],"output":["text"]}}),
                 template_id: None,
             },
         )
@@ -287,6 +287,7 @@ async fn connection(gateway: &Gateway, base_url: &str) -> anyhow::Result<Connect
     let route = gateway
         .admin()
         .create_model(CreateRoute {
+            output_modality: stravia_core::db::models::RouteOutputModality::Text,
             model_id: "builtin-update-route".into(),
             display_name: None,
             balance: None,

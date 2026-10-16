@@ -7,6 +7,8 @@ const model: Route = {
   model_id: 'upstream-exact',
   display_name: 'My model',
   balance: 'traffic_equalization',
+  output_modality: 'text',
+  image_generation_bound: false,
   target_provider: 'provider-one',
   target_model: 'upstream-exact',
   is_enabled: true,

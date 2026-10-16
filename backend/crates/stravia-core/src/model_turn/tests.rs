@@ -100,6 +100,7 @@ async fn add_test_provider_model(gateway: &Gateway, provider_id: &str) {
                 metadata: serde_json::json!({
                     "id": "upstream-model",
                     "name": "upstream-model",
+                    "modalities": {"input": ["text"], "output": ["text"]},
                 }),
                 template_id: None,
             },
@@ -564,6 +565,7 @@ async fn gateway_with_captured_protocol(
             CreateManualProviderModel {
                 metadata: serde_json::json!({
                     "id": "upstream-model",
+                    "modalities": {"input": ["text"], "output": ["text"]},
                     "reasoning_efforts": ["none", "minimal", "low", "medium", "high"],
                 }),
                 template_id: None,
@@ -573,6 +575,7 @@ async fn gateway_with_captured_protocol(
         .expect("Provider Model with declared thinking efforts");
     let model = admin
         .create_model(CreateRoute {
+            output_modality: crate::db::models::RouteOutputModality::Text,
             model_id: model_name.into(),
             display_name: None,
             balance: None,
@@ -595,6 +598,7 @@ async fn gateway_with_captured_protocol(
     } else {
         let other_model = admin
             .create_model(CreateRoute {
+                output_modality: crate::db::models::RouteOutputModality::Text,
                 model_id: format!("{model_name}-other"),
                 display_name: None,
                 balance: None,
@@ -768,6 +772,7 @@ async fn first_token_timeout_records_one_precise_attempt_terminal_without_usage(
     add_test_provider_model(&gateway, &provider.id).await;
     let model = admin
         .create_model(CreateRoute {
+            output_modality: crate::db::models::RouteOutputModality::Text,
             model_id: "timeout-model".into(),
             display_name: None,
             balance: None,
@@ -933,6 +938,7 @@ async fn run_anthropic_reasoning_rejection(
     add_test_provider_model(&gateway, &provider.id).await;
     let model = admin
         .create_model(CreateRoute {
+            output_modality: crate::db::models::RouteOutputModality::Text,
             model_id: "rejection-model".into(),
             display_name: None,
             balance: None,
@@ -1066,6 +1072,7 @@ async fn request_scoped_http_errors_count_without_same_target_retries() {
     add_test_provider_model(&gateway, &provider.id).await;
     let model = admin
         .create_model(CreateRoute {
+            output_modality: crate::db::models::RouteOutputModality::Text,
             model_id: "request-error-model".into(),
             display_name: None,
             balance: None,
@@ -1507,6 +1514,7 @@ mod rpm_admission {
                 gateway
                     .admin()
                     .create_model(CreateRoute {
+                        output_modality: crate::db::models::RouteOutputModality::Text,
                         model_id: name.into(),
                         display_name: None,
                         balance: None,
@@ -2452,6 +2460,7 @@ async fn execute_tools_without_model_capability_declarations() {
     add_test_provider_model(&gateway, &provider.id).await;
     let model = admin
         .create_model(CreateRoute {
+            output_modality: crate::db::models::RouteOutputModality::Text,
             model_id: "no-tools-model".into(),
             display_name: None,
             balance: None,

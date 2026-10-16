@@ -1342,6 +1342,7 @@ async fn catalog_provider_without_dedicated_vendor_adapter_reaches_upstream() {
                 metadata: serde_json::json!({
                     "id": "glm-5",
                     "name": "GLM-5",
+                    "modalities": {"input": ["text"], "output": ["text"]},
                 }),
                 template_id: None,
             },
@@ -1351,6 +1352,7 @@ async fn catalog_provider_without_dedicated_vendor_adapter_reaches_upstream() {
     gateway
         .admin()
         .create_model(CreateRoute {
+            output_modality: crate::db::models::RouteOutputModality::Text,
             model_id: "gpt-5.4".into(),
             display_name: None,
             balance: None,
@@ -1563,6 +1565,7 @@ async fn unrepresentable_thinking_control_is_a_typed_422_before_upstream() {
         .storage
         .routes()
         .put(crate::db::models::PutRoute {
+            output_modality: route.output_modality,
             id: Some(route.id.clone()),
             model_id: route.model_id.clone(),
             display_name: route.display_name.clone(),

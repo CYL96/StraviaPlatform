@@ -184,6 +184,7 @@ async fn protected_responses_router_with_base_url(
             CreateManualProviderModel {
                 metadata: serde_json::json!({
                     "id": "auth-model",
+                    "modalities": {"input": ["text"], "output": ["text"]},
                     "name": "Auth model",
                     "reasoning_efforts": ["none", "low", "medium", "high", "xhigh"]
                 }),
@@ -194,6 +195,7 @@ async fn protected_responses_router_with_base_url(
         .expect("Provider Model");
     let model = admin
         .create_model(CreateRoute {
+            output_modality: crate::db::models::RouteOutputModality::Text,
             model_id: "auth-model".into(),
             display_name: None,
             balance: None,

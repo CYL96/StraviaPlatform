@@ -86,20 +86,79 @@ impl Drop for CapabilityObservation {
 }
 
 impl Gateway {
-    /// Validates every enabled destination. A mixed Route is rejected rather
-    /// than silently filtering targets and changing its scheduling policy.
+    /// Re-read both the Route and raw model declaration at the send boundary.
+    /// Prepared executions and cached selection hints never grant eligibility.
+    pub(crate) async fn route_target_output_matches(
+        &self,
+        route_id: &str,
+        provider_id: &str,
+        model_id: &str,
+    ) -> anyhow::Result<bool> {
+        let route = self
+            .storage
+            .routes()
+            .get(route_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Route is unavailable"))?;
+        let modality = route.output_modality.ok_or_else(|| {
+            anyhow::anyhow!(
+                "Route output modality is unconfigured; select and save an output modality"
+            )
+        })?;
+        if !route.is_enabled
+            || !route.targets.iter().any(|target| {
+                target.enabled
+                    && target.provider_id().as_str() == provider_id
+                    && target.model().as_str() == model_id
+            })
+        {
+            return Ok(false);
+        }
+        Ok(self
+            .storage
+            .provider_models()
+            .find(provider_id, model_id)
+            .await?
+            .is_some_and(|model| model.metadata.supports_route_output_modality(modality)))
+    }
+
+    /// Output mismatches leave scheduling eligibility first. Every remaining
+    /// enabled destination must still pass the existing adapter checks.
     pub(crate) async fn validate_vendor_route_capability(
         &self,
         route: &RouteConfig,
         capability: Capability,
     ) -> anyhow::Result<()> {
         anyhow::ensure!(route.is_enabled, "Route is disabled");
+        let modality = route.output_modality.ok_or_else(|| {
+            anyhow::anyhow!(
+                "Route output modality is unconfigured; select and save an output modality"
+            )
+        })?;
+        anyhow::ensure!(
+            capability != Capability::MediaImage
+                || modality == crate::db::models::RouteOutputModality::Image,
+            "Image generation requires an image-output Route"
+        );
         anyhow::ensure!(
             route.targets.iter().any(|target| target.enabled),
             "Route has no enabled Target"
         );
 
+        let mut matching_targets = 0;
         for target in route.targets.iter().filter(|target| target.enabled) {
+            let model = self
+                .storage
+                .provider_models()
+                .find(target.provider_id().as_str(), target.model().as_str())
+                .await?;
+            if !model
+                .as_ref()
+                .is_some_and(|model| model.metadata.supports_route_output_modality(modality))
+            {
+                continue;
+            }
+            matching_targets += 1;
             let provider = self
                 .storage
                 .providers()
@@ -120,11 +179,6 @@ impl Gateway {
                 .iter()
                 .find(|channel| channel.id == channel_id)
                 .ok_or_else(|| anyhow::anyhow!("Target Provider channel is unavailable"))?;
-            let model = self
-                .storage
-                .provider_models()
-                .find(target.provider_id().as_str(), target.model().as_str())
-                .await?;
             super::validate_target_capability(
                 channel,
                 target.model().as_str(),
@@ -132,6 +186,10 @@ impl Gateway {
                 capability,
             )?;
         }
+        anyhow::ensure!(
+            matching_targets > 0,
+            "Route has no output-modality-matching Target"
+        );
         Ok(())
     }
 
@@ -323,6 +381,13 @@ impl Gateway {
                 if !policy.retry_current() {
                     break;
                 }
+                if !self.route_target_output_matches(
+                    &route.model_id,
+                    target.provider_id().as_str(),
+                    target.model().as_str(),
+                ).await? {
+                    break;
+                }
                 let sent = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let result = if let Some(failure) = preparation_failure {
                     Err(failure)
@@ -418,14 +483,14 @@ impl Gateway {
                         if let Some(error) = failure.error.downcast_ref::<super::ModelTurnError>()
                             && matches!(
                                 error.code.as_str(),
-                                "target_rpm_busy" | "target_ineligible"
+                                "target_rpm_busy" | "target_ineligible" | "target_output_modality_mismatch"
                             )
                         {
                             if !sent.load(std::sync::atomic::Ordering::Acquire) {
                                 policy.release_unsent_exception();
                             }
                             policy.skip_current();
-                            if error.code == "target_ineligible" {
+                            if matches!(error.code.as_str(), "target_ineligible" | "target_output_modality_mismatch") {
                                 excluded.insert(selected_target_key(&target));
                                 last_error = Some(failure);
                             }
@@ -701,6 +766,9 @@ async fn any_vendor_cancelled(vendor_leases: &BTreeMap<String, PreparedVendorExe
 
 fn selection_error(error: SelectionError) -> anyhow::Error {
     match error {
+        SelectionError::UnconfiguredRoute => anyhow::anyhow!(
+            "Route output modality is unconfigured; select and save an output modality"
+        ),
         SelectionError::SchedulingEvidence(source) => {
             source.context("Route scheduling is unavailable")
         }

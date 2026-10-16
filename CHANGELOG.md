@@ -2,8 +2,15 @@
 
 ## Unreleased
 
+### Changed
+
+- **Breaking — all historical Routes require reconfiguration:** SQLite and PostgreSQL incremental migration `0021` leaves every existing Route nonexecutable until an administrator explicitly selects text or image output, fixes mismatched Targets, and saves each Route. Route IDs, Targets, scheduling parameters, enabled preferences, and image-generation references are retained; toggling enabled, ordinary edits, and repeated OneClick onboarding do not restore execution. Stop the instance and back up the complete data directory and any external database before upgrading; reopen traffic only after reconfiguration. Rollback requires restoring the pre-upgrade backup, not running an older binary against the upgraded schema.
+- Routes now have one text or image output purpose, validated against raw Provider Model output declarations rather than text display fallback or image input support. Missing and explicitly empty declarations do not qualify; dual-output models can serve either purpose. Only OneClick infers a new Route's purpose (text first, otherwise image); explicit binding requires an existing Route. Declaration drift retains Targets but excludes mismatches from execution while eligible Targets continue; other media adapter incompatibilities still reject. Image generation requires an image Route, and its reference blocks conversion to text even while disabled; explicitly unbind it, optionally disabling the feature in the same save. See [Media Generation](docs/design/media-generation.md).
+
 ### Fixed
 
+- Historical Route destinations whose model aliases resolve through the saved service inventory can now be explicitly reconfigured for a supported output without replacing their original aliases or scheduling settings.
+- Interaction Observation now links a request resumed after client-side compaction to the turn it actually continues, instead of an earlier turn whose retained answer happened to be longer. Among matching delivered sources, the one ending latest in the replayed history wins; reasoning replayed with unchanged encrypted content or signature no longer cuts off the final turn, while changed or missing opaque state still blocks the match. Only newly admitted requests are affected; existing Observations are not regrouped. See [Interaction Observation](docs/design/interaction-observation.md).
 - CI now reuses successful complete checks for the exact same commit across `dev`, `main`, and Release, or waits for an existing automatic CI run instead of starting another full test matrix. PR merge checks and explicit manual/cache-warm runs remain independent; failed, cancelled, partial, or unavailable evidence cannot authorize a release.
 
 ## [0.5.1] - 2026-10-16

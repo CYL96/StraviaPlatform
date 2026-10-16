@@ -30,6 +30,7 @@ async fn media_only_injection_rejects_guessed_search_before_research_execution()
     let admin = gateway.admin();
     let parent = admin
         .create_model(CreateRoute {
+            output_modality: crate::db::models::RouteOutputModality::Text,
             model_id: "read-scope-parent".into(),
             display_name: None,
             balance: None,
@@ -180,6 +181,7 @@ async fn non_vision_parent_uses_capability_owned_media_model() {
         .expect("parent Provider Model");
     let parent_model = admin
         .create_model(CreateRoute {
+            output_modality: crate::db::models::RouteOutputModality::Text,
             model_id: "text-parent".into(),
             display_name: None,
             balance: None,
@@ -233,6 +235,7 @@ async fn non_vision_parent_uses_capability_owned_media_model() {
         .expect("Media Provider Model");
     let media_model = admin
         .create_model(CreateRoute {
+            output_modality: crate::db::models::RouteOutputModality::Text,
             model_id: "media-vision".into(),
             display_name: None,
             balance: None,
@@ -478,11 +481,12 @@ impl stravia_runtime_contract::hook::HookSession for ClearHiddenMediaPlanSession
 }
 
 #[tokio::test]
-async fn mixed_media_route_prefers_native_targets_and_rejects_targets_without_tools() {
+async fn mixed_media_route_prefers_eligible_native_then_bridges_after_output_drift() {
     let (native_url, native_calls, native_requests) =
         serve_openai_sequence_with_requests(vec![openai_response("native vision")]).await;
-    let (bridge_url, bridge_calls) =
-        serve_openai_sequence(vec![openai_response("bridge must not run")]).await;
+    let (bridge_url, bridge_calls, bridge_requests) =
+        serve_openai_sequence_with_requests(vec![openai_response("bridge after output drift")])
+            .await;
     let (no_tools_url, no_tools_calls) =
         serve_openai_sequence(vec![openai_response("unsupported must not run")]).await;
     let data_dir = tempfile::tempdir().expect("temporary data directory");
@@ -532,6 +536,7 @@ async fn mixed_media_route_prefers_native_targets_and_rejects_targets_without_to
     let mixed_model = gateway
         .admin()
         .create_model(CreateRoute {
+            output_modality: crate::db::models::RouteOutputModality::Text,
             model_id: "mixed-media".into(),
             display_name: None,
             balance: Some("traffic_equalization".into()),
@@ -547,7 +552,7 @@ async fn mixed_media_route_prefers_native_targets_and_rejects_targets_without_to
                     thinking_level_map: Vec::new(),
                 },
                 CreateTarget {
-                    provider_id: native.id,
+                    provider_id: native.id.clone(),
                     model: "native".into(),
                     enabled: true,
                     priority: Some(2),
@@ -564,6 +569,7 @@ async fn mixed_media_route_prefers_native_targets_and_rejects_targets_without_to
     let unsupported_model = gateway
         .admin()
         .create_model(CreateRoute {
+            output_modality: crate::db::models::RouteOutputModality::Text,
             model_id: "unsupported-media".into(),
             display_name: None,
             balance: None,
@@ -581,6 +587,52 @@ async fn mixed_media_route_prefers_native_targets_and_rejects_targets_without_to
         })
         .await
         .expect("unsupported Media Model");
+    gateway
+        .admin()
+        .create_manual_provider_model(
+            &native.id,
+            "media-reader",
+            crate::provider_models::CreateManualProviderModel {
+                metadata: serde_json::json!({
+                    "id": "media-reader",
+                    "reasoning_efforts": ["medium"],
+                    "modalities": {"input": ["text", "image"], "output": ["text"]}
+                }),
+                template_id: None,
+            },
+        )
+        .await
+        .expect("independent Media Understanding Provider Model");
+    let media_model = gateway
+        .admin()
+        .create_model(CreateRoute {
+            output_modality: crate::db::models::RouteOutputModality::Text,
+            model_id: "drift-media-reader".into(),
+            display_name: None,
+            balance: None,
+            targets: vec![CreateTarget {
+                provider_id: native.id.clone(),
+                model: "media-reader".into(),
+                enabled: true,
+                priority: None,
+                first_token_timeout_ms: None,
+                target_retry_budget: None,
+                target_cooldown_ms: None,
+                thinking_level_map: Vec::new(),
+            }],
+            default_thinking_level: None,
+        })
+        .await
+        .expect("independent Media Understanding Route");
+    gateway
+        .admin()
+        .update_media_understanding_config(stravia_media::admin::MediaUnderstandingConfigUpdate {
+            enabled: true,
+            model_id: Some(media_model.id.into()),
+            thinking_level: Some(stravia_runtime_contract::thinking::ThinkingLevel::Medium),
+        })
+        .await
+        .expect("enable Media Understanding for bridge");
     let key = gateway
         .admin()
         .create_api_key(crate::db::models::CreateApiKey {
@@ -589,11 +641,11 @@ async fn mixed_media_route_prefers_native_targets_and_rejects_targets_without_to
             rpm_limit: None,
             expires_at: None,
             mcp_access_enabled: false,
-            transparent_injection_enabled: false,
+            transparent_injection_enabled: true,
             inject_web_search: false,
             inject_media_generation: false,
             model_ids: vec![mixed_model.id.into(), unsupported_model.id.into()],
-            inject_media_understanding: false,
+            inject_media_understanding: true,
         })
         .await
         .expect("Media API key");
@@ -647,6 +699,64 @@ async fn mixed_media_route_prefers_native_targets_and_rejects_targets_without_to
         "{native_request}"
     );
 
+    let detail = gateway
+        .admin()
+        .get_provider_model(&native.id, "native")
+        .await
+        .expect("native Provider Model before drift");
+    gateway
+        .admin()
+        .update_provider_model(
+            &native.id,
+            "native",
+            crate::provider_models::UpdateProviderModel {
+                revision: detail.revision,
+                metadata: serde_json::json!({
+                    "id": "native",
+                    "attachment": true,
+                    "tool_call": false,
+                    "modalities": {"input": ["text", "image"], "output": ["image"]}
+                }),
+            },
+        )
+        .await
+        .expect("native Target loses text output");
+    let bridge_response = execute_non_stream_request_with_headers(
+        gateway.clone(),
+        headers.clone(),
+        image_request("mixed-media"),
+    )
+    .await;
+    let status = bridge_response.status();
+    let body = to_bytes(bridge_response.into_body(), usize::MAX)
+        .await
+        .expect("bridge response body");
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(
+        native_calls.load(Ordering::SeqCst),
+        1,
+        "output-ineligible native Target must not receive another request"
+    );
+    assert_eq!(bridge_calls.load(Ordering::SeqCst), 1);
+    let bridge_request = bridge_requests
+        .lock()
+        .first()
+        .cloned()
+        .expect("eligible bridge Provider request");
+    assert!(
+        bridge_request.contains("Image 1: [stravia://artifacts/"),
+        "bridge must preserve the image through an Artifact marker: {bridge_request}"
+    );
+
+    gateway
+        .admin()
+        .update_media_understanding_config(stravia_media::admin::MediaUnderstandingConfigUpdate {
+            enabled: false,
+            model_id: None,
+            thinking_level: None,
+        })
+        .await
+        .expect("restore unavailable bridge for unsupported Target assertion");
     let unsupported_response = execute_non_stream_request_with_headers(
         gateway,
         headers,
@@ -677,6 +787,94 @@ fn attachment_request(model: &str, data: &str) -> AiRequest {
             meta: None,
         }],
     )
+}
+
+#[tokio::test]
+async fn historical_route_with_image_input_requires_reconfiguration_before_media_planning() {
+    let (base_url, calls) =
+        serve_openai_sequence(vec![openai_response("must not receive historical request")]).await;
+    let data_dir = tempfile::tempdir().expect("temporary data directory");
+    let gateway = Gateway::new(crate::config::GatewayConfig {
+        data_dir: data_dir.path().to_path_buf(),
+        ..Default::default()
+    })
+    .await
+    .expect("Gateway");
+    let route_id = configure_route_with_id(&gateway, "historical-media", &[base_url]).await;
+    let route = gateway
+        .storage
+        .routes()
+        .list()
+        .await
+        .expect("Routes")
+        .into_iter()
+        .find(|route| route.id == route_id)
+        .expect("configured text-only Route");
+    gateway
+        .storage
+        .routes()
+        .put(crate::db::models::PutRoute {
+            output_modality: None,
+            id: Some(route.id),
+            model_id: route.model_id,
+            display_name: route.display_name,
+            selection_strategy: route.balance,
+            is_enabled: route.is_enabled,
+            targets: Some(
+                route
+                    .targets
+                    .iter()
+                    .map(|target| CreateTarget {
+                        provider_id: target.provider_id().clone().into(),
+                        model: target.model().clone().into(),
+                        enabled: target.enabled,
+                        priority: Some(target.priority),
+                        first_token_timeout_ms: Some(target.first_token_timeout_ms),
+                        target_retry_budget: Some(target.target_retry_budget),
+                        target_cooldown_ms: Some(target.target_cooldown_ms),
+                        thinking_level_map: target.thinking_level_map.clone(),
+                    })
+                    .collect(),
+            ),
+            default_thinking_level: None,
+        })
+        .await
+        .expect("seed historical unconfigured Route");
+    gateway
+        .model_cache
+        .write()
+        .await
+        .reload(gateway.storage.routes())
+        .await
+        .expect("reload historical Route");
+    let headers = authorized_headers(&gateway).await;
+    let response = execute_non_stream_request_with_headers(
+        gateway,
+        headers,
+        attachment_request(
+            "historical-media",
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+        ),
+    )
+    .await;
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("historical Route rejection body");
+    let body: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON rejection");
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(
+        body["error"]["code"], "route_output_modality_unconfigured",
+        "{body}"
+    );
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .expect("error message")
+            .contains("historical-media"),
+        "{body}"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]

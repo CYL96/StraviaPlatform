@@ -409,6 +409,8 @@ def test_model_history_identity_and_preferences_survive_restart_rename_delete_re
 
 def test_existing_target_follows_synced_availability_without_losing_binding_or_overrides(sync_env):
     env = sync_env
+    alpha_metadata = {"id": "alpha", "modalities": {"input": ["text"], "output": ["text"]}}
+    env["upstream"]["body"] = {"data": [alpha_metadata, {"id": "beta"}]}
     provider, path = _provider(env)
     _api(env, f"{path}/models/sync", "POST", {})
     route = _create_model(env, provider, "availability-route", target_model="alpha")
@@ -441,7 +443,7 @@ def test_existing_target_follows_synced_availability_without_losing_binding_or_o
         "model_id": "alpha", "revision": alpha["revision"], "policy": "force_enabled",
     })
     send(True)
-    env["upstream"]["body"] = {"data": [{"id": "alpha", "status": "deprecated"}, {"id": "beta"}]}
+    env["upstream"]["body"] = {"data": [{**alpha_metadata, "status": "deprecated"}, {"id": "beta"}]}
     _api(env, f"{path}/models/sync", "POST", {})
     assert _model(env, path, "alpha")["selection_policy"] == "force_enabled"
     send(True)
@@ -450,7 +452,7 @@ def test_existing_target_follows_synced_availability_without_losing_binding_or_o
         "model_id": "alpha", "revision": alpha["revision"], "policy": "auto",
     })
     send(False)
-    env["upstream"]["body"] = {"data": [{"id": "alpha"}, {"id": "beta"}]}
+    env["upstream"]["body"] = {"data": [alpha_metadata, {"id": "beta"}]}
     _api(env, f"{path}/models/sync", "POST", {})
     send(True)
     alpha = _model(env, path, "alpha")

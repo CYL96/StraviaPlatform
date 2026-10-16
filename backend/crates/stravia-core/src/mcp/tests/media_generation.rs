@@ -172,13 +172,14 @@ async fn generation_app() -> GenerationApp {
         .await
         .unwrap();
     app.gateway.admin().create_manual_provider_model(&provider.id, "gpt-5.4", crate::provider_models::CreateManualProviderModel {
-        metadata: json!({"id":"gpt-5.4","name":"Local GPT","attachment":true,"tool_call":true,"capabilities":["media_image"],"modalities":{"input":["text","image"],"output":["text"]}}),
+        metadata: json!({"id":"gpt-5.4","name":"Local GPT","attachment":true,"tool_call":true,"capabilities":["media_image"],"modalities":{"input":["text","image"],"output":["text","image"]}}),
         template_id: None,
     }).await.unwrap();
     let route = app
         .gateway
         .admin()
         .create_model(CreateRoute {
+            output_modality: crate::db::models::RouteOutputModality::Image,
             model_id: "image-generation".into(),
             display_name: Some("Image generation".into()),
             balance: None,
@@ -246,6 +247,170 @@ async fn call_generate(client: &SdkClient, input: Value) -> rmcp::model::CallToo
         )
         .await
         .unwrap()
+}
+
+#[tokio::test]
+async fn registered_image_output_changes_gate_real_requests_and_recover_the_same_binding() {
+    let fixture = generation_app().await;
+    let admin = fixture.app.gateway.admin();
+    let route = admin.get_model(&fixture.route_id).await.unwrap();
+    let provider_id = route.targets[0].provider_id().as_str();
+    let original_model = admin
+        .get_provider_model(provider_id, "gpt-5.4")
+        .await
+        .unwrap();
+    let mut fallback_metadata = serde_json::to_value(original_model.metadata).unwrap();
+    fallback_metadata["id"] = json!("gpt-5.3-codex");
+    admin
+        .create_manual_provider_model(
+            provider_id,
+            "gpt-5.3-codex",
+            crate::provider_models::CreateManualProviderModel {
+                metadata: fallback_metadata,
+                template_id: None,
+            },
+        )
+        .await
+        .unwrap();
+    let make_target = |model: &str, priority| CreateTarget {
+        provider_id: provider_id.into(),
+        model: model.into(),
+        enabled: true,
+        priority: Some(priority),
+        first_token_timeout_ms: None,
+        target_retry_budget: Some(0),
+        target_cooldown_ms: None,
+        thinking_level_map: Vec::new(),
+    };
+    admin
+        .update_model(
+            &fixture.route_id,
+            crate::db::models::UpdateRoute {
+                targets: Some(vec![
+                    make_target("gpt-5.4", 100),
+                    make_target("gpt-5.3-codex", 0),
+                ]),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let bound = admin.get_model(&fixture.route_id).await.unwrap();
+    let original_target_id = bound
+        .targets
+        .iter()
+        .find(|target| target.model().as_str() == "gpt-5.4")
+        .unwrap()
+        .id
+        .clone();
+    let client = connect(&fixture.app).await;
+
+    let first = call_generate(
+        &client,
+        json!({"type":"image","input":{"prompt":"Before change"}}),
+    )
+    .await;
+    assert_ne!(first.is_error, Some(true), "{first:?}");
+    assert_eq!(fixture.requests.lock().len(), 1);
+    assert_eq!(fixture.requests.lock()[0]["model"], "gpt-5.4");
+
+    let model = admin
+        .get_provider_model(provider_id, "gpt-5.4")
+        .await
+        .unwrap();
+    let mut metadata = serde_json::to_value(model.metadata).unwrap();
+    metadata["modalities"]["output"] = json!(["text"]);
+    admin
+        .update_provider_model(
+            provider_id,
+            "gpt-5.4",
+            crate::provider_models::UpdateProviderModel {
+                metadata,
+                revision: model.revision,
+            },
+        )
+        .await
+        .unwrap();
+    let fallback = call_generate(
+        &client,
+        json!({"type":"image","input":{"prompt":"Use conforming fallback"}}),
+    )
+    .await;
+    assert_ne!(fallback.is_error, Some(true), "{fallback:?}");
+    assert_eq!(fixture.requests.lock().len(), 2);
+    assert_eq!(
+        fixture.requests.lock()[1]["model"],
+        "gpt-5.3-codex",
+        "only the still-conforming Target may receive a request"
+    );
+    let model = admin
+        .get_provider_model(provider_id, "gpt-5.3-codex")
+        .await
+        .unwrap();
+    let mut metadata = serde_json::to_value(model.metadata).unwrap();
+    metadata["modalities"]["output"] = json!(["text"]);
+    admin
+        .update_provider_model(
+            provider_id,
+            "gpt-5.3-codex",
+            crate::provider_models::UpdateProviderModel {
+                metadata,
+                revision: model.revision,
+            },
+        )
+        .await
+        .unwrap();
+    let rejected = call_generate(
+        &client,
+        json!({"type":"image","input":{"prompt":"Must not send"}}),
+    )
+    .await;
+    assert_eq!(rejected.is_error, Some(true), "{rejected:?}");
+    assert_eq!(
+        fixture.requests.lock().len(),
+        2,
+        "mismatched Targets must receive zero additional requests"
+    );
+    let retained = admin.get_model(&fixture.route_id).await.unwrap();
+    let original = retained
+        .targets
+        .iter()
+        .find(|target| target.id == original_target_id)
+        .unwrap();
+    assert!(original.output_modality_mismatch);
+
+    let model = admin
+        .get_provider_model(provider_id, "gpt-5.4")
+        .await
+        .unwrap();
+    let mut metadata = serde_json::to_value(model.metadata).unwrap();
+    metadata["modalities"]["output"] = json!(["text", "image"]);
+    admin
+        .update_provider_model(
+            provider_id,
+            "gpt-5.4",
+            crate::provider_models::UpdateProviderModel {
+                metadata,
+                revision: model.revision,
+            },
+        )
+        .await
+        .unwrap();
+    let recovered = call_generate(
+        &client,
+        json!({"type":"image","input":{"prompt":"After repair"}}),
+    )
+    .await;
+    assert_ne!(recovered.is_error, Some(true), "{recovered:?}");
+    assert_eq!(fixture.requests.lock().len(), 3);
+    assert_eq!(fixture.requests.lock()[2]["model"], "gpt-5.4");
+    let repaired = admin.get_model(&fixture.route_id).await.unwrap();
+    let original = repaired
+        .targets
+        .iter()
+        .find(|target| target.id == original_target_id)
+        .unwrap();
+    assert!(!original.output_modality_mismatch);
 }
 
 async fn upload_image(app: &TestApp, bytes: Vec<u8>, mime: &str) -> String {
@@ -491,7 +656,7 @@ async fn route_failover_handles_typed_status_and_transport_failures() {
                 provider,
                 "gpt-5.2",
                 crate::provider_models::CreateManualProviderModel {
-                    metadata: json!({"id":"gpt-5.2","name":"Fallback GPT","tool_call":true,"capabilities":["media_image"]}),
+                    metadata: json!({"id":"gpt-5.2","name":"Fallback GPT","tool_call":true,"capabilities":["media_image"],"modalities":{"input":["text","image"],"output":["text","image"]}}),
                     template_id: None,
                 },
             )

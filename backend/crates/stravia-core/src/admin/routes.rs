@@ -95,9 +95,16 @@ impl<'a> RouteModule<'a> {
             .collect())
     }
 
-    pub(crate) async fn create(&self, mut input: CreateRoute) -> anyhow::Result<RouteConfig> {
+    pub(crate) async fn create(&self, input: CreateRoute) -> anyhow::Result<RouteConfig> {
+        let _guard = self.gw.route_media_mutation.lock().await;
+        self.create_locked(input).await
+    }
+
+    async fn create_locked(&self, mut input: CreateRoute) -> anyhow::Result<RouteConfig> {
         ensure_route_targets_valid(&input.targets)?;
         self.ensure_new_targets_available(&[], &input.targets)
+            .await?;
+        self.ensure_targets_match(input.output_modality, &[], &input.targets, true)
             .await?;
         self.prepare_thinking_maps(&[], &mut input.targets).await?;
         self.ensure_thinking_controls_representable(&input.targets)
@@ -108,18 +115,111 @@ impl<'a> RouteModule<'a> {
     pub(crate) async fn change(
         &self,
         route_id: &str,
+        input: UpdateRoute,
+    ) -> anyhow::Result<RouteConfig> {
+        let _guard = self.gw.route_media_mutation.lock().await;
+        self.change_locked(route_id, input).await
+    }
+
+    async fn change_locked(
+        &self,
+        route_id: &str,
         mut input: UpdateRoute,
     ) -> anyhow::Result<RouteConfig> {
         let current = self.get(route_id).await?;
-        if let Some(targets) = input.targets.as_mut() {
+        if let Some(modality) = input.output_modality {
+            if modality == crate::db::models::RouteOutputModality::Text
+                && crate::media_generation::config::load(self.gw)
+                    .await?
+                    .image
+                    .route_id
+                    .as_deref()
+                    == Some(current.model_id.as_str())
+            {
+                return Err(coded_error(
+                    "ROUTE_IMAGE_GENERATION_BOUND",
+                    "Unbind this Route in image generation configuration before selecting text output",
+                    serde_json::json!({"route_id": route_id, "action": "unbind_image_generation"}),
+                ));
+            }
+            let retained;
+            let targets = match input.targets.as_deref() {
+                Some(targets) => targets,
+                None => {
+                    retained = route_targets_for_update(&current);
+                    &retained
+                }
+            };
             ensure_route_targets_valid(targets)?;
             self.ensure_new_targets_available(&current.targets, targets)
                 .await?;
+            self.ensure_targets_match(modality, &[], targets, true)
+                .await?;
+        } else if let Some(targets) = input.targets.as_deref() {
+            let adds_target = targets.iter().any(|target| {
+                !current.targets.iter().any(|existing| {
+                    existing.provider_id().as_str() == target.provider_id.trim()
+                        && existing.model().as_str() == target.model.trim()
+                })
+            });
+            if let Some(modality) = current.output_modality {
+                self.ensure_targets_match(modality, &current.targets, targets, false)
+                    .await?;
+            } else if adds_target {
+                return Err(route_unconfigured_error(route_id));
+            }
+        }
+        if let Some(targets) = input.targets.as_mut() {
+            if input.output_modality.is_none() {
+                ensure_route_targets_valid(targets)?;
+                self.ensure_new_targets_available(&current.targets, targets)
+                    .await?;
+            }
             self.prepare_thinking_maps(&current.targets, targets)
                 .await?;
             self.ensure_thinking_controls_representable(targets).await?;
         }
         self.change_record(route_id, input).await
+    }
+
+    async fn ensure_targets_match(
+        &self,
+        modality: crate::db::models::RouteOutputModality,
+        existing: &[TargetConfig],
+        proposed: &[CreateTarget],
+        validate_all: bool,
+    ) -> anyhow::Result<()> {
+        for target in proposed {
+            if !validate_all
+                && existing.iter().any(|current| {
+                    current.provider_id().as_str() == target.provider_id.trim()
+                        && current.model().as_str() == target.model.trim()
+                })
+            {
+                continue;
+            }
+            let provider_id = target.provider_id.trim();
+            let model_id = normalize_model_id(&target.model)?;
+            let record = self
+                .gw
+                .storage
+                .provider_models()
+                .find(provider_id, &model_id)
+                .await?;
+            if !record
+                .is_some_and(|record| record.metadata.supports_route_output_modality(modality))
+            {
+                return Err(coded_error(
+                    "ROUTE_OUTPUT_MODALITY_MISMATCH",
+                    "Remove or replace the Target, or register its matching output modality",
+                    serde_json::json!({
+                        "provider_id": provider_id, "model_id": model_id,
+                        "output_modality": modality, "action": "repair_target_output_modality"
+                    }),
+                ));
+            }
+        }
+        Ok(())
     }
 
     async fn ensure_new_targets_available(
@@ -288,6 +388,8 @@ impl<'a> RouteModule<'a> {
     }
 
     pub(crate) async fn bind(&self, input: RouteBind) -> anyhow::Result<RouteConfig> {
+        let _guard = self.gw.route_media_mutation.lock().await;
+        let one_click = matches!(&input, RouteBind::OneClick { .. });
         let (
             route_id,
             provider_id,
@@ -346,20 +448,17 @@ impl<'a> RouteModule<'a> {
         let route_id = normalize_name(&route_id, "model ID sent by clients")?;
         let provider_model_id = normalize_model_id(&provider_model_id)?;
         let mut existing = self.gw.storage.routes().get(&route_id).await?;
+        if existing.is_none() && !one_click {
+            return Err(coded_error(
+                "ROUTE_NOT_FOUND",
+                "Create the Route with an explicit output modality before binding a Target",
+                serde_json::json!({"route_id": route_id, "action": "create_route"}),
+            ));
+        }
         if let Some(route) = existing.as_mut() {
             self.refresh_route_target_projections(std::slice::from_mut(route))
                 .await?;
         }
-        if let Some(existing) = existing.as_ref()
-            && existing.targets.iter().any(|target| {
-                target.provider_id().as_str() == provider_id
-                    && model_id_match_key(target.model().as_str())
-                        == model_id_match_key(&provider_model_id)
-            })
-        {
-            return Ok(existing.clone());
-        }
-
         self.get_provider(&provider_id).await?;
         let provider_model = self
             .gw
@@ -377,21 +476,62 @@ impl<'a> RouteModule<'a> {
                     }),
                 )
             })?;
+        let modality = match existing.as_ref() {
+            Some(route) => route
+                .output_modality
+                .ok_or_else(|| route_unconfigured_error(&route_id))?,
+            None => [
+                crate::db::models::RouteOutputModality::Text,
+                crate::db::models::RouteOutputModality::Image,
+            ]
+            .into_iter()
+            .find(|modality| {
+                provider_model
+                    .metadata
+                    .supports_route_output_modality(*modality)
+            })
+            .ok_or_else(|| {
+                coded_error(
+                    "ROUTE_OUTPUT_MODALITY_UNREGISTERED",
+                    "Register text or image output before connecting this Provider Model",
+                    serde_json::json!({"provider_id": provider_id, "model_id": provider_model_id,
+                        "action": "register_output_modality"}),
+                )
+            })?,
+        };
+        if !provider_model
+            .metadata
+            .supports_route_output_modality(modality)
+        {
+            return Err(coded_error(
+                "ROUTE_OUTPUT_MODALITY_MISMATCH",
+                "Select a matching Route or manually reconfigure its output modality",
+                serde_json::json!({"route_id": route_id, "provider_id": provider_id,
+                    "model_id": provider_model_id, "output_modality": modality,
+                    "action": "reconfigure_route"}),
+            ));
+        }
+        if let Some(route) = existing.as_ref()
+            && route.targets.iter().any(|target| {
+                target.provider_id().as_str() == provider_id
+                    && same_target_model(target.model().as_str(), &provider_model_id)
+            })
+        {
+            return Ok(route.clone());
+        }
         if !provider_model.effective_available() {
             return Err(coded_error(
                 "PROVIDER_MODEL_UNAVAILABLE",
                 "Provider Model is not available for a new Target",
-                serde_json::json!({
-                    "provider_id": provider_id,
-                    "model_id": provider_model_id,
-                }),
+                serde_json::json!({"provider_id": provider_id, "model_id": provider_model_id}),
             ));
         }
 
         let Some(existing) = existing else {
             return self
-                .create(CreateRoute {
+                .create_locked(CreateRoute {
                     model_id: route_id,
+                    output_modality: modality,
                     display_name: provider_model.metadata.name,
                     balance: Some("traffic_equalization".into()),
                     default_thinking_level: None,
@@ -408,13 +548,6 @@ impl<'a> RouteModule<'a> {
                 })
                 .await;
         };
-        if existing.targets.iter().any(|target| {
-            target.provider_id().as_str() == provider_id
-                && target.model().as_str() == provider_model_id.as_str()
-        }) {
-            return Ok(existing);
-        }
-
         let mut targets = existing
             .targets
             .iter()
@@ -439,7 +572,7 @@ impl<'a> RouteModule<'a> {
             target_cooldown_ms: Some(target_cooldown_ms),
             thinking_level_map: Vec::new(),
         });
-        self.change(
+        self.change_locked(
             &existing.model_id,
             UpdateRoute {
                 targets: Some(targets),
@@ -559,6 +692,14 @@ impl AdminService {
 
 fn same_target_model(left: &str, right: &str) -> bool {
     model_id_match_key(left) == model_id_match_key(right)
+}
+
+fn route_unconfigured_error(route_id: &str) -> anyhow::Error {
+    coded_error(
+        "ROUTE_OUTPUT_MODALITY_UNCONFIGURED",
+        "Explicitly select an output modality and repair all Targets before using this Route",
+        serde_json::json!({"route_id": route_id, "action": "reconfigure_route"}),
+    )
 }
 
 fn route_targets_for_update(route: &RouteConfig) -> Vec<CreateTarget> {

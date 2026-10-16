@@ -55,6 +55,7 @@ async fn execute_fails_over_before_canonical_output_and_returns_the_locked_targe
     }
     let model = admin
         .create_model(CreateRoute {
+            output_modality: crate::db::models::RouteOutputModality::Text,
             model_id: "failover-model".into(),
             display_name: None,
             balance: Some("traffic_equalization".into()),
@@ -151,6 +152,7 @@ async fn http_continuation_not_retained_by_zdr_replays_full_request_once() {
     add_test_provider_model(&gateway, &provider.id).await;
     let model = admin
         .create_model(CreateRoute {
+            output_modality: crate::db::models::RouteOutputModality::Text,
             model_id: "zdr-model".into(),
             display_name: None,
             balance: None,
@@ -272,6 +274,7 @@ async fn execute_does_not_fail_over_after_the_first_canonical_delta() {
     }
     let model = admin
         .create_model(CreateRoute {
+            output_modality: crate::db::models::RouteOutputModality::Text,
             model_id: "stream-lock-model".into(),
             display_name: None,
             balance: Some("traffic_equalization".into()),

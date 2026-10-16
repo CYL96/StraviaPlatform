@@ -334,8 +334,8 @@ def provisioning(session, upstreams: dict[str, Upstream]) -> tuple[str, dict[str
         model = "benchmark-" + protocol
         suffix = "/v1" if protocol in PROTOCOLS[:2] else ""
         provider = post("/api/v1/providers", {"name": model, "source": {"type": "custom", "vendor": "custom", "channel": "default", "protocol": PROVIDERS[protocol], "base_url": f"http://127.0.0.1:{upstream.server_port}{suffix}"}, "credential": {"type": "api_key", "value": "benchmark-only"}, "vendor_options": {}})
-        post(f"/api/v1/providers/{provider['id']}/models", {"model_id": model, "metadata": {}}, 201)
-        route = post("/api/v1/models", {"model_id": model, "targets": [{"provider_id": provider["id"], "model": model}]})
+        post(f"/api/v1/providers/{provider['id']}/models", {"model_id": model, "metadata": {"modalities": {"input": ["text"], "output": ["text"]}}}, 201)
+        route = post("/api/v1/models", {"model_id": model, "output_modality": "text", "targets": [{"provider_id": provider["id"], "model": model}]})
         routes[protocol] = str(route["id"])
     key = post("/api/v1/api-keys", {"name": "isolated-protocol-benchmark", "model_ids": list(routes.values())})["key"]
     return key, routes

@@ -28,6 +28,7 @@ use super::selector::{
 /// Why selection could not produce a policy.
 #[derive(Debug)]
 pub(crate) enum SelectionError {
+    UnconfiguredRoute,
     /// Scheduling evidence (usage stats, provider-model cost join) failed to load.
     SchedulingEvidence(anyhow::Error),
     /// Eligibility filtering left the Route without any Target to attempt.
@@ -86,6 +87,7 @@ impl RouteSelector {
         cooldown: &CooldownAttempts,
         parent_target: &crate::router::GenerationParentTarget,
     ) -> Result<RouteAttemptPolicy, SelectionError> {
+        let eligible = self.output_eligible_targets(route).await?;
         let conversation = conversation_identity(request);
         let conversation_affinity_target = match (&conversation, parent_target) {
             (
@@ -122,6 +124,7 @@ impl RouteSelector {
             &snapshot,
             self.policy_state.clone(),
         );
+        policy.retain(|target| eligible.contains(&selected_target_key(target)));
         if let Some(plan) = media_plan {
             policy.retain(|target| plan.target_keys.contains(&selected_target_key(target)));
         }
@@ -158,6 +161,7 @@ impl RouteSelector {
         observer: Option<&RunObserver>,
         cooldown: &CooldownAttempts,
     ) -> Result<RouteAttemptPolicy, SelectionError> {
+        let eligible = self.output_eligible_targets(route).await?;
         let snapshot = self
             .scheduling_snapshot(&route.targets, observer)
             .await
@@ -172,13 +176,14 @@ impl RouteSelector {
             estimated_uncached_input_tokens: estimated_input_tokens,
             now_ms: self.policy_state.now_ms(),
         };
-        let policy = RouteAttemptPolicy::new(
+        let mut policy = RouteAttemptPolicy::new(
             &route.balance,
             &route.targets,
             context,
             &snapshot,
             self.policy_state.clone(),
         );
+        policy.retain(|target| eligible.contains(&selected_target_key(target)));
         if policy.is_empty() {
             return Err(self
                 .empty_selection_error(route, &snapshot)
@@ -186,6 +191,31 @@ impl RouteSelector {
                 .map_err(SelectionError::SchedulingEvidence)?);
         }
         Ok(policy)
+    }
+
+    async fn output_eligible_targets(
+        &self,
+        route: &RouteConfig,
+    ) -> Result<std::collections::HashSet<String>, SelectionError> {
+        let modality = route
+            .output_modality
+            .ok_or(SelectionError::UnconfiguredRoute)?;
+        let mut eligible = std::collections::HashSet::new();
+        for target in route.targets.iter().filter(|target| target.enabled) {
+            let model = self
+                .storage
+                .provider_models()
+                .find(target.provider_id().as_str(), target.model().as_str())
+                .await
+                .map_err(SelectionError::SchedulingEvidence)?;
+            if model.is_some_and(|model| model.metadata.supports_route_output_modality(modality)) {
+                eligible.insert(target_key(
+                    target.provider_id().as_str(),
+                    target.model().as_str(),
+                ));
+            }
+        }
+        Ok(eligible)
     }
 
     async fn empty_selection_error(
@@ -366,6 +396,8 @@ mod tests {
 
     fn target(provider: &str, priority: i32) -> TargetConfig {
         TargetConfig {
+            output_modality_mismatch: false,
+            route_output_modalities: Vec::new(),
             id: format!("target-{provider}").into(),
             model_id: "route".into(),
             destination: crate::db::identity::TargetDestination::Model {
@@ -385,6 +417,8 @@ mod tests {
 
     fn route(targets: Vec<TargetConfig>) -> RouteConfig {
         RouteConfig {
+            output_modality: Some(crate::db::models::RouteOutputModality::Text),
+            image_generation_bound: false,
             id: "route-id".into(),
             model_id: "route".into(),
             display_name: None,
@@ -444,6 +478,7 @@ mod tests {
     }
 
     struct Fixture {
+        storage: DynStorage,
         selector: RouteSelector,
         policy_state: RoutePolicyState,
         cache_affinity: CacheAffinity,
@@ -454,6 +489,7 @@ mod tests {
         let cache_affinity = CacheAffinity::new(runtime_cache.clone());
         let policy_state = RoutePolicyState::new(runtime_cache);
         Fixture {
+            storage: storage.clone(),
             selector: RouteSelector::new(
                 storage,
                 cache_affinity.clone(),
@@ -467,6 +503,40 @@ mod tests {
 
     fn memory() -> DynStorage {
         Arc::new(MemoryStorage::new(Vec::new(), Vec::new(), Vec::new()))
+    }
+
+    async fn register_targets(storage: &DynStorage, route: &RouteConfig) {
+        let models = storage.provider_models();
+        for target in &route.targets {
+            if models
+                .get(target.provider_id(), target.model())
+                .await
+                .expect("fixture model lookup")
+                .is_some()
+            {
+                continue;
+            }
+            let mutation = models
+                .create(
+                    NewProviderModelRecord {
+                        provider_id: target.provider_id().clone().into(),
+                        model_id: target.model().clone().into(),
+                        source_kind: ProviderModelSourceKind::Manual,
+                        snapshot_state: SnapshotState::Edited { source: None },
+                        metadata_source_provider_id: None,
+                        presence: ProviderModelPresence::Present,
+                        selection_policy: ProviderModelSelectionPolicy::Auto,
+                        metadata: ProviderModelMetadata {
+                            modalities: Some(crate::provider_models::ModelModalities::text_only()),
+                            ..Default::default()
+                        },
+                    },
+                    None,
+                )
+                .await
+                .expect("register route target");
+            assert!(matches!(mutation, ProviderModelMutation::Applied(_)));
+        }
     }
 
     fn no_continuation() -> Arc<dyn ContinuationLookup> {
@@ -781,20 +851,23 @@ mod tests {
     async fn select_orders_targets_by_signed_priority() {
         let fixture = fixture(memory(), no_continuation());
         let route = route(vec![target("low", 0), target("high", 10)]);
-        let mut policy = fixture
-            .selector
-            .select(
-                &principal(),
-                &route,
-                &request(),
-                None,
-                None,
-                estimate_uncached_input_tokens(&request()),
-                &CooldownAttempts::default(),
-                &crate::router::GenerationParentTarget::Unresolved,
-            )
-            .await
-            .expect("select");
+        let mut policy = {
+            register_targets(&fixture.storage, &route).await;
+            fixture
+                .selector
+                .select(
+                    &principal(),
+                    &route,
+                    &request(),
+                    None,
+                    None,
+                    estimate_uncached_input_tokens(&request()),
+                    &CooldownAttempts::default(),
+                    &crate::router::GenerationParentTarget::Unresolved,
+                )
+                .await
+        }
+        .expect("select");
 
         assert_eq!(next_provider(&mut policy).as_deref(), Some("high"));
         assert_eq!(next_provider(&mut policy).as_deref(), Some("low"));
@@ -807,20 +880,23 @@ mod tests {
         cooling.target_retry_budget = 0;
         let route = route(vec![cooling, target("healthy", 0)]);
 
-        let mut first = fixture
-            .selector
-            .select(
-                &principal(),
-                &route,
-                &request(),
-                None,
-                None,
-                estimate_uncached_input_tokens(&request()),
-                &CooldownAttempts::default(),
-                &crate::router::GenerationParentTarget::Unresolved,
-            )
-            .await
-            .expect("first select");
+        let mut first = {
+            register_targets(&fixture.storage, &route).await;
+            fixture
+                .selector
+                .select(
+                    &principal(),
+                    &route,
+                    &request(),
+                    None,
+                    None,
+                    estimate_uncached_input_tokens(&request()),
+                    &CooldownAttempts::default(),
+                    &crate::router::GenerationParentTarget::Unresolved,
+                )
+                .await
+        }
+        .expect("first select");
         let failed = first.next_healthy().expect("cooling target selected first");
         assert_eq!(failed.provider_id().as_str(), "cooling");
         assert_eq!(
@@ -838,20 +914,23 @@ mod tests {
         );
         drop(first);
 
-        let mut second = fixture
-            .selector
-            .select(
-                &principal(),
-                &route,
-                &request(),
-                None,
-                None,
-                estimate_uncached_input_tokens(&request()),
-                &CooldownAttempts::default(),
-                &crate::router::GenerationParentTarget::Unresolved,
-            )
-            .await
-            .expect("second select");
+        let mut second = {
+            register_targets(&fixture.storage, &route).await;
+            fixture
+                .selector
+                .select(
+                    &principal(),
+                    &route,
+                    &request(),
+                    None,
+                    None,
+                    estimate_uncached_input_tokens(&request()),
+                    &CooldownAttempts::default(),
+                    &crate::router::GenerationParentTarget::Unresolved,
+                )
+                .await
+        }
+        .expect("second select");
         assert_eq!(next_provider(&mut second).as_deref(), Some("healthy"));
         assert_eq!(next_provider(&mut second), None);
     }
@@ -877,20 +956,23 @@ mod tests {
         );
         let route = route(vec![target("primary", 10), target("affinity", 0)]);
 
-        let mut policy = fixture
-            .selector
-            .select(
-                &principal(),
-                &route,
-                &request,
-                None,
-                None,
-                estimate_uncached_input_tokens(&request),
-                &CooldownAttempts::default(),
-                &crate::router::GenerationParentTarget::Unresolved,
-            )
-            .await
-            .expect("select");
+        let mut policy = {
+            register_targets(&fixture.storage, &route).await;
+            fixture
+                .selector
+                .select(
+                    &principal(),
+                    &route,
+                    &request,
+                    None,
+                    None,
+                    estimate_uncached_input_tokens(&request),
+                    &CooldownAttempts::default(),
+                    &crate::router::GenerationParentTarget::Unresolved,
+                )
+                .await
+        }
+        .expect("select");
         assert_eq!(next_provider(&mut policy).as_deref(), Some("affinity"));
     }
 
@@ -910,39 +992,45 @@ mod tests {
             .await;
         let route = route(vec![target("primary", 10), target("affinity", 0)]);
 
-        let mut policy = fixture
-            .selector
-            .select(
-                &principal(),
-                &route,
-                &seeded,
-                None,
-                None,
-                estimate_uncached_input_tokens(&seeded),
-                &CooldownAttempts::default(),
-                &crate::router::GenerationParentTarget::Unresolved,
-            )
-            .await
-            .expect("select");
+        let mut policy = {
+            register_targets(&fixture.storage, &route).await;
+            fixture
+                .selector
+                .select(
+                    &principal(),
+                    &route,
+                    &seeded,
+                    None,
+                    None,
+                    estimate_uncached_input_tokens(&seeded),
+                    &CooldownAttempts::default(),
+                    &crate::router::GenerationParentTarget::Unresolved,
+                )
+                .await
+        }
+        .expect("select");
         assert_eq!(next_provider(&mut policy).as_deref(), Some("affinity"));
 
         // A conversation identity suppresses the cache hint entirely.
         let mut identified = request();
         identified.parameters.cache.key = Some("chat-b".into());
-        let mut identified_policy = fixture
-            .selector
-            .select(
-                &principal(),
-                &route,
-                &identified,
-                None,
-                None,
-                estimate_uncached_input_tokens(&identified),
-                &CooldownAttempts::default(),
-                &crate::router::GenerationParentTarget::Unresolved,
-            )
-            .await
-            .expect("select with conversation");
+        let mut identified_policy = {
+            register_targets(&fixture.storage, &route).await;
+            fixture
+                .selector
+                .select(
+                    &principal(),
+                    &route,
+                    &identified,
+                    None,
+                    None,
+                    estimate_uncached_input_tokens(&identified),
+                    &CooldownAttempts::default(),
+                    &crate::router::GenerationParentTarget::Unresolved,
+                )
+                .await
+        }
+        .expect("select with conversation");
         assert_eq!(
             next_provider(&mut identified_policy).as_deref(),
             Some("primary")
@@ -958,20 +1046,23 @@ mod tests {
         let route = route(vec![target("primary", 10), target("continued", 0)]);
         let mut request = request();
         request.parameters.cache.key = Some("chat-c".into());
-        let mut policy = fixture
-            .selector
-            .select(
-                &principal(),
-                &route,
-                &request,
-                None,
-                None,
-                estimate_uncached_input_tokens(&request),
-                &CooldownAttempts::default(),
-                &crate::router::GenerationParentTarget::Unresolved,
-            )
-            .await
-            .expect("select prompt-cache conversation");
+        let mut policy = {
+            register_targets(&fixture.storage, &route).await;
+            fixture
+                .selector
+                .select(
+                    &principal(),
+                    &route,
+                    &request,
+                    None,
+                    None,
+                    estimate_uncached_input_tokens(&request),
+                    &CooldownAttempts::default(),
+                    &crate::router::GenerationParentTarget::Unresolved,
+                )
+                .await
+        }
+        .expect("select prompt-cache conversation");
         assert_eq!(next_provider(&mut policy).as_deref(), Some("primary"));
     }
 
@@ -983,17 +1074,20 @@ mod tests {
         );
         let route = route(vec![target("research", 10), target("continued", 0)]);
 
-        let mut policy = fixture
-            .selector
-            .select_independent(
-                &principal(),
-                &route,
-                12_345,
-                None,
-                &CooldownAttempts::default(),
-            )
-            .await
-            .expect("independent selection");
+        let mut policy = {
+            register_targets(&fixture.storage, &route).await;
+            fixture
+                .selector
+                .select_independent(
+                    &principal(),
+                    &route,
+                    12_345,
+                    None,
+                    &CooldownAttempts::default(),
+                )
+                .await
+        }
+        .expect("independent selection");
         let selected = policy.next_healthy().expect("Model Target");
 
         assert_eq!(selected.provider_id().as_str(), "research");
@@ -1068,20 +1162,23 @@ mod tests {
                 target("earlier", 5),
                 target("continued", 0),
             ]);
-            let mut policy = fixture
-                .selector
-                .select(
-                    &owner,
-                    &route,
-                    child.request(),
-                    None,
-                    None,
-                    estimate_uncached_input_tokens(child.request()),
-                    &CooldownAttempts::default(),
-                    &child.parent_target(),
-                )
-                .await
-                .expect("select resolved parent");
+            let mut policy = {
+                register_targets(&fixture.storage, &route).await;
+                fixture
+                    .selector
+                    .select(
+                        &owner,
+                        &route,
+                        child.request(),
+                        None,
+                        None,
+                        estimate_uncached_input_tokens(child.request()),
+                        &CooldownAttempts::default(),
+                        &child.parent_target(),
+                    )
+                    .await
+            }
+            .expect("select resolved parent");
             assert_eq!(
                 next_provider(&mut policy).as_deref(),
                 Some("continued"),
@@ -1108,20 +1205,23 @@ mod tests {
         assert_eq!(foreign.parent_id(), None);
         let fixture = fixture(memory(), chain.continuation_lookup());
         let route = route(vec![target("primary", 10), target("continued", 0)]);
-        let mut policy = fixture
-            .selector
-            .select(
-                &Principal::new("another-owner"),
-                &route,
-                foreign.request(),
-                None,
-                None,
-                estimate_uncached_input_tokens(foreign.request()),
-                &CooldownAttempts::default(),
-                &foreign.parent_target(),
-            )
-            .await
-            .expect("select isolated principal");
+        let mut policy = {
+            register_targets(&fixture.storage, &route).await;
+            fixture
+                .selector
+                .select(
+                    &Principal::new("another-owner"),
+                    &route,
+                    foreign.request(),
+                    None,
+                    None,
+                    estimate_uncached_input_tokens(foreign.request()),
+                    &CooldownAttempts::default(),
+                    &foreign.parent_target(),
+                )
+                .await
+        }
+        .expect("select isolated principal");
         assert_eq!(next_provider(&mut policy).as_deref(), Some("primary"));
     }
 
@@ -1183,20 +1283,23 @@ mod tests {
             .expect("custom-store parent");
         let fixture = fixture(memory(), chain.continuation_lookup());
         let route = route(vec![target("primary", 10), target("continued", 0)]);
-        let mut policy = fixture
-            .selector
-            .select(
-                &owner,
-                &route,
-                child.request(),
-                None,
-                None,
-                estimate_uncached_input_tokens(child.request()),
-                &CooldownAttempts::default(),
-                &child.parent_target(),
-            )
-            .await
-            .expect("select custom-store continuation");
+        let mut policy = {
+            register_targets(&fixture.storage, &route).await;
+            fixture
+                .selector
+                .select(
+                    &owner,
+                    &route,
+                    child.request(),
+                    None,
+                    None,
+                    estimate_uncached_input_tokens(child.request()),
+                    &CooldownAttempts::default(),
+                    &child.parent_target(),
+                )
+                .await
+        }
+        .expect("select custom-store continuation");
         assert_eq!(next_provider(&mut policy).as_deref(), Some("continued"));
     }
 
@@ -1234,20 +1337,23 @@ mod tests {
             Arc::new(StaticContinuation(Some("continued:model".into()))),
         );
         let route = route(vec![target("primary", 10), target("continued", 0)]);
-        let mut policy = fixture
-            .selector
-            .select(
-                &owner,
-                &route,
-                child.request(),
-                None,
-                None,
-                estimate_uncached_input_tokens(child.request()),
-                &CooldownAttempts::default(),
-                &child.parent_target(),
-            )
-            .await
-            .expect("select Hook continuation");
+        let mut policy = {
+            register_targets(&fixture.storage, &route).await;
+            fixture
+                .selector
+                .select(
+                    &owner,
+                    &route,
+                    child.request(),
+                    None,
+                    None,
+                    estimate_uncached_input_tokens(child.request()),
+                    &CooldownAttempts::default(),
+                    &child.parent_target(),
+                )
+                .await
+        }
+        .expect("select Hook continuation");
         assert_eq!(next_provider(&mut policy).as_deref(), Some("primary"));
     }
 
@@ -1293,20 +1399,23 @@ mod tests {
                 "continued:model",
                 expires_at,
             );
-            let mut policy = fixture
-                .selector
-                .select(
-                    &principal(),
-                    &route,
-                    &request,
-                    None,
-                    None,
-                    estimate_uncached_input_tokens(&request),
-                    &CooldownAttempts::default(),
-                    &evidence,
-                )
-                .await
-                .expect("select without invalid preference");
+            let mut policy = {
+                register_targets(&fixture.storage, &route).await;
+                fixture
+                    .selector
+                    .select(
+                        &principal(),
+                        &route,
+                        &request,
+                        None,
+                        None,
+                        estimate_uncached_input_tokens(&request),
+                        &CooldownAttempts::default(),
+                        &evidence,
+                    )
+                    .await
+            }
+            .expect("select without invalid preference");
             assert_eq!(next_provider(&mut policy).as_deref(), Some("primary"));
         }
     }
@@ -1321,20 +1430,23 @@ mod tests {
         crate::router::stamp_previous_response_id(&mut request, "parent-2");
         let route = route(vec![target("primary", 10), target("continued", 0)]);
 
-        let mut policy = fixture
-            .selector
-            .select(
-                &principal(),
-                &route,
-                &request,
-                None,
-                None,
-                estimate_uncached_input_tokens(&request),
-                &CooldownAttempts::default(),
-                &crate::router::GenerationParentTarget::Unresolved,
-            )
-            .await
-            .expect("select");
+        let mut policy = {
+            register_targets(&fixture.storage, &route).await;
+            fixture
+                .selector
+                .select(
+                    &principal(),
+                    &route,
+                    &request,
+                    None,
+                    None,
+                    estimate_uncached_input_tokens(&request),
+                    &CooldownAttempts::default(),
+                    &crate::router::GenerationParentTarget::Unresolved,
+                )
+                .await
+        }
+        .expect("select");
         assert_eq!(next_provider(&mut policy).as_deref(), Some("continued"));
     }
 
@@ -1348,20 +1460,23 @@ mod tests {
             source_artifact_ids: Vec::new(),
         };
 
-        let mut policy = fixture
-            .selector
-            .select(
-                &principal(),
-                &route,
-                &request(),
-                Some(&plan),
-                None,
-                estimate_uncached_input_tokens(&request()),
-                &CooldownAttempts::default(),
-                &crate::router::GenerationParentTarget::Unresolved,
-            )
-            .await
-            .expect("select");
+        let mut policy = {
+            register_targets(&fixture.storage, &route).await;
+            fixture
+                .selector
+                .select(
+                    &principal(),
+                    &route,
+                    &request(),
+                    Some(&plan),
+                    None,
+                    estimate_uncached_input_tokens(&request()),
+                    &CooldownAttempts::default(),
+                    &crate::router::GenerationParentTarget::Unresolved,
+                )
+                .await
+        }
+        .expect("select");
         assert_eq!(next_provider(&mut policy).as_deref(), Some("native"));
         assert_eq!(next_provider(&mut policy), None);
 
@@ -1370,21 +1485,24 @@ mod tests {
             target_keys: vec!["missing:model".into()],
             source_artifact_ids: Vec::new(),
         };
-        let error = fixture
-            .selector
-            .select(
-                &principal(),
-                &route,
-                &request(),
-                Some(&empty_plan),
-                None,
-                estimate_uncached_input_tokens(&request()),
-                &CooldownAttempts::default(),
-                &crate::router::GenerationParentTarget::Unresolved,
-            )
-            .await
-            .err()
-            .expect("plan without candidates");
+        let error = {
+            register_targets(&fixture.storage, &route).await;
+            fixture
+                .selector
+                .select(
+                    &principal(),
+                    &route,
+                    &request(),
+                    Some(&empty_plan),
+                    None,
+                    estimate_uncached_input_tokens(&request()),
+                    &CooldownAttempts::default(),
+                    &crate::router::GenerationParentTarget::Unresolved,
+                )
+                .await
+        }
+        .err()
+        .expect("plan without candidates");
         assert!(matches!(error, SelectionError::MediaPlanExhausted));
     }
 
@@ -1395,21 +1513,24 @@ mod tests {
         disabled.enabled = false;
         let route = route(vec![disabled]);
 
-        let error = fixture
-            .selector
-            .select(
-                &principal(),
-                &route,
-                &request(),
-                None,
-                None,
-                estimate_uncached_input_tokens(&request()),
-                &CooldownAttempts::default(),
-                &crate::router::GenerationParentTarget::Unresolved,
-            )
-            .await
-            .err()
-            .expect("no eligible target");
+        let error = {
+            register_targets(&fixture.storage, &route).await;
+            fixture
+                .selector
+                .select(
+                    &principal(),
+                    &route,
+                    &request(),
+                    None,
+                    None,
+                    estimate_uncached_input_tokens(&request()),
+                    &CooldownAttempts::default(),
+                    &crate::router::GenerationParentTarget::Unresolved,
+                )
+                .await
+        }
+        .err()
+        .expect("no eligible target");
         assert!(matches!(error, SelectionError::NoEligibleTarget));
     }
 
@@ -1419,21 +1540,24 @@ mod tests {
         let fixture = fixture(storage, no_continuation());
         let route = route(vec![target("a", 0)]);
 
-        let error = fixture
-            .selector
-            .select(
-                &principal(),
-                &route,
-                &request(),
-                None,
-                None,
-                estimate_uncached_input_tokens(&request()),
-                &CooldownAttempts::default(),
-                &crate::router::GenerationParentTarget::Unresolved,
-            )
-            .await
-            .err()
-            .expect("evidence failure");
+        let error = {
+            register_targets(&fixture.storage, &route).await;
+            fixture
+                .selector
+                .select(
+                    &principal(),
+                    &route,
+                    &request(),
+                    None,
+                    None,
+                    estimate_uncached_input_tokens(&request()),
+                    &CooldownAttempts::default(),
+                    &crate::router::GenerationParentTarget::Unresolved,
+                )
+                .await
+        }
+        .err()
+        .expect("evidence failure");
         assert!(matches!(error, SelectionError::SchedulingEvidence(_)));
     }
 
@@ -1450,20 +1574,23 @@ mod tests {
         let fixture = fixture(storage, no_continuation());
         let route = route(vec![target("busy", 0), target("idle", 0)]);
 
-        let mut policy = fixture
-            .selector
-            .select(
-                &principal(),
-                &route,
-                &request(),
-                None,
-                None,
-                estimate_uncached_input_tokens(&request()),
-                &CooldownAttempts::default(),
-                &crate::router::GenerationParentTarget::Unresolved,
-            )
-            .await
-            .expect("stale snapshot still selects");
+        let mut policy = {
+            register_targets(&fixture.storage, &route).await;
+            fixture
+                .selector
+                .select(
+                    &principal(),
+                    &route,
+                    &request(),
+                    None,
+                    None,
+                    estimate_uncached_input_tokens(&request()),
+                    &CooldownAttempts::default(),
+                    &crate::router::GenerationParentTarget::Unresolved,
+                )
+                .await
+        }
+        .expect("stale snapshot still selects");
         assert_eq!(next_provider(&mut policy).as_deref(), Some("idle"));
     }
 
@@ -1512,6 +1639,7 @@ mod tests {
                         selection_policy: ProviderModelSelectionPolicy::Auto,
                         metadata: ProviderModelMetadata {
                             cost: Some(cost.clone()),
+                            modalities: Some(crate::provider_models::ModelModalities::text_only()),
                             ..Default::default()
                         },
                     },
@@ -1527,20 +1655,23 @@ mod tests {
             target("output_heavy", 0),
         ]);
 
-        let mut policy = fixture
-            .selector
-            .select(
-                &principal(),
-                &route,
-                &request(),
-                None,
-                None,
-                estimate_uncached_input_tokens(&request()),
-                &CooldownAttempts::default(),
-                &crate::router::GenerationParentTarget::Unresolved,
-            )
-            .await
-            .expect("select");
+        let mut policy = {
+            register_targets(&fixture.storage, &route).await;
+            fixture
+                .selector
+                .select(
+                    &principal(),
+                    &route,
+                    &request(),
+                    None,
+                    None,
+                    estimate_uncached_input_tokens(&request()),
+                    &CooldownAttempts::default(),
+                    &crate::router::GenerationParentTarget::Unresolved,
+                )
+                .await
+        }
+        .expect("select");
         assert_eq!(next_provider(&mut policy).as_deref(), Some("output_heavy"));
     }
 

@@ -968,7 +968,11 @@ async fn model_target_statuses_stay_behind_admin_auth() -> anyhow::Result<()> {
             &provider.id,
             "upstream-model",
             CreateManualProviderModel {
-                metadata: serde_json::json!({"id": "upstream-model", "name": "Upstream Model"}),
+                metadata: serde_json::json!({
+                    "id": "upstream-model",
+                    "name": "Upstream Model",
+                    "modalities": {"input": ["text"], "output": ["text"]}
+                }),
                 template_id: None,
             },
         )
@@ -977,6 +981,7 @@ async fn model_target_statuses_stay_behind_admin_auth() -> anyhow::Result<()> {
         .admin()
         .create_model(CreateRoute {
             model_id: "statused-model".into(),
+            output_modality: stravia_core::db::models::RouteOutputModality::Text,
             display_name: None,
             balance: None,
             targets: vec![stravia_core::db::models::CreateTarget {
@@ -1034,6 +1039,140 @@ async fn model_target_statuses_stay_behind_admin_auth() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn route_output_modality_http_contract_rejects_invalid_and_mismatched_writes()
+-> anyhow::Result<()> {
+    let data_dir = tempfile::tempdir()?;
+    let gateway = memory_gateway(data_dir.path()).await?;
+    let provider = gateway
+        .admin()
+        .create_provider(CreateProvider {
+            name: Some("Modality contract".into()),
+            source: ProviderSourceInput::Custom {
+                vendor: "custom".into(),
+                channel: "default".into(),
+                protocol: Some("openai-compatible".into()),
+                base_url: "https://example.test/v1".into(),
+                models_source: None,
+                static_models: None,
+            },
+            credential: ProviderCredentialInput::None,
+            vendor_options: Default::default(),
+            use_proxy: false,
+        })
+        .await?;
+    gateway
+        .admin()
+        .create_manual_provider_model(
+            &provider.id,
+            "vision",
+            CreateManualProviderModel {
+                metadata: serde_json::json!({
+                    "id": "vision",
+                    "modalities": {"input": ["text", "image"], "output": ["text"]}
+                }),
+                template_id: None,
+            },
+        )
+        .await?;
+    let app = create_unprotected_router(gateway);
+    let base = serde_json::json!({
+        "model_id": "modality-contract",
+        "targets": [{"provider_id": provider.id, "model": "vision"}]
+    });
+    for modality in [
+        None,
+        Some(serde_json::Value::Null),
+        Some(serde_json::json!("audio")),
+    ] {
+        let mut input = base.clone();
+        if let Some(modality) = modality {
+            input["output_modality"] = modality;
+        }
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/models")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&input)?))?,
+            )
+            .await?;
+        assert!(response.status().is_client_error());
+    }
+
+    let mut input = base;
+    input["output_modality"] = serde_json::json!("image");
+    let mismatch = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/models")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&input)?))?,
+        )
+        .await?;
+    assert_eq!(mismatch.status(), StatusCode::OK);
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&to_bytes(mismatch.into_body(), usize::MAX).await?)?;
+    let error: serde_json::Value =
+        serde_json::from_str(envelope["error"].as_str().expect("Core error envelope"))?;
+    assert_eq!(error["code"], "ROUTE_OUTPUT_MODALITY_MISMATCH");
+    assert_eq!(error["params"]["provider_id"], provider.id);
+    assert_eq!(error["params"]["model_id"], "vision");
+    assert_eq!(error["params"]["output_modality"], "image");
+
+    let listed = app
+        .clone()
+        .oneshot(Request::get("/api/v1/models").body(Body::empty())?)
+        .await?;
+    assert_eq!(listed.status(), StatusCode::OK);
+    let listed: serde_json::Value =
+        serde_json::from_slice(&to_bytes(listed.into_body(), usize::MAX).await?)?;
+    assert!(
+        listed["data"]
+            .as_array()
+            .expect("Route list")
+            .iter()
+            .all(|route| route["model_id"] != "modality-contract")
+    );
+
+    input["output_modality"] = serde_json::json!("text");
+    let created = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/models")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&input)?))?,
+        )
+        .await?;
+    assert_eq!(created.status(), StatusCode::OK);
+    let route: serde_json::Value =
+        serde_json::from_slice(&to_bytes(created.into_body(), usize::MAX).await?)?;
+    let route_id = route["data"]["model_id"].as_str().unwrap();
+    let read = app
+        .clone()
+        .oneshot(Request::get(format!("/api/v1/models/{route_id}")).body(Body::empty())?)
+        .await?;
+    assert_eq!(read.status(), StatusCode::OK);
+    let read: serde_json::Value =
+        serde_json::from_slice(&to_bytes(read.into_body(), usize::MAX).await?)?;
+    assert_eq!(read["data"]["output_modality"], "text");
+    assert_eq!(read["data"]["image_generation_bound"], false);
+    assert_eq!(
+        read["data"]["targets"][0]["output_modality_mismatch"],
+        false
+    );
+
+    let null_update = app
+        .oneshot(
+            Request::put(format!("/api/v1/models/{route_id}"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"output_modality":null}"#))?,
+        )
+        .await?;
+    assert!(null_update.status().is_client_error());
+    Ok(())
+}
+
+#[tokio::test]
 async fn route_bind_endpoint_owns_one_click_target_creation() -> anyhow::Result<()> {
     let data_dir = tempfile::tempdir()?;
     let gateway = memory_gateway(data_dir.path()).await?;
@@ -1062,7 +1201,8 @@ async fn route_bind_endpoint_owns_one_click_target_creation() -> anyhow::Result<
             CreateManualProviderModel {
                 metadata: serde_json::json!({
                     "id": "route-model",
-                    "name": "Route Model"
+                    "name": "Route Model",
+                    "modalities": {"input": ["text"], "output": ["text"]}
                 }),
                 template_id: None,
             },
@@ -1093,6 +1233,7 @@ async fn route_bind_endpoint_owns_one_click_target_creation() -> anyhow::Result<
     let routes: serde_json::Value = serde_json::from_slice(&response_body)?;
     assert_eq!(routes["data"].as_array().map(Vec::len), Some(1));
     assert_eq!(routes["data"][0]["model_id"], "route-model");
+    assert_eq!(routes["data"][0]["output_modality"], "text");
     assert_eq!(
         routes["data"][0]["targets"].as_array().map(Vec::len),
         Some(1)

@@ -29,6 +29,7 @@ pub enum ConnectClientId {
 pub struct ConnectClientModel {
     pub model_id: String,
     pub display_name: String,
+    pub output_modality: Option<crate::db::models::RouteOutputModality>,
     #[serde(default)]
     pub supported_thinking_levels: Vec<String>,
     #[serde(default)]
@@ -764,7 +765,7 @@ fn open_responses_models(input: &ConnectClientApplyInput) -> JsonValue {
                 "modalities".to_owned(),
                 json!({
                     "input": input_modalities(model, input.transparent_image_input_enabled),
-                    "output": ["text"],
+                    "output": output_modalities(model),
                 }),
             ),
         ]);
@@ -877,7 +878,7 @@ fn zcode_models(input: &ConnectClientApplyInput) -> JsonValue {
                 "modalities".to_owned(),
                 json!({
                     "input": input_modalities(model, input.transparent_image_input_enabled),
-                    "output": ["text"],
+                    "output": output_modalities(model),
                 }),
             ),
             (
@@ -1329,6 +1330,15 @@ fn thinking_level_description(level: &str) -> &str {
     }
 }
 
+fn output_modalities(model: &ConnectClientModel) -> &'static [&'static str] {
+    use crate::db::models::RouteOutputModality;
+    match model.output_modality {
+        Some(RouteOutputModality::Text) => &["text"],
+        Some(RouteOutputModality::Image) => &["image"],
+        None => &[],
+    }
+}
+
 fn input_modalities(
     model: &ConnectClientModel,
     transparent_image_input_enabled: bool,
@@ -1367,6 +1377,7 @@ mod tests {
         ConnectClientModel {
             model_id: id.to_owned(),
             display_name: display_name.to_owned(),
+            output_modality: Some(crate::db::models::RouteOutputModality::Text),
             supported_thinking_levels: vec!["off".to_owned(), "medium".to_owned()],
             supports_image_input: true,
             context_window: Some(200_000),

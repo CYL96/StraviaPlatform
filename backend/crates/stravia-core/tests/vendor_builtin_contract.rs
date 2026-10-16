@@ -212,8 +212,13 @@ async fn provider_route_and_key(
     upstream_model: &str,
     credential: ProviderCredentialInput,
     vendor_options: serde_json::Map<String, Value>,
-    model_metadata: Value,
+    mut model_metadata: Value,
 ) -> anyhow::Result<(String, String)> {
+    model_metadata
+        .as_object_mut()
+        .expect("fixture model specification")
+        .entry("modalities")
+        .or_insert_with(|| json!({"input": ["text"], "output": ["text"]}));
     let provider = gateway
         .admin()
         .create_provider(CreateProvider {
@@ -238,6 +243,7 @@ async fn provider_route_and_key(
     let route = gateway
         .admin()
         .create_model(CreateRoute {
+            output_modality: stravia_core::db::models::RouteOutputModality::Text,
             model_id: format!("{name}-route"),
             display_name: None,
             balance: None,
@@ -2825,6 +2831,7 @@ async fn manually_installed_devin_discovers_families_assigns_a_router_and_stream
     let route = gateway
         .admin()
         .create_model(CreateRoute {
+            output_modality: stravia_core::db::models::RouteOutputModality::Text,
             model_id: "devin-contract-route".into(),
             display_name: None,
             balance: None,

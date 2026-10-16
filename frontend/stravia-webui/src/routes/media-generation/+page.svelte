@@ -117,6 +117,23 @@ async function saveRoute(): Promise<void> {
     saving = false
   }
 }
+
+async function clearReference(): Promise<void> {
+  if (!configQuery.data || saving || toggleSaving) return
+  saving = true
+  saveError = ''
+  try {
+    const view = await admin.mediaGeneration.config.update({ enabled: false, image: { route_id: null } })
+    routeId = view.config.image.route_id
+    updateCachedConfig(view)
+    await queryClient.invalidateQueries({ queryKey: ['models'] })
+    toast.success(m.media_generation_settings_saved())
+  } catch (error) {
+    saveError = localizeBackendErrorMessage(error)
+  } finally {
+    saving = false
+  }
+}
 </script>
 
 <svelte:head><title>{m.media_generation_title()} · Stravia</title></svelte:head>
@@ -213,6 +230,16 @@ async function saveRoute(): Promise<void> {
           </Alert.Root>
         {/if}
       </div>
+
+      {#if savedRouteId}
+        <div class="flex flex-wrap items-center gap-3">
+          <p class="min-w-0 break-all text-sm">{m.route_output_bound_reference({ route: savedRouteId })}</p>
+          <Button variant="outline" disabled={saving || toggleSaving} onclick={() => void clearReference()}>
+            {m.route_output_clear_reference()}
+          </Button>
+          <p class="w-full text-sm text-muted-foreground">{m.route_output_clear_reference_help()}</p>
+        </div>
+      {/if}
 
       {#if eligibleRoutesQuery.isPending}
         <div class="flex flex-col gap-3" aria-label={m.media_generation_routes_loading()} aria-busy="true">

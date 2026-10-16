@@ -396,6 +396,20 @@ impl SendEligibility {
             .iter()
             .find(|route| route.id == self.route_id && route.is_enabled)
             .ok_or_else(rejected)?;
+        let output_modality = route.output_modality.ok_or_else(|| {
+            AdmissionError::Rejected(ModelTurnError::new(
+                "route_output_modality_unconfigured",
+                "Select and save an output modality to reconfigure this Route",
+            ))
+        })?;
+        if self.capability == stravia_vendor_sdk::Capability::MediaImage
+            && output_modality != crate::db::models::RouteOutputModality::Image
+        {
+            return Err(AdmissionError::Rejected(ModelTurnError::new(
+                "media_generation_route_output_modality_mismatch",
+                "Image generation requires an image-output Route",
+            )));
+        }
         let target = route
             .targets
             .iter()
@@ -467,6 +481,16 @@ impl SendEligibility {
             .is_some_and(|model| !model.effective_available())
         {
             return Err(rejected());
+        }
+        if !model.as_ref().is_some_and(|model| {
+            model
+                .metadata
+                .supports_route_output_modality(output_modality)
+        }) {
+            return Err(AdmissionError::Rejected(ModelTurnError::new(
+                "target_output_modality_mismatch",
+                "Target no longer registers the Route output modality",
+            )));
         }
         crate::model_turn::validate_target_capability(
             channel,

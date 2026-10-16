@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::str::FromStr;
 use std::sync::LazyLock;
 
+use crate::db::models::RouteOutputModality;
 use anyhow::Context;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -240,6 +241,16 @@ impl ProviderModelMetadata {
         static TEXT_MODALITIES: LazyLock<ModelModalities> =
             LazyLock::new(ModelModalities::text_only);
         self.modalities.as_ref().unwrap_or(&TEXT_MODALITIES)
+    }
+
+    /// Route eligibility uses the persisted declaration, never display defaults.
+    pub fn supports_route_output_modality(&self, modality: RouteOutputModality) -> bool {
+        self.modalities.as_ref().is_some_and(|modalities| {
+            modalities
+                .output
+                .iter()
+                .any(|output| output == modality.as_str())
+        })
     }
 
     pub fn has_specification(&self) -> bool {
@@ -491,6 +502,16 @@ pub struct ProviderModelRecord {
 }
 
 impl ProviderModelRecord {
+    pub fn route_output_modalities(&self) -> Vec<RouteOutputModality> {
+        if !self.effective_available() {
+            return Vec::new();
+        }
+        [RouteOutputModality::Text, RouteOutputModality::Image]
+            .into_iter()
+            .filter(|modality| self.metadata.supports_route_output_modality(*modality))
+            .collect()
+    }
+
     pub fn effective_available(&self) -> bool {
         match self.selection_policy {
             ProviderModelSelectionPolicy::ForceEnabled => true,
@@ -760,6 +781,7 @@ pub struct ProviderModelSummary {
     pub id: String,
     pub name: String,
     pub available: bool,
+    pub route_output_modalities: Vec<RouteOutputModality>,
     pub source_kind: ProviderModelSourceKind,
     pub snapshot_state: SnapshotState,
     pub selection_policy: ProviderModelSelectionPolicy,
@@ -784,6 +806,7 @@ impl From<&ProviderModelRecord> for ProviderModelSummary {
                 .clone()
                 .unwrap_or_else(|| record.model_id.clone()),
             available: record.effective_available(),
+            route_output_modalities: record.route_output_modalities(),
             source_kind: record.source_kind,
             snapshot_state: record.snapshot_state.clone(),
             selection_policy: record.selection_policy,
@@ -801,6 +824,7 @@ impl From<&ProviderModelRecord> for ProviderModelSummary {
 pub struct ProviderModelDetail {
     pub id: String,
     pub available: bool,
+    pub route_output_modalities: Vec<RouteOutputModality>,
     pub source_kind: ProviderModelSourceKind,
     pub can_reimport: bool,
     pub snapshot_state: SnapshotState,
@@ -817,6 +841,7 @@ impl From<ProviderModelRecord> for ProviderModelDetail {
     fn from(mut record: ProviderModelRecord) -> Self {
         let extensions = record.metadata.extension_value();
         let available = record.effective_available();
+        let route_output_modalities = record.route_output_modalities();
         let thinking_level_map = crate::thinking::generate_thinking_level_map(&record.metadata);
         record
             .metadata
@@ -825,6 +850,7 @@ impl From<ProviderModelRecord> for ProviderModelDetail {
         Self {
             id: record.model_id,
             available,
+            route_output_modalities,
             source_kind: record.source_kind,
             can_reimport: record.source_kind == ProviderModelSourceKind::Discovered
                 && record.metadata_source_provider_id.is_some(),

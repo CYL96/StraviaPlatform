@@ -1,5 +1,7 @@
 export interface Route {
   id: string
+  output_modality: RouteOutputModality | null
+  image_generation_bound: boolean
   model_id: string
   display_name?: string | null
   balance: RouteSelectionStrategy
@@ -15,9 +17,13 @@ export interface Route {
 }
 
 export type RouteSelectionStrategy = 'traffic_equalization' | 'latency_preference'
+export type RouteOutputModality = 'text' | 'image'
 
 export interface Target {
   id: string
+  output_modality_mismatch: boolean
+  /** Raw output declarations resolved by Core for this saved destination, regardless of availability. */
+  route_output_modalities: RouteOutputModality[]
   model_id: string
   provider_id: string
   model: string
@@ -49,6 +55,7 @@ export interface ThinkingLevelMapping {
 
 export interface CreateRoute {
   model_id: string
+  output_modality: RouteOutputModality
   display_name?: string | null
   balance?: RouteSelectionStrategy
   targets: CreateTarget[]
@@ -73,6 +80,7 @@ export interface UnbindRouteInput {
 
 export interface UpdateRoute {
   model_id?: string
+  output_modality?: RouteOutputModality
   display_name?: string | null
   balance?: RouteSelectionStrategy
   targets?: CreateTarget[]
