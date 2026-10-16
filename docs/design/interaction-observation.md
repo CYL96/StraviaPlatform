@@ -184,9 +184,9 @@ Observation 写入、SSE、Debug 分段文件、容量统计或导出的普通�
 
 `native_compaction_associated` 表示原生状态跨越已登记边界，`retained_tail_associated` 仅表示客户端幸存上下文的诊断推断。两者与既有确定 Generation 关系在 `context_events`、forest/detail、SSE、详情及画布中分开；推断不改变父边、Target Continuation 或有效输入。分组按 ADR-0053 诊断规则，不恢复已删除历史。来源卡片已清理时不从核心存储复活。
 
-尾部索引只接收实际收到的规范化 client-shaped 输入和已交付公开输出。流式与非流式输出均复用 Generation Chain 拥有的 ingress 历史整形规则，使诊断索引与客户端回放采用相同分块；整形失败记录 observation gap，不能把交付前的 canonical 分块作为后备索引。指纹仅筛选候选，完整语义再次核验；匹配旧历史后缀与新请求任意连续区间。只有顶层 leading system/developer 可排除，内部差异不能删除后拼接。完整工具 ID、参数、结果、角色、媒体与控制保持语义身份。有 Generation parent 时仍对本次收到的 client 输入做尾部诊断。多个来源同时匹配时，若其中唯一一个匹配的语义单元与字节均严格更长，采用该更长来源；并列等长匹配仍为 `ambiguous`。
+尾部索引只接收实际收到的规范化 client-shaped 输入和已交付公开输出。流式与非流式输出均复用 Generation Chain 拥有的 ingress 历史整形规则，使诊断索引与客户端回放采用相同分块；整形失败记录 observation gap，不能把交付前的 canonical 分块作为后备索引。指纹仅筛选候选，完整语义再次核验；匹配旧历史后缀与新请求任意连续区间。只有顶层 leading system/developer 可排除，内部差异不能删除后拼接。完整工具 ID、参数、结果、角色、媒体与控制保持语义身份。有 Generation parent 时仍对本次收到的 client 输入做尾部诊断。每个来源取本次输入中结束最晚的强匹配；多个来源同时匹配时，采用匹配区间结束最晚的来源，结束位置相同再依次比较语义单元跨度与证据字节，三者全部并列仍为 `ambiguous`。压缩后的回放是线性历史，更早结束的匹配是更晚来源之前的历史，因此保留的旧回答更长不能使旧来源胜出。`matched_units` 是输入中的连续跨度（含私有摘要单元），`matched_bytes` 只计公开证据。
 
-无签名、无密文且带合法 History Marker 的公开思考投影参与精确匹配，保留全部预览与标记字节，不恢复隐藏内容，也不把投影本身算作公开回答。它不截断相邻 User 与公开回答的完整交互，因此客户端切换模型并更新顶层提示后，仍可形成诊断关联。无 Marker 的原始思考、签名、密文和 native state 继续使用不可匹配边界；预览或 Marker 的改动不能跳过后拼接。完整交互、唯一来源、Principal 隔离及资源预算要求不变，Generation Chain 的严格父链规则不变。
+无签名、无密文且带合法 History Marker 的公开思考投影参与精确匹配，保留全部预览与标记字节，不恢复隐藏内容，也不把投影本身算作公开回答。它不截断相邻 User 与公开回答的完整交互，因此客户端切换模型并更新顶层提示后，仍可形成诊断关联。其余私有控制（签名或密文 reasoning、redacted thinking、native compaction 等）所在单元替换为其不透明字段（`encrypted_content`、`signature`、redacted `data`）的域分隔 SHA-256 摘要：客户端原样回放同一不透明状态时，摘要单元证明连续，最后一轮不会因隐藏 reasoning 被截断；摘要不计入强匹配的单元下限、字节门槛或完整交互，不透明字节变化即不匹配。无签名、无密文的原始思考和无 Marker 投影没有可验证的回放身份，继续使用随机不可匹配边界；预览或 Marker 的改动不能跳过后拼接。完整交互、唯一来源、Principal 隔离及资源预算要求不变，Generation Chain 的严格父链规则不变。
 
 隔离样本校准采用至少两个完整语义单元、256 canonical UTF-8 bytes、64 assistant UTF-8 bytes，并额外要求完整 User/Assistant 交互或闭合工具关系。短应答样本为 193/3 bytes，泛化短交互 220/30 bytes；具体英文任务 587/240 bytes、具体中文任务 567/213 bytes 达到长度门槛。长度达标不能替代唯一性、角色和工具闭合。
 
@@ -201,9 +201,9 @@ Observation 写入、SSE、Debug 分段文件、容量统计或导出的普通�
 
 重现时分别构造纯文本 User、Assistant `AiItem`，累加 `canonical::item_value` 返回的各个语义单元经 `serde_json::to_vec` 编码后的字节数。纯文本 User 单元包含 `role`、单元素 `content` 数组及值为 null 的 `tool_calls`、`tool_call_id`、`artifact_references`；Assistant 单元包含 `role` 和单个文本 `content` 对象。第二个数值是 Assistant 原文的 UTF-8 长度，中文不转义为 ASCII。资源预算用于限制候选集合、序列化和核验成本，不是从这些小样本推断出的性能保证；截断搜索必须保持未关联。
 
-每窗口最多 512 单元/512 KiB：超限时保留最新后缀，而不是丢弃整个窗口；单个语义单元超过字节上限仍返回 `resource_limit`。进程索引最多 128 候选/16 MiB，单次最多 65,536 单元检查和 8 MiB 内容核验。候选核验超过资源预算返回 `resource_limit`；保留候选未完整索引（包括冷启动）返回 `index_unavailable`；多个来源成立返回 `ambiguous`。这些情况不影响正常推理。敏感比对内容只在易失索引中保存，隐藏 reasoning/native state 使用不匹配边界；持久 Observation 只保存来源与匹配元数据。核心原生登记的重启保证与诊断索引可用性不是同一承诺。
+每窗口最多 512 单元/512 KiB：超限时保留最新后缀，而不是丢弃整个窗口；单个语义单元超过字节上限仍返回 `resource_limit`。进程索引最多 128 候选/16 MiB，单次最多 65,536 单元检查和 8 MiB 内容核验。候选核验超过资源预算返回 `resource_limit`；保留候选未完整索引（包括冷启动）返回 `index_unavailable`；多个来源成立返回 `ambiguous`。这些情况不影响正常推理。敏感比对内容只在易失索引中保存，隐藏 reasoning/native state 只保留不透明字段摘要或随机边界，不保留原文；持久 Observation 只保存来源与匹配元数据。核心原生登记的重启保证与诊断索引可用性不是同一承诺。
 
-无 metadata、无 tool calls 且仅含普通文本的 item 形成一个语义单元；其原始 UTF-8 文本总长度是编码尺寸的下界。该下界已超出剩余窗口预算时，在物化 JSON 前沿用既有后缀溢出裁决，避免先复制数 MB 正文再丢弃。混合内容、私有控制及 native metadata 仍走完整投影与不可匹配边界；原有预算、指纹与完整性标记不变，也不裁剪推理请求或 Generation Chain 历史。
+无 metadata、无 tool calls 且仅含普通文本的 item 形成一个语义单元；其原始 UTF-8 文本总长度是编码尺寸的下界。该下界已超出剩余窗口预算时，在物化 JSON 前沿用既有后缀溢出裁决，避免先复制数 MB 正文再丢弃。混合内容、私有控制及 native metadata 仍走完整投影与私有摘要／不可匹配边界；原有预算、指纹与完整性标记不变，也不裁剪推理请求或 Generation Chain 历史。
 
 收到输入的证明与已交付尾部共用 16 MiB 进程索引预算，并额外要求包含 leading 前缀的完整输入不超过 512 items/512 KiB；超限后缀仍可用于既有尾部诊断，但不能证明结果回放。输入证明只保留 canonical 摘要，不向普通 Observation 新增完整请求、签名或密文。
 

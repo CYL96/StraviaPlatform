@@ -127,8 +127,7 @@ impl Window {
                     return Self::overflow_window(units, bytes);
                 }
                 if private_control(&value) && !public_thinking_projection(&value) {
-                    // A nonmatching boundary preserves continuity without retaining private state.
-                    value = serde_json::json!({"diagnostic_boundary": stravia_runtime_contract::identifier::new_id()});
+                    value = private_unit(&value);
                 }
                 let Some((hash, unit_bytes)) = hash_json(&value, MAX_WINDOW_BYTES - bytes).ok()?
                 else {
@@ -567,7 +566,9 @@ impl TailIndex {
                 continue;
             };
             let mut best = None;
-            for &end in positions.get(&last.hash).into_iter().flatten() {
+            // 压缩后的回放是一条线性历史：同一来源只取输入中最晚结束的强匹配，
+            // 该位置之后才是本次续接；同一结束位置内取最长匹配。
+            for &end in positions.get(&last.hash).into_iter().flatten().rev() {
                 let mut length = 0;
                 while length < old.units.len() && length <= end {
                     comparisons += 1;
@@ -592,10 +593,14 @@ impl TailIndex {
                     continue;
                 }
                 let start = end + 1 - length;
-                let mut bytes: usize = input.units[start..=end].iter().map(|unit| unit.bytes).sum();
+                let mut bytes: usize = input.units[start..=end]
+                    .iter()
+                    .filter(|unit| evidence(unit))
+                    .map(|unit| unit.bytes)
+                    .sum();
                 for begin in start..=end {
                     let units = end + 1 - begin;
-                    if bytes < MIN_MATCH_BYTES || best.is_some_and(|(n, _, _)| units <= n) {
+                    if bytes < MIN_MATCH_BYTES {
                         break;
                     }
                     comparisons += units;
@@ -603,33 +608,41 @@ impl TailIndex {
                         return result("resource_limit", None, 0, 0, 0, None);
                     }
                     if strong(&input.units[begin..=end], bytes) {
-                        best = Some((units, bytes, begin));
+                        best = Some((end, units, bytes, begin));
                         break;
                     }
-                    bytes -= input.units[begin].bytes;
+                    if evidence(&input.units[begin]) {
+                        bytes -= input.units[begin].bytes;
+                    }
+                }
+                if best.is_some() {
+                    break;
                 }
             }
             if let Some(best) = best {
                 accepted.push((source, best));
             }
         }
+        // matched_units 是输入中的连续跨度（含私有摘要），供 user_after_match 定位匹配之后的内容；
+        // matched_bytes 只计可比对的公开证据。
         match accepted.as_slice() {
             [] => result("no_match", None, 0, 0, 0, None),
-            [(source, (units, bytes, start))] => {
+            [(source, (_, units, bytes, start))] => {
                 let pair = (source.0.clone(), source.1.clone());
                 result("inferred", Some(&pair), 1, *units, *bytes, Some(*start))
             }
             _ => {
-                let Some((source, (units, bytes, start))) = accepted
+                // 结束位置更晚的来源是线性回放中更近的祖先；更早结束的匹配必然是其前缀历史。
+                let Some((source, (end, units, bytes, start))) = accepted
                     .iter()
-                    .max_by_key(|(_, (units, bytes, _))| (*units, *bytes))
+                    .max_by_key(|(_, (end, units, bytes, _))| (*end, *units, *bytes))
                 else {
                     return result("ambiguous", None, accepted.len(), 0, 0, None);
                 };
                 if accepted
                     .iter()
-                    .filter(|(_, (match_units, match_bytes, _))| {
-                        *match_units == *units && *match_bytes == *bytes
+                    .filter(|(_, (match_end, match_units, match_bytes, _))| {
+                        *match_end == *end && *match_units == *units && *match_bytes == *bytes
                     })
                     .count()
                     == 1
@@ -695,15 +708,63 @@ fn private_control(value: &Value) -> bool {
     }
 }
 
+const PRIVATE_DIGEST: &str = "private_digest";
+
+/// 私有控制单元只保留不透明字段（密文、签名、redacted data）的 SHA-256 摘要：客户端原样回放
+/// 同一份不透明状态时可证明连续，内容不进入索引。没有不透明字段的原始思考或控制标记无法证明
+/// 回放身份，仍使用随机边界阻断匹配。
+fn private_unit(value: &Value) -> Value {
+    fn collect<'a>(value: &'a Value, parent_kind: Option<&str>, out: &mut Vec<(&'a str, &'a str)>) {
+        match value {
+            Value::Object(object) => {
+                let kind = object.get("type").and_then(Value::as_str).or(parent_kind);
+                for (key, child) in object {
+                    let opaque = matches!(key.as_str(), "encrypted_content" | "signature")
+                        || (key == "data" && kind == Some("redacted_thinking"));
+                    match child {
+                        Value::String(text) if opaque && !text.is_empty() => out.push((key, text)),
+                        _ => collect(child, kind, out),
+                    }
+                }
+            }
+            Value::Array(values) => values
+                .iter()
+                .for_each(|child| collect(child, parent_kind, out)),
+            _ => {}
+        }
+    }
+    let mut opaque = Vec::new();
+    collect(value, None, &mut opaque);
+    if opaque.is_empty() {
+        return serde_json::json!({"diagnostic_boundary": stravia_runtime_contract::identifier::new_id()});
+    }
+    // 排序使摘要不依赖 JSON Map 的遍历顺序；长度前缀避免字段拼接歧义。
+    opaque.sort_unstable();
+    let mut digest = Sha256::new();
+    digest.update(b"stravia.retained-tail.private.v1");
+    for (key, text) in opaque {
+        for part in [key, text] {
+            digest.update((part.len() as u64).to_le_bytes());
+            digest.update(part.as_bytes());
+        }
+    }
+    serde_json::json!({PRIVATE_DIGEST: hash_hex(&digest.finalize().into())})
+}
+
+/// 私有摘要只证明连续，不计入匹配强度、语义单元数或字节数。
+fn evidence(unit: &Unit) -> bool {
+    unit.value.get(PRIVATE_DIGEST).is_none()
+}
+
 fn strong(units: &[Unit], bytes: usize) -> bool {
-    if units.len() < 2 || bytes < MIN_MATCH_BYTES {
+    if units.iter().filter(|unit| evidence(unit)).count() < 2 || bytes < MIN_MATCH_BYTES {
         return false;
     }
     let mut user = false;
     let mut answer = false;
     let mut calls = HashSet::new();
     let mut resolved = HashSet::new();
-    for unit in units {
+    for unit in units.iter().filter(|unit| evidence(unit)) {
         match unit.value.get("role").and_then(Value::as_str) {
             Some("user") => user = true,
             Some("assistant") => {
@@ -999,7 +1060,7 @@ mod tests {
     }
 
     #[test]
-    fn unique_longest_nested_source_is_the_later_turn() {
+    fn nested_source_ending_later_is_the_later_turn() {
         let (index, with_gpt, _) = nested_sources();
         assert!(matches!(
             associate(&index, Some(&with_gpt), &candidates()),
@@ -1063,15 +1124,9 @@ mod tests {
     }
 
     #[test]
-    fn private_thinking_remains_an_unmatchable_boundary() {
+    fn thinking_without_opaque_state_remains_an_unmatchable_boundary() {
         for thinking in [
             AiItem::thinking("未投影的原始思考", None),
-            AiItem::thinking(
-                crate::history_marker::render_history_marker_reference(
-                    "abcdefghijklmnopqrstuvwxyzab",
-                ),
-                Some("protected-signature".into()),
-            ),
             AiItem::thinking("<!--sh:invalid-->", None),
         ] {
             assert!(matches!(
@@ -1079,6 +1134,115 @@ mod tests {
                 RunEvent::RetainedTailAssociated { status, .. } if status == "no_match"
             ));
         }
+    }
+
+    /// Source delivered `[reasoning, answer]` for `question`; input replays
+    /// `question, replayed, answer` and then a new User turn.
+    fn private_replay(replayed: AiItem) -> (Window, RunEvent) {
+        let question = long_user("confirm");
+        let answer = long_answer("final");
+        let mut old = Window::capture(std::slice::from_ref(&question)).unwrap();
+        assert!(
+            old.append(
+                Window::capture(&[
+                    AiItem::thinking("隐藏思考", Some("opaque-state-a".into())),
+                    answer.clone(),
+                ])
+                .unwrap()
+            )
+        );
+        let input = Window::capture(&[question, replayed, answer, long_user("next")]).unwrap();
+        let mut index = TailIndex::default();
+        index.insert(
+            "final-run".into(),
+            old.clone(),
+            i64::MAX,
+            "principal",
+            "final-turn",
+        );
+        let event = associate(
+            &index,
+            Some(&input),
+            &[("final-run".into(), "final-turn".into())],
+        );
+        (old, event)
+    }
+
+    #[test]
+    fn replayed_opaque_reasoning_links_the_final_turn_without_retaining_it() {
+        let (old, event) =
+            private_replay(AiItem::thinking("隐藏思考", Some("opaque-state-a".into())));
+        assert!(matches!(
+            event,
+            RunEvent::RetainedTailAssociated {
+                status,
+                source_interaction_id: Some(source),
+                matched_units: 3,
+                input_start: Some(0),
+                ..
+            } if status == "inferred" && source == "final-turn"
+        ));
+        assert!(old.units.iter().all(|unit| {
+            let text = unit.value.to_string();
+            !text.contains("opaque-state-a") && !text.contains("隐藏思考")
+        }));
+    }
+
+    #[test]
+    fn changed_opaque_reasoning_breaks_the_match() {
+        let (_, event) =
+            private_replay(AiItem::thinking("隐藏思考", Some("opaque-state-b".into())));
+        assert!(matches!(
+            event,
+            RunEvent::RetainedTailAssociated { status, .. } if status == "no_match"
+        ));
+    }
+
+    #[test]
+    fn latest_ending_source_beats_a_longer_earlier_source() {
+        // 压缩后旧来源仍完整保留且回答更长，但最近一轮在输入中结束得更晚。
+        let old_user = long_user("old");
+        let old_answer = AiItem::output_text(format!("old {}", "很长的旧回答。".repeat(80)));
+        let recent_user = long_user("recent");
+        let recent_answer = long_answer("recent");
+        let mut old = Window::capture(std::slice::from_ref(&old_user)).unwrap();
+        assert!(old.append(Window::capture(std::slice::from_ref(&old_answer)).unwrap()));
+        let mut recent = Window::capture(std::slice::from_ref(&recent_user)).unwrap();
+        assert!(recent.append(Window::capture(std::slice::from_ref(&recent_answer)).unwrap()));
+        let input = Window::capture(&[
+            long_user("compaction summary"),
+            old_user,
+            old_answer,
+            recent_user,
+            recent_answer,
+            long_user("next"),
+        ])
+        .unwrap();
+        let mut index = TailIndex::default();
+        index.insert("run-old".into(), old, i64::MAX, "principal", "old-turn");
+        index.insert(
+            "run-recent".into(),
+            recent,
+            i64::MAX,
+            "principal",
+            "recent-turn",
+        );
+        assert!(matches!(
+            associate(
+                &index,
+                Some(&input),
+                &[
+                    ("run-old".into(), "old-turn".into()),
+                    ("run-recent".into(), "recent-turn".into()),
+                ]
+            ),
+            RunEvent::RetainedTailAssociated {
+                status,
+                source_interaction_id: Some(source),
+                input_start: Some(3),
+                ..
+            } if status == "inferred" && source == "recent-turn"
+        ));
     }
 
     fn bulky(tag: &str, bytes: usize) -> AiItem {
