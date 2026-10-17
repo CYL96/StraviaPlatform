@@ -216,6 +216,20 @@ Desktop 与独立 Server 的清单对齐共享依赖的运行期、宿主构建�
 
 共享 `reqwest` 启用 TLS、系统代理编译特性与 SOCKS transport，但默认 Gateway、Provider Catalog 与 S3 客户端显式直连，不继承环境变量或操作系统代理。编译特性不改变应用的出站选择，也不移除现有 TLS provider 或 JSON 默认递归深度保护。
 
+### devenv 开发环境
+
+Linux 开发先安装 [Nix 与 devenv](https://devenv.sh/getting-started/)，在仓库根目录运行 `devenv shell`，再使用 `Taskfile.yml` 中的开发命令。启用 direnv shell hook 后，也可审阅 `.envrc` 并运行 `direnv allow` 自动加载环境；此操作会信任并执行 `.envrc`。
+
+工具链及服务配置集中在 `devenv.nix`。Rust/Bun 由 language 模块提供，版本分别以 `rust-toolchain.toml`、`package.json` 为准；原生 C/C++ 和 Rust 统一使用 Clang，Linux 链接使用 mold，不修改宿主机或 `.cargo/config.toml`。更新输入使用 `devenv update`，并一并保留 `devenv.lock`。
+
+进入 linked worktree 时，从主 worktree 通过 reflink 补齐缺失的 `.stravia-dev` 和 `target`，不合并或覆盖现有目录。初始化按 worktree 加锁，每个目录暂存后原子发布；不支持 reflink 或跨文件系统时阻止进入 shell，不退回完整复制。
+
+初始化前应停止主 worktree 的应用与构建：逐文件复制不是原子快照，也不是 SQLite/WAL 在线备份。复制包含配置凭据，外部 PostgreSQL、Redis 连接不会自动隔离，启动新实例前须确认连接目标。`target` 只用于预热，Cargo 仍可能重新编译。
+
+PostgreSQL 16 通过 `devenv up postgres` 启动，只监听本地 Unix socket；使用 `devenv processes down` 停止，数据保留在 `.devenv/state/postgres`。数据库 E2E 必须显式使用隔离的数据库与 Redis，不得使用日常开发实例。
+
+进入 shell 不自动安装工作区依赖或启动服务；环境只提供 Docker 客户端，Docker daemon、测试浏览器和桌面图形会话仍需单独准备。
+
 ### 共享出站代理配置与独立选择
 
 设置页维护共享代理地址及绕过规则，不再提供全局启用开关。`outbound_proxy` 是 settings 中一行 JSON（`url`、`bypass`、`force_http1`）：一次 PUT 提交完整配置，一次读取取得完整快照，验证或持久化失败保留原配置。URL 为空表示尚未配置；非空仅接受可用的 `http`、`https`、`socks5`、`socks5h` 代理地址。保存和使用边界均拒绝未知 scheme，不静默改为直连；错误不回显可能含凭据的 URL，保存并不检查代理在线或认证成功。Core reqwest 的 `socks5` 在本机解析目标，`socks5h` 将目标域名交给代理解析；LocalWeb 保留 ADR-0026 的既有代理侧 DNS 策略（其 `socks5` 规范化为 `socks5h`），不据此推断 Core 的 DNS 行为。读取迁移留下的非法旧 URL 不阻断管理编辑，使用时仍须校验并失败关闭。

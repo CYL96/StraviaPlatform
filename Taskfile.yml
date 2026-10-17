@@ -44,7 +44,6 @@ tasks:
     generates:
       - target/vendor-plugins/manifest.json
     cmds:
-      - rustup target add wasm32-wasip2
       - cargo run --locked -p stravia-vendor-base --bin stravia-build-vendors
 
   build:vendors:all:
@@ -95,7 +94,6 @@ tasks:
     generates:
       - target/vendor-test-fixtures/*.wasm
     cmds:
-      - rustup target add wasm32-wasip2
       - bun backend/crates/stravia-vendor-sdk/fixtures/build.ts
 
   dev:web:

@@ -31,6 +31,7 @@
 *.patch
 !/patches/*.patch
 /.stravia-dev/
+/.devenv-worktree-init-*/
 /.stravia-desktop-e2e/
 
 # Environment files (keep safe-to-commit examples)
@@ -72,3 +73,10 @@ venv/
 .DS_Store
 Thumbs.db
 Desktop.ini
+
+# devenv / direnv
+/.devenv/
+/.devenv.flake.nix
+/devenv.local.nix
+/devenv.local.yaml
+/.direnv/
