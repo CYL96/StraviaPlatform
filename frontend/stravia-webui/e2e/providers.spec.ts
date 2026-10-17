@@ -102,7 +102,7 @@ test('service cards filter sign-in methods and use local logos before remote fal
     }
   })
   await page.goto('/providers')
-  await page.getByRole('button', { name: /连接.*服务/ }).click()
+  await page.getByRole('button', { name: /添加.*供应商/ }).click()
   const grid = page.locator('[data-provider-grid]')
   const openAi = grid.getByRole('button', { name: /^OpenAI API 密钥$/ })
   const compatible = grid.getByRole('button', { name: /^OpenAI Compatible API 密钥$/ })
@@ -128,7 +128,7 @@ test('service cards filter sign-in methods and use local logos before remote fal
   failLogo = true
   const successfulLogoRequests = remoteLogoRequests
   await page.reload()
-  await page.getByRole('button', { name: /连接.*服务/ }).click()
+  await page.getByRole('button', { name: /添加.*供应商/ }).click()
   await expect.poll(() => remoteLogoRequests).toBeGreaterThan(successfulLogoRequests)
   await expect(compatible.locator('img')).toHaveCount(0)
   await expect(compatible.locator('.route-provider-mark')).toHaveText('O')
@@ -217,15 +217,15 @@ test('configured Providers table filters and persists column customization', asy
   await page.setViewportSize({ width: 1279, height: 800 })
   await page.goto('/providers')
 
-  const table = page.getByRole('table', { name: 'Connected AI model services' })
+  const table = page.getByRole('table', { name: 'Connected AI providers' })
   await expect(table.getByRole('row')).toHaveCount(3)
-  const search = page.getByPlaceholder('Search model services…')
+  const search = page.getByPlaceholder('Search providers…')
   await search.fill('Alpha')
   await expect(table.getByRole('row')).toHaveCount(2)
   await expect(table).toContainText('Alpha Service')
   await expect(table).not.toContainText('Zeta Service')
   await search.fill('__missing__')
-  await expect(table).toContainText('No model services match your search.')
+  await expect(table).toContainText('No providers match your search.')
   await search.fill('')
 
   await page.getByRole('button', { name: 'Columns' }).click()
@@ -234,7 +234,7 @@ test('configured Providers table filters and persists column customization', asy
 
   await page.reload()
   await expect(table.getByRole('columnheader', { name: /Authentication/ })).toHaveCount(0)
-  await table.getByRole('button', { name: 'Sort Model service ascending' }).click()
+  await table.getByRole('button', { name: 'Sort Provider ascending' }).click()
   await expect(table.getByRole('row').nth(1)).toContainText('Alpha Service')
 })
 
@@ -263,13 +263,13 @@ test('provider editor selects a service before validating its configuration', as
     })
   })
   await page.goto('/providers')
-  await page.getByRole('button', { name: /Connect (first )?service/ }).click()
+  await page.getByRole('button', { name: /Add (your first )?provider/ }).click()
 
   await expect(page.getByRole('button', { name: 'Cancel', exact: true })).toBeVisible()
   await expect(page.getByRole('button', { name: 'Connect', exact: true })).toHaveCount(0)
   const searchInput = page.locator('[data-provider-toolbar] input')
   await expect(searchInput).toBeVisible()
-  const refreshButton = page.getByRole('button', { name: 'Reload model services' })
+  const refreshButton = page.getByRole('button', { name: 'Reload providers' })
   await expect(refreshButton).toBeVisible()
   await refreshButton.click()
   await expect(page.getByRole('button', { name: /^OpenAI Compatible / })).toBeVisible()
@@ -279,7 +279,7 @@ test('provider editor selects a service before validating its configuration', as
   await searchInput.fill('OpenAI')
   await expect(page.getByRole('button', { name: /^OpenAI API key$/ })).toBeVisible()
   await expect(page.getByRole('button', { name: /OpenAI.*Codex.*OAuth account/ })).toBeVisible()
-  await expect(page.getByRole('tab', { name: 'Choose service' })).toHaveAttribute('aria-selected', 'true')
+  await expect(page.getByRole('tab', { name: 'Choose provider' })).toHaveAttribute('aria-selected', 'true')
   const openAiOption = page.getByRole('button', { name: /^OpenAI API key$/ })
   const codexOption = page.getByRole('button', { name: /OpenAI.*Codex.*OAuth account/ })
   await openAiOption.focus()
@@ -287,9 +287,9 @@ test('provider editor selects a service before validating its configuration', as
   await expect(codexOption).toBeFocused()
 
   await searchInput.fill('__missing_provider__')
-  await expect(page.getByText('No matching services', { exact: true })).toBeVisible()
+  await expect(page.getByText('No matching providers', { exact: true })).toBeVisible()
   await page.getByRole('button', { name: 'Clear search' }).click()
-  await expect(page.getByText('No matching services', { exact: true })).toHaveCount(0)
+  await expect(page.getByText('No matching providers', { exact: true })).toHaveCount(0)
 
   const compatibleOption = page.getByRole('button', { name: /^OpenAI Compatible / })
   await compatibleOption.click()
@@ -314,7 +314,7 @@ test('provider editor selects a service before validating its configuration', as
   await expect(apiKey).toHaveAttribute('type', 'text')
   await expect(apiKey).toHaveValue('fixture-only-provider-secret-corrected')
 
-  await page.getByRole('tab', { name: 'Choose service' }).click()
+  await page.getByRole('tab', { name: 'Choose provider' }).click()
   await page.getByRole('button', { name: /^OpenAI Compatible / }).click()
   await expect(apiKey).toHaveAttribute('type', 'password')
   await expect(apiKey).toHaveValue('')
@@ -339,7 +339,7 @@ test('Provider draft submission locks editing and dismissal until a failed write
   })
 
   await page.goto('/providers')
-  await page.getByRole('button', { name: /Connect (first )?service/ }).click()
+  await page.getByRole('button', { name: /Add (your first )?provider/ }).click()
   await page.getByRole('button', { name: /^OpenAI Compatible / }).click()
   const name = page.getByLabel('Connection name', { exact: true })
   const baseUrl = page.getByLabel('Base URL', { exact: true })
@@ -356,8 +356,8 @@ test('Provider draft submission locks editing and dismissal until a failed write
     await expect(page.getByRole('switch')).toBeDisabled()
     await expect(page.getByRole('button', { name: 'Back', exact: true })).toBeDisabled()
     await expect(page.getByRole('button', { name: 'Cancel', exact: true })).toBeDisabled()
-    await expect(page.getByRole('button', { name: 'Close service setup' })).toBeDisabled()
-    await expect(page.getByRole('tab', { name: 'Choose service' })).toBeDisabled()
+    await expect(page.getByRole('button', { name: 'Close provider setup' })).toBeDisabled()
+    await expect(page.getByRole('tab', { name: 'Choose provider' })).toBeDisabled()
     await page.keyboard.press('Escape')
     await expect(page.getByRole('heading', { name: 'Connection details' })).toBeVisible()
     await page.mouse.click(5, 400)
@@ -437,7 +437,7 @@ test('editing a Provider keeps saved credentials write-only', async ({ page }) =
 
   await page.goto('/providers/credential-provider?view=connection')
   await expect(page.getByRole('heading', { name: credentialProvider.name })).toBeVisible()
-  await expect(page.getByRole('link', { name: 'Available models' })).toBeVisible()
+  await expect(page.getByRole('link', { name: 'Upstream models' })).toBeVisible()
   await expect(page.getByLabel('API key', { exact: true })).toHaveValue('')
   await page.getByRole('button', { name: 'Save connection' }).click()
 
@@ -762,7 +762,7 @@ test('Provider draft keeps partial save failure visible and blocks navigation du
     await expect(name).toBeDisabled()
     await expect(baseUrl).toBeDisabled()
     await expect(page.getByRole('button', { name: 'Use another account' })).toBeDisabled()
-    await page.getByRole('link', { name: 'Available models', exact: true }).click()
+    await page.getByRole('link', { name: 'Upstream models', exact: true }).click()
     await expect(page).toHaveURL('/providers/partial-provider?view=connection')
     await expect(page.getByRole('button', { name: 'Save connection' })).toBeDisabled()
     expect(writes).toBe(1)
@@ -778,7 +778,7 @@ test('Provider draft keeps partial save failure visible and blocks navigation du
     expect(saved.name).toBe('Updated account')
     expect(writes).toBe(1)
     expect(binds).toBe(1)
-    await page.getByRole('link', { name: 'Available models', exact: true }).click()
+    await page.getByRole('link', { name: 'Upstream models', exact: true }).click()
     await expect(page).toHaveURL('/providers/partial-provider?view=models')
   } finally {
     bindGate.resolve()
@@ -878,7 +878,7 @@ test('Provider Model specifications preserve direction, precision, and unknown s
   })
 
   await page.goto(`/providers/${provider.id}?view=models`)
-  const table = page.getByRole('table', { name: 'Models from this service' })
+  const table = page.getByRole('table', { name: 'Models from this provider' })
   const precisionRow = table.getByRole('row').filter({ hasText: /Precision Model.*precision-model/ })
   const unknownRow = table.getByRole('row').filter({ hasText: /Unknown Model.*unknown-model/ })
   const binaryRow = table.getByRole('row').filter({ hasText: /Binary Limit.*binary-limit/ })
@@ -1017,7 +1017,7 @@ test('Model specification filters combine all conditions and compose with catalo
   await page.route('**/api/v1/models', (route) => route.fulfill({ json: { data: [referencedRoute] } }))
 
   await page.goto(`/providers/${provider.id}?view=models`)
-  const table = page.getByRole('table', { name: 'Models from this service' })
+  const table = page.getByRole('table', { name: 'Models from this provider' })
   const filterButton = table.getByRole('button', { name: 'Show filter menu for Model specification' })
   await filterButton.click()
   const specificationDialog = page.getByRole('dialog', { name: 'Filter by Model specification' })
@@ -1071,7 +1071,7 @@ test('Model specification filters combine all conditions and compose with catalo
   await page.getByRole('button', { name: 'Show filter menu for Model availability' }).click()
   const availabilityDialog = page.getByRole('dialog', { name: 'Filter by Model availability' })
   await availabilityDialog.locator('[data-slot="select-trigger"][aria-label="Model availability"]').click()
-  await page.getByRole('option', { name: 'Can be used', exact: true }).click()
+  await page.getByRole('option', { name: 'Available', exact: true }).click()
   await availabilityDialog.getByRole('button', { name: 'Apply' }).click()
   await page.getByRole('button', { name: 'Show filter menu for How models were added' }).click()
   const sourceDialog = page.getByRole('dialog', { name: 'Filter by How models were added' })
@@ -1246,7 +1246,7 @@ test('Provider Model editor uses structured fields and preserves exact decimal i
     .filter({ hasText: /GPT Test.*gpt-test/ })
     .click()
 
-  await expect(page.locator('#provider-model-id')).toHaveValue('gpt-test')
+  await expect(page.getByText('gpt-test', { exact: true })).toBeVisible()
   const extensionFields = page.getByRole('button', { name: 'Extension fields (read only) · 1', exact: true })
   await expect(extensionFields).toHaveAttribute('aria-expanded', 'false')
   await extensionFields.click()
@@ -1304,7 +1304,7 @@ test('Provider Model editor uses structured fields and preserves exact decimal i
   expect(savedMetadata.reasoning_efforts).toEqual(['none', 'low', 'medium', 'high', 'future'])
 
   await page.getByRole('button', { name: 'Cancel', exact: true }).click()
-  await page.getByRole('button', { name: 'Add model', exact: true }).click()
+  await page.getByRole('button', { name: 'Add manually', exact: true }).click()
   const manualModelPicker = page.locator('#manual-provider-model-search')
   await manualModelPicker.click()
   const manualModelSearch = page.getByPlaceholder('Search model template')
@@ -1319,7 +1319,7 @@ test('Provider Model editor uses structured fields and preserves exact decimal i
   await page.getByRole('option', { name: /GPT-5\.4.*openai\/gpt-5\.4/ }).click()
   await page.getByRole('button', { name: 'Continue' }).click()
   await expect.poll(() => prepareBodies[0]).toEqual({ model_id: 'gpt-5.4', template_id: 'openai/gpt-5.4' })
-  await expect(page.locator('#provider-model-id')).toHaveValue('gpt-5.4')
+  await expect(page.getByRole('dialog').getByText('gpt-5.4', { exact: true })).toBeVisible()
   await expect(page.locator('#provider-model-name')).toHaveValue('GPT-5.4')
   await expect(extensionFields).toHaveAttribute('aria-expanded', 'false')
   await extensionFields.click()
@@ -1328,12 +1328,12 @@ test('Provider Model editor uses structured fields and preserves exact decimal i
   await expect(extensionPreview).toContainText('Template benchmark')
 
   await page.getByRole('button', { name: 'Close model editor' }).click()
-  await page.getByRole('button', { name: 'Add model', exact: true }).click()
+  await page.getByRole('button', { name: 'Add manually', exact: true }).click()
   await manualModelPicker.click()
   await manualModelSearch.fill('openai/gpt-5.3-codex-spark')
   await page.getByRole('option', { name: /GPT-5\.3 Codex Spark.*openai\/gpt-5\.3-codex-spark/ }).click()
   const [manualDialogBounds, manualPickerBounds] = await Promise.all([
-    page.getByRole('dialog', { name: 'Add a model' }).boundingBox(),
+    page.getByRole('dialog', { name: 'Add a model manually' }).boundingBox(),
     manualModelPicker.boundingBox(),
   ])
   if (!manualDialogBounds || !manualPickerBounds) {
@@ -1349,7 +1349,7 @@ test('Provider Model editor uses structured fields and preserves exact decimal i
   await page.getByRole('option', { name: /Claude Opus 4\.6.*anthropic\/claude-opus-4\.6/ }).click()
   await page.getByRole('button', { name: 'Continue' }).click()
   await expect(page.getByText('The selected model is no longer available. Search for another model.')).toBeVisible()
-  await expect(page.getByRole('dialog', { name: 'Add a model' })).toBeVisible()
+  await expect(page.getByRole('dialog', { name: 'Add a model manually' })).toBeVisible()
   await expect(manualModelPicker).toHaveText(/Claude Opus 4\.6.*anthropic\/claude-opus-4\.6/)
 })
 
@@ -1357,7 +1357,7 @@ test('OAuth Provider configuration allows manual completion while the localhost 
   page,
 }) => {
   await page.goto('/providers')
-  await page.getByRole('button', { name: /Connect (first )?service/ }).click()
+  await page.getByRole('button', { name: /Add (your first )?provider/ }).click()
   await page.getByRole('button', { name: /Codex.*OAuth account/ }).click()
 
   await expect(page.getByLabel('Connection name')).toHaveValue('OpenAI Codex')
@@ -1552,7 +1552,7 @@ test('completed OAuth satisfies session credential fields and submits the provid
   })
 
   await page.goto('/providers')
-  await page.getByRole('button', { name: /Connect (first )?service/ }).click()
+  await page.getByRole('button', { name: /Add (your first )?provider/ }).click()
   await page.getByRole('button', { name: /Devin.*OAuth account/ }).click()
 
   const providerForm = page.locator('form.route-overlay-form')
@@ -1612,7 +1612,7 @@ test('Provider draft discards OAuth initialization completed after configuration
   })
 
   await page.goto('/providers')
-  await page.getByRole('button', { name: /Connect (first )?service/ }).click()
+  await page.getByRole('button', { name: /Add (your first )?provider/ }).click()
   await page.getByRole('button', { name: /OpenAI.*Codex.*OAuth account/ }).click()
   const popupPromise = page.waitForEvent('popup')
   await page.getByRole('button', { name: 'Sign in with OAuth' }).click()
@@ -1671,7 +1671,7 @@ test('manual OAuth fallback shows one full callback URL field', async ({ page })
     }
   })
   await page.goto('/providers')
-  await page.getByRole('button', { name: /Connect (first )?service/ }).click()
+  await page.getByRole('button', { name: /Add (your first )?provider/ }).click()
   await page.getByRole('button', { name: /Codex.*OAuth account/ }).click()
   await page.getByRole('button', { name: 'Sign in with OAuth' }).click()
 
@@ -1830,9 +1830,9 @@ test('Provider detail separates connection, inventory, references, and guarded m
   await page.goto(`/providers/${provider.id}?view=models`)
   await expect(page.getByRole('heading', { name: provider.name })).toBeVisible()
   const providerBreadcrumb = page.getByRole('navigation', { name: 'Breadcrumb' })
-  await expect(providerBreadcrumb.getByRole('link', { name: 'Model services' })).toHaveAttribute('href', '/providers')
+  await expect(providerBreadcrumb.getByRole('link', { name: 'Providers' })).toHaveAttribute('href', '/providers')
   await expect(providerBreadcrumb.getByText(provider.name, { exact: true })).toHaveAttribute('aria-current', 'page')
-  const providerViews = page.getByRole('navigation', { name: 'Model service details' })
+  const providerViews = page.getByRole('navigation', { name: 'Provider details' })
   await expect(providerViews).toHaveCSS('border-bottom-width', '0px')
   await providerViews.getByRole('link', { name: 'Connection settings' }).click()
   const connectionSection = page
@@ -1847,10 +1847,10 @@ test('Provider detail separates connection, inventory, references, and guarded m
       return sectionBox && formBox ? Math.round((formBox.width / sectionBox.width) * 100) : 0
     })
     .toBeGreaterThanOrEqual(95)
-  await providerViews.getByRole('link', { name: 'Available models' }).click()
+  await providerViews.getByRole('link', { name: 'Upstream models' }).click()
   await expect(page.getByRole('link', { name: 'Connection settings' })).toBeVisible()
-  await expect(page.getByRole('link', { name: 'Available models' })).toHaveAttribute('aria-current', 'page')
-  const modelTable = page.getByRole('table', { name: 'Models from this service' })
+  await expect(page.getByRole('link', { name: 'Upstream models' })).toHaveAttribute('aria-current', 'page')
+  const modelTable = page.getByRole('table', { name: 'Models from this provider' })
   const modelTableContainer = modelTable.locator('xpath=..')
   expect(await modelTableContainer.evaluate((element) => element.scrollWidth)).toBeLessThanOrEqual(
     await modelTableContainer.evaluate((element) => element.clientWidth),
@@ -1879,13 +1879,13 @@ test('Provider detail separates connection, inventory, references, and guarded m
     .click()
   await expect(page).toHaveURL(/view=models&model=openai%2Fgpt-test/)
   await page.getByRole('button', { name: 'Model actions' }).click()
-  await page.getByRole('menuitem', { name: 'Restore details from service…' }).click()
+  await page.getByRole('menuitem', { name: 'Restore details from provider…' }).click()
   await expect(
     page.getByText(
       'This catalog entry is no longer available. Your saved model is unchanged. Refresh the catalog or update it manually.',
     ),
   ).toBeVisible()
-  await expect(page.locator('#provider-model-id')).toHaveValue('openai/gpt-test')
+  await expect(page.getByText('openai/gpt-test', { exact: true })).toBeVisible()
   await page.getByRole('button', { name: 'Cancel', exact: true }).press('Enter')
   await page.getByRole('button', { name: 'Show filter menu for Model availability' }).click()
   let availabilityFilterDialog = page.getByRole('dialog', { name: 'Filter by Model availability' })
@@ -1906,7 +1906,7 @@ test('Provider detail separates connection, inventory, references, and guarded m
     }
   })
   expect(modelColumns.rows).toEqual([modelColumns.header, modelColumns.header])
-  await expect(page.getByRole('link', { name: 'Used by models' })).toBeVisible()
+  await expect(page.getByRole('link', { name: 'Linked models' })).toBeVisible()
   await page.getByRole('button', { name: 'Sync models' }).click()
   await expect(page.locator('[data-sonner-toast]').getByRole('button', { name: 'Retry', exact: true })).toBeVisible()
   await expect(modelTable.getByRole('row').filter({ hasText: /GPT Test.*openai\/gpt-test/ })).toBeVisible()
@@ -1955,7 +1955,7 @@ test('Provider detail separates connection, inventory, references, and guarded m
   await expect(page.getByRole('alertdialog', { name: 'Delete Retired Model?' })).toHaveCount(0)
   await page.getByRole('button', { name: 'Cancel', exact: true }).click()
 
-  await page.getByRole('link', { name: 'Used by models' }).click()
+  await page.getByRole('link', { name: 'Linked models' }).click()
   await expect(page.getByRole('link', { name: 'client-model' })).toBeVisible()
   await expect(page.getByText('retired-model', { exact: true })).toBeVisible()
   routeQueryFails = true
@@ -2046,17 +2046,17 @@ test('dependency previews block referenced Provider deletion and explain Route d
   await page.goto('/providers')
   await page.getByRole('button', { name: `More actions for ${provider.name}` }).click()
 
-  await page.getByRole('menuitem', { name: 'Delete service…' }).click()
+  await page.getByRole('menuitem', { name: 'Delete provider…' }).click()
   await expect(page.getByRole('alertdialog', { name: `Cannot delete ${provider.name}` })).toBeVisible()
   await expect(page.getByRole('link', { name: /used-route.*upstream/ })).toBeVisible()
-  await expect(page.getByRole('button', { name: 'Delete service' })).toBeDisabled()
+  await expect(page.getByRole('button', { name: 'Delete provider' })).toBeDisabled()
   expect(providerDeletes).toBe(0)
   await page.getByRole('button', { name: 'Cancel' }).click()
   await page.getByRole('button', { name: `More actions for ${safeProvider.name}` }).click()
-  await page.getByRole('menuitem', { name: 'Delete service…' }).click()
+  await page.getByRole('menuitem', { name: 'Delete provider…' }).click()
   await expect(page.getByRole('alertdialog', { name: `Delete ${safeProvider.name}?` })).toBeVisible()
-  await expect(page.getByRole('button', { name: 'Delete service' })).toBeEnabled()
-  await page.getByRole('button', { name: 'Delete service' }).click()
+  await expect(page.getByRole('button', { name: 'Delete provider' })).toBeEnabled()
+  await page.getByRole('button', { name: 'Delete provider' }).click()
   await expect.poll(() => providerDeletes).toBe(1)
 
   await page.goto('/models')
@@ -2145,7 +2145,7 @@ test('creating a Provider opens its saved detail and recovers automatic model sy
   })
 
   await page.goto('/providers')
-  await page.getByRole('button', { name: /Connect (first )?service/ }).click()
+  await page.getByRole('button', { name: /Add (your first )?provider/ }).click()
   await page.getByRole('button', { name: /^OpenAI Compatible / }).click()
   await page.getByLabel('Connection name').fill(createdProvider.name)
   await page.getByLabel('Base URL').fill(createdProvider.base_url)
@@ -2168,7 +2168,7 @@ test('creating a Provider opens its saved detail and recovers automatic model sy
   await expect(page).toHaveURL(new RegExp(`/providers/${createdProvider.id}\\?view=models`))
   await expect(page.getByRole('heading', { name: createdProvider.name })).toBeVisible()
   await expect(page.getByText('Syncing models…')).toBeVisible()
-  await expect(page.getByRole('link', { name: 'Use a model' })).toHaveAttribute(
+  await expect(page.getByRole('link', { name: 'New model from this provider' })).toHaveAttribute(
     'href',
     `/models/new?provider=${createdProvider.id}`,
   )
@@ -2180,8 +2180,7 @@ test('creating a Provider opens its saved detail and recovers automatic model sy
   await expect(syncToast).toBeVisible()
   await expect(syncToast).toContainText('Added 3 · No longer offered 1 · Offered again 2')
   await expect(page.locator('.route-page').getByText('Model changes saved', { exact: true })).toHaveCount(0)
-  const inventorySummary = page.getByRole('heading', { name: 'Models from this service' }).locator('..')
-  const freshness = inventorySummary.locator('p').filter({ hasText: 'Last checked' })
+  const freshness = page.locator('p').filter({ hasText: 'Last checked' })
   await expect(freshness).toBeVisible()
   await expect(freshness).toContainText('Added 3')
   await expect(freshness).toContainText('No longer offered 1')
@@ -2350,9 +2349,9 @@ test('visible provider model actions bind exact IDs and keep inventory open', as
   await existingAction.click()
   const existingToast = page
     .locator('[data-sonner-toast]')
-    .filter({ hasText: 'Added this service to model gpt-existing.' })
+    .filter({ hasText: 'Added this provider to model gpt-existing.' })
   await expect(existingToast).toBeVisible()
-  await expect(page.locator('.route-page').getByText('Added this service to model gpt-existing.')).toHaveCount(0)
+  await expect(page.locator('.route-page').getByText('Added this provider to model gpt-existing.')).toHaveCount(0)
   expect(bindBodies[0]).toEqual({ provider_id: provider.id, provider_model_id: 'gpt-existing' })
 
   const newAction = page.getByRole('button', { name: 'Add gpt-new to a model' })

@@ -166,7 +166,7 @@ for (const destination of ['connection', 'providers', 'narrow-settings']) {
       await page.getByRole('link', { name: 'Connection settings', exact: true }).click()
       await expect(page).toHaveURL(/view=connection/)
     } else if (destination === 'providers') {
-      await page.getByRole('link', { name: 'Model services', exact: true }).first().click()
+      await page.getByRole('link', { name: 'Providers', exact: true }).first().click()
       await expect(page).toHaveURL(/\/providers$/)
     } else {
       await page.getByRole('link', { name: 'Settings', exact: true }).click()
@@ -177,7 +177,7 @@ for (const destination of ['connection', 'providers', 'narrow-settings']) {
     const toast = page.locator('[data-sonner-toast]').filter({ hasText: 'Model changes saved' })
     await toast.getByRole('button', { name: 'View details' }).focus()
     await page.keyboard.press('Enter')
-    const panel = page.getByRole('dialog', { name: 'Model changes' })
+    const panel = page.getByRole('dialog', { name: 'Change history' })
     await expect(panel).toBeVisible()
     const selected = panel.getByLabel('View details', { exact: true })
     await expect(selected).toContainText('exact-model')
@@ -190,7 +190,7 @@ for (const destination of ['connection', 'providers', 'narrow-settings']) {
     } else if (destination === 'providers') {
       await expect(page).toHaveURL(/\/providers$/)
       await expect(
-        page.getByRole('button', { name: 'Model changes', exact: true }).filter({ visible: true }).first(),
+        page.getByRole('button', { name: 'Change history', exact: true }).filter({ visible: true }).first(),
       ).toBeFocused()
     } else {
       await expect(page).toHaveURL(/\/settings$/)
@@ -260,7 +260,7 @@ for (const locale of ['en-US', 'zh-CN']) {
         .locator('[data-sonner-toast]')
         .filter({ hasText: locale === 'en-US' ? 'Model changes saved' : '模型变更已保存' })
       await expect(toast).toContainText(locale === 'en-US' ? 'Specification updated 1' : '规格更新 1')
-      await page.getByRole('button', { name: locale === 'en-US' ? 'Model changes' : '模型变更', exact: true }).click()
+      await page.getByRole('button', { name: locale === 'en-US' ? 'Change history' : '变更记录', exact: true }).click()
       const panel = page.getByRole('dialog')
       await panel.locator('#history-search').fill('slow')
       await expect.poll(() => delayed).toBe(true)
@@ -291,7 +291,7 @@ test('320px history keeps error, empty and no-match distinct and restores keyboa
     ),
   )
   await page.goto('/providers')
-  const trigger = page.getByRole('button', { name: 'Model changes', exact: true }).filter({ visible: true })
+  const trigger = page.getByRole('button', { name: 'Change history', exact: true }).filter({ visible: true })
   await trigger.focus()
   await page.keyboard.press('Enter')
   const panel = page.getByRole('dialog')
@@ -399,7 +399,7 @@ test('older keyset pages remain whole batches when a newer record arrives', asyn
     })
   })
   await page.goto('/providers')
-  await page.getByRole('button', { name: 'Model changes', exact: true }).filter({ visible: true }).click()
+  await page.getByRole('button', { name: 'Change history', exact: true }).filter({ visible: true }).click()
   const panel = page.getByRole('dialog')
   await panel.locator('#history-search').fill('exact-model')
   newer = true

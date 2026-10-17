@@ -12,6 +12,7 @@ import { localeState } from '$lib/localization.svelte'
 import { resolvePluginText } from '$lib/plugin-text'
 import { ProviderConnectionDraft, type ProviderConnectionSubmission } from '$lib/provider-connection-draft.svelte'
 import type { Provider, UpdateProvider } from '$lib/types'
+import FormSection from '$lib/components/form-section.svelte'
 import ProviderConfigFields from '$lib/components/provider-config-fields.svelte'
 import ProviderOAuthAuthorization from '$lib/components/provider-oauth-authorization.svelte'
 import * as Alert from '$lib/components/ui/alert'
@@ -182,14 +183,8 @@ async function testConnection(): Promise<void> {
   }} />
 
 <section class="route-section" aria-labelledby="provider-connection-title">
-  <div class="route-section-header">
-    <div>
-      <h2 id="provider-connection-title" class="route-section-title">
-        {m.provider_connection_view_connection_settings()}
-      </h2>
-      <p class="route-section-description">{m.provider_connection_view_summary()}</p>
-    </div>
-  </div>
+  <!-- 页签已经写明「连接设置」，可见标题只会重复；保留语义标题供辅助技术定位。 -->
+  <h2 id="provider-connection-title" class="sr-only">{m.provider_connection_view_connection_settings()}</h2>
 
   {#if providerDescriptorsQuery.isError}
     <Alert.Root variant="destructive" class="mb-4">
@@ -210,78 +205,82 @@ async function testConnection(): Promise<void> {
   {/if}
 
   <form
-    class="flex flex-col gap-5"
+    class="flex flex-col gap-6"
     onsubmit={(event) => {
       event.preventDefault()
       save()
     }}>
-    <Field.Group class="grid gap-4 sm:grid-cols-2">
-      <Field.Field size="name" class="sm:col-span-2">
-        <Field.Label for="provider-name">{m.common_connection_name()}</Field.Label>
-        <Input
-          id="provider-name"
-          bind:value={draft.fields.name}
-          required
-          disabled={draft.submitting}
-          oninput={nameChanged} />
-      </Field.Field>
-      <Field.Field size="fill" class="sm:col-span-2">
-        <Field.Label for="provider-base-url">{m.common_base_url()}</Field.Label>
-        <Input
-          id="provider-base-url"
-          class="font-technical"
-          bind:value={draft.fields.baseUrl}
-          type="url"
-          required={!supportsConfigValidation}
-          disabled={draft.submitting}
-          oninput={configurationChanged} />
-      </Field.Field>
-      {#if descriptor && channel}
-        <ProviderConfigFields
-          fields={configFields}
-          configGroups={descriptor.config_groups}
-          protocol={provider.protocol}
-          bind:values={draft.fields.values}
-          {configuredSecretFields}
-          issues={previewIssues}
-          idPrefix={`provider-config-${provider.id}`}
-          disabled={draft.submitting}
-          onChanged={configurationChanged} />
+    <FormSection title={m.provider_connection_view_section_connection()}>
+      <Field.Group class="grid gap-4 sm:grid-cols-2">
+        <Field.Field size="name" class="sm:col-span-2">
+          <Field.Label for="provider-name">{m.common_connection_name()}</Field.Label>
+          <Input
+            id="provider-name"
+            bind:value={draft.fields.name}
+            required
+            disabled={draft.submitting}
+            oninput={nameChanged} />
+        </Field.Field>
+        <Field.Field size="fill" class="sm:col-span-2">
+          <Field.Label for="provider-base-url">{m.common_base_url()}</Field.Label>
+          <Input
+            id="provider-base-url"
+            class="font-technical"
+            bind:value={draft.fields.baseUrl}
+            type="url"
+            required={!supportsConfigValidation}
+            disabled={draft.submitting}
+            oninput={configurationChanged} />
+        </Field.Field>
+        {#if descriptor && channel}
+          <ProviderConfigFields
+            fields={configFields}
+            configGroups={descriptor.config_groups}
+            protocol={provider.protocol}
+            bind:values={draft.fields.values}
+            {configuredSecretFields}
+            issues={previewIssues}
+            idPrefix={`provider-config-${provider.id}`}
+            disabled={draft.submitting}
+            onChanged={configurationChanged} />
+        {/if}
+      </Field.Group>
+
+      {#if draft.unknownOptionKeys.length > 0}
+        <Alert.Root>
+          <Alert.Title>{m.provider_config_legacy_values_retained()}</Alert.Title>
+          <Alert.Description>
+            {m.provider_config_legacy_values_retained_help({ fields: draft.unknownOptionKeys.join(', ') })}
+          </Alert.Description>
+        </Alert.Root>
       {/if}
-    </Field.Group>
 
-    {#if draft.unknownOptionKeys.length > 0}
-      <Alert.Root>
-        <Alert.Title>{m.provider_config_legacy_values_retained()}</Alert.Title>
-        <Alert.Description>
-          {m.provider_config_legacy_values_retained_help({ fields: draft.unknownOptionKeys.join(', ') })}
-        </Alert.Description>
-      </Alert.Root>
-    {/if}
+      {#if oauthProvider && descriptor && channel}
+        <ProviderOAuthAuthorization
+          bind:this={oauthAuthorization}
+          vendorId={descriptor.provider_id}
+          channel={channel.id}
+          flow={channel.auth!.flow}
+          configuration={draft.oauthConfiguration}
+          useProxy={draft.fields.useProxy}
+          mode="reconnect"
+          disabled={draft.submitting}
+          onStateChange={oauthStateChanged} />
+      {/if}
+    </FormSection>
 
-    {#if oauthProvider && descriptor && channel}
-      <ProviderOAuthAuthorization
-        bind:this={oauthAuthorization}
-        vendorId={descriptor.provider_id}
-        channel={channel.id}
-        flow={channel.auth!.flow}
-        configuration={draft.oauthConfiguration}
-        useProxy={draft.fields.useProxy}
-        mode="reconnect"
-        disabled={draft.submitting}
-        onStateChange={oauthStateChanged} />
-    {/if}
-
-    <Field.Field orientation="horizontal" class="min-h-10 justify-between rounded-lg border px-3 py-2">
-      <Field.Label for="provider-use-proxy" hint={m.common_send_requests_service_proxy_configured_settings()}>
-        {m.common_use_proxy()}
-      </Field.Label>
-      <Switch
-        id="provider-use-proxy"
-        checked={draft.fields.useProxy}
-        disabled={draft.submitting}
-        onCheckedChange={useProxyChanged} />
-    </Field.Field>
+    <FormSection title={m.provider_connection_view_section_network()}>
+      <Field.Field orientation="horizontal" class="justify-between">
+        <Field.Label for="provider-use-proxy" hint={m.common_send_requests_service_proxy_configured_settings()}>
+          {m.common_use_proxy()}
+        </Field.Label>
+        <Switch
+          id="provider-use-proxy"
+          checked={draft.fields.useProxy}
+          disabled={draft.submitting}
+          onCheckedChange={useProxyChanged} />
+      </Field.Field>
+    </FormSection>
 
     {#if connectionError || submitMessage || previewIssueError}
       <p class="text-sm text-destructive">{connectionError || submitMessage || previewIssueError}</p>

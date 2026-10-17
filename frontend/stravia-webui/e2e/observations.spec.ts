@@ -1549,7 +1549,7 @@ test.describe('Interaction Observation canvas', () => {
       'Time',
       'Client / API Key',
       'Model',
-      'Model service',
+      'Provider',
       'Error source',
       'Error',
       'Duration',

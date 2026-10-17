@@ -85,7 +85,7 @@ Devin 的 `GetUserStatus` 在 `PlanStatus` 中报告每日、每周剩余百分�
 Muse Code 由独立 `muse-code` 插件提供，固定接入 `https://api.meta.ai/v1`，不把普通 Meta 目录 Profile 自动迁移为订阅连接。
 
 1. 在供应商插件管理页本地导入 Release 的 `stravia-vendor-muse-code-v{version}.wasm`；本地构建使用 `task build:vendors:all`，从 `target/vendor-plugins-all/manifest.json` 找到对应组件。更新同样须重新构建并导入独立 Wasm，仅升级宿主不会更新已安装 codec。
-2. 添加 **Muse Code** 模型服务。`subscription` 使用 Meta device login：打开界面提供的 `auth.meta.com` 验证页，完成设备授权；插件向设备 token 端点换取账号 token，再向 `/muse-code/key` 提交 onboarding 请求取得推理 API key。订阅 inactive 或需付款/账号操作时明确失败，用户在 Meta 账号完成操作后重新登录；不自动再次 mint key。插件只提供这一种登录方式，不接受手动 Model API key。
+2. 添加 **Muse Code** 供应商。`subscription` 使用 Meta device login：打开界面提供的 `auth.meta.com` 验证页，完成设备授权；插件向设备 token 端点换取账号 token，再向 `/muse-code/key` 提交 onboarding 请求取得推理 API key。订阅 inactive 或需付款/账号操作时明确失败，用户在 Meta 账号完成操作后重新登录；不自动再次 mint key。插件只提供这一种登录方式，不接受手动 Model API key。
 3. 保存后同步模型，并把实际发现的模型绑定到 Route。插件通过订阅换取的 Bearer API key 与 `x-api-version: 1.0.0` 读取 `/v1/models`、调用 `/v1/responses`；账号 OAuth token 不作为推理凭据。未知模型仍登记真实 ID，但不猜测上下文或能力。
 
 插件提供认证、模型发现与推理，没有额度查询能力，不把缺失额度显示为零。Meta 无已实现的 refresh/revoke grant；插件不伪造刷新成功或到期时间，失效后需重新登录。接入边界见 [Meta Muse Code 认证](https://dev.meta.ai/docs/muse-code/auth)、[CreateResponse schema](https://dev.meta.ai/docs/api-reference/responses/schemas#create-response)、[Responses 兼容范围](https://dev.meta.ai/docs/protocols/responses#openai-compatibility)；已知型号能力种子固定依据 [oh-my-pi `v18.10.4`](https://github.com/can1357/oh-my-pi/tree/v18.10.4)，不扩大 `/models` 返回的集合。
@@ -138,7 +138,7 @@ Claude Pro/Max 订阅由专属插件 `claude-code`（crate `stravia-vendor-claud
 
 Antigravity 由专属 `antigravity` 插件提供，不内嵌、不复用普通 Gemini API-key 身份。运行 `task build:vendors:all` 后，本地导入 `target/vendor-plugins-all/manifest.json` 中对应的 Wasm；发布附件沿用 `stravia-vendor-antigravity-v{version}.wasm` 命名。
 
-1. 添加 **Antigravity** 模型服务，选择 OAuth。浏览器授权后，从 Google 网站复制授权码并粘贴到界面的秘密输入框；不监听 loopback 端口。如果网站回调没有显示授权码，但跳转地址已有 `code` 参数，只提交该参数解码后的授权码，不提交整个回调 URL。
+1. 添加 **Antigravity** 供应商，选择 OAuth。浏览器授权后，从 Google 网站复制授权码并粘贴到界面的秘密输入框；不监听 loopback 端口。如果网站回调没有显示授权码，但跳转地址已有 `code` 参数，只提交该参数解码后的授权码，不提交整个回调 URL。
 2. 保存连接并同步账号模型。项目异步接入未完成时，保留凭据与 operation，后续真实发现请求检查一次进度并明确报告 pending；不猜 project/tier 或自动重试。
 3. 将发现的模型绑定到 Route。额度页读取账号共享池、剩余比例和重置时间；缺失额度不显示为零，未知窗口保留，disabled 不自动等于 exhausted。
 
@@ -334,7 +334,7 @@ Canonical `MessageContent` 与 Chat 文本/parts 解码直接接收 owned string
 ### 插件卸载
 
 - 管理页面为 `base` 之外的已安装插件提供卸载入口，包括加载失败、产物缺失以及历史上来自程序随附包的专属插件。`base` 不能卸载；其恢复流程仍使用“恢复内置版本”。
-- 卸载前确认插件名称及影响：依赖该插件的模型服务和能力将不可用；取消该 Vendor 的活动调用和未完成认证会话，但不能保证上游已停止执行或计费。
+- 卸载前确认插件名称及影响：依赖该插件的供应商和能力将不可用；取消该 Vendor 的活动调用和未完成认证会话，但不能保证上游已停止执行或计费。
 - Core 先停止新任务准入，取消并排空该 Vendor 的操作，撤销旧结果与写回，再移除安装记录和运行态。卸载不需要成功加载组件，也不依赖损坏组件的描述符。其他 Vendor 的调用和无关更新预览保持不变。
 - 卸载保留 Provider 配置、凭据、模型、Route/Target 绑定、历史、用量、插件私有数据与恢复标记，不自动删除或改绑；内容寻址产物文件也不在此次操作中清理。卸载相关的旧更新预览失效，避免重装后重复使用旧确认。
 - 重新安装仍通过导入预览；卸载后旧安装描述符不再作为数据兼容基线，保留数据可能需要管理员明确确认重置，不能静默复用无法证明兼容的数据。

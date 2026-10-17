@@ -17,7 +17,6 @@ import {
 } from '$lib/model-changes'
 import type { ModelChangeType, ModelChangeSource, ModelChangeRecord } from '$lib/types'
 import * as Sheet from '$lib/components/ui/sheet'
-import * as Field from '$lib/components/ui/field'
 import * as Select from '$lib/components/ui/select'
 import * as Empty from '$lib/components/ui/empty'
 import { Input } from '$lib/components/ui/input'
@@ -25,6 +24,9 @@ import { Button } from '$lib/components/ui/button'
 import { Badge } from '$lib/components/ui/badge'
 import { Spinner } from '$lib/components/ui/spinner'
 import RequestFailure from '$lib/components/request-failure.svelte'
+import ChevronRightIcon from '@lucide/svelte/icons/chevron-right'
+import SearchIcon from '@lucide/svelte/icons/search'
+import { cn } from '$lib/utils.js'
 let open = $state(false)
 let providerId = $state('')
 let type = $state<ModelChangeType | ''>('')
@@ -123,53 +125,82 @@ $effect(() => {
 </script>
 
 {#snippet batch(record: ModelChangeRecord)}
-  <article class="min-w-0 border-b py-4">
+  {@const open = Boolean(expanded[record.id])}
+  <article class="min-w-0 border-b last:border-b-0">
     <Button
       variant="ghost"
-      class="h-auto min-h-10 w-full justify-between whitespace-normal text-left"
-      aria-expanded={Boolean(expanded[record.id])}
+      class="h-auto min-h-10 w-full items-start justify-start gap-3 rounded-md px-2 py-3 text-left font-normal whitespace-normal"
+      aria-expanded={open}
       aria-controls={`batch-${record.id}`}
       onclick={() => (expanded[record.id] = !expanded[record.id])}>
-      <span class="min-w-0 break-words"
-        >{record.provider_name}{#if record.provider_deleted}
-          · {m.model_changes_deleted()}{/if}{#if record.initial_sync}
-          · {m.model_changes_initial()}{/if}<span class="block"
-          >{record.outcome === 'failure'
-            ? m.model_changes_failed()
-            : record.outcome === 'partial_success'
-              ? m.model_changes_partial()
-              : [...new Set(record.changes.flatMap((item) => item.types))]
-                  .map(
-                    (kind) =>
-                      `${changeLabel(kind)} ${record.changes.filter((item) => item.types.includes(kind)).length}`,
-                  )
-                  .join(' · ')}</span
-        ></span>
-      <span aria-hidden="true">{expanded[record.id] ? '−' : '+'}</span>
+      <ChevronRightIcon
+        class={cn(
+          'mt-0.5 size-4 shrink-0 text-muted-foreground transition-transform duration-[140ms] ease-[cubic-bezier(0.2,0,0,1)]',
+          open && 'rotate-90',
+        )}
+        aria-hidden="true" />
+      <span class="flex min-w-0 flex-1 flex-col gap-1">
+        <span class="flex min-w-0 items-baseline justify-between gap-3">
+          <span class="min-w-0 truncate font-medium">{record.provider_name}</span>
+          <time class="shrink-0 font-technical text-xs text-muted-foreground" datetime={record.checked_at}
+            >{formatLogTime(record.checked_at)}</time>
+        </span>
+        <span
+          class={cn(
+            'flex flex-wrap items-center gap-x-1.5 gap-y-1 text-[0.8125rem] leading-[1.45]',
+            record.outcome === 'success' ? 'text-foreground' : 'text-destructive',
+          )}>
+          <span
+            >{record.outcome === 'failure'
+              ? m.model_changes_failed()
+              : record.outcome === 'partial_success'
+                ? m.model_changes_partial()
+                : [...new Set(record.changes.flatMap((item) => item.types))]
+                    .map(
+                      (kind) =>
+                        `${changeLabel(kind)} ${record.changes.filter((item) => item.types.includes(kind)).length}`,
+                    )
+                    .join(' · ')}</span>
+          <span class="text-muted-foreground">· {sourceLabel(record.source)}</span>
+          {#if record.initial_sync}<Badge variant="outline">{m.model_changes_initial()}</Badge>{/if}
+          {#if record.provider_deleted}<Badge variant="outline">{m.model_changes_deleted()}</Badge>{/if}
+        </span>
+      </span>
     </Button>
-    <p class="mt-1 px-3 text-xs text-muted-foreground">
-      <time datetime={record.checked_at}>{formatLogTime(record.checked_at)}</time> · {sourceLabel(record.source)}
-    </p>
-    {#if expanded[record.id]}
-      <div id={`batch-${record.id}`} class="flex min-w-0 flex-col gap-4 px-3 pt-4">
-        {#if record.error}<p class="break-words text-destructive">{modelChangeReason(record.error)}</p>{/if}
+    {#if open}
+      <div id={`batch-${record.id}`} class="ms-[1.125rem] mb-3 flex min-w-0 flex-col border-s ps-4">
+        {#if record.error}<p class="py-2 text-[0.8125rem] break-words text-destructive">
+            {modelChangeReason(record.error)}
+          </p>{/if}
         {#each record.changes as item (item.model_id)}
-          <div class="flex min-w-0 flex-col gap-2">
-            <p class="break-all font-medium">{item.name || item.model_id}</p>
-            {#if item.name && item.name !== item.model_id}<p class="break-all font-technical">{item.model_id}</p>{/if}
-            <div class="flex flex-wrap gap-2">
-              {#each item.types as kind (kind)}<Badge variant="outline" class="h-auto text-sm"
-                  >{changeLabel(kind)}</Badge
-                >{/each}
+          <div class="flex min-w-0 flex-col gap-1.5 border-b border-border/60 py-2.5 last:border-b-0">
+            <div class="flex min-w-0 items-start justify-between gap-3">
+              <div class="min-w-0">
+                <p class="text-sm font-medium break-all">{item.name || item.model_id}</p>
+                {#if item.name && item.name !== item.model_id}<p
+                    class="font-technical text-xs break-all text-muted-foreground">
+                    {item.model_id}
+                  </p>{/if}
+              </div>
+              <div class="flex shrink-0 flex-wrap justify-end gap-1">
+                {#each item.types as kind (kind)}<Badge variant="outline">{changeLabel(kind)}</Badge>{/each}
+              </div>
             </div>
-            {#if item.types.includes('selection_policy_changed') && item.before_policy && item.after_policy}<p>
+            {#if item.types.includes('selection_policy_changed') && item.before_policy && item.after_policy}<p
+                class="text-[0.8125rem]">
                 {policyLabel(item.before_policy)} → {policyLabel(item.after_policy)}
               </p>{/if}
             {#each item.specification as diff (diff.field)}
-              <dl class="flex min-w-0 flex-col gap-1">
+              <dl class="flex min-w-0 flex-col gap-0.5 text-[0.8125rem] leading-[1.45]">
                 <dt class="font-medium">{specificationField(diff.field)}</dt>
-                <dd class="break-words">{m.model_changes_before()}: {specificationValue(diff.before)}</dd>
-                <dd class="break-words">{m.model_changes_after()}: {specificationValue(diff.after)}</dd>
+                <dd class="break-words">
+                  <span class="text-muted-foreground">{m.model_changes_before()}:</span>
+                  {specificationValue(diff.before)}
+                </dd>
+                <dd class="break-words">
+                  <span class="text-muted-foreground">{m.model_changes_after()}:</span>
+                  {specificationValue(diff.after)}
+                </dd>
               </dl>
             {/each}
           </div>
@@ -193,56 +224,58 @@ $effect(() => {
       }
     }}>
     <Sheet.Header><Sheet.Title>{m.model_changes_title()}</Sheet.Title></Sheet.Header>
-    <div class="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto px-4 pb-4">
-      <Field.FieldGroup>
-        <Field.Field
-          ><Field.FieldLabel for="history-provider">{m.common_model_service()}</Field.FieldLabel><Select.Root
-            type="single"
-            bind:value={providerId}
-            ><Select.Trigger id="history-provider" class="w-full"
-              >{serviceOptions.get(providerId) ?? (providerId || m.model_changes_all_services())}</Select.Trigger
-            ><Select.Content
+    <div class="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto px-4 pb-4">
+      <!-- 历史面板以浏览为主：筛选收成一行紧凑控件，选项文案自带维度名，不再逐项占用标签行。 -->
+      <div class="@container flex flex-col gap-2">
+        <div class="relative">
+          <SearchIcon
+            class="pointer-events-none absolute start-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground"
+            aria-hidden="true" />
+          <Input
+            id="history-search"
+            type="search"
+            class="ps-9"
+            placeholder={m.model_changes_search()}
+            aria-label={m.model_changes_search()}
+            bind:value={search} />
+        </div>
+        <div class="grid gap-2 @sm:grid-cols-3">
+          <Select.Root type="single" bind:value={providerId}>
+            <Select.Trigger id="history-provider" class="w-full min-w-0" aria-label={m.common_model_service()}
+              ><span class="truncate"
+                >{serviceOptions.get(providerId) ?? (providerId || m.model_changes_all_services())}</span
+              ></Select.Trigger>
+            <Select.Content
               ><Select.Group
                 ><Select.Item value="">{m.model_changes_all_services()}</Select.Item
                 >{#each [...serviceOptions] as [id, name] (id)}<Select.Item value={id}>{name}</Select.Item
                   >{/each}</Select.Group
-              ></Select.Content
-            ></Select.Root
-          ></Field.Field>
-        <Field.Field
-          ><Field.FieldLabel for="history-type">{m.model_changes_type()}</Field.FieldLabel><Select.Root
-            type="single"
-            bind:value={type}
-            ><Select.Trigger id="history-type" class="w-full"
-              >{type ? changeLabel(type) : m.model_changes_all()}</Select.Trigger
-            ><Select.Content
+              ></Select.Content>
+          </Select.Root>
+          <Select.Root type="single" bind:value={type}>
+            <Select.Trigger id="history-type" class="w-full min-w-0" aria-label={m.model_changes_type()}
+              ><span class="truncate">{type ? changeLabel(type) : m.model_changes_all_types()}</span></Select.Trigger>
+            <Select.Content
               ><Select.Group
-                ><Select.Item value="">{m.model_changes_all()}</Select.Item
+                ><Select.Item value="">{m.model_changes_all_types()}</Select.Item
                 >{#each changeTypes as kind (kind)}<Select.Item value={kind}>{changeLabel(kind)}</Select.Item
                   >{/each}</Select.Group
-              ></Select.Content
-            ></Select.Root
-          ></Field.Field>
-        <Field.Field
-          ><Field.FieldLabel for="history-source">{m.model_changes_source()}</Field.FieldLabel><Select.Root
-            type="single"
-            bind:value={source}
-            ><Select.Trigger id="history-source" class="w-full"
-              >{source ? sourceLabel(source) : m.model_changes_all()}</Select.Trigger
-            ><Select.Content
+              ></Select.Content>
+          </Select.Root>
+          <Select.Root type="single" bind:value={source}>
+            <Select.Trigger id="history-source" class="w-full min-w-0" aria-label={m.model_changes_source()}
+              ><span class="truncate">{source ? sourceLabel(source) : m.model_changes_all_sources()}</span
+              ></Select.Trigger>
+            <Select.Content
               ><Select.Group
-                ><Select.Item value="">{m.model_changes_all()}</Select.Item
+                ><Select.Item value="">{m.model_changes_all_sources()}</Select.Item
                 >{#each ['automatic_sync', 'manual_sync', 'manual_change'] as origin (origin)}<Select.Item
                     value={origin}>{sourceLabel(origin as ModelChangeSource)}</Select.Item
                   >{/each}</Select.Group
-              ></Select.Content
-            ></Select.Root
-          ></Field.Field>
-        <Field.Field
-          ><Field.FieldLabel for="history-search">{m.model_changes_search()}</Field.FieldLabel><Input
-            id="history-search"
-            bind:value={search} /></Field.Field>
-      </Field.FieldGroup>
+              ></Select.Content>
+          </Select.Root>
+        </div>
+      </div>
       {#if providers.isError}<RequestFailure
           message={localizeBackendErrorMessage(providers.error)}
           retry={() => providers.refetch()} />{/if}
@@ -258,14 +291,18 @@ $effect(() => {
       {#if history.isError}<RequestFailure
           message={localizeBackendErrorMessage(history.error)}
           retry={() => history.refetch()} />{/if}
-      {#if history.isPending}<p role="status">
-          {m.model_changes_loading()}
+      {#if history.isPending}<p role="status" class="flex items-center gap-2 py-6 text-sm text-muted-foreground">
+          <Spinner />{m.model_changes_loading()}
         </p>{:else if records.length === 0 && !history.isError}<Empty.Root
           ><Empty.Header
             ><Empty.Title>{filtered ? m.model_changes_no_match() : m.model_changes_empty()}</Empty.Title></Empty.Header
           ></Empty.Root
         >{:else}
-        {#each records.filter((record) => record.id !== selectedId) as record (record.id)}{@render batch(record)}{/each}
+        <div class="flex flex-col">
+          {#each records.filter((record) => record.id !== selectedId) as record (record.id)}{@render batch(
+              record,
+            )}{/each}
+        </div>
       {/if}
       {#if history.hasNextPage}<Button
           variant="outline"

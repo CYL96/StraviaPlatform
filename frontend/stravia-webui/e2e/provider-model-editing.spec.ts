@@ -133,37 +133,56 @@ async function openModel(page: Page, name: string) {
   await page.getByRole('row').filter({ hasText: name }).getByRole('cell').filter({ hasText: name }).click()
 }
 
+for (const surface of ['detail', 'cell'] as const) {
+  test(`${surface} modality editing keeps custom choices available and saves independent directions`, async ({
+    page,
+  }) => {
+    const fixture = await setup(page)
+    fixture.details['model-a'].metadata.modalities = { input: ['text', 'binary'], output: ['text'] }
+    await page.route('**/api/v1/settings/rpm_admission', (route) => route.fulfill({ json: { data: null } }))
+    if (surface === 'detail') await openModel(page, 'Alpha Model')
+    else await page.getByRole('button', { name: 'Modalities model-a', exact: true }).click()
+
+    const input = page.locator('[data-modality-select="input"]')
+    await input.click()
+    const custom = page.getByRole('option', { name: 'binary', exact: true })
+    await custom.click()
+    await expect(custom).toBeVisible()
+    await expect(custom).not.toHaveAttribute('aria-selected', 'true')
+    await custom.click()
+    await expect(custom).toHaveAttribute('aria-selected', 'true')
+    await page.getByRole('option', { name: 'Audio', exact: true }).click()
+    await page.keyboard.press('Escape')
+    await page.locator('[data-modality-select="output"]').click()
+    await page.getByRole('option', { name: 'Image', exact: true }).click()
+    await page.keyboard.press('Escape')
+    await page.getByRole('button', { name: surface === 'detail' ? 'Save model' : 'Save', exact: true }).click()
+    await expect
+      .poll(() => fixture.writes.map((write) => (write.metadata as Detail['metadata']).modalities))
+      .toEqual([{ input: ['text', 'audio', 'binary'], output: ['text', 'image'] }])
+  })
+}
+
 const discardDialog = (page: Page) => page.getByRole('alertdialog', { name: 'Discard unsaved model changes?' })
 const nameField = (page: Page) => page.locator('#provider-model-name')
 
-test('automatic sync preference saves independently without submitting or clearing a model draft', async ({ page }) => {
+test('detail footer saves an RPM-only change once without rewriting the model specification', async ({ page }) => {
   const fixture = await setup(page)
-  let enabled = true
-  await page.route(`**/api/v1/providers/${providerId}/models/sync-state`, async (route) => {
-    if (route.request().method() === 'PUT') enabled = route.request().postDataJSON().automatic_sync
-    await route.fulfill({
-      json: {
-        data: {
-          automatic_sync: enabled,
-          in_progress: false,
-          pause_reason: null,
-          last_check: null,
-          has_successful_sync: true,
-        },
-      },
-    })
+  const rpmWrites: unknown[] = []
+  await page.route('**/api/v1/settings/rpm_admission', async (route) => {
+    if (route.request().method() === 'PUT') {
+      rpmWrites.push(JSON.parse(route.request().postDataJSON().value))
+      await route.fulfill({ json: { data: null } })
+    } else await route.fulfill({ json: { data: null } })
   })
-  await page.reload()
   await openModel(page, 'Alpha Model')
-  await nameField(page).fill('Unsaved Alpha specification')
-  await page.getByRole('switch', { name: 'Automatic sync' }).click()
-  await expect(page.getByRole('switch', { name: 'Automatic sync' })).not.toBeChecked()
-  await expect(nameField(page)).toHaveValue('Unsaved Alpha specification')
+  const rpm = page.getByRole('region', { name: 'RPM limit', exact: true })
+  await expect(rpm.getByRole('button')).toHaveCount(0)
+  await rpm.getByRole('spinbutton', { name: 'Requests per minute', exact: true }).fill('12')
+  await page.getByRole('button', { name: 'Save model', exact: true }).click()
+  await expect.poll(() => rpmWrites.length).toBe(1)
+  expect(rpmWrites[0]).toMatchObject({ destinations: [{ provider_id: providerId, model: 'model-a', rpm_limit: 12 }] })
   expect(fixture.writes).toEqual([])
-  expect(fixture.selections).toEqual([])
-  await page.getByRole('switch', { name: 'Automatic sync' }).click()
-  await expect(page.getByRole('switch', { name: 'Automatic sync' })).toBeChecked()
-  await expect(nameField(page)).toHaveValue('Unsaved Alpha specification')
 })
 
 test('late Alpha detail cannot replace Beta after an in-app model switch', async ({ page }) => {
@@ -206,14 +225,14 @@ test('dirty Back, Forward and internal navigation preserve or discard the draft 
   await expect(nameField(page)).toHaveValue('Alpha Model')
   await nameField(page).fill('Unsaved Alpha')
   await page
-    .getByRole('navigation', { name: 'Model service details' })
+    .getByRole('navigation', { name: 'Provider details' })
     .getByRole('link', { name: 'Connection settings' })
     .click()
   await expect(discardDialog(page)).toBeVisible()
   await page.getByRole('button', { name: 'Keep editing' }).click()
   await expect(nameField(page)).toHaveValue('Unsaved Alpha')
   await page
-    .getByRole('navigation', { name: 'Model service details' })
+    .getByRole('navigation', { name: 'Provider details' })
     .getByRole('link', { name: 'Connection settings' })
     .click()
   await page.getByRole('button', { name: 'Discard changes' }).click()
@@ -234,7 +253,7 @@ test('dirty Back, Forward and internal navigation preserve or discard the draft 
 })
 
 async function chooseManualTemplate(page: Page) {
-  await page.getByRole('button', { name: 'Add model', exact: true }).click()
+  await page.getByRole('button', { name: 'Add manually', exact: true }).click()
   await page.locator('#manual-provider-model-search').click()
   await page.getByPlaceholder('Search model template').fill('openai/gpt-5.4')
   await page.getByRole('option', { name: /GPT-5\.4.*openai\/gpt-5\.4/ }).click()
@@ -272,7 +291,7 @@ test('cancelling manual preparation prevents late results from reopening the edi
   })
   await chooseManualTemplate(page)
   await expect.poll(() => preparing).toBe(true)
-  await page.getByRole('dialog', { name: 'Add a model' }).getByRole('button', { name: 'Cancel' }).click()
+  await page.getByRole('dialog', { name: 'Add a model manually' }).getByRole('button', { name: 'Cancel' }).click()
   const lateResponse = page.waitForResponse((response) => response.url().endsWith('/model/prepare'))
   gate.resolve()
   await (await lateResponse).finished()

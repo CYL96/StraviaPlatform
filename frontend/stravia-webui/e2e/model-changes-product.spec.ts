@@ -134,7 +134,7 @@ test('real backend records discovery, manual policy, failure and retained delete
     const toast = page.locator('[data-sonner-toast]').filter({ hasText: 'Added 1 · No longer offered 1' })
     await expect(toast).toBeVisible()
     await toast.getByRole('button', { name: 'View details' }).click()
-    const panel = page.getByRole('dialog', { name: 'Model changes' })
+    const panel = page.getByRole('dialog', { name: 'Change history' })
     const details = panel.getByLabel('View details', { exact: true })
     await expect(details).toContainText('first-synthetic')
     await expect(details).toContainText('second-synthetic')
@@ -145,7 +145,7 @@ test('real backend records discovery, manual policy, failure and retained delete
       policy: 'force_disabled',
       revision: detail.revision,
     })
-    await page.getByRole('button', { name: 'Model changes', exact: true }).click()
+    await page.getByRole('button', { name: 'Change history', exact: true }).click()
     const policyBatch = panel.getByRole('button').filter({ hasText: 'Availability policy changed' })
     await policyBatch.focus()
     await page.keyboard.press('Enter')
@@ -161,9 +161,9 @@ test('real backend records discovery, manual policy, failure and retained delete
     await api(`/providers/${provider.id}`, 'DELETE')
     await page.goto(`${origin}/providers`)
     // Empty configured lists still offer retained global history.
-    await page.getByRole('button', { name: 'Model changes', exact: true }).click()
+    await page.getByRole('button', { name: 'Change history', exact: true }).click()
     await expect(page.getByRole('dialog')).toContainText('Browser history service')
-    await expect(page.getByRole('dialog')).toContainText('Deleted service')
+    await expect(page.getByRole('dialog')).toContainText('Provider deleted')
   } finally {
     try {
       if (browser.isConnected()) await context.close()

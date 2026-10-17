@@ -317,6 +317,14 @@ html[lang='zh-CN'] .font-structural {
   }
 }
 
+/* 超宽单栏表单中固定宽度的控件列会让标签与控件之间出现大片空白；此时按 2:3 分配标签列与控件列。数字与时间保留语义宽度。 */
+@container field (min-width: 72rem) {
+  [data-slot='field'][data-orientation='responsive']:not([data-size='number']):not([data-size='datetime'])
+    > [data-slot='field-layout'] {
+    grid-template-columns: minmax(12rem, 2fr) minmax(var(--field-control-width), 3fr);
+  }
+}
+
 .field-actions {
   display: flex;
   flex-wrap: wrap;

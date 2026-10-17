@@ -1089,7 +1089,7 @@ test('Route Builder loads Provider Models and edits priority-lane destinations i
   await page.getByRole('option', { name: /GPT-5\.4.*openai\/gpt-5\.4/ }).click()
   await displayName.fill('')
   await page.getByRole('button', { name: 'Add destination' }).click()
-  await page.getByLabel('Destination 1 model service', { exact: true }).click()
+  await page.getByLabel('Destination 1 provider', { exact: true }).click()
   await page.getByRole('option', { name: 'Provider A' }).click()
   await expect(page.getByLabel('Destination 1 model', { exact: true })).toHaveText(/Choose a model/)
   await expect(page.getByLabel('Destination 1 model', { exact: true })).toBeEnabled()
@@ -1129,7 +1129,7 @@ test('Route Builder loads Provider Models and edits priority-lane destinations i
   await page.getByRole('button', { name: 'Confirm' }).click()
 
   await page.getByRole('button', { name: 'Add destination' }).click()
-  await page.getByLabel('Destination 2 model service', { exact: true }).click()
+  await page.getByLabel('Destination 2 provider', { exact: true }).click()
   await page.getByRole('option', { name: 'Provider A' }).click()
   await page.getByLabel('Destination 2 model', { exact: true }).click()
   await page.getByRole('option', { name: /GPT Available.*gpt-available/ }).click()
@@ -1163,7 +1163,7 @@ test('Route Builder loads Provider Models and edits priority-lane destinations i
   await expect(page.getByLabel('Layer 1')).toBeVisible()
 
   await page.getByRole('button', { name: 'Edit destination 1' }).click()
-  await page.getByLabel('Destination 1 model service', { exact: true }).click()
+  await page.getByLabel('Destination 1 provider', { exact: true }).click()
   await page.getByRole('option', { name: 'Provider B' }).click()
   await expect(page.getByLabel('Destination 1 model', { exact: true })).toHaveText(/Choose a model/)
   await expect(page.getByRole('button', { name: 'Confirm', exact: true })).toBeDisabled()

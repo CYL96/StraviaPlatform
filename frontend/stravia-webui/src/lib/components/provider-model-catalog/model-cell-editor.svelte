@@ -8,7 +8,8 @@ import * as m from '$lib/paraglide/messages.js'
 import { admin } from '$lib/admin-client'
 import { localizeBackendErrorMessage } from '$lib/backend-error'
 import { localeState } from '$lib/localization.svelte'
-import { specificationModalities, specificationModality, specificationReasoningEfforts } from '$lib/model-specification'
+import { specificationReasoningEfforts } from '$lib/model-specification'
+import ModalitySelect from '$lib/components/modality-select.svelte'
 import { providerModelSelectionPolicyLabel } from '$lib/provider-model-labels'
 import { inputValue } from '$lib/utils.js'
 import type { ProviderModelDetail, ProviderModelSelectionPolicy, ProviderModelSummary } from '$lib/types'
@@ -57,14 +58,9 @@ let label = $derived(
         ? m.provider_model_editor_reasoning_efforts()
         : m.common_availability_adding_models(),
 )
-let modalityOptions = $derived([
-  ...new Set([
-    ...specificationModalities.map(({ key }) => key),
-    ...(detail?.metadata.modalities?.input ?? []),
-    ...(detail?.metadata.modalities?.output ?? []),
-    ...input,
-    ...output,
-  ]),
+let registeredModalities = $derived([
+  ...(detail?.metadata.modalities?.input ?? []),
+  ...(detail?.metadata.modalities?.output ?? []),
 ])
 let effortOptions = $derived([
   ...new Set([
@@ -190,26 +186,33 @@ async function save(selection?: ProviderModelSelectionPolicy): Promise<void> {
   </Popover.Trigger>
   <Popover.Content
     align="start"
-    class="flex max-h-[min(80vh,40rem)] w-80 max-w-[calc(100vw-2rem)] flex-col gap-4 overflow-y-auto">
-    <Popover.Header>
-      <Popover.Title class="break-all">{label} · {model.id}</Popover.Title>
+    class="flex max-h-[min(80vh,40rem)] w-80 max-w-[calc(100vw-2rem)] flex-col p-0"
+    role="dialog">
+    <!-- 字段名已由表单标签给出；标题只交代正在编辑哪个模型，避免「字段 · ID」与标签重复。 -->
+    <Popover.Header class="border-b border-border/60 px-4 py-3">
+      <Popover.Title class="truncate">{model.name || model.id}</Popover.Title>
+      {#if model.name && model.name !== model.id}
+        <Popover.Description class="truncate font-technical text-xs">{model.id}</Popover.Description>
+      {/if}
     </Popover.Header>
     {#if loading}
-      <div class="flex min-h-20 items-center justify-center" aria-busy="true"><Spinner /></div>
+      <div class="flex min-h-24 items-center justify-center" aria-busy="true"><Spinner /></div>
     {/if}
     {#if error}
-      <Alert.Root variant="destructive" role="alert"
-        ><Alert.Description class="whitespace-pre-line">{error}</Alert.Description></Alert.Root>
-      {#if !detail && !loading}<Button variant="outline" onclick={() => load()}>{m.common_retry()}</Button>{/if}
+      <div class="flex flex-col items-start gap-3 px-4 pt-4" class:pb-4={!detail && !loading}>
+        <Alert.Root variant="destructive" role="alert"
+          ><Alert.Description class="whitespace-pre-line">{error}</Alert.Description></Alert.Root>
+        {#if !detail && !loading}<Button variant="outline" onclick={() => load()}>{m.common_retry()}</Button>{/if}
+      </div>
     {/if}
     {#if detail && !loading}
       <form
-        class="flex flex-col gap-4"
+        class="flex min-h-0 flex-col"
         onsubmit={(event) => {
           event.preventDefault()
           void save(field === 'availability' ? policy : undefined)
         }}>
-        <Field.Group>
+        <Field.Group class="min-h-0 overflow-y-auto p-4">
           {#if field === 'context'}
             <Field.Field>
               <Field.Label for={`${uid}-context`}>{label}</Field.Label>
@@ -218,6 +221,7 @@ async function save(selection?: ProviderModelSelectionPolicy): Promise<void> {
                 type="number"
                 min="0"
                 step="1"
+                class="font-technical"
                 value={context}
                 oninput={(event: Event) => {
                   context = inputValue(event)
@@ -232,31 +236,21 @@ async function save(selection?: ProviderModelSelectionPolicy): Promise<void> {
                   >{target === 'input'
                     ? m.provider_model_editor_accepted_input_types()
                     : m.provider_model_editor_generated_output_types()}</Field.Label>
-                <Select.Root
-                  type="multiple"
-                  disabled={saving}
-                  bind:value={
-                    () => (target === 'input' ? input : output),
-                    (values: string[]) => {
-                      if (target === 'input') input = values
-                      else output = values
-                    }
-                  }>
-                  <Select.Trigger id={`${uid}-${target}`} class="w-full min-w-0">
-                    <span class="truncate"
-                      >{(target === 'input' ? input : output)
-                        .map((value) => specificationModality(value).label())
-                        .join(', ') || m.provider_model_editor_select_content_types()}</span>
-                  </Select.Trigger>
-                  <Select.Content
-                    ><Select.Group>
-                      {#each modalityOptions as value (value)}
-                        {@const modality = specificationModality(value)}
-                        <Select.Item {value} label={modality.label()}
-                          ><modality.icon aria-hidden="true" />{modality.label()}</Select.Item>
-                      {/each}
-                    </Select.Group></Select.Content>
-                </Select.Root>
+                {#if target === 'input'}
+                  <ModalitySelect
+                    id={`${uid}-${target}`}
+                    {target}
+                    registered={registeredModalities}
+                    disabled={saving}
+                    bind:value={input} />
+                {:else}
+                  <ModalitySelect
+                    id={`${uid}-${target}`}
+                    {target}
+                    registered={registeredModalities}
+                    disabled={saving}
+                    bind:value={output} />
+                {/if}
               </Field.Field>
             {/each}
           {:else if field === 'efforts'}
@@ -324,7 +318,7 @@ async function save(selection?: ProviderModelSelectionPolicy): Promise<void> {
             </Field.Field>
           {/if}
         </Field.Group>
-        <div class="flex justify-end gap-2">
+        <div class="flex items-center justify-end gap-2 border-t border-border/60 px-4 py-3">
           <Button
             type="button"
             variant="outline"
@@ -334,7 +328,7 @@ async function save(selection?: ProviderModelSelectionPolicy): Promise<void> {
             }}>{m.common_cancel()}</Button>
           {#if field !== 'availability' || error}
             <Button type="submit" disabled={saving}
-              >{#if saving}<Spinner data-icon="inline-start" />{/if}{m.common_save_model()}</Button>
+              >{#if saving}<Spinner data-icon="inline-start" />{/if}{m.common_save()}</Button>
           {:else if saving}<Spinner />{/if}
         </div>
       </form>
