@@ -47,6 +47,7 @@ impl Gateway {
         let remaining_ms = job
             .execution_deadline_unix_ms
             .saturating_sub(chrono::Utc::now().timestamp_millis());
+        let accepted_at = job.execution.accepted_at();
         let result = if remaining_ms <= 0 {
             stravia_runtime_contract::hook::PlatformToolResult {
                 tool_id: stravia_runtime_contract::hook::ToolId::new("deadline"),
@@ -61,7 +62,14 @@ impl Gateway {
         } else {
             match tokio::time::timeout(
                 std::time::Duration::from_millis(remaining_ms as u64),
-                interaction_observation::scope::scope(observer.clone(), job.execution.execute()),
+                crate::tool_execution::scope_execution(
+                    accepted_at,
+                    Instant::now() + std::time::Duration::from_millis(remaining_ms as u64),
+                    interaction_observation::scope::scope(
+                        observer.clone(),
+                        job.execution.execute(),
+                    ),
+                ),
             )
             .await
             {
@@ -149,7 +157,9 @@ impl Gateway {
                 let root_request = crate::rpm::current_root_request();
                 self.lifecycle
                     .spawn(crate::rpm::scope_root_request(root_request, async move {
-                        let raw = if parallel_safe {
+                        let raw = if job.execution.public_execution() {
+                            Self::execute_history_marker_job(job).await
+                        } else if parallel_safe {
                             let _permit = execution_gate.read().await;
                             Self::execute_history_marker_job(job).await
                         } else {

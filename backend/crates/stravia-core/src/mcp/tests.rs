@@ -13,6 +13,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 mod media_generation;
 mod snapshots;
+mod tool_executions;
 
 struct EchoTool;
 

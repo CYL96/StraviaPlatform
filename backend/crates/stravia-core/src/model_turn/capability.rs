@@ -50,6 +50,7 @@ impl CapabilityObservation {
             .unwrap_or_default();
         if let Some(observer) = &observer {
             observer.record(crate::interaction_observation::RunEvent::ModelTurnStarted {
+                retention_detached: false,
                 model_turn_id: id.clone(),
                 route_id: route.id.clone().into(),
                 model_display_name: route.display_name.clone(),
@@ -71,6 +72,7 @@ impl CapabilityObservation {
         if let Some(observer) = &self.observer {
             observer.record(
                 crate::interaction_observation::RunEvent::ModelTurnFinished {
+                    retention_detached: false,
                     model_turn_id: self.id.clone(),
                     status: status.to_owned(),
                 },

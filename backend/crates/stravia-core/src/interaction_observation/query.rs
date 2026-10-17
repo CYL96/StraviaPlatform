@@ -2032,6 +2032,7 @@ mod tests {
                 id,
                 id,
                 &RunEvent::ModelTurnStarted {
+                    retention_detached: false,
                     model_turn_id: id.into(),
                     route_id: "route".into(),
                     model_display_name: None,
@@ -2139,6 +2140,7 @@ mod tests {
                     id,
                     id,
                     &RunEvent::ModelTurnStarted {
+                        retention_detached: false,
                         model_turn_id: id.into(),
                         route_id: "route".into(),
                         model_display_name: None,
@@ -2213,6 +2215,7 @@ mod tests {
         admit_chain_node(store, "known-input", "known-input", None, 1).await?;
         for event in [
             RunEvent::ModelTurnStarted {
+                retention_detached: false,
                 model_turn_id: "known-input".into(),
                 route_id: "route".into(),
                 model_display_name: None,
@@ -2418,6 +2421,7 @@ mod tests {
                     id,
                     id,
                     &RunEvent::ModelTurnStarted {
+                        retention_detached: false,
                         model_turn_id: id.into(),
                         route_id: "route".into(),
                         model_display_name: None,
@@ -2522,6 +2526,7 @@ mod tests {
                 "child",
                 "child",
                 &RunEvent::ModelTurnFinished {
+                    retention_detached: false,
                     model_turn_id: "child".into(),
                     status: "failed".into(),
                 },

@@ -9,6 +9,23 @@ pub(super) struct RetentionBatch {
 }
 
 impl ObservationStore {
+    async fn cancel_removed_tool_executions(&self) -> anyhow::Result<()> {
+        let ids: Vec<String> = match self {
+            Self::Sqlite(pool, _, _) => {
+                sqlx::query_scalar("DELETE FROM removed_tool_executions RETURNING id")
+                    .fetch_all(pool)
+                    .await?
+            }
+            Self::Postgres(pool, _) => {
+                sqlx::query_scalar("DELETE FROM removed_tool_executions RETURNING id")
+                    .fetch_all(pool)
+                    .await?
+            }
+        };
+        crate::tool_execution::cancel_removed(&ids);
+        Ok(())
+    }
+
     #[tracing::instrument(
         target = "stravia::perf",
         name = "observation.maintenance.update_retention",
@@ -70,6 +87,7 @@ impl ObservationStore {
                     .fetch_all(&mut *tx)
                     .await?;
                 tx.commit().await?;
+                self.cancel_removed_tool_executions().await?;
                 Ok(RetentionBatch {
                     has_more: rejected == RETENTION_BATCH_SIZE as u64
                         || removed_interactions.len() == RETENTION_BATCH_SIZE as usize,
@@ -91,6 +109,7 @@ impl ObservationStore {
                     .fetch_all(&mut *tx)
                     .await?;
                 tx.commit().await?;
+                self.cancel_removed_tool_executions().await?;
                 Ok(RetentionBatch {
                     has_more: rejected == RETENTION_BATCH_SIZE as u64
                         || removed_interactions.len() == RETENTION_BATCH_SIZE as usize,
@@ -178,6 +197,7 @@ impl ObservationStore {
                     tx.commit().await?;
                     deleted
                 };
+                self.cancel_removed_tool_executions().await?;
                 self.remove_orphan_manifests().await?;
                 Ok(deleted)
             }
@@ -188,6 +208,7 @@ impl ObservationStore {
                     .await?;
                 let deleted = sqlx::query_scalar("DELETE FROM interaction_observations WHERE status NOT IN ('running','waiting_client') RETURNING id").fetch_all(&mut *tx).await?;
                 tx.commit().await?;
+                self.cancel_removed_tool_executions().await?;
                 self.remove_orphan_manifests().await?;
                 Ok(deleted)
             }

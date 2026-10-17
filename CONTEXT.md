@@ -330,6 +330,11 @@ _避免使用_：Marker Cache、Tool Continuation Store
 Platform Tool Execution 是由 History Marker Store 跟踪、可与客户端工具并行推进的一次平台工具执行。进程崩溃时未落盘完成的执行转为失败结果并提示模型重新请求工具，Stravia 不自动重放可能已经产生副作用的调用。
 _避免使用_：Tool Retry Job、Inference Run
 
+## 工具执行引用（Tool Execution Reference）
+
+工具执行引用是供客户端与模型通过 StraviaRead 查询某次平台工具执行状态及结果的稳定、不透明引用，外壳为 `stravia://tool-executions/<id>`。它不是模型生成的 tool-call ID、History Marker 或结果文件的 Artifact Reference，也不授予访问权限；解析仍受所属 Principal 的访问隔离约束。
+_避免使用_：Tool Call ID、工具定义 ID、访问凭据
+
 ## Generation Chain
 
 Generation Chain 是归属于 Principal、由已完整交付且终态为 `completed` 或 `incomplete` 的生成请求与最终响应组成的不可变历史有向无环图，独立于 ingress 协议。每个节点保存的是该次交付在 ingress 协议下的形态，其内容来自已完成的 Client Projection，不等于 Effective Model Request 的 items；ingress 形态改写由 Generation Chain 拥有，Marker 与 Projection Delimiter 规则不属于它。Stravia 始终记录每个这类生成请求；每个请求形成一个可分支的节点。`failed`、取消、客户端断线与 delivery failure 不形成节点。它不拥有可变 Session head 或 Inference Run 生命周期状态。
@@ -812,7 +817,7 @@ Internal Web Fetch Leaf 是内部 Agent 读取网页正文的基础能力，通�
 
 ## StraviaRead
 
-StraviaRead 是客户端、外层模型与内部 Agent 的统一内容读取工具入口，覆盖文件、网页、图片理解与搜索。搜索语义由平台确定的执行环境区分为外层完整研究与内部基础检索，统一入口不合并两者的执行身份。
+StraviaRead 是客户端、外层模型与内部 Agent 的统一内容读取工具入口，覆盖文件、网页、图片理解、搜索及工具执行状态与结果查询。搜索语义由平台确定的执行环境区分为外层完整研究与内部基础检索，统一入口不合并两者的执行身份。
 _避免使用_：Artifact Store、无上下文的全局工具执行器
 
 ## Read Snapshot

@@ -66,7 +66,7 @@ Generation parent 存在但对应父观察不可用时，新准入记录 `genera
 
 `failed_request` 表示历史中存在失败请求，不覆盖 `completed`、`running` 或 `waiting_client` 主状态；这些状态使用独立的低权重历史失败标记。无活动且以失败结束的交互仍显示失败。`visible_tail` 在每个 Model Turn 开始时（已有输出且尚未以空行结尾）追加一个空行，使预览按 Markdown 段落分隔各 Turn 的输出。`visible_tail` 为空或仅包含空白字符，而 `client_output_delivered` 为真时显示“已交付输出，暂无文本预览”，不能否定已经交付的工具调用或思考预览。该判断不修改 Markdown 原文或代码缩进，也不把思考内容替换为公开正文。
 
-响应完成不等于后台工具完成。仅在最后一个 `RunObserver` 释放、确认不会再产生该 Run 的事件后，writer 才把残留运行中的 Model Turn／Target attempt 记为 `interrupted`，释放残留活动计数并追加 `unfinished_observation_activity` gap。后台执行持有的观察句柄继续保护真实活动；收口不改写 Run 的交付状态、Generation 关联或已确认 usage，不将缺失的结束事实推断为成功。
+响应完成不等于后台工具完成。仅在最后一个 `RunObserver` 释放、确认不会再产生该 Run 的事件后，writer 才把残留运行中的 Model Turn／Target attempt 记为 `interrupted`，释放残留活动计数并追加 `unfinished_observation_activity` gap。普通后台执行持有的观察句柄继续保护真实活动；公开 `generate` / `StraviaRead` 的子 Model Turn 保留诊断与用量，但不额外占用来源请求的活动保护计数，避免任务已交接仍阻止本已具备资格的来源清理。来源请求自身与其他在途工作的原有保护不变。收口不改写 Run 的交付状态、Generation 关联或已确认 usage，不将缺失的结束事实推断为成功。
 
 等待客户端的常规解除只凭客户端回传证据，不使用会话级猜测超时。同一 Interaction 内，一个 Run 的全部公开工具交接都已收到其他 Run 中 sequence 严格更晚的同 ID `client_tool_result` 时，该分支不再参与活动等待聚合，即使结果来自 sibling、结构上仍是叶节点。错误工具结果同样证明客户端已回传，但不证明最终生成成功；没有最终生成响应时，不能因此把 Interaction 标为 `completed`。判定只读取工具 ID 与事件顺序，不读取参数、结果正文或 Debug 文件；缺失或空 ID、没有 handoff、先于 handoff 的结果、部分回传以及同 ID 多次 handoff 均保守保留等待，重复 result 幂等，不跨 Interaction 或 Principal 匹配。状态计算使用尚未物理清除的历史证据，不按事件各自的到期时间截断；Bundle 只使用导出快照内的事件，不能借未来结果解除过去的等待。原 RunOutcome、工具历史和 Generation Chain 父边不改写。
 
@@ -444,6 +444,8 @@ Observation、Rejected Request、Debug manifest 与 Trace 文件跟随 `log_rete
 writer 在每批提交后立即失效对应的实时状态和归属索引；后续批次失败时明确返回错误，已提交批次不回滚，下一次清理继续处理剩余记录，不自动重试。全部批次成功后统一移除 owner 已不存在的 manifest，避免每批扫描全部 owner。清理前的用量持久化屏障、长期统计不随详情删除的语义，以及手动清除的事务边界保持不变。
 
 “清除历史记录”只删除非活动 Interaction 与 Rejected Request；`running` 和 `waiting_client` 保留，并在结果中报告跳过数量。清理不取消 Inference Run。
+
+公开 Tool Execution 是此诊断隔离规则的局部例外：非 MCP 执行以来源 Inference Run 身份关联保留，不要求普通诊断行成功写入。实际删除来源 Run 的同一事务写入不可撤销的来源清理 fence、隔离 backing History Marker 的迟到完成并删除公开引用；提交后取消所属本地执行并唤醒查询等待者。周期到期与手动清理使用相同数据库触发器，不因后台工具尚在运行而额外保护来源。普通诊断缺失或写入失败不是清理，不能取消执行；清理不删除独立 Artifact 或仍合法保留的隐藏历史。MCP 不关联伪造的来源 Run，公开引用沿用历史保留期；查询不续期。
 
 “清除 Debug 数据”关闭活动 writer 后删除全部受管目录并清空进程内索引。活动 Run 的 Trace 停止并标记 `debug_data_cleared` partial；请求记录、Rejected Request 与 Debug 开关状态不变，后续准入的 Run 继续正常捕获。
 

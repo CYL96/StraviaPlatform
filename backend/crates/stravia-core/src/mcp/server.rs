@@ -143,15 +143,26 @@ impl ServerHandler for StraviaMcpServer {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
-        let context = mcp_context(&context)?;
+        let request_cancellation = context.ct.clone();
+        let mut context = mcp_context(&context)?;
+        let cancellation = stravia_runtime_contract::CancellationToken::new();
+        context.request_cancellation = Some(cancellation.clone());
         let arguments = Value::Object(request.arguments.unwrap_or_default());
-        let outcome = crate::rpm::scope_root_request(
+        let call = crate::rpm::scope_root_request(
             crate::rpm::RootRequest::default(),
             self.gateway
                 .mcp_registry
                 .call(request.name.as_ref(), arguments, &context),
-        )
-        .await;
+        );
+        tokio::pin!(call);
+        let outcome = tokio::select! {
+            biased;
+            result = &mut call => result,
+            _ = request_cancellation.cancelled() => {
+                cancellation.cancel();
+                call.await
+            }
+        };
         match outcome {
             Ok(output) => {
                 let mut result = if output.is_error {

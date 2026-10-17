@@ -104,7 +104,7 @@ pub struct Gateway {
     pub(crate) update_service: Arc<admin::updates::UpdateService>,
     pub(crate) _sqlite_pool: Option<SqlitePool>,
     pub(crate) _postgres_pool: Option<Pool<Postgres>>,
-    history_marker_execution_gate: Arc<tokio::sync::RwLock<()>>,
+    pub(crate) history_marker_execution_gate: Arc<tokio::sync::RwLock<()>>,
     pub(crate) lifecycle: Arc<GatewayLifecycle>,
     pub(crate) provider_model_sync: Arc<provider_model_sync::ProviderModelSyncRuntime>,
     lifecycle_owner: bool,

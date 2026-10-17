@@ -346,6 +346,7 @@ impl Gateway {
                         .clone(),
                 ))
             };
+        history_markers.recover_public_executions().await?;
         let agent_definitions = if let Some(pool) = sqlite_pool.as_ref() {
             agent::AgentDefinitionRegistry::sqlite(pool.clone())
         } else if let Some(pool) = postgres_pool.as_ref() {

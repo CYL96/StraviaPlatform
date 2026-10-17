@@ -54,14 +54,12 @@ where
     T::deserialize(deserializer).map(Some)
 }
 
-pub(crate) async fn generate(
-    gateway: &Gateway,
-    input: Value,
-    principal: Principal,
-    cancellation: CancellationToken,
-    deadline: Instant,
-) -> Result<Value, GenerationError> {
-    let input: GenerateRequest = serde_json::from_value(input).map_err(|error| {
+pub(crate) fn validate_input(input: &Value) -> Result<(), GenerationError> {
+    parse_input(input).map(|_| ())
+}
+
+fn parse_input(input: &Value) -> Result<GenerateRequest, GenerationError> {
+    let input = GenerateRequest::deserialize(input).map_err(|error| {
         GenerationError::new(
             "invalid_generation_input",
             format!("Invalid media generation input: {error}"),
@@ -79,7 +77,7 @@ pub(crate) async fn generate(
             "Image prompt must not be empty",
         ));
     }
-    let references = input.input.reference_images.unwrap_or_default();
+    let references = input.input.reference_images.as_deref().unwrap_or_default();
     if references.len() > MAX_REFERENCE_IMAGES {
         return Err(GenerationError::new(
             "reference_image_limit_exceeded",
@@ -103,7 +101,18 @@ pub(crate) async fn generate(
             "Reference images must be plain Artifact References without read options, or public HTTP(S) URLs",
         ));
     }
+    Ok(input)
+}
 
+pub(crate) async fn generate(
+    gateway: &Gateway,
+    input: Value,
+    principal: Principal,
+    cancellation: CancellationToken,
+    deadline: Instant,
+) -> Result<Value, GenerationError> {
+    let input = parse_input(&input)?;
+    let references = input.input.reference_images.unwrap_or_default();
     let route = config::validated_route(gateway).await?;
     check_execution(&cancellation, deadline)?;
 

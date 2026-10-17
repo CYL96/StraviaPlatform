@@ -109,6 +109,7 @@ pub(crate) struct DetachedPlatformExecution {
     call: PlatformToolCall,
     context: ToolExecutionContext,
     limit: std::time::Duration,
+    accepted_at: tokio::time::Instant,
 }
 
 impl DetachedPlatformExecution {
@@ -124,6 +125,17 @@ impl DetachedPlatformExecution {
 
     pub(crate) fn parallel_safe(&self) -> bool {
         self.tools.parallel_safe(&self.call.tool_id)
+    }
+
+    pub(crate) fn public_execution(&self) -> bool {
+        matches!(
+            self.call.tool_id.as_str(),
+            "media-generation" | "stravia-read"
+        )
+    }
+
+    pub(crate) fn accepted_at(&self) -> tokio::time::Instant {
+        self.accepted_at
     }
 
     pub(crate) fn call(&self) -> &PlatformToolCall {
@@ -185,6 +197,11 @@ impl InferenceRun {
         cancellation: stravia_runtime_contract::CancellationToken,
     ) -> DetachedPlatformExecution {
         let limit = self.tools.execution_limit(&call.tool_id);
+        let cancellation = if matches!(call.tool_id.as_str(), "media-generation" | "stravia-read") {
+            self.cancellation.clone()
+        } else {
+            cancellation
+        };
         DetachedPlatformExecution {
             tools: self.tools.clone(),
             call,
@@ -197,6 +214,7 @@ impl InferenceRun {
                 progress: None,
             },
             limit,
+            accepted_at: tokio::time::Instant::now(),
         }
     }
     pub async fn on_request(&mut self, request: &mut AiRequest) -> Result<HookControl, HookError> {

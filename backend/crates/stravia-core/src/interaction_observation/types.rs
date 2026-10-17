@@ -317,6 +317,8 @@ pub(crate) enum RunEvent {
         has_new_user: bool,
     },
     ModelTurnStarted {
+        #[serde(default)]
+        retention_detached: bool,
         model_turn_id: String,
         route_id: String,
         model_display_name: Option<String>,
@@ -324,6 +326,8 @@ pub(crate) enum RunEvent {
         estimated_input_tokens: Option<i64>,
     },
     ModelTurnFinished {
+        #[serde(default)]
+        retention_detached: bool,
         model_turn_id: String,
         status: String,
     },

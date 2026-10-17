@@ -20,6 +20,7 @@ pub(super) const SUBSCRIPTION_POLL_INTERVAL: Duration = Duration::from_secs(1);
 pub struct McpContext {
     pub api_key_id: String,
     execution: Option<McpExecutionContext>,
+    request_cancellation: Option<stravia_runtime_contract::CancellationToken>,
 }
 
 #[derive(Clone)]
@@ -33,6 +34,7 @@ impl McpContext {
         Self {
             api_key_id,
             execution: None,
+            request_cancellation: None,
         }
     }
 
@@ -47,6 +49,7 @@ impl McpContext {
                 cancellation,
                 deadline,
             }),
+            request_cancellation: None,
         }
     }
 
@@ -221,12 +224,18 @@ impl McpToolRegistry {
         arguments: Value,
         context: &McpContext,
     ) -> Result<McpToolOutput, McpToolError> {
+        let accepted = tokio::time::Instant::now();
         let tool = self
             .tools
             .get(name)
             .ok_or_else(|| McpToolError::new("tool_not_found", format!("unknown tool: {name}")))?;
         let tool_deadline = tool.deadline();
         let deadline = tokio::time::Instant::now() + tool_deadline;
+        let deadline = context
+            .execution
+            .as_ref()
+            .map(|execution| deadline.min(execution.deadline.into()))
+            .unwrap_or(deadline);
         let available = tokio::time::timeout_at(deadline, tool.available(context))
             .await
             .map_err(|_| {
@@ -244,12 +253,27 @@ impl McpToolRegistry {
                 format!("tool is not available: {name}"),
             ));
         }
-        let cancellation = stravia_runtime_contract::CancellationToken::new();
+        let cancellation = context
+            .execution
+            .as_ref()
+            .map(|execution| execution.cancellation.child_token())
+            .or_else(|| context.request_cancellation.clone())
+            .unwrap_or_default();
         let call_context = context.for_call(cancellation.clone(), deadline.into_std());
-        let mut call = Box::pin(tool.call(arguments, &call_context));
+        let mut call = Box::pin(crate::tool_execution::scope_execution(
+            accepted,
+            deadline.into_std(),
+            tool.call(arguments, &call_context),
+        ));
         tokio::select! {
             biased;
             result = &mut call => result,
+            _ = cancellation.cancelled() => {
+                if tool.await_cancellation_cleanup() {
+                    return call.await;
+                }
+                Err(McpToolError::new("cancelled", "tool request cancelled"))
+            }
             _ = tokio::time::sleep_until(deadline) => {
                 cancellation.cancel();
                 if tool.await_cancellation_cleanup()

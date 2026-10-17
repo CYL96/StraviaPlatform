@@ -103,6 +103,7 @@ async fn bundle_usage_revision_preserves_reported_fields_and_ticket_watermark() 
     let (_directory, pool, observation) = fixture().await?;
     let run = admit(&observation, "usage-run", None);
     run.record(RunEvent::ModelTurnStarted {
+        retention_detached: false,
         model_turn_id: "turn".into(),
         route_id: "route".into(),
         model_display_name: None,
@@ -141,6 +142,7 @@ async fn bundle_usage_revision_preserves_reported_fields_and_ticket_watermark() 
         usage: None,
     });
     run.record(RunEvent::ModelTurnFinished {
+        retention_detached: false,
         model_turn_id: "turn".into(),
         status: "completed".into(),
     });
@@ -215,6 +217,7 @@ async fn bundle_net_input_clamps_attempts_and_preserves_unknown_operands() -> an
     let (_directory, pool, observation) = fixture().await?;
     let run = admit(&observation, "net-usage-run", None);
     run.record(RunEvent::ModelTurnStarted {
+        retention_detached: false,
         model_turn_id: "net-turn".into(),
         route_id: "route".into(),
         model_display_name: None,
@@ -254,6 +257,7 @@ async fn bundle_net_input_clamps_attempts_and_preserves_unknown_operands() -> an
         });
     }
     run.record(RunEvent::ModelTurnFinished {
+        retention_detached: false,
         model_turn_id: "net-turn".into(),
         status: "completed".into(),
     });
@@ -358,6 +362,7 @@ async fn bundle_detached_activity_outlives_child_delivery_at_ticket_watermark() 
     let (_directory, pool, observation) = fixture().await?;
     let parent = admit(&observation, "parent", None);
     parent.record(RunEvent::ModelTurnStarted {
+        retention_detached: false,
         model_turn_id: "turn".into(),
         route_id: "route".into(),
         model_display_name: None,
@@ -375,6 +380,7 @@ async fn bundle_detached_activity_outlives_child_delivery_at_ticket_watermark() 
         input: None,
     });
     parent.record(RunEvent::ModelTurnFinished {
+        retention_detached: false,
         model_turn_id: "turn".into(),
         status: "completed".into(),
     });
