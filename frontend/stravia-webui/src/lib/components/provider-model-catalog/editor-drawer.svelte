@@ -51,7 +51,7 @@ let editor = $state<{ submit: () => void }>()
         <Sheet.Description class="break-all font-technical">{detail.id}</Sheet.Description>
         <div class="flex flex-wrap gap-2">
           <Badge variant={detail.available ? 'secondary' : 'outline'}>
-            {detail.available ? m.common_used() : m.common_unavailable()}
+            {detail.available ? m.model_specification_available() : m.common_unavailable()}
           </Badge>
           <Badge variant="outline">
             {detail.source_kind === 'manual' ? m.common_added_manually() : m.common_synced()}
@@ -72,7 +72,7 @@ let editor = $state<{ submit: () => void }>()
             {onDirtyChange} />
         {/if}
       </div>
-      <Sheet.Footer class="route-overlay-footer justify-between sm:justify-between">
+      <Sheet.Footer class="route-overlay-footer">
         <Button variant="outline" onclick={onClose} disabled={saving}>{m.common_cancel()}</Button>
         <Button onclick={() => editor?.submit()} disabled={saving}>
           {#if saving}<Spinner data-icon="inline-start" />{/if}

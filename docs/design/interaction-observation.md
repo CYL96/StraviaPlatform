@@ -729,10 +729,10 @@ forest、root changes 与详情摘要共用批量 Run Debug flags 读取，并�
 
 失败请求列表 `GET /api/v1/observations/failed-requests` 合并准入前 Rejected Request 与最终 `status=failed` 的 Inference Run，是既有观察数据的查询投影，不新建执行记录或重复累计用量：
 
-- 查询参数沿用 Interaction forest 的 `start_at` / `end_at`（或兼容的 `anchor_at` / `window_index`）与 `cursor` / `limit`（默认 50、最大 200），另支持 `provider`、`model`、`api_key` 筛选；`model` 匹配模型路由的 28 位 ASCII 小写字母不透明 ID，`api_key` 匹配 key ID 或名称，`provider` 匹配该 Run 实际调用过的模型服务；
+- 查询参数沿用 Interaction forest 的 `start_at` / `end_at`（或兼容的 `anchor_at` / `window_index`）与 `cursor` / `limit`（默认 50、最大 200），另支持 `provider`、`model`、`api_key` 筛选；`model` 匹配模型路由的 28 位 ASCII 小写字母不透明 ID，`api_key` 匹配 key ID 或名称，`provider` 匹配该 Run 实际调用过的供应商；
 - 排序为 `started_at` DESC、`kind` ASC、`id` ASC，`next_cursor` 是不透明的 JSON keyset 游标，相同时间记录跨页不重复、不遗漏；`total` 为当前时间范围与筛选条件下的总数；
-- 响应为 `{ data: { items, total, next_cursor, snapshot_sequence } }`；每项 `FailedRequestSummary` 包含 `id`、`kind`（`rejection | run`）、`request_id`、`started_at`、`duration_ms`、`api_key_id`、`api_key_name`、`client`、`model`、`model_display_name`、`services`（实际调用过的模型服务去重列表）、`error`（`source` 取 `platform | upstream | null`，附 `code`、`message`、`status_code`）、`interaction_id`、`root_id`、`run_id`、`debug_status`（`none`、`partial` 或 manifest 状态）与 `observation_gap`；
-- 分类以一次客户端请求的最终结果为准：内部重试或切换模型服务后最终成功的请求不进入列表；单纯主动取消或断线（含 499、`request_aborted`、`cancelled`、`client_disconnected`、`websocket_delivery_dropped`）被排除；后来重新发起并成功的请求不抹掉早先失败行；
+- 响应为 `{ data: { items, total, next_cursor, snapshot_sequence } }`；每项 `FailedRequestSummary` 包含 `id`、`kind`（`rejection | run`）、`request_id`、`started_at`、`duration_ms`、`api_key_id`、`api_key_name`、`client`、`model`、`model_display_name`、`services`（实际调用过的供应商去重列表）、`error`（`source` 取 `platform | upstream | null`，附 `code`、`message`、`status_code`）、`interaction_id`、`root_id`、`run_id`、`debug_status`（`none`、`partial` 或 manifest 状态）与 `observation_gap`；
+- 分类以一次客户端请求的最终结果为准：内部重试或切换供应商后最终成功的请求不进入列表；单纯主动取消或断线（含 499、`request_aborted`、`cancelled`、`client_disconnected`、`websocket_delivery_dropped`）被排除；后来重新发起并成功的请求不抹掉早先失败行；
 - 失败 Run 的开始时间取 ingress 接收时间，结束时间在终止方截取，不使用 writer 入队时间；历史记录缺少的字段如实表达缺口：0045 之前的 Rejected Request 无 `started_at` 时回退按 `occurred_at` 排序并置 `observation_gap=true`，缺失诊断保持未知，不能补回；
 - `GET /api/v1/observations/failed-requests/{kind}/{id}` 返回 `{ data: { request, events, trace, snapshot_sequence } }`；`trace` 是既有 Debug manifest 元数据。诊断包仍通过既有 Interaction/Rejection ticket 与下载入口获取，该列表不新增 Debug 捕获，也不改变脱敏与保留期规则。
 
@@ -749,7 +749,7 @@ forest、root changes 与详情摘要共用批量 Run Debug flags 读取，并�
 
 #### 失败请求列表
 
-“失败的请求 / Failed Requests”页签使用传统表格列表，不使用卡片或拓扑。失败口径遵循 `CONTEXT.md` 的 Failed Request 定义，以每次客户端请求的最终结果判断，而非仅按 HTTP 状态码或内部上游尝试判断：准入前拒绝与最终 `status=failed` 的 Run 进入列表；内部重试或切换模型服务后最终成功的请求，以及单纯由客户端主动取消或断线终止的请求不进入列表；后来重新发起并成功的请求不抹掉早先失败行。已归属 Interaction 且交付过客户端可见输出的失败 Run 仍保留在原交互链路中；从未交付任何客户端可见输出且最终失败的交互按 `CONTEXT.md`「交互链路」成员规则默认不进画布，可从失败列表跳转或深链回看。准入前失败只在失败列表展示，不伪造交互关联。
+“失败的请求 / Failed Requests”页签使用传统表格列表，不使用卡片或拓扑。失败口径遵循 `CONTEXT.md` 的 Failed Request 定义，以每次客户端请求的最终结果判断，而非仅按 HTTP 状态码或内部上游尝试判断：准入前拒绝与最终 `status=failed` 的 Run 进入列表；内部重试或切换供应商后最终成功的请求，以及单纯由客户端主动取消或断线终止的请求不进入列表；后来重新发起并成功的请求不抹掉早先失败行。已归属 Interaction 且交付过客户端可见输出的失败 Run 仍保留在原交互链路中；从未交付任何客户端可见输出且最终失败的交互按 `CONTEXT.md`「交互链路」成员规则默认不进画布，可从失败列表跳转或深链回看。准入前失败只在失败列表展示，不伪造交互关联。
 
 列表按请求开始时间倒序（`started_at` DESC、`kind` ASC、`id` ASC，契约见第 9 节），每次失败请求一行，默认七列为：
 
@@ -758,7 +758,7 @@ forest、root changes 与详情摘要共用批量 Run Debug flags 读取，并�
 | 时间 | 请求开始时间；缺少开始时间的旧拒绝记录回退按 ingress 时间排序并标记 `observation_gap`。 |
 | 客户端 / API Key | API Key 名称或客户端来源；未认证时显示“未认证”，不可得时显示“—”。 |
 | 模型 | 请求的路由模型；无法解析时显示“—”。 |
-| 模型服务 | 实际调用的模型服务；未调用上游时显示“—”。 |
+| 供应商 | 实际调用的供应商；未调用上游时显示“—”。 |
 | 错误来源 | 平台错误或上游错误；未知时显示“—”。 |
 | 错误 | 简短原因及可用的 HTTP 状态码，完整内容进入详情。 |
 | 耗时 | 请求开始到终止的持续时间；不可得时显示“—”。 |
@@ -912,7 +912,7 @@ reset 恢复开启新的 view epoch，取消或拒绝旧上下文结果；在权
 
 每个 Run 内的事件统一按 `occurred_at` 升序、同一时刻按 `sequence` 升序排列，不再将 Model Turn、Target attempt 或工具的子树整体提前展开，以免把较晚的完成事件放到较早的客户端输出之前。拒绝请求的事件采用相同排序规则。每个事件的「原始事件数据」默认折叠，展开后保留原始 kind 与完整 payload，因果关联字段不丢失；Run 和 Interaction ID 收在默认折叠的「技术标识」中。未知事件仍保留原始数据入口，不推断成功或其他未记录的结果。
 
-Run 分段默认折叠为摘要：标题行只显示编号、模型显示名（缺失时使用 Route ID）与开始偏移，不放状态、中断或 Debug 标签：Run 状态由主干圆点的形状与颜色表达并为读屏保留状态文字，用户中断见事件流，记录不完整见 Run 告警，Debug 捕获状态见交互概览；其下两行小字分别显示实际服务的上游模型与模型服务、耗时、首 Token 与 Token 速度，以及输入、输出、缓存读取与缓存写入用量，未报告的值显示中性破折号。上游模型取该 Run 已完成的 Target attempt（平台工具循环可有多个），没有已完成 attempt 时取最近开始的 attempt，回退前失败的 attempt 不冒充服务方；同一 attempt 的修订完成事件以最后一条为准。首 Token 取第一个服务 attempt；Run Token 速度使用 Run 已确认输出除以客户端完整请求耗时，遵循 §3.3 的缺失覆盖规则，不借服务 attempts 的速度代替。展开 Run 才显示技术标识与事件流；Trace 不完整的提示不随之折叠。
+Run 分段默认折叠为摘要：标题行只显示编号、模型显示名（缺失时使用 Route ID）与开始偏移，不放状态、中断或 Debug 标签：Run 状态由主干圆点的形状与颜色表达并为读屏保留状态文字，用户中断见事件流，记录不完整见 Run 告警，Debug 捕获状态见交互概览；其下两行小字分别显示实际服务的上游模型与供应商、耗时、首 Token 与 Token 速度，以及输入、输出、缓存读取与缓存写入用量，未报告的值显示中性破折号。上游模型取该 Run 已完成的 Target attempt（平台工具循环可有多个），没有已完成 attempt 时取最近开始的 attempt，回退前失败的 attempt 不冒充服务方；同一 attempt 的修订完成事件以最后一条为准。首 Token 取第一个服务 attempt；Run Token 速度使用 Run 已确认输出除以客户端完整请求耗时，遵循 §3.3 的缺失覆盖规则，不借服务 attempts 的速度代替。展开 Run 才显示技术标识与事件流；Trace 不完整的提示不随之折叠。
 
 排序后相邻、已经分别按 Canonical Item 收口的 `client_visible_content` 只在界面上组成默认折叠的计数分组，不改写或合并独立 item；相邻且 `name` 相同、非空的 `client_tool_handoff` 同样仅作展示分组，例如「Bash × 4 · 已交给客户端」。分组显示首次和末次事件时间，不跨越其他事件、工具名称或 Run。展开分组保留每条事件的时间与完整原文入口，实时追加保持已有分组的展开状态。事件行将原始数据入口收至标题右侧箭头，不再重复占用一行按钮；展开 Run 后，关键结果和错误直接可见，不因精简而隐藏。
 
@@ -1068,4 +1068,4 @@ Rust workspace 新增：
 - 合并后的状态、用量与 Debug Bundle 不重复计算，子交互分别汇总；历史失败与交付记录保持原事实。SSE 和刷新后的详情、forest 得到一致归属。
 - 来源过期或被清理后不复活节点；新规则不重分配既有 Run。诊断失败不改变客户端响应、执行重试或 Generation Chain。
 
-验证先运行最直接的 Rust 回归，再扩大到 core 检查和相关 SQLite/PostgreSQL 存储用例。使用隔离、非生产的模型服务进行实际 HTTP 请求和浏览器检查，观察新请求形成的交互、父子连接及最终回复；实现触及 Desktop 特有行为时再验证实际桌面应用。
+验证先运行最直接的 Rust 回归，再扩大到 core 检查和相关 SQLite/PostgreSQL 存储用例。使用隔离、非生产的供应商进行实际 HTTP 请求和浏览器检查，观察新请求形成的交互、父子连接及最终回复；实现触及 Desktop 特有行为时再验证实际桌面应用。

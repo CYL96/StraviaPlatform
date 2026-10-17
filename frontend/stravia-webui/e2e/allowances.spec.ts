@@ -168,7 +168,7 @@ test('keeps confirmed guards and open details when an older account read finishe
     const toggleDetails = provider.getByRole('button', { name: 'Alpha account allowance details' })
     await toggleDetails.click()
     const details = provider.getByRole('table', { name: 'Alpha account allowance details' })
-    const weekly = details.getByRole('switch', { name: 'Pause this service when Weekly window is exhausted' })
+    const weekly = details.getByRole('switch', { name: 'Pause this provider when Weekly window is exhausted' })
     await expect(weekly).not.toBeChecked()
     const oldSnapshot = structuredClone(snapshots[0])
     let heldReads = 0
@@ -342,7 +342,7 @@ for (const locale of ['en-US', 'zh-CN']) {
         })
         .click()
       const weekly = provider.getByRole('switch', {
-        name: locale === 'en-US' ? 'Pause this service when Weekly window is exhausted' : '每周窗口耗尽时暂停此服务',
+        name: locale === 'en-US' ? 'Pause this provider when Weekly window is exhausted' : '每周窗口耗尽时暂停此供应商',
       })
       await weekly.click()
       await saveStarted.promise
@@ -359,7 +359,7 @@ for (const locale of ['en-US', 'zh-CN']) {
       const credits = provider
         .getByRole('switch', {
           name:
-            locale === 'en-US' ? 'Pause this service when Account balance is exhausted' : '账户余额耗尽时暂停此服务',
+            locale === 'en-US' ? 'Pause this provider when Account balance is exhausted' : '账户余额耗尽时暂停此供应商',
           exact: true,
         })
         .first()
@@ -430,7 +430,7 @@ for (const locale of ['en-US', 'zh-CN']) {
     })
     await page.goto('/allowances')
     const weekly = page.getByRole('switch', {
-      name: locale === 'en-US' ? 'Pause this service when Weekly window is exhausted' : '每周窗口耗尽时暂停此服务',
+      name: locale === 'en-US' ? 'Pause this provider when Weekly window is exhausted' : '每周窗口耗尽时暂停此供应商',
     })
     // 暂停状态属于必须立即可见的异常，不能藏在默认折叠的详情里
     await expect(page.getByTestId('allowance-suspension').first()).toBeVisible()
@@ -613,7 +613,7 @@ test('renders the matrix, shared summary, timeline, forecast, model details, and
   await expect(matrix.getByText('9.99 CNY')).toBeVisible()
   await expect(matrix.getByText('Account balance', { exact: true })).toHaveCount(2)
   await expect(matrix.getByText('Showing the last successful result because this refresh failed.')).toBeVisible()
-  await expect(matrix.getByText('Reconnect this model service or update its credential.')).toBeVisible()
+  await expect(matrix.getByText('Reconnect this provider or update its credential.')).toBeVisible()
 
   const conditionSummary = page.getByRole('region', { name: 'Allowance condition' })
   const forecastPanel = page
@@ -658,7 +658,7 @@ test('renders the matrix, shared summary, timeline, forecast, model details, and
   await expect(matrix.locator('[data-highlighted="true"]')).toHaveAttribute('id', alphaId!)
   await betaReset.focus()
   await expect(matrix.locator('[data-highlighted="true"]')).toHaveAttribute('id', betaId!)
-  await page.getByLabel('Search model services').focus()
+  await page.getByLabel('Search providers').focus()
   await expect(matrix.locator('[data-highlighted="true"]')).toHaveCount(0)
   await alphaReset.click()
   await expect(alphaAllowance).toBeFocused()
@@ -840,7 +840,7 @@ test('search and all filters drive the same visible collection', async ({ page }
   await mockAllowances(page, [errorSnapshot, staleSnapshot, freshSnapshot])
   await page.goto('/allowances')
 
-  const search = page.getByLabel('Search model services')
+  const search = page.getByLabel('Search providers')
   const timelinePanel = page
     .locator('[data-slot="card"]')
     .filter({ has: page.getByRole('heading', { name: 'Reset timeline' }) })
@@ -858,7 +858,7 @@ test('search and all filters drive the same visible collection', async ({ page }
   await expect(page.getByText('No allowances match these filters.')).toBeVisible()
   await search.fill('')
 
-  await selectFilter(page, 'Filter by service type', 'openai / codex')
+  await selectFilter(page, 'Filter by provider type', 'openai / codex')
   await expect(page.getByRole('list', { name: 'Allowance matrix' }).getByText('Beta account')).toBeVisible()
   await expect(page.getByRole('list', { name: 'Allowance matrix' }).getByText('Alpha account')).toHaveCount(0)
   await expect(timelinePanel).toContainText('Beta account')
@@ -870,7 +870,7 @@ test('search and all filters drive the same visible collection', async ({ page }
   )
   await expect(forecastPanel).toContainText('Current windows are already exhausted')
 
-  await selectFilter(page, 'Filter by service type', 'All')
+  await selectFilter(page, 'Filter by provider type', 'All')
   await selectFilter(page, 'Filter by allowance condition', 'Exhausted')
   await expect(page.getByRole('list', { name: 'Allowance matrix' }).getByText('Alpha account')).toHaveCount(0)
   await expect(page.getByRole('list', { name: 'Allowance matrix' }).getByText('Beta account')).toBeVisible()
@@ -900,8 +900,8 @@ test('renders the empty and request-error states with recovery guidance', async 
   await mockAllowances(page, [])
   await page.goto('/allowances')
   await expect(page.getByRole('heading', { name: 'No allowance data available' })).toBeVisible()
-  await expect(page.getByText(/Enable and connect a supported model service/)).toBeVisible()
-  await expect(page.getByRole('link', { name: 'Manage model services' })).toHaveAttribute('href', '/providers')
+  await expect(page.getByText(/Enable and connect a supported provider/)).toBeVisible()
+  await expect(page.getByRole('link', { name: 'Manage providers' })).toHaveAttribute('href', '/providers')
 
   await page.unroute('**/api/v1/provider-allowances**')
   await page.route('**/api/v1/provider-allowances**', async (route) => {
@@ -928,7 +928,7 @@ test('keeps the matrix and side panels usable on a narrow Chinese viewport', asy
   const matrix = page.getByRole('list', { name: '额度矩阵' })
   await expect(matrix.getByText('Alpha account')).toBeVisible()
   await matrix.getByRole('button', { name: 'Alpha account 额度详情' }).click()
-  await expect(matrix.getByRole('switch', { name: '每周窗口耗尽时暂停此服务' })).toBeVisible()
+  await expect(matrix.getByRole('switch', { name: '每周窗口耗尽时暂停此供应商' })).toBeVisible()
   await expect(page.getByRole('heading', { name: '重置时间轴' })).toBeVisible()
   await expect(page.getByRole('heading', { name: '预计耗尽' })).toBeVisible()
   const overflow = await page.evaluate(

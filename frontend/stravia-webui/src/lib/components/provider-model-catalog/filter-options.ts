@@ -9,7 +9,7 @@ export function catalogFilterOptions() {
     availability: {
       allLabel: m.common_all_models(),
       options: [
-        { value: 'available', label: m.common_used() },
+        { value: 'available', label: m.model_specification_available() },
         { value: 'unavailable', label: m.common_unavailable() },
       ],
     },

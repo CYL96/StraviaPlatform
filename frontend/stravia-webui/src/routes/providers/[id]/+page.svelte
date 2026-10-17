@@ -136,11 +136,9 @@ async function syncModels(id = providerId): Promise<ProviderModelSyncSummary | u
       ><ArrowLeftIcon data-icon="inline-start" />{m.providers_back_model_services()}</Button>
   </div>
 {:else}
-  <div class="route-page">
-    <PageHeader
-      eyebrow={m.common_model_service_details()}
-      title={provider.name}
-      description={m.providers_page_summary()}>
+  <!-- 页头、页签和各页签内容共用同一最大宽度，右上角操作与表单、保存按钮右边界对齐；宽度需容纳服务模型表格的全部列。 -->
+  <div class="route-page mx-auto w-full max-w-[90rem]">
+    <PageHeader eyebrow={m.common_model_service()} title={provider.name}>
       {#snippet meta()}
         {@const credentialInvalid = provider.credential_status === 'invalid'}
         <div class="flex flex-wrap items-center gap-2">
@@ -166,7 +164,7 @@ async function syncModels(id = providerId): Promise<ProviderModelSyncSummary | u
       {/snippet}
       {#snippet actions()}
         {#if usesProviderModels}
-          <Button href={`/models/new?provider=${encodeURIComponent(provider.id)}`}
+          <Button variant="outline" href={`/models/new?provider=${encodeURIComponent(provider.id)}`}
             ><PlusIcon data-icon="inline-start" />{m.providers_use_model()}</Button>
         {/if}
       {/snippet}
@@ -221,16 +219,12 @@ async function syncModels(id = providerId): Promise<ProviderModelSyncSummary | u
         onSync={canDiscoverModels ? syncModels : undefined} />
     {:else if view === 'routes'}
       <section class="route-section" aria-labelledby="provider-route-references-title">
-        <div class="route-section-header">
-          <div>
-            <h2 id="provider-route-references-title" class="route-section-title">
-              {m.providers_used_models()}
-            </h2>
-            <p class="route-section-description">
-              {m.providers_model_usage_summary()}
-            </p>
-          </div>
-          <Badge variant="outline">{routeReferences.length}</Badge>
+        <h2 id="provider-route-references-title" class="sr-only">{m.providers_used_models()}</h2>
+        <div class="route-section-header items-center">
+          <p class="route-section-description mt-0">{m.providers_model_usage_summary()}</p>
+          {#if routeReferences.length > 0}<Badge variant="outline" class="font-technical"
+              >{routeReferences.length}</Badge
+            >{/if}
         </div>
         {#if routesQuery.isPending}
           <div class="grid min-h-32 place-items-center"><Spinner /></div>
@@ -244,9 +238,13 @@ async function syncModels(id = providerId): Promise<ProviderModelSyncSummary | u
             </Button>
           </div>
         {:else if routeReferences.length === 0}
-          <p class="border-y py-8 text-sm text-muted-foreground">
-            {m.providers_no_models_use_model_service_yet()}
-          </p>
+          <div class="flex flex-col items-center gap-3 rounded-xl border border-dashed px-4 py-10 text-center">
+            <p class="text-sm text-muted-foreground">{m.providers_no_models_use_model_service_yet()}</p>
+            {#if usesProviderModels}
+              <Button variant="outline" href={resolve(`/providers/${encodeURIComponent(providerId)}?view=models`)}
+                >{m.providers_browse_service_models()}</Button>
+            {/if}
+          </div>
         {:else}
           <div class="divide-y border-y">
             {#each routeReferences as reference (reference.target.id)}

@@ -304,7 +304,7 @@ async function copyProvider(): Promise<void> {
 <svelte:head><title>{m.common_model_services()} · Stravia</title></svelte:head>
 
 {#snippet providerPageActions()}
-  <Button onclick={openCreate}><PlusIcon data-icon="inline-start" />{m.common_connect_service()}</Button>
+  <Button onclick={openCreate}><PlusIcon data-icon="inline-start" />{m.providers_add()}</Button>
 {/snippet}
 
 {#snippet providerActions(provider: Provider)}
@@ -429,7 +429,8 @@ async function copyProvider(): Promise<void> {
   </div>
 {/snippet}
 
-<div class="route-page providers-page">
+<!-- 与模型服务详情页同宽，从列表进入详情时页头、操作与内容边界不跳动。 -->
+<div class="route-page providers-page mx-auto w-full max-w-[90rem]">
   <PageHeader
     eyebrow={m.common_setup()}
     title={m.common_model_services()}
@@ -464,7 +465,7 @@ async function copyProvider(): Promise<void> {
           ><Empty.Title>{m.providers_no_model_services_connected()}</Empty.Title><Empty.Description
             >{m.providers_model_nowhere_without_provider()}</Empty.Description
           ></Empty.Header>
-        <Empty.Content><Button onclick={openCreate}>{m.common_connect_first_service()}</Button></Empty.Content>
+        <Empty.Content><Button onclick={openCreate}>{m.providers_add_first()}</Button></Empty.Content>
       </Empty.Root>
     {:else}
       <div class="route-desktop-table min-h-0 flex-1">

@@ -148,6 +148,6 @@ test('empty media generation configuration stays usable in Chinese dark mode at 
   await expect(page.getByRole('heading', { name: '媒体生成', exact: true })).toBeVisible()
   await expect(page.getByRole('switch', { name: '启用媒体生成' })).toBeDisabled()
   await expect(page.getByRole('link', { name: '管理模型', exact: true }).first()).toHaveAttribute('href', '/models')
-  await expect(page.getByRole('link', { name: '管理模型服务', exact: true })).toHaveAttribute('href', '/providers')
+  await expect(page.getByRole('link', { name: '管理供应商', exact: true })).toHaveAttribute('href', '/providers')
   await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true)
 })

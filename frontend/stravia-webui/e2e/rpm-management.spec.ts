@@ -380,7 +380,7 @@ test('real management persists root and destination RPM limits and queue setting
     metadata: { ...concurrent.metadata, description: 'Changed by another administrator' },
     revision: concurrent.revision,
   })
-  await cellEditor.getByRole('button', { name: 'Save model', exact: true }).click()
+  await cellEditor.getByRole('button', { name: 'Save', exact: true }).click()
   await expect(cellEditor.getByRole('alert')).toBeVisible()
   await expect(cellEditor.getByRole('spinbutton', { name: 'Context tokens', exact: true })).toHaveValue('256000')
   expect((await readModel()).metadata.limit?.context).toBe(200000)
@@ -388,7 +388,7 @@ test('real management persists root and destination RPM limits and queue setting
   await cellEditor.getByRole('button', { name: 'Cancel', exact: true }).click()
   await contextTrigger.click()
   await cellEditor.getByRole('spinbutton', { name: 'Context tokens', exact: true }).fill('256000')
-  await cellEditor.getByRole('button', { name: 'Save model', exact: true }).click()
+  await cellEditor.getByRole('button', { name: 'Save', exact: true }).click()
   await expect(cellEditor).toBeHidden()
   expect((await readModel()).metadata).toEqual({
     ...initialMetadata,
@@ -397,10 +397,10 @@ test('real management persists root and destination RPM limits and queue setting
   })
   await expect(page).toHaveURL(`${management.origin}${catalogUrl}`)
   await table.getByRole('button', { name: 'Modalities rpm-upstream', exact: true }).click()
-  await cellEditor.getByRole('button', { name: 'Generated output types', exact: true }).click()
+  await cellEditor.getByRole('button', { name: 'Supported output types', exact: true }).click()
   await page.getByRole('option', { name: 'Image', exact: true }).click()
   await page.keyboard.press('Escape')
-  await cellEditor.getByRole('button', { name: 'Save model', exact: true }).click()
+  await cellEditor.getByRole('button', { name: 'Save', exact: true }).click()
   await expect(cellEditor).toBeHidden()
   expect((await readModel()).metadata.modalities).toEqual({
     input: ['text', 'image', 'binary'],
@@ -409,7 +409,7 @@ test('real management persists root and destination RPM limits and queue setting
   await table.getByRole('button', { name: 'Reasoning effort rpm-upstream', exact: true }).click()
   await cellEditor.getByRole('textbox', { name: 'Custom reasoning effort', exact: true }).fill('custom-effort')
   await cellEditor.getByRole('button', { name: 'Add', exact: true }).click()
-  await cellEditor.getByRole('button', { name: 'Save model', exact: true }).click()
+  await cellEditor.getByRole('button', { name: 'Save', exact: true }).click()
   await expect(cellEditor).toBeHidden()
   expect((await readModel()).metadata.reasoning_efforts).toEqual(['low', 'high', 'future', 'custom-effort'])
   expect((await readModel()).metadata.cost).toEqual(initialMetadata.cost)
@@ -420,15 +420,15 @@ test('real management persists root and destination RPM limits and queue setting
   expect((await readModel()).selection_policy).toBe('force_enabled')
 
   await goto(`${catalogUrl}&model=rpm-upstream`)
-  const detailRpm = page.locator('section[aria-labelledby="provider-model-rpm-title"]')
+  const detailRpm = page.getByRole('region', { name: 'RPM limit', exact: true })
   await detailRpm.getByRole('spinbutton', { name: 'Requests per minute', exact: true }).fill('21')
-  await detailRpm.getByRole('button', { name: 'Save limit', exact: true }).click()
+  await page.getByRole('button', { name: 'Save model', exact: true }).click()
   await expect.poll(async () => (await readDestination())?.rpm_limit).toBe(21)
   expect(await readRpm()).toMatchObject({ preferred_wait_ms: 1500, total_wait_ms: 10000, queue_capacity: 16 })
   await page.reload()
   await expect(detailRpm.getByRole('spinbutton', { name: 'Requests per minute', exact: true })).toHaveValue('21')
   await detailRpm.getByRole('spinbutton', { name: 'Requests per minute', exact: true }).fill('')
-  await detailRpm.getByRole('button', { name: 'Save limit', exact: true }).click()
+  await page.getByRole('button', { name: 'Save model', exact: true }).click()
   await expect.poll(readDestination).toBeUndefined()
 
   // Switch through the same persisted local preference used by the app.

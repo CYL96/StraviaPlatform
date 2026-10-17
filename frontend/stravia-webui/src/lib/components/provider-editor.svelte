@@ -260,7 +260,7 @@ function saveProvider(): void {
     interactOutsideBehavior={draft.submitting ? 'ignore' : 'close'}>
     <Sheet.Header class="border-b">
       <Sheet.Title
-        >{step === 'select' ? m.common_connect_service() : m.provider_editor_connection_details()}</Sheet.Title>
+        >{step === 'select' ? m.providers_add() : m.provider_editor_connection_details()}</Sheet.Title>
       <Sheet.Description>
         {step === 'select'
           ? m.provider_editor_choose_ai_service_how_want_sign()

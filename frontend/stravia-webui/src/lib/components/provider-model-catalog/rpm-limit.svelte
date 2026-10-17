@@ -9,7 +9,12 @@ import { Spinner } from '$lib/components/ui/spinner'
 import RpmForm from './rpm-form.svelte'
 
 // 移动端行没有表头，showLabel 让摘要自带「RPM」前缀。
-let { providerId, modelId, showLabel = false }: { providerId: string; modelId: string; showLabel?: boolean } = $props()
+let {
+  providerId,
+  modelId,
+  modelName,
+  showLabel = false,
+}: { providerId: string; modelId: string; modelName: string; showLabel?: boolean } = $props()
 
 const query = createQuery(() => ({ queryKey: rpmQueryKey, queryFn: loadRpm }))
 const destination = $derived(
@@ -44,8 +49,10 @@ let open = $state(false)
   </Popover.Trigger>
   <Popover.Content align="start" class="flex w-80 max-w-[calc(100vw-2rem)] flex-col p-0" role="dialog">
     <Popover.Header class="border-b border-border/60 px-4 py-3">
-      <Popover.Title>{m.rpm_column()}</Popover.Title>
-      <Popover.Description class="break-all font-technical text-xs">{modelId}</Popover.Description>
+      <Popover.Title class="truncate">{modelName || modelId}</Popover.Title>
+      {#if modelName && modelName !== modelId}
+        <Popover.Description class="truncate font-technical text-xs">{modelId}</Popover.Description>
+      {/if}
     </Popover.Header>
     {#if open}
       <RpmForm {providerId} {modelId} onSaved={() => (open = false)} onCancel={() => (open = false)} />

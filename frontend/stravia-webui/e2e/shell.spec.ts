@@ -53,7 +53,7 @@ test('sidebar stays usable in expanded and compact modes', async ({ page }) => {
   await expect(page.getByRole('button', { name: 'Expand navigation' })).toHaveAttribute('aria-expanded', 'false')
   await expect.poll(async () => (await main.boundingBox())!.width).toBeGreaterThan(expandedContent!.width)
   await expect(navigation.getByRole('link', { name: 'Settings', exact: true })).toHaveAttribute('aria-current', 'page')
-  const providerItem = navigation.getByRole('link', { name: 'Model services', exact: true })
+  const providerItem = navigation.getByRole('link', { name: 'Providers', exact: true })
   await expect(providerItem).toHaveAttribute('href', '/providers')
   await providerItem.click()
   await expect(page).toHaveURL(/\/providers$/)

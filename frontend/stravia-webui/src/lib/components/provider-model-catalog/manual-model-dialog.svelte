@@ -37,9 +37,10 @@ let {
   <Dialog.Layout>
     {#snippet header()}
       <Dialog.Title>{m.provider_model_catalog_add_model_manually_label()}</Dialog.Title>
+      <Dialog.Description>{m.provider_model_catalog_add_model_manually_description()}</Dialog.Description>
     {/snippet}
-    <Field.Field>
-      <Field.Label for="manual-provider-model-search">{m.provider_model_catalog_search_model()}</Field.Label>
+    <Field.Field orientation="vertical">
+      <Field.Label for="manual-provider-model-search">{m.provider_model_catalog_model_template()}</Field.Label>
       <ModelCombobox
         id="manual-provider-model-search"
         value={templateId}

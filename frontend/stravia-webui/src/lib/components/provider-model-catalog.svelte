@@ -31,6 +31,7 @@ import type { ProviderModelEditingOperation } from '$lib/provider-model-editing'
 import { getDataTableLabels } from '$lib/data-table-labels'
 import { formatLogTime } from '$lib/format'
 import { formatSpecificationTokens } from '$lib/model-specification'
+import FormSection from '$lib/components/form-section.svelte'
 import ModalityIcons from '$lib/components/modality-icons.svelte'
 import { localeState } from '$lib/localization.svelte'
 import {
@@ -55,6 +56,8 @@ import * as DropdownMenu from '$lib/components/ui/dropdown-menu'
 import * as InputGroup from '$lib/components/ui/input-group'
 import * as Empty from '$lib/components/ui/empty'
 import RequestFailure from '$lib/components/request-failure.svelte'
+import StatusIndicator from '$lib/components/status-indicator.svelte'
+import TechnicalValue from '$lib/components/technical-value.svelte'
 import { allCatalogFilterValue, catalogFilterOptions } from './provider-model-catalog/filter-options'
 import { Spinner } from '$lib/components/ui/spinner'
 import CatalogConfirmations from './provider-model-catalog/confirmations.svelte'
@@ -97,6 +100,11 @@ let preferenceSaving = $state(false)
 let preferenceError = $state('')
 let preferenceEpoch = 0
 let editor = $state<{ submit: () => void }>()
+let rpmForm = $state<{ save: () => Promise<void> }>()
+// 详情页底部只有一个「保存模型」：模型规格与 RPM 限额是两个独立资源，按各自是否有改动分别提交。
+let specificationDirty = $state(false)
+let rpmDirty = $state(false)
+let rpmSaving = $state(false)
 let addingRouteModelId = $state('')
 let internalNavigation = false
 
@@ -485,32 +493,60 @@ function selectManualTemplate(templateId: string): void {
   manualTemplateId = templateId
 }
 
+async function saveModelDetail(): Promise<void> {
+  // 只改了 RPM 时不重写模型规格，避免无意义地推进规格修订号。
+  if (specificationDirty || !rpmDirty) editor?.submit()
+  if (!rpmDirty || !rpmForm) return
+  rpmSaving = true
+  try {
+    await rpmForm.save()
+  } finally {
+    rpmSaving = false
+  }
+}
+
 function clearManualTemplate(): void {
   manualTemplateId = ''
 }
 </script>
 
-<div class="flex flex-wrap items-center gap-3">
-  {#if syncStateQuery.data}
-    <Switch
-      id="automatic-model-sync"
-      checked={syncStateQuery.data.automatic_sync}
-      disabled={preferenceSaving}
-      onCheckedChange={(value: boolean) => void saveAutomaticSync(value)} />
-    <label for="automatic-model-sync">{m.model_changes_automatic()}</label>
-    {#if preferenceSaving}<Spinner />{/if}
-    {#if syncStateQuery.data.in_progress}<p role="status">{m.model_changes_in_progress()}</p>{/if}
-    {#if syncStateQuery.data.automatic_sync && syncStateQuery.data.pause_reason}<p>
+<!-- 自动同步属于服务模型列表级设置：与「同步模型」同处列表头部，单个模型编辑页不显示。 -->
+{#snippet syncStatus()}
+  <div class="flex min-h-10 flex-wrap items-center gap-x-4 gap-y-1 text-sm">
+    {#if syncStateQuery.data}
+      <div class="flex items-center gap-3">
+        <Switch
+          id="automatic-model-sync"
+          checked={syncStateQuery.data.automatic_sync}
+          disabled={preferenceSaving}
+          onCheckedChange={(value: boolean) => void saveAutomaticSync(value)} />
+        <label for="automatic-model-sync" class="font-medium">{m.model_changes_automatic()}</label>
+        {#if preferenceSaving}<Spinner />{/if}
+      </div>
+    {/if}
+    {#if displayedSyncSummary}
+      <p class="min-w-0 text-muted-foreground">
+        {m.provider_model_catalog_last_checked()}
+        <time class="font-technical text-xs" datetime={displayedSyncSummary.checked_at}
+          >{formatLogTime(displayedSyncSummary.checked_at)}</time>
+        · {sourceLabel(displayedSyncSummary.source)}
+        {#if summaryDescription(displayedSyncSummary)}
+          · <span class="text-foreground">{summaryDescription(displayedSyncSummary)}</span>{/if}
+        {#if displayedSyncSummary.error}<span class="block text-destructive"
+            >{modelChangeReason(displayedSyncSummary.error)}</span
+          >{/if}
+      </p>
+    {:else if syncStateQuery.isPending}
+      <Spinner />
+    {/if}
+    {#if syncStateQuery.data?.in_progress}<p role="status" class="flex items-center gap-2 text-muted-foreground">
+        <Spinner />{m.model_changes_in_progress()}
+      </p>{/if}
+    {#if syncStateQuery.data?.automatic_sync && syncStateQuery.data.pause_reason}<p class="text-warning">
         {modelChangeReason(syncStateQuery.data.pause_reason)}
       </p>{/if}
-  {/if}
-</div>
-{#if preferenceError}<RequestFailure
-    message={preferenceError}
-    retry={() => saveAutomaticSync(!syncStateQuery.data?.automatic_sync)} />{/if}
-{#if syncStateQuery.isError}<RequestFailure
-    message={localizeBackendErrorMessage(syncStateQuery.error)}
-    retry={() => syncStateQuery.refetch()} />{/if}
+  </div>
+{/snippet}
 
 {#snippet providerModelIdentityCell(context: DataTableCellContext<ProviderModelSummary>)}
   {@const model = context.row.original}
@@ -585,7 +621,7 @@ function clearManualTemplate(): void {
 {/snippet}
 
 {#snippet providerModelRpmCell(context: DataTableCellContext<ProviderModelSummary>)}
-  <RpmLimit {providerId} modelId={context.row.original.id} />
+  <RpmLimit {providerId} modelId={context.row.original.id} modelName={context.row.original.name} />
 {/snippet}
 
 {#snippet providerModelSourceCell(context: DataTableCellContext<ProviderModelSummary>)}
@@ -691,7 +727,10 @@ function clearManualTemplate(): void {
               {modelEditing.detail.source_kind === 'manual' ? m.common_added_manually() : m.common_synced()}
             </Badge>
           </div>
-          <p class="route-section-description break-all font-technical">{modelEditing.detail.id}</p>
+          <TechnicalValue
+            value={modelEditing.detail.id}
+            copyable
+            class="max-w-[min(40rem,100%)] text-[0.8125rem] text-muted-foreground" />
         </div>
         <DropdownMenu.Root>
           <DropdownMenu.Trigger>
@@ -736,51 +775,51 @@ function clearManualTemplate(): void {
           disabled={modelEditing.busy}
           onSave={(metadataJson: string) => void editing.save(metadataJson)}
           onSelectionChange={(policy: ProviderModelSelectionPolicy) => void editing.changeSelection(policy)}
-          onDirtyChange={(value: boolean) => editing.markDirty(value)} />
+          onDirtyChange={(value: boolean) => {
+            specificationDirty = value
+            editing.markDirty(value || rpmDirty)
+          }} />
       </div>
       {#key modelEditing.detail.id}
-        <section class="flex min-w-0 flex-col gap-4 border-t pt-4" aria-labelledby="provider-model-rpm-title">
-          <h3 id="provider-model-rpm-title" class="text-sm font-semibold">{m.rpm_column()}</h3>
-          <RpmForm {providerId} modelId={modelEditing.detail.id} />
-        </section>
+        <FormSection title={m.rpm_column()} class="mt-6">
+          <RpmForm
+            bind:this={rpmForm}
+            {providerId}
+            modelId={modelEditing.detail.id}
+            embedded
+            onDirtyChange={(value: boolean) => {
+              rpmDirty = value
+              editing.markDirty(value || specificationDirty)
+            }} />
+        </FormSection>
       {/key}
       <div
-        class="sticky bottom-0 z-20 mt-2 flex translate-y-2 justify-end gap-2 border-t bg-background py-2 after:absolute after:inset-x-0 after:top-full after:h-2 after:bg-background after:content-['']">
-        <Button variant="outline" class="min-h-10" onclick={() => editing.close()} disabled={modelEditing.busy}
-          >{m.common_cancel()}</Button>
-        <Button class="min-h-10" onclick={() => editor?.submit()} disabled={modelEditing.busy}>
-          {#if modelEditing.busy}<Spinner data-icon="inline-start" />{/if}{m.common_save_model()}
-        </Button>
+        class="sticky bottom-0 z-20 mt-6 flex translate-y-2 flex-wrap items-center justify-end gap-x-4 gap-y-2 border-t bg-background py-2 after:absolute after:inset-x-0 after:top-full after:h-2 after:bg-background after:content-['']">
+        {#if modelEditing.dirty}
+          <StatusIndicator tone="warning" label={m.provider_model_editor_unsaved()} class="me-auto" />
+        {/if}
+        <div class="flex gap-2">
+          <Button
+            variant="outline"
+            class="min-h-10"
+            onclick={() => editing.close()}
+            disabled={modelEditing.busy || rpmSaving}>{m.common_cancel()}</Button>
+          <Button
+            class="min-h-10"
+            onclick={saveModelDetail}
+            disabled={modelEditing.busy || rpmSaving}
+            aria-busy={modelEditing.busy || rpmSaving}>
+            {#if modelEditing.busy || rpmSaving}<Spinner data-icon="inline-start" />{/if}{m.common_save_model()}
+          </Button>
+        </div>
       </div>
     {/if}
   </section>
 {:else}
   <section class="route-section" aria-labelledby="provider-model-inventory-title">
-    <div class="route-section-header">
-      <div>
-        <h2 id="provider-model-inventory-title" class="route-section-title">
-          {m.provider_model_catalog_models_service()}
-        </h2>
-        <p class="route-section-description">
-          {m.provider_model_catalog_page_summary()}
-        </p>
-        <p class="mt-2 text-sm">
-          {#if displayedSyncSummary}
-            {m.provider_model_catalog_last_checked()}
-            <span class="text-xs text-muted-foreground"
-              >{formatLogTime(displayedSyncSummary.checked_at)} · {sourceLabel(displayedSyncSummary.source)}</span>
-            {#if summaryDescription(displayedSyncSummary)}
-              · {summaryDescription(displayedSyncSummary)}{/if}
-            {#if displayedSyncSummary.error}<span class="block text-destructive"
-                >{modelChangeReason(displayedSyncSummary.error)}</span
-              >{/if}
-          {:else if syncStateQuery.isPending}
-            <Spinner />
-          {:else if !syncStateQuery.isError}
-            {m.model_changes_not_checked()}
-          {/if}
-        </p>
-      </div>
+    <h2 id="provider-model-inventory-title" class="sr-only">{m.provider_model_catalog_models_service()}</h2>
+    <div class="route-section-header items-center">
+      {@render syncStatus()}
       <div class="flex flex-wrap gap-2">
         <Button data-model-changes-trigger variant="outline" onclick={() => changesSheet.show(providerId)}
           >{m.model_changes_title()}</Button>
@@ -792,6 +831,13 @@ function clearManualTemplate(): void {
         </Button>
       </div>
     </div>
+
+    {#if preferenceError}<RequestFailure
+        message={preferenceError}
+        retry={() => saveAutomaticSync(!syncStateQuery.data?.automatic_sync)} />{/if}
+    {#if syncStateQuery.isError}<RequestFailure
+        message={localizeBackendErrorMessage(syncStateQuery.error)}
+        retry={() => syncStateQuery.refetch()} />{/if}
 
     {#if modelsQuery.isError && modelsQuery.data}
       <RequestFailure
@@ -867,7 +913,7 @@ function clearManualTemplate(): void {
               {@render modelAvailability(model)}
               <Badge variant="outline"
                 >{model.source_kind === 'manual' ? m.common_added_manually() : m.common_synced()}</Badge>
-              <RpmLimit {providerId} modelId={model.id} showLabel />
+              <RpmLimit {providerId} modelId={model.id} modelName={model.name} showLabel />
               {#if references.length > 0}
                 <a
                   class="inline-flex min-h-10 items-center rounded-md px-2 text-sm font-medium hover:bg-muted"

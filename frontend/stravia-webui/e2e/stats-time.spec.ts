@@ -373,7 +373,7 @@ test.describe('statistics absolute time windows', () => {
     await expect(deletedModel.getByRole('button')).toHaveCount(0)
 
     for (const [tableName, resourceName] of [
-      ['Model services', 'Reused service name'],
+      ['Providers', 'Reused service name'],
       ['API Key usage', 'Reused key name'],
     ] as const) {
       const table = page.getByRole('table', { name: tableName, exact: true })

@@ -12,7 +12,7 @@ test('empty Chat offers service setup instead of a composer', async ({ page }) =
 
   const main = page.getByRole('main')
   await expect(main.getByRole('heading', { name: 'New conversation', exact: true })).toBeVisible()
-  await expect(main.getByRole('link', { name: 'Connect a model service' })).toBeVisible()
+  await expect(main.getByRole('link', { name: 'Connect a provider' })).toBeVisible()
   await expect(main.getByRole('textbox', { name: 'Message' })).toHaveCount(0)
 })
 
@@ -38,11 +38,11 @@ test('Chat does not treat a failed configuration fetch as an empty instance', as
 
   const main = page.getByRole('main')
   await expect(main.getByRole('alert')).toContainText('Configuration fetch failed')
-  await expect(main.getByRole('link', { name: 'Connect a model service' })).toHaveCount(0)
+  await expect(main.getByRole('link', { name: 'Connect a provider' })).toHaveCount(0)
 
   providerFetchFails = false
   await main.getByRole('button', { name: 'Retry' }).click()
-  await expect(main.getByRole('link', { name: 'Connect a model service' })).toBeVisible()
+  await expect(main.getByRole('link', { name: 'Connect a provider' })).toBeVisible()
 })
 
 test('Usage analytics exposes a failed latency series and recovers without fabricating zero speed', async ({
@@ -579,7 +579,7 @@ test('Usage analytics exposes an initial query failure and recovers on retry', a
 
 for (const scenario of [
   { path: '/api-keys', primary: '/api-keys', dependency: '/models', action: 'Create first API Key' },
-  { path: '/models', primary: '/models', dependency: '/providers', action: 'Go to model services' },
+  { path: '/models', primary: '/models', dependency: '/providers', action: 'Go to providers' },
 ]) {
   test(`${scenario.path} finishes its first load when dependencies arrive first`, async ({ page }) => {
     let releasePrimary!: () => void
@@ -644,13 +644,13 @@ for (const scenario of [
 
 test('empty Model services, Models, API Keys, and logs speak the missing dependency', async ({ page }) => {
   await page.goto('/providers')
-  await expect(page.getByText('A model has nowhere to go until you connect a model service.')).toBeVisible()
-  await expect(page.getByRole('button', { name: 'Connect first service' })).toHaveCount(1)
-  await expect(page.getByRole('button', { name: 'Connect service' })).toHaveCount(0)
+  await expect(page.getByText('A model has nowhere to go until you connect a provider.')).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Add your first provider' })).toHaveCount(1)
+  await expect(page.getByRole('button', { name: 'Add provider' })).toHaveCount(0)
 
   await page.goto('/models')
-  await expect(page.getByText('Connect a model service first')).toBeVisible()
-  await expect(page.getByRole('link', { name: 'Go to model services' })).toBeVisible()
+  await expect(page.getByText('Connect a provider first')).toBeVisible()
+  await expect(page.getByRole('link', { name: 'Go to providers' })).toBeVisible()
   await expect(page.getByRole('link', { name: 'Add model' })).toHaveCount(0)
 
   await page.goto('/api-keys')

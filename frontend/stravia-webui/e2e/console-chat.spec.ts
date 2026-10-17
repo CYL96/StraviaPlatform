@@ -841,7 +841,7 @@ test('history searches message content, renames, deletes and confirms exact clea
   await expect(allLink).toBeHidden()
   await expect(chatLink).toHaveAttribute('aria-expanded', 'false')
 
-  await navigation.getByRole('link', { name: 'Model services', exact: true }).focus()
+  await navigation.getByRole('link', { name: 'Providers', exact: true }).focus()
   await page.keyboard.press('Shift+Tab')
   await expect(chatLink).toBeFocused()
   await expect(chatLink).toHaveAttribute('aria-expanded', 'true')
