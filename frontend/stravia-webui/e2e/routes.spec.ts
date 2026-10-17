@@ -5,7 +5,7 @@ import { prepareApp } from './prepare-app'
 const thinkingLevels = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const
 
 for (const locale of ['en-US', 'zh-CN'] as const) {
-  test(`route output repair preserves destinations and failed drafts (${locale}, 320px)`, async ({ page }) => {
+  test(`model type changes preserve destinations and failed drafts (${locale}, 320px)`, async ({ page }) => {
     await page.addInitScript((language) => localStorage.setItem('stravia-locale', language), locale)
     await page.setViewportSize({ width: 320, height: 800 })
     const zh = locale === 'zh-CN'
@@ -39,7 +39,7 @@ for (const locale of ['en-US', 'zh-CN'] as const) {
       model_id: 'legacy',
       display_name: 'Retained route',
       balance: 'traffic_equalization',
-      output_modality: null,
+      output_modality: 'text',
       image_generation_bound: false,
       is_enabled: true,
       supported_thinking_levels: [],
@@ -87,25 +87,29 @@ for (const locale of ['en-US', 'zh-CN'] as const) {
     })
 
     await page.goto('/models/new')
-    await expect(page.getByRole('radio', { name: zh ? '文字输出' : 'Text output', exact: true })).toBeChecked()
+    const modelType = page.getByRole('button', { name: zh ? '输出类型' : 'Output type', exact: true })
+    await expect(modelType).toHaveText(zh ? '文本' : 'Text')
     await page.goto('/models/legacy')
-    await expect(page.getByRole('radio', { checked: true })).toHaveCount(0)
-    await expect(
-      page.getByRole('status').filter({ hasText: zh ? '需要重新配置' : 'Reconfiguration required' }),
-    ).toBeVisible()
-    const image = page.getByRole('radio', { name: zh ? '图片输出' : 'Image output', exact: true })
-    await image.focus()
-    await page.keyboard.press('Space')
-    await expect(image).toBeChecked()
-    await expect(page.getByText(zh ? /以下请求目标/ : /These destinations/)).toBeVisible()
+    await expect(modelType).toHaveText(zh ? '文本' : 'Text')
+    await modelType.focus()
+    await page.keyboard.press('Enter')
+    await page.keyboard.press('ArrowDown')
+    await page.keyboard.press('Enter')
+    await expect(modelType).toHaveText(zh ? '图片' : 'Image')
+    await modelType.click()
+    await expect(page.getByRole('option', { selected: true })).toHaveText(zh ? '图片' : 'Image')
+    await page.keyboard.press('Escape')
+    await expect(page.getByRole('alert')).toHaveCount(0)
     await page.getByRole('button', { name: zh ? '保存模型' : 'Save model', exact: true }).click()
+    await expect(page.getByRole('alert')).toContainText(zh ? '以下请求目标' : 'These destinations')
+    await expect(page.getByRole('alert')).toContainText('Modality service · text-only')
     expect(attempts).toBe(0)
     // A disabled incompatible destination still blocks switching; remove it explicitly.
     await page.getByRole('button', { name: zh ? '移除请求目标 2' : 'Remove destination 2', exact: true }).click()
     await page.locator('#route-display-name').fill('Retained failure draft')
     await page.getByRole('button', { name: zh ? '保存模型' : 'Save model', exact: true }).click()
     await expect(page.getByRole('alert')).toContainText('Configuration changed')
-    await expect(image).toBeChecked()
+    await expect(modelType).toHaveText(zh ? '图片' : 'Image')
     await expect(page.locator('#route-display-name')).toHaveValue('Retained failure draft')
     await expect(page.locator('[data-slot="target-card"]')).toHaveCount(1)
     await page.getByRole('button', { name: zh ? '保存模型' : 'Save model', exact: true }).click()
@@ -196,9 +200,10 @@ test('historical model alias can repair output without replacing its destination
 
   await page.goto('/models/historical-alias')
   await expect.poll(() => inventoryLoaded).toBe(true)
-  await expect(page.getByRole('radio', { checked: true })).toHaveCount(0)
+  await expect(page.getByRole('button', { name: 'Output type', exact: true })).toHaveText('Select an output type')
   await expect(page.locator('[data-slot="target-card"]')).toHaveCount(1)
-  await page.getByRole('radio', { name: 'Text output', exact: true }).check()
+  await page.getByRole('button', { name: 'Output type', exact: true }).click()
+  await page.getByRole('option', { name: 'Text', exact: true }).click()
   await expect(page.getByText(/These destinations/)).toHaveCount(0)
   await page.getByRole('button', { name: 'Save model', exact: true }).click()
   await expect.poll(() => body).toBeDefined()
@@ -223,7 +228,8 @@ test('image-bound route switching exposes a visible unlink path without losing i
   await page.route('**/api/v1/models/bound-image', (route) => route.fulfill({ json: { data: saved } }))
   await page.route('**/api/v1/models/bound-image/target-statuses', (route) => route.fulfill({ json: { data: [] } }))
   await page.goto('/models/bound-image')
-  await page.getByRole('radio', { name: 'Text output', exact: true }).check()
+  await page.getByRole('button', { name: 'Output type', exact: true }).click()
+  await page.getByRole('option', { name: 'Text', exact: true }).click()
   await page.locator('#route-display-name').fill('Unsaved switch')
   const recovery = page.getByRole('link', { name: 'Open media generation', exact: true })
   await expect(recovery).toHaveAttribute('href', '/media-generation')
@@ -231,7 +237,7 @@ test('image-bound route switching exposes a visible unlink path without losing i
   await page.getByRole('button', { name: 'Save model', exact: true }).click()
   await expect(page.getByRole('alert')).toContainText('Clear that reference')
   await expect(page.locator('#route-display-name')).toHaveValue('Unsaved switch')
-  await expect(page.getByRole('radio', { name: 'Text output', exact: true })).toBeChecked()
+  await expect(page.getByRole('button', { name: 'Output type', exact: true })).toHaveText('Text')
 })
 
 test('prefilled model metadata stays clean without erasing a user draft', async ({ page }) => {
@@ -1061,7 +1067,7 @@ test('Route Builder loads Provider Models and edits priority-lane destinations i
 
   await page.goto('/models/new')
   await expect(page.getByRole('heading', { name: 'Add model' })).toBeVisible()
-  await expect(page.getByRole('radio', { name: 'Text output', exact: true })).toBeChecked()
+  await expect(page.getByRole('button', { name: 'Output type', exact: true })).toHaveText('Text')
   const createRouteBreadcrumb = page.getByRole('navigation', { name: 'Breadcrumb' })
   await expect(createRouteBreadcrumb.getByRole('link', { name: 'Models' })).toHaveAttribute('href', '/models')
   await expect(createRouteBreadcrumb.getByText('Create', { exact: true })).toHaveAttribute('aria-current', 'page')
@@ -1261,6 +1267,7 @@ test('Destination status reflects runtime state without overwriting the editor d
     ],
   }
   let statusMode: 'cooling' | 'available' | 'error' | 'paused' | 'invalid' = 'cooling'
+  let writes = 0
 
   await page.route('**/api/v1/providers', async (route) => {
     await route.fulfill({
@@ -1283,6 +1290,7 @@ test('Destination status reflects runtime state without overwriting the editor d
     })
   })
   await page.route('**/api/v1/models/status-route', async (route) => {
+    if (route.request().method() !== 'GET') writes++
     await route.fulfill({ json: { data: model } })
   })
   await page.route('**/api/v1/models/status-route/target-statuses', async (route) => {
@@ -1321,6 +1329,19 @@ test('Destination status reflects runtime state without overwriting the editor d
   statusMode = 'available'
   await expect(card.getByRole('status')).toHaveText('Available')
   await expect(page.locator('#route-display-name')).toHaveValue('My unsaved label')
+
+  const outputType = page.getByRole('button', { name: 'Output type', exact: true })
+  await outputType.click()
+  await page.getByRole('option', { name: 'Image', exact: true }).click()
+  await expect(card.getByRole('status')).toHaveText('Output does not match this route')
+  await expect(card.getByRole('status')).toHaveAttribute('data-tone', 'error')
+  await expect(page.getByRole('alert')).toHaveCount(0)
+  await page.getByRole('button', { name: 'Save model', exact: true }).click()
+  await expect(page.getByRole('alert')).toContainText('Provider · upstream-model')
+  expect(writes).toBe(0)
+  await outputType.click()
+  await page.getByRole('option', { name: 'Text', exact: true }).click()
+  await expect(card.getByRole('status')).toHaveText('Available')
 
   statusMode = 'error'
   await expect(card.getByRole('status')).toHaveCount(0)

@@ -31,7 +31,7 @@ fn rewrite(route: &RouteConfig, output_modality: Option<RouteOutputModality>) ->
     }
 }
 
-async fn upgrade_and_repair(storage: &dyn Storage) -> anyhow::Result<()> {
+async fn upgrade_and_preserve(storage: &dyn Storage) -> anyhow::Result<()> {
     let enabled = storage.routes().get("enabled-route").await?.unwrap();
     let disabled = storage.routes().get("disabled-route").await?.unwrap();
     assert_eq!(enabled.id.as_str(), "enabled-key");
@@ -43,8 +43,8 @@ async fn upgrade_and_repair(storage: &dyn Storage) -> anyhow::Result<()> {
     assert_eq!(enabled.default_thinking_level.as_deref(), Some("high"));
     assert_eq!(disabled.balance, "traffic_equalization");
     assert_eq!(disabled.default_thinking_level, None);
-    assert_eq!(enabled.output_modality, None);
-    assert_eq!(disabled.output_modality, None);
+    assert_eq!(enabled.output_modality, Some(RouteOutputModality::Text));
+    assert_eq!(disabled.output_modality, Some(RouteOutputModality::Text));
     assert_eq!(enabled.targets.len(), 2);
     assert_eq!(disabled.targets.len(), 1);
     for (target, id, model, enabled, priority, timeout, retries, cooldown) in [
@@ -90,11 +90,11 @@ async fn upgrade_and_repair(storage: &dyn Storage) -> anyhow::Result<()> {
     }
     let original_enabled = serde_json::to_value(&enabled)?;
     let original_disabled = serde_json::to_value(&disabled)?;
-    let mut toggle = rewrite(&enabled, None);
+    let mut toggle = rewrite(&enabled, enabled.output_modality);
     toggle.is_enabled = false;
     let toggled = storage.routes().put(toggle).await?;
-    assert_eq!(toggled.output_modality, None);
-    let mut ordinary = rewrite(&toggled, None);
+    assert_eq!(toggled.output_modality, Some(RouteOutputModality::Text));
+    let mut ordinary = rewrite(&toggled, toggled.output_modality);
     ordinary.is_enabled = true;
     let unchanged = storage.routes().put(ordinary).await?;
     assert_eq!(serde_json::to_value(&unchanged)?, original_enabled);
@@ -117,7 +117,7 @@ async fn upgrade_and_repair(storage: &dyn Storage) -> anyhow::Result<()> {
             .await?
             .unwrap()
             .output_modality,
-        None
+        Some(RouteOutputModality::Text)
     );
 
     let repaired = storage
@@ -157,9 +157,7 @@ async fn assert_reconstructed(storage: &dyn Storage) -> anyhow::Result<()> {
     assert_reference(storage).await
 }
 
-#[tokio::test]
-async fn sqlite_upgrade_requires_explicit_route_reconfiguration_and_preserves_identity()
--> anyhow::Result<()> {
+async fn sqlite_upgrade(version: i64) -> anyhow::Result<()> {
     let directory = tempfile::tempdir()?;
     let options = sqlx::sqlite::SqliteConnectOptions::new()
         .filename(directory.path().join("routes.db"))
@@ -173,15 +171,31 @@ async fn sqlite_upgrade_requires_explicit_route_reconfiguration_and_preserves_id
     let prefix = sqlx::migrate::Migrator::with_migrations(
         migrations
             .iter()
-            .filter(|migration| migration.version < 21)
+            .filter(|migration| migration.version <= version)
             .cloned()
             .collect(),
     );
     prefix.run(pool.migration_pool()).await?;
     sqlx::raw_sql(HISTORICAL_ROUTES).execute(&pool).await?;
+    if version >= 21 {
+        sqlx::query("INSERT INTO models (id, model_id, output_modality) VALUES ('image-key', 'configured-image', 'image')")
+            .execute(&pool)
+            .await?;
+    }
     stravia_core::migrations::migrate_sqlite(&pool, None).await?;
     let storage = SqliteStorage::from_pool(pool.clone());
-    upgrade_and_repair(&storage).await?;
+    upgrade_and_preserve(&storage).await?;
+    if version >= 21 {
+        assert_eq!(
+            storage
+                .routes()
+                .get("configured-image")
+                .await?
+                .unwrap()
+                .output_modality,
+            Some(RouteOutputModality::Image)
+        );
+    }
     for invalid in ["", "audio", "TEXT"] {
         assert!(
             sqlx::query("UPDATE models SET output_modality = ? WHERE id = 'enabled-key'")
@@ -204,9 +218,15 @@ async fn sqlite_upgrade_requires_explicit_route_reconfiguration_and_preserves_id
 }
 
 #[tokio::test]
-#[ignore = "requires DB_URL pointing to an isolated PostgreSQL test server"]
-async fn postgres_upgrade_requires_explicit_route_reconfiguration_and_preserves_identity()
+async fn sqlite_upgrade_defaults_unconfigured_routes_to_text_and_preserves_identity()
 -> anyhow::Result<()> {
+    for version in [20, 21] {
+        sqlite_upgrade(version).await?;
+    }
+    Ok(())
+}
+
+async fn postgres_upgrade(version: i64) -> anyhow::Result<()> {
     let url = std::env::var("DB_URL")?;
     let admin = sqlx::postgres::PgPoolOptions::new()
         .max_connections(1)
@@ -226,12 +246,17 @@ async fn postgres_upgrade_requires_explicit_route_reconfiguration_and_preserves_
         let prefix = sqlx::migrate::Migrator::with_migrations(
             migrations
                 .iter()
-                .filter(|migration| migration.version < 21)
+                .filter(|migration| migration.version <= version)
                 .cloned()
                 .collect(),
         );
         prefix.run(pool.migration_pool()).await?;
         sqlx::raw_sql(HISTORICAL_ROUTES).execute(&pool).await?;
+        if version >= 21 {
+            sqlx::query("INSERT INTO models (id, model_id, output_modality) VALUES ('image-key', 'configured-image', 'image')")
+                .execute(&pool)
+                .await?;
+        }
         stravia_core::migrations::migrate_postgres(&pool, None).await?;
         let mut storage_url = url::Url::parse(&url)?;
         storage_url
@@ -239,7 +264,16 @@ async fn postgres_upgrade_requires_explicit_route_reconfiguration_and_preserves_
             .append_pair("options", &format!("-c search_path={schema}"));
         let config = SqlBackendConfig::with_url(storage_url.to_string());
         let storage = PostgresStorage::connect(config.clone()).await?;
-        let assertions = upgrade_and_repair(&storage).await;
+        let assertions = async {
+            upgrade_and_preserve(&storage).await?;
+            if version >= 21 {
+                assert_eq!(
+                    storage.routes().get("configured-image").await?.unwrap().output_modality,
+                    Some(RouteOutputModality::Image)
+                );
+            }
+            anyhow::Ok(())
+        }.await;
         storage.pool().close().await;
         assertions?;
         for invalid in ["", "audio", "TEXT"] {
@@ -264,4 +298,14 @@ async fn postgres_upgrade_requires_explicit_route_reconfiguration_and_preserves_
         .await?;
     admin.close().await;
     result
+}
+
+#[tokio::test]
+#[ignore = "requires DB_URL pointing to an isolated PostgreSQL test server"]
+async fn postgres_upgrade_defaults_unconfigured_routes_to_text_and_preserves_identity()
+-> anyhow::Result<()> {
+    for version in [20, 21] {
+        postgres_upgrade(version).await?;
+    }
+    Ok(())
 }

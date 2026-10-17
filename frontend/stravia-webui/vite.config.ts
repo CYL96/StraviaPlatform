@@ -22,6 +22,8 @@ export default defineConfig(({ mode }) => {
       exclude: ['@lucide/svelte', '@tanstack/svelte-query', 'mode-watcher'],
     },
     server: {
+      // Bun 在 localhost 的 IPv6 地址被占用后可能改绑 IPv4，导致两个实例仍使用同一端口。
+      host: '127.0.0.1',
       port: 5173,
       proxy: {
         '/api/v1': {

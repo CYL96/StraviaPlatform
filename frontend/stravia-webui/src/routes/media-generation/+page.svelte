@@ -2,7 +2,6 @@
 import * as m from '$lib/paraglide/messages.js'
 import { resolve } from '$app/paths'
 import { createQuery, useQueryClient } from '@tanstack/svelte-query'
-import ImagePlusIcon from '@lucide/svelte/icons/image-plus'
 import { toast } from 'svelte-sonner'
 
 import { admin } from '$lib/admin-client'
@@ -13,7 +12,6 @@ import RequestFailure from '$lib/components/request-failure.svelte'
 import * as Alert from '$lib/components/ui/alert'
 import { Badge } from '$lib/components/ui/badge'
 import { Button } from '$lib/components/ui/button'
-import * as Empty from '$lib/components/ui/empty'
 import * as Field from '$lib/components/ui/field'
 import * as Select from '$lib/components/ui/select'
 import { Skeleton } from '$lib/components/ui/skeleton'
@@ -44,13 +42,7 @@ const hasChanges = $derived(Boolean(configQuery.data) && routeId !== savedRouteI
 const savedConfigurationValid = $derived(
   Boolean(configQuery.data?.validation.valid && configQuery.data.config.image.route_id),
 )
-const canSave = $derived(
-  Boolean(configQuery.data) &&
-    hasChanges &&
-    !saving &&
-    !toggleSaving &&
-    (!configQuery.data!.config.enabled || Boolean(routeId)),
-)
+const canSave = $derived(Boolean(configQuery.data) && hasChanges && !saving && !toggleSaving)
 const selectedRoute = $derived(eligibleRoutes.find((route) => route.id === routeId))
 const selectedRouteLabel = $derived(routeId ? selectedRoute?.name || routeId : m.media_generation_no_route())
 const validationMessage = $derived.by(() => {
@@ -106,10 +98,14 @@ async function saveRoute(): Promise<void> {
   saving = true
   saveError = ''
   try {
-    const input: MediaGenerationConfig = { enabled: current.config.enabled, image: { route_id: routeId } }
+    const input: MediaGenerationConfig = {
+      enabled: current.config.enabled && Boolean(routeId),
+      image: { route_id: routeId },
+    }
     const view = await admin.mediaGeneration.config.update(input)
     routeId = view.config.image.route_id
     updateCachedConfig(view)
+    await queryClient.invalidateQueries({ queryKey: ['models'] })
     toast.success(m.media_generation_settings_saved())
   } catch (error) {
     saveError = localizeBackendErrorMessage(error)
@@ -218,16 +214,11 @@ async function clearReference(): Promise<void> {
       <div class="flex flex-col gap-3">
         {#if hasChanges}
           <p class="text-sm text-muted-foreground" role="status">
-            {m.media_generation_route_unsaved()}
+            {routeId ? m.media_generation_route_unsaved() : m.media_generation_route_clear_pending()}
           </p>
         {/if}
         {#if saveError}
           <Alert.Root variant="destructive"><Alert.Description>{saveError}</Alert.Description></Alert.Root>
-        {/if}
-        {#if configQuery.data.config.enabled && !routeId}
-          <Alert.Root variant="warning" role="status">
-            <Alert.Description>{m.media_generation_enabled_route_required()}</Alert.Description>
-          </Alert.Root>
         {/if}
       </div>
 
@@ -254,7 +245,7 @@ async function clearReference(): Promise<void> {
           retrying={eligibleRoutesQuery.isFetching} />
       {:else}
         <Field.Group>
-          <Field.Field size="select" data-invalid={configQuery.data.config.enabled && !routeId}>
+          <Field.Field size="select">
             <Field.Label for="media-generation-image-route">{m.media_generation_route_label()}</Field.Label>
             <Select.Root
               type="single"
@@ -264,10 +255,7 @@ async function clearReference(): Promise<void> {
                 saveError = ''
               }}
               disabled={saving || toggleSaving}>
-              <Select.Trigger
-                id="media-generation-image-route"
-                class="w-full"
-                aria-invalid={configQuery.data.config.enabled && !routeId}>
+              <Select.Trigger id="media-generation-image-route" class="w-full">
                 <span class={routeId && !selectedRoute?.name ? 'font-technical' : ''}>
                   {selectedRouteLabel}
                 </span>
@@ -290,32 +278,8 @@ async function clearReference(): Promise<void> {
                 </Select.Group>
               </Select.Content>
             </Select.Root>
-            <Field.Description>{m.media_generation_route_description()}</Field.Description>
-            {#if configQuery.data.config.enabled && !routeId}
-              <Field.Error>{m.media_generation_enabled_route_required()}</Field.Error>
-            {/if}
           </Field.Field>
         </Field.Group>
-
-        {#if eligibleRoutes.length === 0}
-          <Empty.Root class="border-y py-6">
-            <Empty.Header>
-              <Empty.Media variant="icon"><ImagePlusIcon /></Empty.Media>
-              <Empty.Title>{m.media_generation_no_eligible_routes()}</Empty.Title>
-              <Empty.Description>{m.media_generation_no_eligible_routes_help()}</Empty.Description>
-            </Empty.Header>
-            <Empty.Content>
-              <div class="flex flex-wrap justify-center gap-2">
-                <Button href={resolve('/models')} variant="outline" size="sm">
-                  {m.media_generation_manage_routes()}
-                </Button>
-                <Button href={resolve('/providers')} variant="outline" size="sm">
-                  {m.media_generation_manage_model_services()}
-                </Button>
-              </div>
-            </Empty.Content>
-          </Empty.Root>
-        {/if}
       {/if}
     </section>
   {/if}

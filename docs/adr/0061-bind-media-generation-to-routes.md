@@ -16,7 +16,7 @@ status: accepted
 
 上述输出用途与漂移规则分别取代本 ADR 早先不引入 Route 输出类型的限制、以及输出模态失配使整条媒体路由失败的行为；不恢复旧协议 dispatcher route-type gate，不改变普通推理与托管图片生成的协议含义，也不放宽其他适配器不兼容检查。选择专用 Route 仍有独立维护成本，且声明驱动的资格不构成真实生成成功保证。
 
-图片生成引用在总开关关闭时也阻止 Route 改为文字；须先清空该引用，可同时解绑并关闭功能。关闭总开关和删除 Target 都不是解绑；无效旧引用保留供修复，允许停用和明确解绑。历史 Route 经两种数据库的增量迁移后均待重新配置、不可执行，不能按旧图片生成引用自动推断用途；保留身份、绑定、启用偏好和参数，逐条明确选择用途并保存合格配置后恢复，详见 [媒体生成设计](../design/media-generation.md) 与 [ADR-0073](0073-cutover-to-single-baseline-schema.md)。
+图片生成引用在总开关关闭时也阻止 Route 改为文字；须先清空该引用，可同时解绑并关闭功能。关闭总开关和删除 Target 都不是解绑；无效旧引用保留供修复，允许停用和明确解绑。两种数据库的增量迁移均将未配置用途的历史 Route 统一回填为文字，不覆盖已明确保存的用途；保留身份、绑定、启用偏好和参数，不根据旧图片生成引用自动推断图片用途。历史引用若指向文字 Route，须明确改为图片用途并保存合格配置，或更换、清空引用，详见 [媒体生成设计](../design/media-generation.md) 与 [ADR-0073](0073-cutover-to-single-baseline-schema.md)。
 
 Codex 接入参考 OMP 的托管生图链路：Target 配置支持托管图片工具的 GPT 对话模型，复用所选 Provider 的 Codex 认证与连接设置，请求 Responses 并以 `tool_choice` 强制使用 `image_generation`。有参考图时请求编辑，无参考图时请求生成；消费流式响应并提取图片结果后收存为 Artifact。不运行本地 Codex CLI，也不采用直接调用 `images/generations` 或 `images/edits` 的独立图片接口。具体支持的模型及尺寸映射表按该接入链路核定，不由普通推理可用性推断。
 

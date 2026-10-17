@@ -218,10 +218,11 @@ describe('Stravia desktop smoke', () => {
       await expect($('[data-slot="target-card"][data-enabled="true"]')).toHaveText(
         expect.stringContaining(`Native modality ${suffix}`),
       )
-      await expect($('input[name="route-output-modality"][value="text"]')).toBeSelected()
+      await expect($('#route-output-modality')).toHaveText('Text')
       await $('#route-model-id').setValue(modelId)
-      await $('input[name="route-output-modality"][value="image"]').click()
-      await expect($('input[name="route-output-modality"][value="image"]')).toBeSelected()
+      await $('#route-output-modality').click()
+      await $('[role="option"][data-value="image"]').click()
+      await expect($('#route-output-modality')).toHaveText('Image')
       await $('button=Save model').click()
       await browser.waitUntil(async () => new URL(await browser.getUrl()).pathname === '/models', {
         timeoutMsg: 'native route editor did not finish saving the chosen image modality',
@@ -229,8 +230,8 @@ describe('Stravia desktop smoke', () => {
       route = createdRoute(await adminRequest(port, `/models/${encodeURIComponent(modelId)}`))
       expect(route.output_modality).toBe('image')
       await $(`a[href="/models/${encodeURIComponent(modelId)}"]`).click()
-      await $('input[name="route-output-modality"][value="image"]').waitForDisplayed()
-      await expect($('input[name="route-output-modality"][value="image"]')).toBeSelected()
+      await $('#route-output-modality').waitForDisplayed()
+      await expect($('#route-output-modality')).toHaveText('Image')
     } finally {
       const modelsLink = await $('a[href="/models"]')
       if (await modelsLink.isExisting()) {

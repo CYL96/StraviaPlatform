@@ -1315,6 +1315,8 @@ Observation metadata、文件 manifest 与 Trace segment 共用 `log_retention_d
 - **Desktop 版**：通过 Tauri IPC 取得动态端口与原生管理会话的 access JWT，随后以 Bearer JWT 通过 loopback HTTP 调用 `/api/v1/*`；refresh token 只保留在原生进程内存中
 - **Server 版**：通过当前页面 origin 的 HTTP 调用 `/api/v1/*`
 
+开发前端的 Vite 默认显式监听 `127.0.0.1:5173`，端口占用时由 Vite 递增选择可用端口。不要以 `localhost` 作为默认监听地址：Windows 上的 Bun 可能在 IPv6 回环地址占用后改绑 IPv4，令不同实例以相同的 `localhost` 端口对外显示。`task dev:server` 将 Vite 实际打印地址的 origin 传给后端，并保留既有管理入口与 CSRF 校验。既有前端进程需重启才能应用新绑定；访问控制台实际打印的 URL。旧 `localhost` 入口的 Cookie 不会迁移到 `127.0.0.1`，需要时重新登录，不影响已保存的实例数据。
+
 Request Records 使用 `/api/v1/observations/interactions`、`/interactions/{id}`、`/rejections`、`/rejections/{id}`、`/failed-requests`、`/failed-requests/{kind}/{id}` 和 authenticated fetch SSE `/events?after=<sequence>`；`GET|PUT /debug` 读取或确认切换进程状态，`DELETE /history` 清理非 active 历史。Interaction/Rejection 的 `POST .../debug-bundle-tickets` 固定 snapshot；公开导航路径 `GET /api/v1/observations/debug-bundles/{ticket}` 只消费 60 秒单次 ticket，并返回 `no-store` / `no-referrer`。旧 logs collection/detail 与 flat CSV surface 不保留。
 
 **技术栈：**
