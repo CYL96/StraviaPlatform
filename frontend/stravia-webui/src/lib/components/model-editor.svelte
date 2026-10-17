@@ -16,6 +16,7 @@ import { admin } from '$lib/admin-client'
 import { modelIdFromCatalogId } from '$lib/catalog-model-id'
 import { localizeBackendErrorMessage, unrepresentableThinkingTarget } from '$lib/backend-error'
 import { formatList } from '$lib/format'
+import { specificationModality } from '$lib/model-specification'
 import { inputValue } from '$lib/utils.js'
 import {
   thinkingControlContext,
@@ -232,7 +233,7 @@ function modelCandidates(target: RouteTargetForm): ProviderModelSummary[] {
 }
 
 function targetModalityMismatch(target: RouteTargetForm): boolean {
-  if (!form.outputModality || !target.model || target.loading) return false
+  if (!form.outputModality || !target.model) return false
   const savedTarget = initialModel?.targets.find(
     (item) =>
       target.persisted &&
@@ -243,15 +244,14 @@ function targetModalityMismatch(target: RouteTargetForm): boolean {
   if (savedTarget) {
     return !savedTarget.route_output_modalities.includes(form.outputModality)
   }
+  if (target.loading) return false
   const summary = selectedSummary(target)
   if (summary) return !summary.route_output_modalities?.includes(form.outputModality)
   return false
 }
 
 const modalityBlockers = $derived(targets.filter(targetModalityMismatch))
-const imageBindingBlocksSwitch = $derived(
-  Boolean(initialModel?.image_generation_bound && form.outputModality === 'text'),
-)
+const imageBindingBlocksSwitch = $derived(Boolean(model?.image_generation_bound && form.outputModality === 'text'))
 
 function selectedSummary(target: RouteTargetForm): ProviderModelSummary | undefined {
   return target.inventory.find((item) => item.id === target.model)
@@ -432,7 +432,6 @@ function targetModelIdentity(
 
 function targetIssueLabels(target: RouteTargetForm, summary: ProviderModelSummary | undefined): string[] {
   const labels: string[] = []
-  if (targetModalityMismatch(target)) labels.push(m.route_output_mismatch())
   if (target.persisted && summary && !summary.available) labels.push(m.model_editor_model_no_longer_available())
   if (unwritableThinkingLevels(target).length > 0) labels.push(m.model_editor_thinking_map_unwritable())
   return labels
@@ -656,7 +655,10 @@ async function saveModel(): Promise<void> {
   }
   const modalityChanged = initialModel?.output_modality !== form.outputModality
   if (modalityChanged && modalityBlockers.length > 0) {
-    saveError = m.route_output_blockers()
+    saveError = `${m.route_output_blockers()} ${formatList(
+      modalityBlockers.map((target) => `${targetProviderLabel(target)} · ${target.model}`),
+    )}`
+    toast.error(saveError)
     return
   }
   const targetsChanged = !initialModel || JSON.stringify(draftSnapshot().targets) !== JSON.stringify(savedDraft.targets)
@@ -814,41 +816,7 @@ async function saveModel(): Promise<void> {
             bind:checked={() => form.enabled, (checked: boolean) => (form.enabled = checked)} />
         </div>
       </div>
-      <Field.Group class="grid gap-4 md:grid-cols-4">
-        <Field.Field orientation="vertical" class="md:col-span-4">
-          <fieldset class="min-w-0">
-            <legend class="mb-2 text-sm font-medium">{m.route_output_label()}</legend>
-            <div class="flex flex-wrap gap-4">
-              {#each ['text', 'image'] as modality (modality)}
-                <label class="flex min-h-10 items-center gap-2">
-                  <input type="radio" name="route-output-modality" value={modality} bind:group={form.outputModality} />
-                  {modality === 'text' ? m.route_output_text() : m.route_output_image()}
-                </label>
-              {/each}
-            </div>
-          </fieldset>
-          {#if initialModel && !initialModel.output_modality}
-            <p class="text-sm text-warning" role="status">{m.route_output_reconfigure()}</p>
-          {/if}
-          {#if imageBindingBlocksSwitch}
-            <p class="text-sm text-warning" role="status">
-              {m.route_output_unlink_first()}
-              <a class="underline underline-offset-2" href={resolve('/media-generation')}
-                >{m.route_output_open_media()}</a>
-            </p>
-          {/if}
-          {#if modalityBlockers.length > 0}
-            <div class="text-sm text-warning" role="status">
-              <p>{m.route_output_blockers()}</p>
-              <ul class="list-inside list-disc">
-                {#each modalityBlockers as target (target.key)}
-                  <li>{targetProviderLabel(target)} · {target.model}</li>
-                {/each}
-              </ul>
-            </div>
-          {/if}
-          {#if saveError}<p class="text-sm text-destructive" role="alert">{saveError}</p>{/if}
-        </Field.Field>
+      <Field.Group class="grid gap-4 md:grid-cols-2 lg:grid-cols-5">
         <Field.Field orientation="vertical" class="md:col-span-2">
           <Field.Label for="route-model-id">{m.model_editor_model_id()}</Field.Label>
           <ModelIdCombobox
@@ -879,6 +847,40 @@ async function saveModel(): Promise<void> {
             placeholder={m.model_editor_model_name_placeholder()} />
         </Field.Field>
         <Field.Field orientation="vertical">
+          <Field.Label for="route-output-modality">{m.route_output_label()}</Field.Label>
+          <Select.Root
+            type="single"
+            bind:value={
+              () => form.outputModality ?? undefined,
+              (value: Route['output_modality'] | undefined) => (form.outputModality = value ?? null)
+            }>
+            <Select.Trigger id="route-output-modality" class="w-full" aria-label={m.route_output_label()}>
+              {#if form.outputModality}
+                {@const modality = specificationModality(form.outputModality)}
+                <span class="flex min-w-0 items-center gap-2">
+                  <modality.icon class="text-muted-foreground" aria-hidden="true" />
+                  {modality.label()}
+                </span>
+              {:else}
+                {m.route_output_placeholder()}
+              {/if}
+            </Select.Trigger>
+            <Select.Content>
+              <Select.Group>
+                {#each ['text', 'image'] as value (value)}
+                  {@const modality = specificationModality(value)}
+                  <Select.Item
+                    {value}
+                    label={modality.label()}
+                    class="pr-1.5 [&_.cn-select-item-indicator-icon]:hidden">
+                    <modality.icon class="text-muted-foreground" aria-hidden="true" />{modality.label()}
+                  </Select.Item>
+                {/each}
+              </Select.Group>
+            </Select.Content>
+          </Select.Root>
+        </Field.Field>
+        <Field.Field orientation="vertical">
           <Field.Label for="route-balance">{m.model_editor_how_requests_sent()}</Field.Label>
           <Select.Root type="single" bind:value={form.balance}>
             <Select.Trigger id="route-balance" class="w-full" aria-label={m.model_editor_how_requests_sent()}>
@@ -893,6 +895,16 @@ async function saveModel(): Promise<void> {
           </Select.Root>
         </Field.Field>
       </Field.Group>
+      {#if initialModel && !initialModel.output_modality}
+        <p class="text-sm text-warning" role="status">{m.route_output_reconfigure()}</p>
+      {/if}
+      {#if imageBindingBlocksSwitch}
+        <p class="text-sm text-warning" role="status">
+          {m.route_output_unlink_first()}
+          <a class="underline underline-offset-2" href={resolve('/media-generation')}>{m.route_output_open_media()}</a>
+        </p>
+      {/if}
+      {#if saveError}<p class="text-sm text-destructive" role="alert">{saveError}</p>{/if}
     </section>
 
     <section class="route-section" aria-labelledby="route-targets-title">
@@ -1047,7 +1059,13 @@ async function saveModel(): Promise<void> {
                                 {targetProviderLabel(target)}
                               </span>
                             </span>
-                            {#if status}
+                            {#if targetModalityMismatch(target)}
+                              <StatusIndicator
+                                compact
+                                class="justify-self-end @max-sm/target:col-start-2 @max-sm/target:justify-self-start"
+                                label={m.route_output_mismatch()}
+                                tone="error" />
+                            {:else if status}
                               <StatusIndicator
                                 compact
                                 class="justify-self-end @max-sm/target:col-start-2 @max-sm/target:justify-self-start"
@@ -1128,7 +1146,7 @@ async function saveModel(): Promise<void> {
                   data-key={target.key}
                   draggable="true"
                   class={[
-                    'group flex w-full cursor-grab select-none flex-col items-start rounded-lg border bg-background p-3 pr-12 text-left shadow-xs transition-[border-color,opacity] hover:border-primary/40 focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50 active:cursor-grabbing',
+                    'group @container/target flex w-full cursor-grab select-none flex-col items-start rounded-lg border bg-background p-3 pr-12 text-left shadow-xs transition-[border-color,opacity] hover:border-primary/40 focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50 active:cursor-grabbing',
                     draggedTargetKey === target.key && 'opacity-50',
                   ]}
                   onclick={() => editTarget(target)}
@@ -1140,7 +1158,8 @@ async function saveModel(): Promise<void> {
                   }}
                   ondragstart={(event) => startTargetDrag(event, target)}
                   ondragend={finishTargetDrag}>
-                  <div class="grid w-full min-w-0 grid-cols-[auto_minmax(0,1fr)] items-start gap-x-2 text-left">
+                  <div
+                    class="grid w-full min-w-0 grid-cols-[auto_minmax(0,1fr)_auto] items-start gap-x-2 gap-y-1 text-left @max-sm/target:grid-cols-[auto_minmax(0,1fr)]">
                     <GripVerticalIcon class="mt-0.5 size-4 shrink-0 text-muted-foreground" />
                     <span class="min-w-0">
                       <span
@@ -1150,6 +1169,13 @@ async function saveModel(): Promise<void> {
                         {targetProviderLabel(target)}
                       </span>
                     </span>
+                    {#if targetModalityMismatch(target)}
+                      <StatusIndicator
+                        compact
+                        class="justify-self-end @max-sm/target:col-start-2 @max-sm/target:justify-self-start"
+                        label={m.route_output_mismatch()}
+                        tone="error" />
+                    {/if}
                   </div>
                   {#if issueLabels.length > 0}
                     <div class="flex w-full min-w-0 flex-wrap gap-1.5 pl-6 pt-2">

@@ -6,6 +6,125 @@ test.beforeEach(async ({ page }) => {
   await prepareApp(page)
 })
 
+for (const enabled of [false, true]) {
+  test(`saving no image route releases a previously opened model (media enabled: ${enabled})`, async ({ page }) => {
+    let config = { enabled, image: { route_id: 'historical-image-route' as string | null } }
+    const model = {
+      id: 'historical-image-route',
+      model_id: 'historical-image-route',
+      display_name: 'Historical image route',
+      balance: 'traffic_equalization',
+      output_modality: null,
+      image_generation_bound: true,
+      is_enabled: true,
+      supported_thinking_levels: [],
+      targets: [
+        {
+          id: 'historical-target',
+          provider_id: 'text-provider',
+          model: 'text-model',
+          enabled: true,
+          priority: 0,
+          first_token_timeout_ms: 60000,
+          target_retry_budget: 0,
+          target_cooldown_ms: 60000,
+          thinking_level_map: [],
+          route_output_modalities: ['text'],
+          output_modality_mismatch: true,
+        },
+      ],
+    }
+    let savedOutput: string | undefined
+    let modelReads = 0
+    let releaseModelRefresh!: () => void
+    const modelRefresh = new Promise<void>((resolve) => {
+      releaseModelRefresh = resolve
+    })
+    await page.route('**/api/v1/providers', (route) =>
+      route.fulfill({
+        json: {
+          data: [{ id: 'text-provider', name: 'Text service', protocol: 'openai-compatible', is_enabled: true }],
+        },
+      }),
+    )
+    await page.route('**/api/v1/providers/text-provider/models', (route) =>
+      route.fulfill({
+        json: {
+          data: {
+            models: [{ id: 'text-model', name: 'Text model', available: true, route_output_modalities: ['text'] }],
+          },
+        },
+      }),
+    )
+    await page.route('**/api/v1/models', (route) =>
+      route.fulfill({
+        json: { data: [{ ...model, image_generation_bound: config.image.route_id === model.model_id }] },
+      }),
+    )
+    await page.route('**/api/v1/models/historical-image-route', async (route) => {
+      if (route.request().method() === 'GET') {
+        if (++modelReads > 1) await modelRefresh
+      } else {
+        const input = route.request().postDataJSON()
+        if (config.image.route_id) {
+          await route.fulfill({ status: 400, json: { code: 'ROUTE_IMAGE_GENERATION_BOUND' } })
+          return
+        }
+        savedOutput = input.output_modality
+      }
+      await route.fulfill({
+        json: { data: { ...model, image_generation_bound: config.image.route_id === model.model_id } },
+      })
+    })
+    await page.route('**/api/v1/models/historical-image-route/target-statuses', (route) =>
+      route.fulfill({ json: { data: [] } }),
+    )
+    await page.route('**/api/v1/media-generation/config', async (route) => {
+      if (route.request().method() === 'PUT') config = route.request().postDataJSON()
+      await route.fulfill({
+        json: {
+          data: {
+            config,
+            validation: {
+              valid: false,
+              code: config.image.route_id ? 'route_output_modality_unconfigured' : 'media_generation_route_missing',
+              message: null,
+            },
+          },
+        },
+      })
+    })
+    await page.route('**/api/v1/media-generation/eligible-routes', (route) => route.fulfill({ json: { data: [] } }))
+
+    await page.goto('/models/historical-image-route')
+    await page.getByRole('button', { name: 'Output type', exact: true }).click()
+    await page.getByRole('option', { name: 'Text', exact: true }).click()
+    await page.getByRole('link', { name: 'Open media generation', exact: true }).click()
+    await page.getByRole('button', { name: 'Discard changes', exact: true }).click()
+    const routeSelect = page.getByRole('button', { name: 'Model Route', exact: true })
+    await expect(routeSelect).toContainText('historical-image-route')
+    await routeSelect.click()
+    await page.getByRole('option', { name: 'No route selected', exact: true }).click()
+    await expect(page.getByRole('button', { name: 'Save settings', exact: true })).toBeEnabled()
+    await page.getByRole('button', { name: 'Save settings', exact: true }).click()
+    await expect.poll(() => config).toEqual({ enabled: false, image: { route_id: null } })
+    await expect(page.getByRole('switch', { name: 'Enable media generation' })).not.toBeChecked()
+    await expect(page.getByRole('button', { name: 'Unlink route and disable', exact: true })).toHaveCount(0)
+
+    await page.getByRole('link', { name: 'Manage models', exact: true }).click()
+    await page.getByRole('row').filter({ hasText: 'Historical image route' }).click()
+    await page.getByRole('button', { name: 'Output type', exact: true }).click()
+    await page.getByRole('option', { name: 'Text', exact: true }).click()
+    await page.getByRole('textbox', { name: 'Display name', exact: true }).fill('Recovered draft')
+    releaseModelRefresh()
+    await expect(page.getByRole('link', { name: 'Open media generation', exact: true })).toHaveCount(0)
+    await expect(page.getByRole('textbox', { name: 'Display name', exact: true })).toHaveValue('Recovered draft')
+    await expect(page.getByRole('button', { name: 'Output type', exact: true })).toHaveText('Text')
+    await page.getByRole('button', { name: 'Save model', exact: true }).click()
+    await expect.poll(() => savedOutput).toBe('text')
+  })
+}
+
 for (const locale of ['en-US', 'zh-CN'] as const) {
   test(`invalid historical media reference can be disabled and unlinked (${locale}, 320px)`, async ({ page }) => {
     await page.addInitScript((language) => localStorage.setItem('stravia-locale', language), locale)
@@ -147,7 +266,6 @@ test('empty media generation configuration stays usable in Chinese dark mode at 
   await expect(page.locator('html')).toHaveClass(/\bdark\b/)
   await expect(page.getByRole('heading', { name: '媒体生成', exact: true })).toBeVisible()
   await expect(page.getByRole('switch', { name: '启用媒体生成' })).toBeDisabled()
-  await expect(page.getByRole('link', { name: '管理模型', exact: true }).first()).toHaveAttribute('href', '/models')
-  await expect(page.getByRole('link', { name: '管理模型服务', exact: true })).toHaveAttribute('href', '/providers')
+  await expect(page.getByRole('link', { name: '管理模型', exact: true })).toHaveAttribute('href', '/models')
   await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true)
 })

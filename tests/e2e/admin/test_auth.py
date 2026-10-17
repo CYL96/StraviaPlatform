@@ -64,7 +64,7 @@ def test_development_task_accepts_vite_origin_without_bypassing_csrf(
         assert proc.stdout is not None
         for line in proc.stdout:
             logs.append(line.rstrip())
-            match = re.search(r"Local:.*?(http://localhost:\d+)", line)
+            match = re.search(r"Local:.*?(http://127\.0\.0\.1:\d+)", line)
             if match:
                 origins.append(match.group(1))
                 frontend_ready.set()
@@ -74,6 +74,7 @@ def test_development_task_accepts_vite_origin_without_bypassing_csrf(
     try:
         assert frontend_ready.wait(90), "development WebUI did not start"
         base = origins[0]
+        assert base != "http://127.0.0.1:5173", "development WebUI reused the occupied port"
         wait_until_ready(f"{base}/api/v1/auth/state", timeout=90)
         status, state = http_request("GET", f"{base}/api/v1/auth/state")
         assert status == 200, state
