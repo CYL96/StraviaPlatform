@@ -228,6 +228,10 @@ Linux 开发先安装 [Nix 与 devenv](https://devenv.sh/getting-started/)，在
 
 PostgreSQL 16 通过 `devenv up postgres` 启动，只监听本地 Unix socket；使用 `devenv processes down` 停止，数据保留在 `.devenv/state/postgres`。数据库 E2E 必须显式使用隔离的数据库与 Redis，不得使用日常开发实例。
 
+首次通过 `devenv shell` 或 direnv 激活工作区时，从 `23471` 起选择未被占用、也未被其他工作区登记的后端端口，导出 `STRAVIA_PORT`；继续使用 `task dev:server`，Server 与 Vite 代理自动继承，WebUI 仍从 `5173` 起自动避让。端口按工作区真实路径保存在 `${XDG_STATE_HOME:-~/.local/state}/stravia/devenv/server-ports.json`，分配使用跨工作区文件锁与原子写入；重新进入时复用，新分配时回收已删除工作区的登记。初始化仅在运行时执行，失败阻止进入 shell，不在 Nix 求值阶段探测端口或写状态。
+
+登记不等于操作系统保留端口，无法阻止无关程序在初始化后占用它；需要临时覆盖时，在环境内运行 `STRAVIA_PORT=<port> task dev:server`。环境外的命令仍使用显式端口或默认 `23471`。
+
 进入 shell 不自动安装工作区依赖或启动服务；环境只提供 Docker 客户端，Docker daemon、测试浏览器和桌面图形会话仍需单独准备。
 
 ### 共享出站代理配置与独立选择

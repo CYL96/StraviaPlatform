@@ -33,16 +33,58 @@ let
     librsvg
     gsettings-desktop-schemas
   ];
-  worktreeInit = pkgs.writeScript "stravia-worktree-init" ''
+  workspaceInit = pkgs.writeScript "stravia-workspace-init" ''
     #!${lib.getExe pkgs.python3}
+    import errno
     import fcntl
+    import json
     import os
     from pathlib import Path
+    import socket
     import subprocess
     import sys
     import tempfile
 
-    root = Path(os.environ["DEVENV_ROOT"])
+    root = Path(os.environ["DEVENV_ROOT"]).resolve(strict=True)
+    state = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state")
+    registry_directory = state / "stravia/devenv"
+    registry_directory.mkdir(parents=True, exist_ok=True)
+    registry = registry_directory / "server-ports.json"
+
+    # 跨工作区串行分配；尚未启动的工作区也保留登记，避免其他工作区复用。
+    with (registry_directory / "server-ports.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            allocations = json.loads(registry.read_text())
+        except FileNotFoundError:
+            allocations = {}
+        allocations = {
+            directory: port for directory, port in allocations.items()
+            if Path(directory).is_dir()
+        }
+        # 复用已有登记，不重新探测可能正由本工作区 Server 使用的端口。
+        if str(root) not in allocations:
+            reserved = set(allocations.values())
+            for port in range(23471, 65536):
+                if port in reserved:
+                    continue
+                with socket.socket() as listener:
+                    try:
+                        listener.bind(("127.0.0.1", port))
+                    except OSError as error:
+                        if error.errno == errno.EADDRINUSE:
+                            continue
+                        raise
+                    allocations[str(root)] = port
+                    with tempfile.TemporaryDirectory(dir=registry_directory) as temporary:
+                        staged = Path(temporary) / registry.name
+                        staged.write_text(json.dumps(allocations) + "\n")
+                        staged.replace(registry)
+                    break
+            else:
+                raise SystemExit("No free Stravia development server port available")
+        print(allocations[str(root)])
+
     if not (root / ".git").is_file():
         raise SystemExit(0)
 
@@ -125,7 +167,8 @@ in
 
   # 放在实际 shell hook 中，避免 CLI 忽略初始化 task 的失败后继续启动。
   enterShell = ''
-    ${worktreeInit} || exit $?
+    STRAVIA_PORT="$(${workspaceInit})" || exit $?
+    export STRAVIA_PORT
   '' + lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
     # 未安装到系统目录的 GTK schema 仍须能被桌面进程找到。
     export XDG_DATA_DIRS="${lib.makeSearchPath "share/gsettings-schemas/${pkgs.gtk3.name}" [ pkgs.gtk3 ]}:${lib.makeSearchPath "share/gsettings-schemas/${pkgs.gsettings-desktop-schemas.name}" [ pkgs.gsettings-desktop-schemas ]}:''${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
