@@ -25,7 +25,7 @@ use crate::{
 const TOOL_ID: &str = "media-generation";
 const TOOL_NAME: &str = "generate";
 const LIMIT: Duration = Duration::from_secs(15 * 60);
-const DESCRIPTION: &str = "Generate one image from a prompt, optionally using up to five ordered JPEG/PNG/WebP reference images (owned plain stravia://artifacts/<artifact-id> paths without read options, or public HTTP(S) image URLs; at most 32 MiB and 25 megapixels each). aspect_ratio and resolution are preferences mapped by the selected image Provider and are not exact guarantees. Returns a stable Artifact path and actual image dimensions. Reuse it as a reference image, or use StraviaRead with ?download=1 to download. Retries may repeat generation and consume quota.";
+const DESCRIPTION: &str = "Generate one image from a prompt, optionally using up to five ordered JPEG/PNG/WebP reference images (owned plain stravia://artifacts/<artifact-id> paths without read options, or public HTTP(S) image URLs; at most 32 MiB and 25 megapixels each). aspect_ratio and resolution are preferences mapped by the selected image Provider and are not exact guarantees. Returns a stable Artifact path and actual image dimensions. Reuse it as a reference image, or use StraviaRead with ?download=1 to download. Waits up to 60 seconds, then returns an execution path and status; read that path with StraviaRead and optional ?wait=<seconds> for status and the original result or error. Cancelling a query stops only its wait. Local cancellation does not guarantee upstream generation or quota consumption stops; retries may repeat generation and consume quota.";
 
 pub(crate) fn input_schema() -> Value {
     json!({
@@ -86,10 +86,40 @@ impl GenerateTool {
         }
         execution::generate(&self.gateway, arguments, principal, cancellation, deadline).await
     }
+
+    async fn run_result(
+        &self,
+        arguments: Value,
+        context: ToolExecutionContext,
+        deadline: Instant,
+    ) -> Result<PlatformToolOutput, PlatformToolError> {
+        // 生图 future 包含素材收存和 Vendor 路由状态；在公开执行包装边界固定其
+        // 地址，避免 debug 构建逐层内联搬移大型 future 耗尽工作线程栈。
+        let result =
+            Box::pin(self.run(arguments, context.principal, context.cancellation, deadline)).await;
+        let is_error = result.is_err();
+        Ok(PlatformToolOutput {
+            content: vec![ContentBlock::Unknown {
+                raw: result.unwrap_or_else(error_value),
+            }],
+            is_error,
+            metadata: Default::default(),
+        })
+    }
 }
 
 fn error_value(error: GenerationError) -> Value {
     json!({"error":{"code":error.code,"message":error.message}})
+}
+
+fn error_output(error: GenerationError) -> PlatformToolOutput {
+    PlatformToolOutput {
+        content: vec![ContentBlock::Unknown {
+            raw: error_value(error),
+        }],
+        is_error: true,
+        metadata: Default::default(),
+    }
 }
 
 #[async_trait]
@@ -122,36 +152,37 @@ impl PlatformTool for GenerateTool {
         arguments: Value,
         context: ToolExecutionContext,
     ) -> Result<Value, PlatformToolError> {
-        self.run(
-            arguments,
-            context.principal,
-            context.cancellation,
-            Instant::now() + LIMIT,
-        )
-        .await
-        .map_err(|error| PlatformToolError::new(error_value(error).to_string()))
+        let result = PlatformTool::execute_result(self, arguments, context).await?;
+        let (value, _) = crate::hook::tool::blocks_to_value(result.content)?;
+        if result.is_error {
+            Err(PlatformToolError::new(value.to_string()))
+        } else {
+            Ok(value)
+        }
     }
     async fn execute_result(
         &self,
         arguments: Value,
         context: ToolExecutionContext,
     ) -> Result<PlatformToolOutput, PlatformToolError> {
-        let result = self
-            .run(
+        if let Err(error) = execution::validate_input(&arguments) {
+            return Ok(error_output(error));
+        }
+        let source = crate::tool_execution::ExecutionSource::InferenceRun(context.run_id.clone());
+        let tool = self.clone();
+        self.gateway
+            .execute_public_tool(
+                self,
                 arguments,
-                context.principal,
-                context.cancellation,
-                Instant::now() + LIMIT,
+                context,
+                source,
+                move |arguments, context| async move {
+                    let deadline = crate::tool_execution::current_deadline()
+                        .unwrap_or_else(|| Instant::now() + LIMIT);
+                    tool.run_result(arguments, context, deadline).await
+                },
             )
-            .await;
-        let is_error = result.is_err();
-        Ok(PlatformToolOutput {
-            content: vec![ContentBlock::Unknown {
-                raw: result.unwrap_or_else(error_value),
-            }],
-            is_error,
-            metadata: Default::default(),
-        })
+            .await
     }
 }
 
@@ -191,23 +222,52 @@ impl McpTool for GenerateTool {
         arguments: Value,
         context: &McpContext,
     ) -> Result<McpToolOutput, McpToolError> {
+        if let Err(error) = execution::validate_input(&arguments) {
+            return Ok(McpToolOutput::execution_error(error_value(error)));
+        }
         let (cancellation, deadline) = context
             .execution()
             .unwrap_or_else(|| (CancellationToken::new(), Instant::now() + LIMIT));
-        Ok(
-            match self
-                .run(
-                    arguments,
-                    Principal::new(context.api_key_id.clone()),
-                    cancellation,
-                    deadline,
-                )
-                .await
-            {
-                Ok(value) => McpToolOutput::success(value),
-                Err(error) => McpToolOutput::execution_error(error_value(error)),
-            },
-        )
+        let caller_cancellation = cancellation.clone();
+        let run_id = stravia_runtime_contract::identifier::new_id();
+        let execution_context = ToolExecutionContext {
+            request_id: run_id.clone(),
+            run_id,
+            principal: Principal::new(context.api_key_id.clone()),
+            read_scope: stravia_runtime_contract::hook::ReadExposureScope::FULL,
+            cancellation,
+            progress: None,
+        };
+        let tool = self.clone();
+        let result = self
+            .gateway
+            .execute_public_tool(
+                self,
+                arguments,
+                execution_context,
+                crate::tool_execution::ExecutionSource::Mcp,
+                move |arguments, context| async move {
+                    tool.run_result(arguments, context, deadline).await
+                },
+            )
+            .await;
+        match result {
+            Ok(result) => {
+                let (value, _) =
+                    crate::hook::tool::blocks_to_value(result.content).map_err(|error| {
+                        McpToolError::new("result_encoding_failed", error.to_string())
+                    })?;
+                Ok(if result.is_error {
+                    McpToolOutput::execution_error(value)
+                } else {
+                    McpToolOutput::success(value)
+                })
+            }
+            Err(error) => Ok(McpToolOutput::execution_error(json!({"error":{
+                "code": if caller_cancellation.is_cancelled() { "cancelled" } else { "generation_failed" },
+                "message":error.to_string()
+            }}))),
+        }
     }
 }
 

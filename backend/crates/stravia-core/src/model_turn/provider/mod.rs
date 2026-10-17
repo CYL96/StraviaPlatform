@@ -512,6 +512,7 @@ mod diagnostic_tests {
                     },
                 );
             run.record(RunEvent::ModelTurnStarted {
+                retention_detached: false,
                 model_turn_id: id.clone(),
                 route_id: "route".into(),
                 model_display_name: None,

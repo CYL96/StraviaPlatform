@@ -948,7 +948,10 @@ impl IngressObserver {
                 .record(&inner.run_id, writer::now());
         }
         drop(ingress);
-        RunObserver { inner }
+        RunObserver {
+            inner,
+            retention_detached: false,
+        }
     }
     pub(crate) fn reject(mut self, outcome: RejectedOutcome) {
         self.reject_inner(outcome);
@@ -1001,6 +1004,7 @@ impl Drop for IngressObserver {
 #[derive(Clone)]
 pub(crate) struct RunObserver {
     inner: Arc<RunObserverInner>,
+    retention_detached: bool,
 }
 
 /// A committed asynchronous publication may outlive the request future that
@@ -1040,6 +1044,14 @@ struct RunObserverInner {
     protected: redaction::ProtectedSecrets,
 }
 impl RunObserver {
+    /// 公开执行的清理归属由来源请求决定，内部 Model Turn 不额外保护来源记录。
+    pub(crate) fn for_public_execution(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            retention_detached: true,
+        }
+    }
+
     pub(crate) fn hold_generation_commit_fence(
         &self,
         fence: crate::generation_chain::GenerationCommitFence,
@@ -1201,7 +1213,18 @@ impl RunObserver {
     pub(crate) fn run_id(&self) -> &str {
         &self.inner.run_id
     }
-    pub(crate) fn record(&self, event: RunEvent) {
+    pub(crate) fn record(&self, mut event: RunEvent) {
+        match &mut event {
+            RunEvent::ModelTurnStarted {
+                retention_detached, ..
+            }
+            | RunEvent::ModelTurnFinished {
+                retention_detached, ..
+            } => {
+                *retention_detached = self.retention_detached;
+            }
+            _ => {}
+        }
         if !self.inner.debug_enabled && matches!(event, RunEvent::Wire { .. }) {
             return;
         }
@@ -1937,6 +1960,7 @@ mod snapshot_tests {
             let observation = test_observation(&pool, directory.path(), false).await;
             let run = test_run(&observation, "async-summary", facts(Vec::new()));
             run.record(RunEvent::ModelTurnStarted {
+                retention_detached: false,
                 model_turn_id: "async-turn".into(),
                 route_id: "route".into(),
                 model_display_name: None,
@@ -2023,6 +2047,7 @@ mod snapshot_tests {
             let observation = test_observation(&pool, directory.path(), false).await;
             let run = test_run(&observation, "mixed-batch", facts(Vec::new()));
             run.record(RunEvent::ModelTurnStarted {
+                retention_detached: false,
                 model_turn_id: "mixed-turn".into(),
                 route_id: "route".into(),
                 model_display_name: None,
@@ -2609,6 +2634,7 @@ mod snapshot_tests {
         let observation = test_observation(&pool, directory.path(), true).await;
         let run = test_run(&observation, "missing-finish", facts(Vec::new()));
         run.record(RunEvent::ModelTurnStarted {
+            retention_detached: false,
             model_turn_id: "turn".into(),
             route_id: "route".into(),
             model_display_name: None,
@@ -2731,6 +2757,7 @@ mod snapshot_tests {
         let observation = test_observation(&pool, directory.path(), true).await;
         let run = test_run(&observation, "early-usage", facts(Vec::new()));
         run.record(RunEvent::ModelTurnStarted {
+            retention_detached: false,
             model_turn_id: "early-turn".into(),
             route_id: "route".into(),
             model_display_name: None,
@@ -2798,6 +2825,7 @@ mod snapshot_tests {
         let observation = test_observation(&pool, directory.path(), true).await;
         let parent = test_run(&observation, "protected-parent", facts(Vec::new()));
         parent.record(RunEvent::ModelTurnStarted {
+            retention_detached: false,
             model_turn_id: "turn".into(),
             route_id: "route".into(),
             model_display_name: None,
@@ -2813,6 +2841,7 @@ mod snapshot_tests {
             });
         }
         parent.record(RunEvent::ModelTurnFinished {
+            retention_detached: false,
             model_turn_id: "turn".into(),
             status: "completed".into(),
         });

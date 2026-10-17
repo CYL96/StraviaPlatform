@@ -2468,6 +2468,7 @@ async fn apply_sqlite(
                 .await?;
         }
         RunEvent::ModelTurnStarted {
+            retention_detached,
             model_turn_id,
             route_id,
             model_display_name,
@@ -2480,14 +2481,19 @@ async fn apply_sqlite(
             .fetch_one(&mut **tx)
             .await?;
             sqlx::query("INSERT INTO model_turn_observations (id,run_id,interaction_id,route_id,model_display_name,api_key_id,api_key_name,status,started_at,last_event_sequence,estimated_input_tokens) VALUES (?,?,?,?,?,?,?,'running',?,?,?)").bind(model_turn_id).bind(rid).bind(iid).bind(route_id).bind(model_display_name).bind(key.0).bind(key.1).bind(now).bind(seq).bind(estimated_input_tokens).execute(&mut **tx).await?;
-            sqlx::query("UPDATE inference_run_observations SET background_active=background_active+1 WHERE id=?").bind(rid).execute(&mut **tx).await?;
+            if !retention_detached {
+                sqlx::query("UPDATE inference_run_observations SET background_active=background_active+1 WHERE id=?").bind(rid).execute(&mut **tx).await?;
+            }
         }
         RunEvent::ModelTurnFinished {
+            retention_detached,
             model_turn_id,
             status,
         } => {
             sqlx::query("UPDATE model_turn_observations SET status=?,finished_at=?,last_event_sequence=? WHERE id=?").bind(status).bind(now).bind(seq).bind(model_turn_id).execute(&mut **tx).await?;
-            sqlx::query("UPDATE inference_run_observations SET background_active=MAX(background_active-1,0) WHERE id=?").bind(rid).execute(&mut **tx).await?;
+            if !retention_detached {
+                sqlx::query("UPDATE inference_run_observations SET background_active=MAX(background_active-1,0) WHERE id=?").bind(rid).execute(&mut **tx).await?;
+            }
         }
         RunEvent::TargetAttemptStarted {
             model_turn_id,
@@ -2559,6 +2565,7 @@ async fn apply_postgres(
                 .await?;
         }
         RunEvent::ModelTurnStarted {
+            retention_detached,
             model_turn_id,
             route_id,
             model_display_name,
@@ -2571,14 +2578,19 @@ async fn apply_postgres(
             .fetch_one(&mut **tx)
             .await?;
             sqlx::query("INSERT INTO model_turn_observations (id,run_id,interaction_id,route_id,model_display_name,api_key_id,api_key_name,status,started_at,last_event_sequence,estimated_input_tokens) VALUES ($1,$2,$3,$4,$5,$6,$7,'running',$8,$9,$10)").bind(model_turn_id).bind(rid).bind(iid).bind(route_id).bind(model_display_name).bind(key.0).bind(key.1).bind(now).bind(seq).bind(estimated_input_tokens).execute(&mut **tx).await?;
-            sqlx::query("UPDATE inference_run_observations SET background_active=background_active+1 WHERE id=$1").bind(rid).execute(&mut **tx).await?;
+            if !retention_detached {
+                sqlx::query("UPDATE inference_run_observations SET background_active=background_active+1 WHERE id=$1").bind(rid).execute(&mut **tx).await?;
+            }
         }
         RunEvent::ModelTurnFinished {
+            retention_detached,
             model_turn_id,
             status,
         } => {
             sqlx::query("UPDATE model_turn_observations SET status=$1,finished_at=$2,last_event_sequence=$3 WHERE id=$4").bind(status).bind(now).bind(seq).bind(model_turn_id).execute(&mut **tx).await?;
-            sqlx::query("UPDATE inference_run_observations SET background_active=GREATEST(background_active-1,0) WHERE id=$1").bind(rid).execute(&mut **tx).await?;
+            if !retention_detached {
+                sqlx::query("UPDATE inference_run_observations SET background_active=GREATEST(background_active-1,0) WHERE id=$1").bind(rid).execute(&mut **tx).await?;
+            }
         }
         RunEvent::TargetAttemptStarted {
             model_turn_id,
@@ -2899,6 +2911,7 @@ mod tests {
                     interaction,
                     run,
                     &RunEvent::ModelTurnStarted {
+                        retention_detached: false,
                         model_turn_id: run.into(),
                         route_id: "route".into(),
                         model_display_name: None,
@@ -2998,6 +3011,7 @@ mod tests {
                 id,
                 id,
                 &RunEvent::ModelTurnStarted {
+                    retention_detached: false,
                     model_turn_id: id.into(),
                     route_id: "route".into(),
                     model_display_name: None,
@@ -4083,6 +4097,7 @@ mod tests {
                     iid,
                     &result,
                     &RunEvent::ModelTurnStarted {
+                        retention_detached: false,
                         model_turn_id: format!("{iid}-background"),
                         route_id: "route".into(),
                         model_display_name: None,
@@ -4539,6 +4554,7 @@ mod tests {
             ),
             (
                 RunEvent::ModelTurnStarted {
+                    retention_detached: false,
                     model_turn_id: "duplicate".into(),
                     route_id: "route".into(),
                     model_display_name: None,
@@ -4549,6 +4565,7 @@ mod tests {
             ),
             (
                 RunEvent::ModelTurnStarted {
+                    retention_detached: false,
                     model_turn_id: "duplicate".into(),
                     route_id: "route".into(),
                     model_display_name: None,
@@ -4677,6 +4694,7 @@ mod tests {
                     (wire(), None, 4),
                     (
                         RunEvent::ModelTurnStarted {
+                            retention_detached: false,
                             model_turn_id: "interleaved-turn".into(),
                             route_id: "route".into(),
                             model_display_name: None,
@@ -4720,6 +4738,7 @@ mod tests {
             ),
             (
                 RunEvent::ModelTurnStarted {
+                    retention_detached: false,
                     model_turn_id: "interleaved-turn".into(),
                     route_id: "route".into(),
                     model_display_name: None,
@@ -4841,6 +4860,7 @@ mod tests {
         );
         admit_tool_run(&store, "turns", None, "alice").await?;
         let turn = |id: &str| RunEvent::ModelTurnStarted {
+            retention_detached: false,
             model_turn_id: id.into(),
             route_id: "route".into(),
             model_display_name: None,
@@ -5368,6 +5388,7 @@ mod tests {
                 "gap",
                 "gap",
                 &RunEvent::ModelTurnStarted {
+                    retention_detached: false,
                     model_turn_id: "gap-turn".into(),
                     route_id: "route".into(),
                     model_display_name: None,

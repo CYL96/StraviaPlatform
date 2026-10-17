@@ -123,7 +123,7 @@ CREATE TABLE history_markers (
     published_at INTEGER,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
-    expires_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL, execution_fenced INTEGER NOT NULL DEFAULT 0,
     CHECK (
         (kind = 'thinking' AND tool_id IS NULL AND call_payload IS NULL
          AND execution_state IS NULL AND segment_payload IS NOT NULL)
@@ -449,12 +449,26 @@ CREATE TABLE providers (
     revision          INTEGER NOT NULL DEFAULT 0
 );
 
+CREATE TABLE public_tool_executions (
+    id TEXT PRIMARY KEY,
+    marker_reference TEXT NOT NULL UNIQUE,
+    principal TEXT NOT NULL,
+    source_kind TEXT NOT NULL CHECK (source_kind IN ('mcp', 'inference_run')),
+    source_run_id TEXT,
+    process_id TEXT NOT NULL,
+    handed_off_at BIGINT,
+    expires_at BIGINT NOT NULL,
+    CHECK ((source_kind = 'mcp' AND source_run_id IS NULL) OR (source_kind = 'inference_run' AND source_run_id IS NOT NULL))
+);
+
 CREATE TABLE rejected_request_observations (
     id TEXT PRIMARY KEY, occurred_at INTEGER NOT NULL, method TEXT NOT NULL, path TEXT NOT NULL,
     ingress_protocol TEXT NOT NULL, stage TEXT NOT NULL, code TEXT NOT NULL, status_code INTEGER NOT NULL,
     debug_enabled INTEGER NOT NULL, last_event_sequence INTEGER NOT NULL,
     expires_at INTEGER NOT NULL
 , failure_json TEXT, request_model TEXT, api_key_id TEXT, api_key_name TEXT, started_at INTEGER, duration_ms INTEGER);
+
+CREATE TABLE removed_tool_executions (id TEXT PRIMARY KEY);
 
 CREATE TABLE reversible_redaction_mappings (
     reference TEXT PRIMARY KEY NOT NULL,
@@ -550,6 +564,8 @@ CREATE TABLE target_attempt_observations (
     usage_recorded INTEGER NOT NULL DEFAULT 0,
     last_event_sequence INTEGER NOT NULL
 );
+
+CREATE TABLE tool_execution_sources (source_run_id TEXT PRIMARY KEY, removed INTEGER NOT NULL DEFAULT 0, expires_at BIGINT NOT NULL DEFAULT 0, fence_until BIGINT NOT NULL DEFAULT 0);
 
 CREATE TABLE turn_chain_contents (
  id INTEGER PRIMARY KEY AUTOINCREMENT, principal TEXT NOT NULL, content_key TEXT NOT NULL, content BLOB NOT NULL,
@@ -771,6 +787,8 @@ CREATE INDEX observation_tail_sources_hash_idx
 
 CREATE INDEX observation_tail_sources_interaction_idx ON observation_tail_sources(interaction_id);
 
+CREATE INDEX public_tool_executions_source ON public_tool_executions(source_run_id);
+
 CREATE INDEX rejected_requests_expiry_idx ON rejected_request_observations(expires_at, id);
 
 CREATE INDEX rejected_requests_started_idx
@@ -787,6 +805,13 @@ CREATE INDEX target_attempts_interaction_idx ON target_attempt_observations(inte
 CREATE INDEX target_attempts_run_status_idx ON target_attempt_observations(run_id, status);
 
 CREATE INDEX target_attempts_turn_idx ON target_attempt_observations(model_turn_id, started_at, id);
+
+CREATE VIEW public_tool_execution_lifetimes AS
+SELECT p.*,
+    CASE WHEN p.source_kind = 'mcp' THEN p.expires_at
+         WHEN EXISTS (SELECT 1 FROM inference_run_observations r WHERE r.id = p.source_run_id) THEN 9223372036854775807
+         ELSE s.expires_at END AS retained_until
+FROM public_tool_executions p LEFT JOIN tool_execution_sources s ON s.source_run_id = p.source_run_id;
 
 CREATE VIEW stats_usage_attempt_source AS
 SELECT
@@ -1203,6 +1228,25 @@ BEGIN SELECT RAISE(ABORT, 'invalid boolean value'); END;
 CREATE TRIGGER rejected_request_observations_boolean_update BEFORE UPDATE ON rejected_request_observations
 WHEN (typeof(NEW.debug_enabled) <> 'integer' OR NEW.debug_enabled NOT IN (0, 1))
 BEGIN SELECT RAISE(ABORT, 'invalid boolean value'); END;
+
+CREATE TRIGGER remove_source_tool_executions BEFORE DELETE ON inference_run_observations BEGIN
+    -- Both public tools have a 900s absolute acceptance deadline. Keep even an
+    -- as-yet unassociated source fenced until every pre-delete admission must
+    -- have expired. Admission checks that original deadline, not a fresh TTL.
+    -- Changing public execution_limit requires updating this safety boundary.
+    -- 901s rounds the second-resolution SQLite clock conservatively upward.
+    INSERT INTO tool_execution_sources(source_run_id, removed, fence_until)
+        VALUES (OLD.id, 1, MAX(CAST(strftime('%s', 'now') AS BIGINT) * 1000 + 901000,
+            COALESCE((SELECT MAX(MAX(h.execution_deadline, COALESCE(h.lease_expires_at, 0)))
+                FROM history_markers h JOIN public_tool_executions p ON p.marker_reference = h.reference
+                WHERE p.source_run_id = OLD.id), 0)))
+        ON CONFLICT(source_run_id) DO UPDATE SET removed = 1, fence_until = excluded.fence_until;
+    INSERT INTO removed_tool_executions(id) SELECT id FROM public_tool_executions WHERE source_run_id = OLD.id ON CONFLICT DO NOTHING;
+    UPDATE history_markers SET execution_fenced = 1, execution_owner = NULL, lease_expires_at = 0,
+        execution_state = CASE WHEN execution_state = 'pending' THEN 'running' ELSE execution_state END
+        WHERE reference IN (SELECT marker_reference FROM public_tool_executions WHERE source_run_id = OLD.id);
+    DELETE FROM public_tool_executions WHERE source_run_id = OLD.id;
+END;
 
 CREATE TRIGGER stats_usage_attempt_insert AFTER INSERT ON target_attempt_observations
 BEGIN

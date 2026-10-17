@@ -184,6 +184,23 @@ pub struct PlatformMarkerInput {
 }
 
 #[derive(Debug, Clone)]
+pub struct PublicExecutionInput {
+    pub source_run_id: Option<String>,
+    pub retention: Duration,
+    /// Original acceptance deadline, captured before any asynchronous work.
+    pub deadline_unix_ms: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct PublicExecution {
+    pub id: String,
+    pub marker_reference: String,
+    pub state: PlatformExecutionState,
+    pub deadline_unix_ms: i64,
+    pub segment: Option<HiddenHistorySegment>,
+}
+
+#[derive(Debug, Clone)]
 pub struct ThinkingMarkerInput {
     pub block: ContentBlock,
     pub source: Option<ThinkingSource>,
@@ -229,6 +246,32 @@ pub enum HistoryMarkerError {
 
 #[async_trait]
 pub trait HistoryMarkerStore: Send + Sync {
+    async fn create_public_execution(
+        &self,
+        principal: &Principal,
+        marker_reference: &str,
+        input: PublicExecutionInput,
+    ) -> Result<String, HistoryMarkerError>;
+
+    async fn resolve_public_execution(
+        &self,
+        principal: &Principal,
+        id: &str,
+    ) -> Result<Option<PublicExecution>, HistoryMarkerError>;
+
+    /// Calls `before_commit` exactly once after a successful transactional update,
+    /// immediately before COMMIT. A false result explicitly rolls the update back
+    /// and returns `TerminalConflict`. A COMMIT error can be ambiguous: a confirmed
+    /// persisted handoff succeeds; otherwise the storage error remains unresolved.
+    async fn handoff_public_execution(
+        &self,
+        principal: &Principal,
+        id: &str,
+        before_commit: &(dyn Fn() -> bool + Send + Sync),
+    ) -> Result<(), HistoryMarkerError>;
+
+    async fn recover_public_executions(&self) -> Result<(), HistoryMarkerError>;
+
     async fn create_platform(
         &self,
         principal: &Principal,

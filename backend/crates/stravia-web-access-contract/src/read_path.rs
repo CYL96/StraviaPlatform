@@ -14,6 +14,8 @@
 //!   Artifact fragment 一律拒绝；不支持旧 Artifact wrapper。
 //! - 选项为 `question`、`raw`、`lines`、`download`、`previous_path`、`cursor`，
 //!   互斥规则见 [`parse_read_path`]。
+//! - 执行查询：`stravia://tool-executions/<28 lowercase letters>?wait=<u64 seconds>`；
+//!   缺省或零立即观察，正数仅等待当前查询，不创建执行或延长原期限。
 //!
 //! 错误（[`ReadPathError`]）区分无效 scheme、选项、编码与范围，且不在消息中
 //! 回显完整带凭据 URL 或参数值。
@@ -51,6 +53,14 @@ pub struct ReadInput {
 pub enum ReadTarget {
     Search(SearchPath),
     Resource(ResourcePath),
+    ToolExecution(ToolExecutionPath),
+}
+
+/// Read-only observation of an existing execution; `wait` never changes its deadline.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolExecutionPath {
+    pub id: String,
+    pub wait_seconds: u64,
 }
 
 /// 一次搜索读取。
@@ -169,6 +179,10 @@ pub enum ReadPathError {
     /// Turn 引用不是精确的稳定 URI。
     #[error("invalid Turn Reference")]
     InvalidTurnReference,
+    #[error("invalid Tool Execution Reference")]
+    InvalidToolExecutionReference,
+    #[error("wait must be a non-negative integer number of seconds within u64 range")]
+    InvalidWait,
     /// 行选择语法或数值非法。
     #[error("invalid lines selection: {reason}")]
     InvalidLineSelection { reason: &'static str },
@@ -243,7 +257,52 @@ pub fn parse_read_path(path: &str) -> Result<ReadTarget, ReadPathError> {
     if let Some(rest) = path.strip_prefix("search://") {
         return parse_search(rest);
     }
+    if let Some(rest) = path.strip_prefix("stravia://tool-executions/") {
+        return parse_tool_execution(rest);
+    }
     parse_resource(path)
+}
+
+fn parse_tool_execution(rest: &str) -> Result<ReadTarget, ReadPathError> {
+    let (id, parameters) = rest
+        .split_once('?')
+        .map_or((rest, None), |(id, query)| (id, Some(query)));
+    if id.len() != TURN_ID_LEN || !id.bytes().all(|byte| byte.is_ascii_lowercase()) {
+        return Err(ReadPathError::InvalidToolExecutionReference);
+    }
+    let mut wait_seconds = None;
+    if let Some(parameters) = parameters {
+        for segment in parameters.split('&') {
+            if segment.is_empty() || segment.contains('#') {
+                return Err(ReadPathError::MalformedParameter {
+                    reason: "execution parameters must contain nonempty entries and no fragment",
+                });
+            }
+            let (key, value) = segment.split_once('=').unwrap_or((segment, ""));
+            let key = decode_percent(key, "execution parameters", true)?;
+            let value = decode_percent(value, "execution parameters", true)?;
+            if key != "wait" {
+                return Err(ReadPathError::UnknownParameter {
+                    parameter: printable_parameter(&key),
+                });
+            }
+            if wait_seconds.is_some() {
+                return Err(ReadPathError::DuplicateParameter { parameter: "wait" });
+            }
+            if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(ReadPathError::InvalidWait);
+            }
+            wait_seconds = Some(
+                value
+                    .parse::<u64>()
+                    .map_err(|_| ReadPathError::InvalidWait)?,
+            );
+        }
+    }
+    Ok(ReadTarget::ToolExecution(ToolExecutionPath {
+        id: id.to_owned(),
+        wait_seconds: wait_seconds.unwrap_or(0),
+    }))
 }
 
 /// 将搜索目标重新编码为 `search://` path；与 [`parse_read_path`] 严格互逆。
@@ -788,6 +847,76 @@ fn encode_component(out: &mut String, value: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn execution_queries_accept_full_wait_range_without_changing_identity() {
+        let id = "a".repeat(TURN_ID_LEN);
+        for (suffix, expected) in [
+            ("", 0),
+            ("?wait=0", 0),
+            ("?wait=61", 61),
+            ("?wait=18446744073709551615", u64::MAX),
+            ("?%77ait=%36%31", 61),
+        ] {
+            assert_eq!(
+                parse_read_path(&format!("stravia://tool-executions/{id}{suffix}")).unwrap(),
+                ReadTarget::ToolExecution(ToolExecutionPath {
+                    id: id.clone(),
+                    wait_seconds: expected
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn execution_queries_reject_invalid_wait_and_uri_options() {
+        let base = format!("stravia://tool-executions/{}", "a".repeat(TURN_ID_LEN));
+        for suffix in [
+            "?",
+            "?wait",
+            "?wait=",
+            "?wait=-1",
+            "?wait=+1",
+            "?wait=1.0",
+            "?wait=1e2",
+            "?wait=18446744073709551616",
+            "?wait=NaN",
+            "?wait=1&wait=2",
+            "?wait=0&%77ait=1",
+            "?other=1",
+            "?wait=1&",
+            "?wait=%GG",
+            "?wait=1#fragment",
+            "#fragment",
+            "/extra",
+            "?download=1",
+            "?wait=１",
+        ] {
+            assert!(
+                parse_read_path(&format!("{base}{suffix}")).is_err(),
+                "{suffix}"
+            );
+        }
+        for id in [
+            "a",
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaa1",
+        ] {
+            assert!(parse_read_path(&format!("stravia://tool-executions/{id}")).is_err());
+        }
+        assert!(parse_read_path("search://q?wait=1").is_err());
+        assert!(parse_read_path(&format!(
+            "stravia://artifacts/{}?wait=1",
+            "a".repeat(ARTIFACT_DIGEST_LEN)
+        ))
+        .is_err());
+        let ReadTarget::Resource(resource) =
+            parse_read_path("https://example.com/?wait=61").unwrap()
+        else {
+            panic!("ordinary URL query must remain a resource");
+        };
+        assert_eq!(resource.url, "https://example.com/?wait=61");
+    }
 
     #[test]
     fn search_encoding_round_trips_without_form_decoding_the_text() {

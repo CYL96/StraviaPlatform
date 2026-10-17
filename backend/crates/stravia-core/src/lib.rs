@@ -38,6 +38,7 @@ mod storage_test_faults;
 #[cfg(test)]
 mod test_support;
 pub mod thinking;
+pub(crate) mod tool_execution;
 pub mod turn_chain;
 pub(crate) mod web_access;
 pub(crate) mod web_search;

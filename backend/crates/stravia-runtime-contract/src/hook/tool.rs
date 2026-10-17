@@ -146,6 +146,10 @@ pub trait PlatformTool: Send + Sync + 'static {
     fn execution_limit(&self) -> Option<Duration> {
         None
     }
+    /// 公开调用的同步等待窗口；未声明时为 60 秒，与实际执行期限无关。
+    fn synchronous_wait(&self) -> Option<Duration> {
+        None
+    }
     fn parallel_safe(&self) -> bool {
         false
     }

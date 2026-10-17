@@ -122,6 +122,7 @@ impl ModelTurnExecutor for LiveModelTurnExecutor {
                 })
                 .unwrap_or_else(|| (input.request.model.clone(), None));
             observer.record(RunEvent::ModelTurnStarted {
+                retention_detached: false,
                 model_turn_id: model_turn_id.clone(),
                 route_id,
                 model_display_name,
@@ -457,6 +458,7 @@ impl ModelTurnTerminal {
         }
         if let Some(observer) = &self.observer {
             observer.record(RunEvent::ModelTurnFinished {
+                retention_detached: false,
                 model_turn_id: self.model_turn_id.clone(),
                 status: status.to_owned(),
             });

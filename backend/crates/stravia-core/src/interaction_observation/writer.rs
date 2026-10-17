@@ -421,6 +421,7 @@ fn event_bytes(event: &RunEvent) -> usize {
         ModelTurnFinished {
             model_turn_id,
             status,
+            ..
         } => model_turn_id.len() + status.len(),
         TargetAttemptStarted {
             model_turn_id,

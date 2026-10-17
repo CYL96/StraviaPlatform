@@ -36,6 +36,7 @@ enum GenerationReply {
     Status(axum::http::StatusCode, &'static str),
     Disconnect,
     Hold,
+    CompleteAfter(tokio::sync::oneshot::Receiver<()>),
     WithoutUsage,
 }
 
@@ -124,6 +125,10 @@ async fn generation_app() -> GenerationApp {
                         )))
                         .unwrap(),
                     Some(GenerationReply::Hold) => futures::future::pending().await,
+                    Some(GenerationReply::CompleteAfter(release)) => {
+                        release.await.expect("release controlled generation");
+                        generation_response(vec![generated_item(PNG)], false)
+                    }
                     Some(GenerationReply::WithoutUsage) => {
                         generation_response(vec![generated_item(PNG)], true)
                     }
@@ -247,6 +252,592 @@ async fn call_generate(client: &SdkClient, input: Value) -> rmcp::model::CallToo
         )
         .await
         .unwrap()
+}
+
+struct HandoffBarrierStore {
+    inner: Arc<dyn crate::history_marker::HistoryMarkerStore>,
+    barrier: parking_lot::Mutex<Option<HandoffBarrier>>,
+}
+
+struct HandoffBarrier {
+    after_commit: bool,
+    entered: tokio::sync::oneshot::Sender<String>,
+    release: tokio::sync::oneshot::Receiver<()>,
+    finished: tokio::sync::oneshot::Sender<bool>,
+}
+
+fn install_handoff_barrier(
+    fixture: &mut GenerationApp,
+    after_commit: bool,
+) -> (
+    tokio::sync::oneshot::Receiver<String>,
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<bool>,
+) {
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+    fixture.app.gateway.history_markers = Arc::new(HandoffBarrierStore {
+        inner: fixture.app.gateway.history_markers.clone(),
+        barrier: parking_lot::Mutex::new(Some(HandoffBarrier {
+            after_commit,
+            entered: entered_tx,
+            release: release_rx,
+            finished: finished_tx,
+        })),
+    });
+    (entered_rx, release_tx, finished_rx)
+}
+
+#[async_trait::async_trait]
+impl crate::history_marker::HistoryMarkerStore for HandoffBarrierStore {
+    async fn create_public_execution(
+        &self,
+        principal: &stravia_runtime_contract::Principal,
+        marker_reference: &str,
+        input: crate::history_marker::PublicExecutionInput,
+    ) -> Result<String, crate::history_marker::HistoryMarkerError> {
+        self.inner
+            .create_public_execution(principal, marker_reference, input)
+            .await
+    }
+
+    async fn resolve_public_execution(
+        &self,
+        principal: &stravia_runtime_contract::Principal,
+        id: &str,
+    ) -> Result<
+        Option<crate::history_marker::PublicExecution>,
+        crate::history_marker::HistoryMarkerError,
+    > {
+        self.inner.resolve_public_execution(principal, id).await
+    }
+
+    async fn handoff_public_execution(
+        &self,
+        principal: &stravia_runtime_contract::Principal,
+        id: &str,
+        before_commit: &(dyn Fn() -> bool + Send + Sync),
+    ) -> Result<(), crate::history_marker::HistoryMarkerError> {
+        let barrier = self.barrier.lock().take();
+        let Some(barrier) = barrier else {
+            return self
+                .inner
+                .handoff_public_execution(principal, id, before_commit)
+                .await;
+        };
+        let HandoffBarrier {
+            after_commit,
+            entered,
+            release,
+            finished,
+        } = barrier;
+        if after_commit {
+            let result = self
+                .inner
+                .handoff_public_execution(principal, id, before_commit)
+                .await;
+            assert!(
+                result.is_ok(),
+                "real handoff must commit before the ACK barrier: {result:?}"
+            );
+            entered
+                .send(id.to_owned())
+                .expect("observe committed handoff");
+            release.await.expect("release committed handoff ACK");
+            let _ = finished.send(result.is_ok());
+            result
+        } else {
+            entered
+                .send(id.to_owned())
+                .expect("observe precommit handoff");
+            release.await.expect("release precommit handoff");
+            let result = self
+                .inner
+                .handoff_public_execution(principal, id, before_commit)
+                .await;
+            let _ = finished.send(result.is_ok());
+            result
+        }
+    }
+
+    async fn recover_public_executions(
+        &self,
+    ) -> Result<(), crate::history_marker::HistoryMarkerError> {
+        self.inner.recover_public_executions().await
+    }
+
+    async fn create_platform(
+        &self,
+        principal: &stravia_runtime_contract::Principal,
+        input: crate::history_marker::PlatformMarkerInput,
+    ) -> Result<crate::history_marker::HistoryMarker, crate::history_marker::HistoryMarkerError>
+    {
+        self.inner.create_platform(principal, input).await
+    }
+
+    async fn create_thinking(
+        &self,
+        principal: &stravia_runtime_contract::Principal,
+        input: crate::history_marker::ThinkingMarkerInput,
+    ) -> Result<crate::history_marker::HistoryMarker, crate::history_marker::HistoryMarkerError>
+    {
+        self.inner.create_thinking(principal, input).await
+    }
+
+    async fn create_reserved_thinking(
+        &self,
+        principal: &stravia_runtime_contract::Principal,
+        reserved: &crate::history_marker::HistoryMarker,
+        input: crate::history_marker::ThinkingMarkerInput,
+    ) -> Result<crate::history_marker::HistoryMarker, crate::history_marker::HistoryMarkerError>
+    {
+        self.inner
+            .create_reserved_thinking(principal, reserved, input)
+            .await
+    }
+
+    async fn resolve(
+        &self,
+        principal: &stravia_runtime_contract::Principal,
+        reference: &str,
+    ) -> Result<
+        Option<crate::history_marker::ResolvedHistoryMarker>,
+        crate::history_marker::HistoryMarkerError,
+    > {
+        self.inner.resolve(principal, reference).await
+    }
+
+    async fn claim_execution(
+        &self,
+        principal: &stravia_runtime_contract::Principal,
+        reference: &str,
+        owner_id: &str,
+        lease: Duration,
+    ) -> Result<crate::history_marker::ClaimOutcome, crate::history_marker::HistoryMarkerError>
+    {
+        self.inner
+            .claim_execution(principal, reference, owner_id, lease)
+            .await
+    }
+
+    async fn finish_execution(
+        &self,
+        principal: &stravia_runtime_contract::Principal,
+        reference: &str,
+        owner_id: &str,
+        state: crate::history_marker::PlatformExecutionState,
+        segment: crate::history_marker::HiddenHistorySegment,
+    ) -> Result<(), crate::history_marker::HistoryMarkerError> {
+        self.inner
+            .finish_execution(principal, reference, owner_id, state, segment)
+            .await
+    }
+
+    async fn wait_terminal(
+        &self,
+        principal: &stravia_runtime_contract::Principal,
+        reference: &str,
+    ) -> Result<
+        Option<crate::history_marker::ResolvedHistoryMarker>,
+        crate::history_marker::HistoryMarkerError,
+    > {
+        self.inner.wait_terminal(principal, reference).await
+    }
+
+    async fn publish(
+        &self,
+        principal: &stravia_runtime_contract::Principal,
+        references: &[String],
+        retention: Duration,
+    ) -> Result<(), crate::history_marker::HistoryMarkerError> {
+        self.inner.publish(principal, references, retention).await
+    }
+
+    async fn extend_retention(
+        &self,
+        principal: &stravia_runtime_contract::Principal,
+        references: &[String],
+        retention: Duration,
+    ) -> Result<(), crate::history_marker::HistoryMarkerError> {
+        self.inner
+            .extend_retention(principal, references, retention)
+            .await
+    }
+
+    async fn cleanup_expired(&self) -> Result<u64, crate::history_marker::HistoryMarkerError> {
+        self.inner.cleanup_expired().await
+    }
+}
+
+#[tokio::test]
+async fn cancellation_before_handoff_commit_releases_generation_gate_without_upstream_release() {
+    let mut fixture = generation_app().await;
+    allow_slow_generation(&fixture).await;
+    let (handoff_entered, release_handoff, handoff_finished) =
+        install_handoff_barrier(&mut fixture, false);
+    let (_release_upstream, upstream_release) = tokio::sync::oneshot::channel();
+    fixture
+        .replies
+        .lock()
+        .push_back(GenerationReply::CompleteAfter(upstream_release));
+    let tool = crate::media_generation::platform::GenerateTool::new(&fixture.app.gateway);
+    let caller = stravia_runtime_contract::CancellationToken::new();
+    let context = McpContext::new(fixture.app.key_id.clone()).for_call(
+        caller.clone(),
+        std::time::Instant::now() + Duration::from_secs(900),
+    );
+    let call = tokio::spawn(async move {
+        McpTool::call(
+            &tool,
+            json!({"type":"image","input":{"prompt":"Cancelled before handoff"}}),
+            &context,
+        )
+        .await
+    });
+    fixture.entered.notified().await;
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(60)).await;
+    tokio::time::resume();
+    let _public_id = handoff_entered.await.unwrap();
+    caller.cancel();
+    call.abort();
+    assert!(call.await.unwrap_err().is_cancelled());
+    release_handoff.send(()).unwrap();
+    assert!(
+        !handoff_finished.await.unwrap(),
+        "cancelled local work must not commit a durable handoff"
+    );
+
+    // Keep the first HTTP response blocked: only local cancellation can release its gate.
+    let client = connect(&fixture.app).await;
+    let next = tokio::time::timeout(
+        Duration::from_secs(10),
+        call_generate(
+            &client,
+            json!({"type":"image","input":{"prompt":"Independent next square"}}),
+        ),
+    )
+    .await
+    .expect("next generation must pass the cancelled generation's gate");
+    assert_ne!(next.is_error, Some(true), "{next:?}");
+    assert_eq!(
+        next.structured_content.unwrap()["media"],
+        json!({"width":1,"height":1})
+    );
+    assert_eq!(fixture.requests.lock().len(), 2);
+}
+
+#[tokio::test]
+async fn cancellation_after_handoff_commit_before_ack_preserves_original_generation() {
+    let mut fixture = generation_app().await;
+    allow_slow_generation(&fixture).await;
+    let (handoff_entered, release_ack, handoff_finished) =
+        install_handoff_barrier(&mut fixture, true);
+    let (release_upstream, upstream_release) = tokio::sync::oneshot::channel();
+    fixture
+        .replies
+        .lock()
+        .push_back(GenerationReply::CompleteAfter(upstream_release));
+    let tool = crate::media_generation::platform::GenerateTool::new(&fixture.app.gateway);
+    let caller = stravia_runtime_contract::CancellationToken::new();
+    let context = McpContext::new(fixture.app.key_id.clone()).for_call(
+        caller.clone(),
+        std::time::Instant::now() + Duration::from_secs(900),
+    );
+    let call = tokio::spawn(async move {
+        McpTool::call(
+            &tool,
+            json!({"type":"image","input":{"prompt":"Committed original square"}}),
+            &context,
+        )
+        .await
+    });
+    fixture.entered.notified().await;
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(60)).await;
+    tokio::time::resume();
+    let public_id = handoff_entered.await.unwrap();
+    caller.cancel();
+    call.abort();
+    assert!(call.await.unwrap_err().is_cancelled());
+    release_ack.send(()).unwrap();
+    assert!(handoff_finished.await.unwrap());
+    release_upstream.send(()).unwrap();
+
+    let client = connect(&fixture.app).await;
+    let execution_path = format!("stravia://tool-executions/{public_id}");
+    let completed = client
+        .call_tool(
+            CallToolRequestParams::new("StraviaRead").with_arguments(
+                json!({"path":format!("{execution_path}?wait=120")})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .unwrap();
+    assert_ne!(completed.is_error, Some(true), "{completed:?}");
+    let completed = completed.structured_content.unwrap();
+    assert_eq!(completed["status"], "completed");
+    assert_eq!(completed["path"], execution_path);
+    assert_eq!(completed["result"]["media"], json!({"width":1,"height":1}));
+    let artifact = completed["result"]["path"].as_str().unwrap();
+    let download = client
+        .call_tool(
+            CallToolRequestParams::new("StraviaRead").with_arguments(
+                json!({"path":format!("{artifact}?download=1")})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .unwrap();
+    assert_ne!(download.is_error, Some(true), "{download:?}");
+    let download = download.structured_content.unwrap();
+    let bytes = reqwest::get(download["download_url"].as_str().unwrap())
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    assert_eq!(
+        bytes.as_ref(),
+        base64::engine::general_purpose::STANDARD
+            .decode(PNG)
+            .unwrap()
+    );
+    assert_eq!(
+        fixture.requests.lock().len(),
+        1,
+        "committed generation must never restart"
+    );
+}
+
+#[tokio::test]
+async fn bounded_generation_queries_share_a_durable_result_and_preserve_artifact_bytes() {
+    let fixture = generation_app().await;
+    allow_slow_generation(&fixture).await;
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    fixture
+        .replies
+        .lock()
+        .push_back(GenerationReply::CompleteAfter(release_rx));
+    let tool = crate::media_generation::platform::GenerateTool::new(&fixture.app.gateway);
+    let caller = stravia_runtime_contract::CancellationToken::new();
+    let context = McpContext::new(fixture.app.key_id.clone()).for_call(
+        caller.clone(),
+        std::time::Instant::now() + Duration::from_secs(900),
+    );
+    let call = tokio::spawn(async move {
+        McpTool::call(
+            &tool,
+            json!({"type":"image","input":{"prompt":"A controlled square"}}),
+            &context,
+        )
+        .await
+        .unwrap()
+    });
+    fixture.entered.notified().await;
+    // 只移动受理后的等待时钟；不依赖调度 sleep，也不修改产品默认窗口。
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(60)).await;
+    tokio::time::resume();
+    let handed_off = call.await.unwrap();
+    assert!(!handed_off.is_error, "{handed_off:?}");
+    let execution_path = handed_off.structured_content["path"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(execution_path.starts_with("stravia://tool-executions/"));
+    assert_eq!(handed_off.structured_content["status"], "running");
+    caller.cancel();
+
+    let client = connect(&fixture.app).await;
+    let running = client
+        .call_tool(
+            CallToolRequestParams::new("StraviaRead").with_arguments(
+                json!({"path":format!("{execution_path}?wait=0")})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .unwrap();
+    assert_ne!(running.is_error, Some(true), "{running:?}");
+    assert_eq!(
+        running.structured_content.unwrap(),
+        json!({"path":execution_path,"status":"running"})
+    );
+    release_tx.send(()).unwrap();
+    let completed = client
+        .call_tool(
+            CallToolRequestParams::new("StraviaRead").with_arguments(
+                json!({"path":format!("{execution_path}?wait=120")})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .unwrap();
+    assert_ne!(completed.is_error, Some(true), "{completed:?}");
+    let completed = completed.structured_content.unwrap();
+    assert_eq!(completed["status"], "completed");
+    assert_eq!(completed["path"], execution_path);
+    assert_eq!(completed["result"]["media"], json!({"width":1,"height":1}));
+    let artifact = completed["result"]["path"].as_str().unwrap();
+    let download = client
+        .call_tool(
+            CallToolRequestParams::new("StraviaRead").with_arguments(
+                json!({"path":format!("{artifact}?download=1")})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .unwrap()
+        .structured_content
+        .unwrap();
+    let bytes = reqwest::get(download["download_url"].as_str().unwrap())
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    assert_eq!(
+        bytes.as_ref(),
+        base64::engine::general_purpose::STANDARD
+            .decode(PNG)
+            .unwrap()
+    );
+    let repeated = client
+        .call_tool(
+            CallToolRequestParams::new("StraviaRead")
+                .with_arguments(json!({"path":execution_path}).as_object().unwrap().clone()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(repeated.structured_content.unwrap(), completed);
+    assert_eq!(fixture.requests.lock().len(), 1);
+}
+
+async fn allow_slow_generation(fixture: &GenerationApp) {
+    let route = fixture
+        .app
+        .gateway
+        .admin()
+        .get_model(&fixture.route_id)
+        .await
+        .unwrap();
+    fixture
+        .app
+        .gateway
+        .admin()
+        .update_model(
+            &fixture.route_id,
+            crate::db::models::UpdateRoute {
+                targets: Some(vec![CreateTarget {
+                    provider_id: route.targets[0].provider_id().as_str().into(),
+                    model: "gpt-5.4".into(),
+                    enabled: true,
+                    priority: Some(0),
+                    first_token_timeout_ms: Some(120_000),
+                    target_retry_budget: Some(0),
+                    target_cooldown_ms: None,
+                    thinking_level_map: Vec::new(),
+                }]),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn execution_storage_failure_never_claims_handoff_or_success_or_retries_generation() {
+    for fail_handoff in [true, false] {
+        let mut fixture = generation_app().await;
+        allow_slow_generation(&fixture).await;
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        crate::migrations::migrate_sqlite(&pool, None)
+            .await
+            .unwrap();
+        sqlx::query(if fail_handoff {
+            "CREATE TRIGGER fail_execution_write BEFORE UPDATE OF handed_off_at ON public_tool_executions BEGIN SELECT RAISE(ABORT, 'controlled handoff storage failure'); END"
+        } else {
+            "CREATE TRIGGER fail_execution_write BEFORE UPDATE OF execution_state ON history_markers WHEN NEW.execution_state = 'completed' BEGIN SELECT RAISE(ABORT, 'controlled result storage failure'); END"
+        }).execute(&pool).await.unwrap();
+        fixture.app.gateway.history_markers =
+            Arc::new(crate::history_marker::SqlHistoryMarkerStore::sqlite(pool));
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        fixture
+            .replies
+            .lock()
+            .push_back(GenerationReply::CompleteAfter(release_rx));
+        let tool = crate::media_generation::platform::GenerateTool::new(&fixture.app.gateway);
+        let context = McpContext::new(fixture.app.key_id.clone());
+        let call = tokio::spawn(async move {
+            McpTool::call(
+                &tool,
+                json!({"type":"image","input":{"prompt":"A storage-bound square"}}),
+                &context,
+            )
+            .await
+            .unwrap()
+        });
+        fixture.entered.notified().await;
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(60)).await;
+        tokio::time::resume();
+        let initial = call.await.unwrap();
+        release_tx.send(()).unwrap();
+        if fail_handoff {
+            assert!(initial.is_error, "{initial:?}");
+            assert!(initial.structured_content.get("path").is_none());
+            let tool = crate::media_generation::platform::GenerateTool::new(&fixture.app.gateway);
+            let next = tokio::time::timeout(
+                Duration::from_secs(10),
+                McpTool::call(
+                    &tool,
+                    json!({"type":"image","input":{"prompt":"A new independent square"}}),
+                    &McpContext::new(fixture.app.key_id.clone()),
+                ),
+            )
+            .await
+            .expect("failed handoff releases the original local execution")
+            .unwrap();
+            assert!(!next.is_error, "{next:?}");
+            assert_eq!(
+                next.structured_content["media"],
+                json!({"width":1,"height":1})
+            );
+            assert_eq!(fixture.requests.lock().len(), 2);
+        } else {
+            assert!(!initial.is_error, "{initial:?}");
+            let path = initial.structured_content["path"].as_str().unwrap();
+            let reader =
+                crate::mcp::read::ReadTool::new(&fixture.app.gateway, &mut Vec::new()).unwrap();
+            let result = McpTool::call(
+                &reader,
+                json!({"path":format!("{path}?wait=120")}),
+                &McpContext::new(fixture.app.key_id.clone()),
+            )
+            .await
+            .unwrap();
+            assert!(result.is_error, "{result:?}");
+            assert!(result.structured_content.get("result").is_none());
+            assert_eq!(fixture.requests.lock().len(), 1);
+        }
+    }
 }
 
 #[tokio::test]

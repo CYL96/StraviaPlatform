@@ -31,7 +31,7 @@ use tokio::io::AsyncReadExt;
 
 pub(crate) const TOOL_ID: &str = "stravia-read";
 pub(crate) const TOOL_NAME: &str = "StraviaRead";
-const DOWNLOAD_DESCRIPTION: &str = "Read content from an owned stravia://artifacts/<artifact-id> path. Add ?download=1 to obtain download information without model execution.";
+const DOWNLOAD_DESCRIPTION: &str = "Read content from an owned stravia://artifacts/<artifact-id> path. Add ?download=1 to obtain download information without model execution. Public reads wait up to 60 seconds, then return a durable execution path and status. Read stravia://tool-executions/<id>?wait=<non-negative seconds> for status and original result or error; omitted wait returns immediately, and explicit waits may exceed 60 seconds within the query deadline. Cancelling a query stops only its wait. Local cancellation cannot guarantee upstream work or quota consumption stops.";
 const NETWORK_DESCRIPTION: &str = "Use search://<percent-encoded query> for a complete sourced research report; allowed_domains and previous_path are search query parameters. Public HTTP(S) resource options use #stravia?.";
 const MEDIA_DESCRIPTION: &str = "Read static JPEG, PNG or WebP images for description and readable text; Office documents (DOCX, XLSX, PPTX, DOC, XLS, PPT) read as extracted Markdown. Add ?question=<encoded question> to an Artifact Reference for a specific question and previous_path for explicit continuation.";
 
@@ -205,6 +205,18 @@ impl ReadTool {
         let target = parse_read_path(&input.path)
             .map_err(|error| PlatformToolError::new(error.to_string()))?;
         let resource_path = match target {
+            ReadTarget::ToolExecution(execution) => {
+                return self
+                    .gateway
+                    .query_tool_execution(
+                        &context.principal,
+                        &execution.id,
+                        Duration::from_secs(execution.wait_seconds),
+                        &context.cancellation,
+                    )
+                    .await
+                    .map(output);
+            }
             ReadTarget::Search(search) => {
                 require(
                     context.read_scope.networking(),
@@ -851,7 +863,7 @@ impl PlatformTool for ReadTool {
         arguments: Value,
         context: ToolExecutionContext,
     ) -> Result<Value, PlatformToolError> {
-        let result = self.read(arguments, context).await?;
+        let result = PlatformTool::execute_result(self, arguments, context).await?;
         let (value, _) = crate::hook::tool::blocks_to_value(result.content)?;
         Ok(value)
     }
@@ -860,7 +872,20 @@ impl PlatformTool for ReadTool {
         arguments: Value,
         context: ToolExecutionContext,
     ) -> Result<PlatformToolOutput, PlatformToolError> {
-        self.read(arguments, context).await
+        if self.internal || is_execution_query(&arguments)? {
+            return self.read(arguments, context).await;
+        }
+        let source = crate::tool_execution::ExecutionSource::InferenceRun(context.run_id.clone());
+        let tool = self.clone();
+        self.gateway
+            .execute_public_tool(
+                self,
+                arguments,
+                context,
+                source,
+                move |arguments, context| async move { tool.read(arguments, context).await },
+            )
+            .await
     }
 }
 
@@ -930,7 +955,18 @@ impl McpTool for ReadTool {
             cancellation,
             progress: None,
         };
-        match self.read(arguments, context).await {
+        let result = match is_execution_query(&arguments) {
+            Err(error) => Err(error),
+            Ok(true) => self.read(arguments, context).await,
+            Ok(false) => {
+                let tool = self.clone();
+                self.gateway.execute_public_tool(
+                self, arguments, context, crate::tool_execution::ExecutionSource::Mcp,
+                move |arguments, context| async move { tool.read(arguments, context).await },
+            ).await
+            }
+        };
+        match result {
             Ok(result) => {
                 let (value, _) =
                     crate::hook::tool::blocks_to_value(result.content).map_err(|error| {
@@ -947,6 +983,14 @@ impl McpTool for ReadTool {
             )),
         }
     }
+}
+
+fn is_execution_query(arguments: &Value) -> Result<bool, PlatformToolError> {
+    let input = <ReadInput as serde::Deserialize>::deserialize(arguments)
+        .map_err(|error| PlatformToolError::new(format!("invalid StraviaRead input: {error}")))?;
+    let target =
+        parse_read_path(&input.path).map_err(|error| PlatformToolError::new(error.to_string()))?;
+    Ok(matches!(target, ReadTarget::ToolExecution(_)))
 }
 
 struct WebPageTool {

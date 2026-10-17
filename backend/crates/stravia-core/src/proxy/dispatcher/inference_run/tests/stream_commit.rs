@@ -460,6 +460,45 @@ struct FailingThinkingMarkerStore {
 
 #[async_trait::async_trait]
 impl crate::history_marker::HistoryMarkerStore for FailingThinkingMarkerStore {
+    async fn create_public_execution(
+        &self,
+        principal: &stravia_runtime_contract::Principal,
+        marker_reference: &str,
+        input: crate::history_marker::PublicExecutionInput,
+    ) -> Result<String, crate::history_marker::HistoryMarkerError> {
+        self.inner
+            .create_public_execution(principal, marker_reference, input)
+            .await
+    }
+
+    async fn resolve_public_execution(
+        &self,
+        principal: &stravia_runtime_contract::Principal,
+        id: &str,
+    ) -> Result<
+        Option<crate::history_marker::PublicExecution>,
+        crate::history_marker::HistoryMarkerError,
+    > {
+        self.inner.resolve_public_execution(principal, id).await
+    }
+
+    async fn handoff_public_execution(
+        &self,
+        principal: &stravia_runtime_contract::Principal,
+        id: &str,
+        before_commit: &(dyn Fn() -> bool + Send + Sync),
+    ) -> Result<(), crate::history_marker::HistoryMarkerError> {
+        self.inner
+            .handoff_public_execution(principal, id, before_commit)
+            .await
+    }
+
+    async fn recover_public_executions(
+        &self,
+    ) -> Result<(), crate::history_marker::HistoryMarkerError> {
+        self.inner.recover_public_executions().await
+    }
+
     async fn create_platform(
         &self,
         principal: &stravia_runtime_contract::Principal,

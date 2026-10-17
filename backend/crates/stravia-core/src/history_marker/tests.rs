@@ -27,6 +27,636 @@ fn principal(id: &str) -> Principal {
     Principal::new(id)
 }
 
+async fn public_test_sql(store: &SqlHistoryMarkerStore, sql: &'static str) {
+    match store {
+        SqlHistoryMarkerStore::Sqlite(pool) => {
+            sqlx::raw_sql(sql).execute(pool).await.unwrap();
+        }
+        SqlHistoryMarkerStore::Postgres(pool) => {
+            sqlx::raw_sql(sql).execute(pool).await.unwrap();
+        }
+    };
+}
+
+async fn assert_public_cleanup_contract(store: &SqlHistoryMarkerStore) {
+    let owner = principal("public-owner");
+    // Deletion before the first association still fences admission; diagnostic
+    // absence alone (exercised below) must not have the same meaning.
+    let unassociated = store
+        .create_platform(
+            &owner,
+            PlatformMarkerInput {
+                tool_id: "web-search".into(),
+                call: call("unassociated-call"),
+                activity: "Searching the web".into(),
+                execution_limit: Duration::from_secs(900),
+                pending_retention: Duration::from_secs(3600),
+            },
+        )
+        .await
+        .unwrap();
+    public_test_sql(store, "INSERT INTO interaction_observations(id,principal,root_id,root_run_id,first_route_id,status,started_at,last_active_at,expires_at) VALUES ('unassociated-source','public-owner','unassociated-source','unassociated-source','route','completed',0,0,0);
+        INSERT INTO inference_run_observations(id,interaction_id,ingress_protocol,route_id,status,debug_enabled,started_at,last_active_at,expires_at) VALUES ('unassociated-source','unassociated-source','responses','route','completed',false,0,0,0);
+        DELETE FROM inference_run_observations WHERE id='unassociated-source'").await;
+    store.cleanup_expired().await.unwrap();
+    assert!(matches!(
+        store
+            .create_public_execution(
+                &owner,
+                &unassociated.reference,
+                PublicExecutionInput {
+                    source_run_id: Some("unassociated-source".into()),
+                    retention: Duration::from_secs(3600),
+                    deadline_unix_ms: chrono::Utc::now().timestamp_millis() + 900_000,
+                },
+            )
+            .await,
+        Err(HistoryMarkerError::TerminalConflict)
+    ));
+    // Advance persisted boundaries, not real time or product TTLs. The fence
+    // may now be reclaimed, but the original execution is also past deadline.
+    public_test_sql(
+        store,
+        "UPDATE tool_execution_sources SET fence_until=0 WHERE source_run_id='unassociated-source'",
+    )
+    .await;
+    store.cleanup_expired().await.unwrap();
+    let remaining: i64 = match store {
+        SqlHistoryMarkerStore::Sqlite(pool) => sqlx::query_scalar(
+            "SELECT COUNT(*) FROM tool_execution_sources WHERE source_run_id='unassociated-source'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap(),
+        SqlHistoryMarkerStore::Postgres(pool) => sqlx::query_scalar(
+            "SELECT COUNT(*) FROM tool_execution_sources WHERE source_run_id='unassociated-source'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap(),
+    };
+    assert_eq!(remaining, 0, "expired source fences are actually reclaimed");
+    assert!(matches!(
+        store
+            .create_public_execution(
+                &owner,
+                &unassociated.reference,
+                PublicExecutionInput {
+                    source_run_id: Some("unassociated-source".into()),
+                    retention: Duration::from_secs(3600),
+                    deadline_unix_ms: 0,
+                },
+            )
+            .await,
+        Err(HistoryMarkerError::TerminalConflict)
+    ));
+    let marker = store
+        .create_platform(
+            &owner,
+            PlatformMarkerInput {
+                tool_id: "web-search".into(),
+                call: call("public-call"),
+                activity: "Searching the web".into(),
+                execution_limit: Duration::from_secs(900),
+                pending_retention: Duration::from_secs(3600),
+            },
+        )
+        .await
+        .unwrap();
+    // Diagnostic absence is not deletion and must not prevent admission.
+    let acceptance_deadline = chrono::Utc::now().timestamp_millis() + 600_000;
+    let id = store
+        .create_public_execution(
+            &owner,
+            &marker.reference,
+            PublicExecutionInput {
+                source_run_id: Some("public-source".into()),
+                retention: Duration::from_secs(3600),
+                deadline_unix_ms: acceptance_deadline,
+            },
+        )
+        .await
+        .unwrap();
+    assert_ne!(id, marker.reference);
+    assert_eq!(
+        store
+            .resolve_public_execution(&owner, &id)
+            .await
+            .unwrap()
+            .unwrap()
+            .deadline_unix_ms,
+        acceptance_deadline,
+        "storage delay must not replace the original acceptance deadline"
+    );
+    assert!(
+        store
+            .resolve_public_execution(&owner, &id)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        store
+            .resolve_public_execution(&principal("other"), &id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .resolve_public_execution(&owner, "unknown")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .claim_execution(
+                &owner,
+                &marker.reference,
+                "public-worker",
+                Duration::from_secs(900)
+            )
+            .await
+            .unwrap(),
+        ClaimOutcome::Claimed
+    );
+    assert!(matches!(
+        store.handoff_public_execution(&owner, &id, &|| false).await,
+        Err(HistoryMarkerError::TerminalConflict)
+    ));
+    let handed_off: i64 = match store {
+        SqlHistoryMarkerStore::Sqlite(pool) => sqlx::query_scalar(
+            "SELECT COUNT(*) FROM public_tool_executions WHERE id = $1 AND handed_off_at IS NOT NULL",
+        )
+        .bind(&id)
+        .fetch_one(pool)
+        .await
+        .unwrap(),
+        SqlHistoryMarkerStore::Postgres(pool) => sqlx::query_scalar(
+            "SELECT COUNT(*) FROM public_tool_executions WHERE id = $1 AND handed_off_at IS NOT NULL",
+        )
+        .bind(&id)
+        .fetch_one(pool)
+        .await
+        .unwrap(),
+    };
+    assert_eq!(handed_off, 0, "a rejected guard must roll back the handoff");
+    store
+        .handoff_public_execution(&owner, &id, &|| true)
+        .await
+        .unwrap();
+    let handed_off: i64 = match store {
+        SqlHistoryMarkerStore::Sqlite(pool) => sqlx::query_scalar(
+            "SELECT COUNT(*) FROM public_tool_executions WHERE id = $1 AND handed_off_at IS NOT NULL",
+        )
+        .bind(&id)
+        .fetch_one(pool)
+        .await
+        .unwrap(),
+        SqlHistoryMarkerStore::Postgres(pool) => sqlx::query_scalar(
+            "SELECT COUNT(*) FROM public_tool_executions WHERE id = $1 AND handed_off_at IS NOT NULL",
+        )
+        .bind(&id)
+        .fetch_one(pool)
+        .await
+        .unwrap(),
+    };
+    assert_eq!(handed_off, 1, "a later accepted handoff must commit");
+    public_test_sql(store, "INSERT INTO interaction_observations(id,principal,root_id,root_run_id,first_route_id,status,started_at,last_active_at,expires_at) VALUES ('public-source','public-owner','public-source','public-source','route','completed',0,0,0);
+        INSERT INTO inference_run_observations(id,interaction_id,ingress_protocol,route_id,status,debug_enabled,started_at,last_active_at,expires_at) VALUES ('public-source','public-source','responses','route','completed',false,0,0,0);").await;
+    let segment = HiddenHistorySegment::Platform {
+        call: call("public-call"),
+        result: ContentBlock::ToolResult {
+            content_kind: Some(stravia_runtime_contract::protocol::ir::ToolResultContentKind::Json),
+            tool_use_id: "public-call".into(),
+            content: serde_json::json!({"report": "retained historical result"}),
+            is_error: Some(false),
+            cache_control: None,
+        },
+    };
+    // Whichever operation wins, cleanup is authoritative once it commits.
+    let (_, _) = tokio::join!(
+        public_test_sql(
+            store,
+            "DELETE FROM interaction_observations WHERE id='public-source'"
+        ),
+        store.finish_execution(
+            &owner,
+            &marker.reference,
+            "public-worker",
+            PlatformExecutionState::Completed,
+            segment.clone()
+        ),
+    );
+    assert!(
+        store
+            .resolve_public_execution(&owner, &id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .handoff_public_execution(&owner, &id, &|| true)
+            .await
+            .is_err()
+    );
+    assert!(matches!(
+        store
+            .finish_execution(
+                &owner,
+                &marker.reference,
+                "public-worker",
+                PlatformExecutionState::Completed,
+                segment
+            )
+            .await,
+        Err(HistoryMarkerError::TerminalConflict)
+    ));
+    assert!(matches!(
+        store
+            .create_public_execution(
+                &owner,
+                &marker.reference,
+                PublicExecutionInput {
+                    source_run_id: Some("public-source".into()),
+                    retention: Duration::from_secs(3600),
+                    deadline_unix_ms: chrono::Utc::now().timestamp_millis() + 900_000,
+                }
+            )
+            .await,
+        Err(HistoryMarkerError::TerminalConflict)
+    ));
+    let late_marker = store
+        .create_platform(
+            &owner,
+            PlatformMarkerInput {
+                tool_id: "web-search".into(),
+                call: call("late-admission"),
+                activity: "Searching the web".into(),
+                execution_limit: Duration::from_secs(900),
+                pending_retention: Duration::from_secs(3600),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        store
+            .create_public_execution(
+                &owner,
+                &late_marker.reference,
+                PublicExecutionInput {
+                    source_run_id: Some("public-source".into()),
+                    retention: Duration::from_secs(3600),
+                    deadline_unix_ms: chrono::Utc::now().timestamp_millis() + 900_000,
+                }
+            )
+            .await,
+        Err(HistoryMarkerError::TerminalConflict)
+    ));
+    // Public cleanup does not remove the independently retained hidden history.
+    assert!(
+        store
+            .resolve(&owner, &marker.reference)
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    // Controlled SQL expiry exercises missing diagnostics without shortening a
+    // product TTL or waiting on the wall clock. The hidden marker outlives the
+    // public source here so both publication and late-result fencing matter.
+    let fallback = store
+        .create_platform(
+            &owner,
+            PlatformMarkerInput {
+                tool_id: "web-search".into(),
+                call: call("fallback-call"),
+                activity: "Searching the web".into(),
+                execution_limit: Duration::from_secs(900),
+                pending_retention: Duration::from_secs(3600),
+            },
+        )
+        .await
+        .unwrap();
+    let fallback_id = store
+        .create_public_execution(
+            &owner,
+            &fallback.reference,
+            PublicExecutionInput {
+                source_run_id: Some("missing-diagnostic-source".into()),
+                retention: Duration::from_secs(3600),
+                deadline_unix_ms: chrono::Utc::now().timestamp_millis() + 900_000,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        store
+            .resolve_public_execution(&owner, &fallback_id)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        store
+            .claim_execution(
+                &owner,
+                &fallback.reference,
+                "fallback-worker",
+                Duration::from_secs(900)
+            )
+            .await
+            .unwrap(),
+        ClaimOutcome::Claimed
+    );
+    store
+        .handoff_public_execution(&owner, &fallback_id, &|| true)
+        .await
+        .unwrap();
+    let same_source = store
+        .create_platform(
+            &owner,
+            PlatformMarkerInput {
+                tool_id: "web-search".into(),
+                call: call("same-source-call"),
+                activity: "Searching the web".into(),
+                execution_limit: Duration::from_secs(900),
+                pending_retention: Duration::from_secs(3600),
+            },
+        )
+        .await
+        .unwrap();
+    let same_source_id = store
+        .create_public_execution(
+            &owner,
+            &same_source.reference,
+            PublicExecutionInput {
+                source_run_id: Some("missing-diagnostic-source".into()),
+                retention: Duration::from_secs(86400),
+                deadline_unix_ms: chrono::Utc::now().timestamp_millis() + 900_000,
+            },
+        )
+        .await
+        .unwrap();
+    public_test_sql(store, "UPDATE tool_execution_sources SET expires_at=0 WHERE source_run_id='missing-diagnostic-source'").await;
+    assert!(
+        store
+            .resolve_public_execution(&owner, &fallback_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .resolve_public_execution(&owner, &same_source_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .claim_execution(
+                &owner,
+                &same_source.reference,
+                "late-worker",
+                Duration::from_secs(900)
+            )
+            .await
+            .unwrap(),
+        ClaimOutcome::NotFound
+    );
+    assert!(
+        store
+            .resolve(&owner, &fallback.reference)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .resolve_many(&owner, std::slice::from_ref(&fallback.reference))
+            .await
+            .unwrap()[0]
+            .is_none()
+    );
+    assert!(
+        store
+            .handoff_public_execution(&owner, &fallback_id, &|| true)
+            .await
+            .is_err()
+    );
+    let fallback_segment = HiddenHistorySegment::Platform {
+        call: call("fallback-call"),
+        result: ContentBlock::ToolResult {
+            content_kind: None,
+            tool_use_id: "fallback-call".into(),
+            content: serde_json::json!({"report": "late result"}),
+            is_error: Some(false),
+            cache_control: None,
+        },
+    };
+    assert!(matches!(
+        store
+            .finish_execution(
+                &owner,
+                &fallback.reference,
+                "fallback-worker",
+                PlatformExecutionState::Completed,
+                fallback_segment.clone()
+            )
+            .await,
+        Err(HistoryMarkerError::TerminalConflict)
+    ));
+    assert!(matches!(
+        store
+            .create_public_execution(
+                &owner,
+                &fallback.reference,
+                PublicExecutionInput {
+                    source_run_id: Some("missing-diagnostic-source".into()),
+                    retention: Duration::from_secs(86400),
+                    deadline_unix_ms: chrono::Utc::now().timestamp_millis() + 900_000,
+                }
+            )
+            .await,
+        Err(HistoryMarkerError::TerminalConflict)
+    ));
+    store.cleanup_expired().await.unwrap();
+    assert!(
+        store
+            .handoff_public_execution(&owner, &fallback_id, &|| true)
+            .await
+            .is_err()
+    );
+    assert!(matches!(
+        store
+            .finish_execution(
+                &owner,
+                &fallback.reference,
+                "fallback-worker",
+                PlatformExecutionState::Completed,
+                fallback_segment
+            )
+            .await,
+        Err(HistoryMarkerError::TerminalConflict)
+    ));
+    assert_ne!(
+        store
+            .claim_execution(
+                &owner,
+                &fallback.reference,
+                "late-worker",
+                Duration::from_secs(900)
+            )
+            .await
+            .unwrap(),
+        ClaimOutcome::Claimed
+    );
+
+    // A real retained source supersedes fallback expiry, including active
+    // protection and changes to the observation's retention deadline.
+    let retained = store
+        .create_platform(
+            &owner,
+            PlatformMarkerInput {
+                tool_id: "web-search".into(),
+                call: call("retained-source-call"),
+                activity: "Searching the web".into(),
+                execution_limit: Duration::from_secs(900),
+                pending_retention: Duration::from_secs(3600),
+            },
+        )
+        .await
+        .unwrap();
+    let retained_id = store
+        .create_public_execution(
+            &owner,
+            &retained.reference,
+            PublicExecutionInput {
+                source_run_id: Some("retained-diagnostic-source".into()),
+                retention: Duration::from_secs(3600),
+                deadline_unix_ms: chrono::Utc::now().timestamp_millis() + 900_000,
+            },
+        )
+        .await
+        .unwrap();
+    public_test_sql(store, "INSERT INTO interaction_observations(id,principal,root_id,root_run_id,first_route_id,status,started_at,last_active_at,expires_at) VALUES ('retained-diagnostic-source','public-owner','retained-diagnostic-source','retained-diagnostic-source','route','running',0,0,0);
+        INSERT INTO inference_run_observations(id,interaction_id,ingress_protocol,route_id,status,debug_enabled,started_at,last_active_at,expires_at) VALUES ('retained-diagnostic-source','retained-diagnostic-source','responses','route','running',false,0,0,0);
+        UPDATE tool_execution_sources SET expires_at=0 WHERE source_run_id='retained-diagnostic-source';").await;
+    store.cleanup_expired().await.unwrap();
+    assert!(
+        store
+            .resolve_public_execution(&owner, &retained_id)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    public_test_sql(store, "UPDATE interaction_observations SET status='completed',expires_at=9223372036854775807 WHERE id='retained-diagnostic-source';
+        UPDATE inference_run_observations SET status='completed',expires_at=9223372036854775807 WHERE id='retained-diagnostic-source'").await;
+    store.cleanup_expired().await.unwrap();
+    assert!(
+        store
+            .resolve_public_execution(&owner, &retained_id)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    public_test_sql(
+        store,
+        "DELETE FROM interaction_observations WHERE id='retained-diagnostic-source'",
+    )
+    .await;
+    assert!(
+        store
+            .resolve_public_execution(&owner, &retained_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let pending = store
+        .create_platform(
+            &owner,
+            PlatformMarkerInput {
+                tool_id: "web-search".into(),
+                call: call("restart-call"),
+                activity: "Searching the web".into(),
+                execution_limit: Duration::from_secs(900),
+                pending_retention: Duration::from_secs(3600),
+            },
+        )
+        .await
+        .unwrap();
+    let id = store
+        .create_public_execution(
+            &owner,
+            &pending.reference,
+            PublicExecutionInput {
+                source_run_id: None,
+                retention: Duration::from_secs(3600),
+                deadline_unix_ms: chrono::Utc::now().timestamp_millis() + 900_000,
+            },
+        )
+        .await
+        .unwrap();
+    public_test_sql(
+        store,
+        "UPDATE public_tool_executions SET process_id='previous-process'",
+    )
+    .await;
+    store.recover_public_executions().await.unwrap();
+    let recovered = store
+        .resolve_public_execution(&owner, &id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovered.state, PlatformExecutionState::Interrupted);
+    assert!(matches!(
+        recovered.segment,
+        Some(HiddenHistorySegment::Platform {
+            result: ContentBlock::ToolResult {
+                is_error: Some(true),
+                ..
+            },
+            ..
+        })
+    ));
+    assert_eq!(
+        store
+            .claim_execution(
+                &owner,
+                &pending.reference,
+                "new-worker",
+                Duration::from_secs(900)
+            )
+            .await
+            .unwrap(),
+        ClaimOutcome::Terminal
+    );
+    public_test_sql(store, "UPDATE public_tool_executions SET expires_at=0").await;
+    assert!(
+        store
+            .resolve_public_execution(&owner, &id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    store.cleanup_expired().await.unwrap();
+    assert!(
+        store
+            .handoff_public_execution(&owner, &id, &|| true)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn sqlite_public_execution_cleanup_fences_late_results_and_restart() {
+    assert_public_cleanup_contract(&SqlHistoryMarkerStore::sqlite(sqlite_pool().await)).await;
+}
+
 #[tokio::test]
 async fn gated_resolution_cleans_private_carriers_and_preserves_protected_blocks() {
     use stravia_runtime_contract::protocol::ir::Role;
@@ -461,6 +1091,7 @@ async fn postgres_history_marker_store_contract_when_configured() {
         .expect("PostgreSQL migrations");
     assert_store_contract(Arc::new(SqlHistoryMarkerStore::postgres(pool.clone()))).await;
     assert_batch_retention_contract(&SqlHistoryMarkerStore::postgres(pool.clone())).await;
+    assert_public_cleanup_contract(&SqlHistoryMarkerStore::postgres(pool.clone())).await;
     pool.close().await;
     sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
         .execute(&admin)
