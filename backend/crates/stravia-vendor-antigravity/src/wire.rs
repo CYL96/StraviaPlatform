@@ -237,7 +237,7 @@ pub(crate) fn infer(
         let bytes = read_http_body(&response, MAX_BODY)?;
         let mut value: Value = serde_json::from_slice(&bytes)
             .map_err(|_| invalid_upstream("Antigravity returned invalid JSON"))?;
-        if let Some(error) = response_error(&value) {
+        if let Some(error) = response_error(&value, &headers) {
             return Err(error);
         }
         let mut inner = value.get_mut("response").map(Value::take).unwrap_or(value);
@@ -255,11 +255,25 @@ pub(crate) fn infer(
     let mut terminal = false;
     while let Some(chunk) = response.read_body()? {
         framing.push(&chunk, |payload| {
-            decode_event(host, &mut decoder, &mut accumulator, &mut terminal, payload)
+            decode_event(
+                host,
+                &mut decoder,
+                &mut accumulator,
+                &mut terminal,
+                payload,
+                &headers,
+            )
         })?;
     }
     framing.finish(|payload| {
-        decode_event(host, &mut decoder, &mut accumulator, &mut terminal, payload)
+        decode_event(
+            host,
+            &mut decoder,
+            &mut accumulator,
+            &mut terminal,
+            payload,
+            &headers,
+        )
     })?;
     let deltas = decoder
         .finish()
@@ -282,13 +296,14 @@ fn decode_event(
     accumulator: &mut StreamResponseAccumulator,
     terminal: &mut bool,
     payload: &[u8],
+    headers: &[(String, String)],
 ) -> Result<(), PluginError> {
     if payload == b"[DONE]" {
         return Ok(());
     }
     let mut value: Value = serde_json::from_slice(payload)
         .map_err(|_| invalid_upstream("Antigravity stream contained invalid JSON"))?;
-    if let Some(error) = response_error(&value) {
+    if let Some(error) = response_error(&value, headers) {
         return Err(error);
     }
     let mut inner = value.get_mut("response").map(Value::take).unwrap_or(value);
@@ -317,7 +332,7 @@ fn decode_event(
     common::emit_deltas(host, accumulator, &deltas)
 }
 
-fn normalize_final_usage(response: &mut Value) {
+pub(crate) fn normalize_final_usage(response: &mut Value) {
     let Some(usage) = response
         .get_mut("usageMetadata")
         .and_then(Value::as_object_mut)
@@ -348,7 +363,7 @@ fn normalize_final_usage(response: &mut Value) {
         .or_insert_with(|| json!(0));
 }
 
-fn response_error(value: &Value) -> Option<PluginError> {
+pub(crate) fn response_error(value: &Value, headers: &[(String, String)]) -> Option<PluginError> {
     let error = value
         .get("error")
         .or_else(|| value.pointer("/response/error"))?;
@@ -360,7 +375,7 @@ fn response_error(value: &Value) -> Option<PluginError> {
         .unwrap_or(502);
     Some(common::upstream_error(
         status,
-        &[],
+        headers,
         &serde_json::to_vec(&json!({"error": error})).expect("JSON value encodes"),
     ))
 }
@@ -711,25 +726,42 @@ fn schema_projection(value: &mut Value) -> Result<(), PluginError> {
     Ok(())
 }
 
-#[derive(Default)]
-struct EventFraming {
+pub(crate) struct EventFraming {
     pending: Vec<u8>,
+    scanned: usize,
     data: Vec<u8>,
     has_data: bool,
+    limit: usize,
+}
+impl Default for EventFraming {
+    fn default() -> Self {
+        Self::with_limit(MAX_EVENT)
+    }
 }
 impl EventFraming {
-    fn push(
+    pub(crate) fn with_limit(limit: usize) -> Self {
+        Self {
+            pending: Vec::new(),
+            scanned: 0,
+            data: Vec::new(),
+            has_data: false,
+            limit,
+        }
+    }
+
+    pub(crate) fn push(
         &mut self,
         bytes: &[u8],
         mut emit: impl FnMut(&[u8]) -> Result<(), PluginError>,
     ) -> Result<(), PluginError> {
         self.pending.extend_from_slice(bytes);
         let mut consumed = 0;
-        while let Some(end) = self.pending[consumed..]
+        let mut scanned = self.scanned;
+        while let Some(end) = self.pending[scanned..]
             .iter()
             .position(|byte| *byte == b'\n')
         {
-            let end = consumed + end;
+            let end = scanned + end;
             let line = &self.pending[consumed..end];
             let line = line.strip_suffix(b"\r").unwrap_or(line);
             if line.is_empty() {
@@ -746,16 +778,19 @@ impl EventFraming {
                 self.data
                     .extend_from_slice(data.strip_prefix(b" ").unwrap_or(data));
             }
-            if self.data.len() > MAX_EVENT {
+            if self.data.len() > self.limit {
                 return Err(common::plugin_error(
                     ErrorKind::ResourceExhausted,
                     "Antigravity SSE event exceeds limit",
                 ));
             }
             consumed = end + 1;
+            scanned = consumed;
         }
+        // 图片 base64 可能跨很多 HTTP chunk；只扫描新到的字节。
+        self.scanned = self.pending.len() - consumed;
         self.pending.drain(..consumed);
-        if self.pending.len() > MAX_EVENT {
+        if self.pending.len() > self.limit {
             return Err(common::plugin_error(
                 ErrorKind::ResourceExhausted,
                 "Antigravity SSE line exceeds limit",
@@ -763,7 +798,7 @@ impl EventFraming {
         }
         Ok(())
     }
-    fn finish(
+    pub(crate) fn finish(
         &mut self,
         mut emit: impl FnMut(&[u8]) -> Result<(), PluginError>,
     ) -> Result<(), PluginError> {

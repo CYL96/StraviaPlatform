@@ -545,12 +545,19 @@ fn discovered_model(entry: &Value) -> Option<DiscoveredModel> {
 /// `/models` 以 Codex 字段声明的每模型规格是权威数据；翻成宿主 metadata
 /// schema 后由宿主合并，覆盖目录与默认填充。
 fn apply_declared_specifications(model: &mut DiscoveredModel) {
-    if let Some(input) = declared_string_list(model.metadata.get("input_modalities")) {
-        // 浅合并以整个 `modalities` key 为单位覆盖，宿主不再提供 output
-        // 模态时按 Codex 文本对话模型补齐。
+    let input = declared_string_list(model.metadata.get("input_modalities"));
+    let output = declared_string_list(model.metadata.get("output_modalities"));
+    if input.is_some() || output.is_some() {
+        let declared = model.metadata.get("modalities");
+        let input = input
+            .or_else(|| declared_string_list(declared.and_then(|value| value.get("input"))))
+            .unwrap_or_else(|| vec!["text".into()]);
+        let output = output
+            .or_else(|| declared_string_list(declared.and_then(|value| value.get("output"))))
+            .unwrap_or_else(|| vec!["text".into()]);
         model.metadata.insert(
             "modalities".into(),
-            serde_json::json!({ "input": input, "output": ["text"] }),
+            serde_json::json!({ "input": input, "output": output }),
         );
     }
     let efforts = model
@@ -588,7 +595,7 @@ fn declared_string_list(value: Option<&Value>) -> Option<Vec<String>> {
         .filter(|item| !item.is_empty())
         .map(str::to_owned)
         .collect::<Vec<_>>();
-    (!list.is_empty()).then_some(list)
+    Some(list)
 }
 
 fn decorate_discovered_model(model: &mut DiscoveredModel) {
@@ -597,16 +604,63 @@ fn decorate_discovered_model(model: &mut DiscoveredModel) {
         .iter()
         .any(|capability| !capability.trim().is_empty());
     thinking::decorate_discovered_model(CATALOG_ID, model);
-    if has_supplier_capabilities {
+    let output = model
+        .metadata
+        .get("modalities")
+        .and_then(|value| value.get("output"));
+    let has_image_output = output
+        .and_then(Value::as_array)
+        .is_some_and(|output| output.iter().any(|modality| modality == "image"));
+    let has_text_output = output
+        .and_then(Value::as_array)
+        .is_none_or(|output| output.iter().any(|modality| modality == "text"));
+    // Codex ModelInfo 的 input_modalities / supports_image_detail_original
+    // 只声明输入；只有明确列出的 image_generation 工具能证明托管图片支持。
+    let has_image_tool = model
+        .metadata
+        .get("experimental_supported_tools")
+        .and_then(Value::as_array)
+        .is_some_and(|tools| tools.iter().any(|tool| tool == "image_generation"));
+    let has_image_capability = model
+        .capabilities
+        .iter()
+        .any(|capability| capability == Capability::MediaImage.as_str());
+    if !has_supplier_capabilities && has_text_output {
+        model.capabilities.push(Capability::Infer.as_str().into());
+        model.capabilities.push(Capability::Search.as_str().into());
+    }
+    if !(has_image_output || has_image_tool || has_image_capability) {
         return;
     }
 
-    model.capabilities.push(Capability::Infer.as_str().into());
-    model.capabilities.push(Capability::Search.as_str().into());
-    if media_generation::supported_model(&model.id) {
+    // 仅使用上游明确的图片输出或工具能力，不从型号或视觉输入推断。
+    if !model
+        .capabilities
+        .iter()
+        .any(|capability| capability == Capability::MediaImage.as_str())
+    {
         model
             .capabilities
             .push(Capability::MediaImage.as_str().into());
+    }
+    let modalities = model
+        .metadata
+        .entry("modalities".into())
+        .or_insert_with(|| serde_json::json!({"input": ["text"], "output": ["text"]}));
+    if !modalities.is_object() {
+        *modalities = serde_json::json!({"input": ["text"], "output": ["text"]});
+    }
+    let output = modalities
+        .as_object_mut()
+        .expect("normalized model modalities")
+        .entry("output")
+        .or_insert_with(|| serde_json::json!(["text"]));
+    if let Value::Array(output) = output {
+        if !output.iter().any(|modality| modality == "image") {
+            output.push(serde_json::json!("image"));
+        }
+    } else {
+        *output = serde_json::json!(["text", "image"]);
     }
 }
 
@@ -1024,7 +1078,7 @@ mod tests {
         assert_eq!(model.id, "gpt-6-luna");
         assert_eq!(
             model.metadata["modalities"],
-            json!({"input": ["text", "image"], "output": ["text"]})
+            json!({"input": ["text", "image"], "output": ["text", "image"]})
         );
         assert_eq!(model.metadata["context_window"], json!(272000));
         assert_eq!(
@@ -1034,15 +1088,95 @@ mod tests {
     }
 
     #[test]
-    fn discovered_model_keeps_undeclared_specifications_empty() {
-        let entry = json!({
-            "slug": "gpt-6-plain",
-            "visibility": "list"
-        });
-        let model = discovered_model(&entry).expect("listed model");
+    fn discovered_model_registers_hosted_image_output() {
+        for entry in [
+            json!({"slug": "future-capability", "capabilities": ["media_image"]}),
+            json!({"slug": "future-tool", "experimental_supported_tools": ["image_generation"]}),
+            json!({"slug": "future-output", "output_modalities": ["text", "image"]}),
+            json!({"slug": "future-mixed", "capabilities": ["infer", "media_image"],
+                "modalities": {"input": ["text"], "output": ["text", "audio"]}}),
+            json!({"slug": "future-nested", "input_modalities": ["text"],
+                "modalities": {"input": ["text"], "output": ["text", "image"]}}),
+        ] {
+            let model = discovered_model(&entry).expect("listed model");
+            assert_eq!(
+                model
+                    .capabilities
+                    .iter()
+                    .filter(|capability| capability.as_str() == Capability::MediaImage.as_str())
+                    .count(),
+                1,
+                "{} must declare the hosted image adapter exactly once",
+                model.id
+            );
+            let output = model.metadata["modalities"]["output"]
+                .as_array()
+                .expect("registered output modalities");
+            assert!(output.contains(&json!("text")), "{}", model.id);
+            assert!(output.contains(&json!("image")), "{}", model.id);
+            if model.id == "future-mixed" {
+                assert!(output.contains(&json!("audio")));
+            }
+        }
+    }
+
+    #[test]
+    fn discovered_model_image_input_does_not_qualify_unsupported_models() {
+        for id in ["future-vision", "gpt-5", "gpt-6.1-sol", "future-unknown"] {
+            let model = discovered_model(&json!({
+                "slug": id,
+                "input_modalities": ["text", "image"]
+            }))
+            .expect("listed model");
+            assert!(
+                !model
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability == Capability::MediaImage.as_str()),
+                "{id}"
+            );
+            assert_eq!(model.metadata["modalities"]["output"], json!(["text"]));
+        }
+    }
+
+    #[test]
+    fn discovered_image_only_model_preserves_output_without_chat_capability() {
+        let model = discovered_model(&json!({
+            "slug": "future-image-only",
+            "selector": "exact/upstream/selection",
+            "input_modalities": ["text"],
+            "output_modalities": ["image"]
+        }))
+        .expect("listed model");
+        assert_eq!(model.id, "future-image-only");
+        assert_eq!(model.selector.as_deref(), Some("exact/upstream/selection"));
+        assert_eq!(model.metadata["modalities"]["output"], json!(["image"]));
+        assert_eq!(model.capabilities, vec![Capability::MediaImage.as_str()]);
+    }
+
+    #[test]
+    fn discovered_unknown_capabilities_do_not_imply_image_output() {
+        let model = discovered_model(&json!({
+            "slug": "future-unknown",
+            "capabilities": ["unknown"],
+            "experimental_supported_tools": ["unknown"],
+            "supports_image_detail_original": true
+        }))
+        .expect("listed model");
+        assert_eq!(model.capabilities, vec!["unknown"]);
         assert!(!model.metadata.contains_key("modalities"));
-        assert!(!model.metadata.contains_key("reasoning_efforts"));
-        assert!(!model.metadata.contains_key("reasoning"));
+    }
+
+    #[test]
+    fn discovered_empty_output_does_not_gain_chat_or_image_capability() {
+        let model = discovered_model(&json!({
+            "slug":"future-empty-output",
+            "input_modalities":["text"],
+            "output_modalities":[]
+        }))
+        .expect("listed model");
+        assert_eq!(model.metadata["modalities"]["output"], json!([]));
+        assert!(model.capabilities.is_empty());
     }
 
     #[test]

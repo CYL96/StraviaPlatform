@@ -6,7 +6,7 @@
 
 Media Generation 的用户可见名称为“媒体生成”，属于 Advanced Capability。统一工具名为 `generate`；本期只支持图片生成与参考图编辑，首个接入后端为 Codex，不提前公布音频或视频类型。
 
-工具通过平台执行，支持显式调用、MCP 及可选透明注入。媒体生成使用独立平台总开关，关闭时所有入口均不可执行。总开关开启后，所有有效 API Key 可显式调用；MCP 另受既有 MCP 开关约束。API Key 增加“媒体生成”透明注入选项，新建及已有 Key 均默认不勾选；该选项只控制自动暴露，不是能力授权。沿用 [ADR-0016](../adr/0016-gate-advanced-capabilities-and-separate-transparent-injection.md)。
+当前接入 Codex 托管图片工具和 Antigravity 原生图片模型。工具通过平台执行，支持显式调用、MCP 及可选透明注入。媒体生成使用独立平台总开关，关闭时所有入口均不可执行。总开关开启后，所有有效 API Key 可显式调用；MCP 另受既有 MCP 开关约束。API Key 增加“媒体生成”透明注入选项，新建及已有 Key 均默认不勾选；该选项只控制自动暴露，不是能力授权。沿用 [ADR-0016](../adr/0016-gate-advanced-capabilities-and-separate-transparent-injection.md)。
 
 ## 2. 工具输入
 
@@ -73,7 +73,7 @@ type ImageGenerateOutput = {
 
 下载使用既有 `StraviaRead({path: "stravia://artifacts/<artifact-id>?download=1"})` 获取限时下载授权，不将下载地址当作稳定身份。保留期、归属、上传与下载授权沿用 [ADR-0048](../adr/0048-separate-artifact-references-from-transfer-grants.md)、[ADR-0049](../adr/0049-snapshot-explicit-media-inputs-as-artifacts.md) 和 [ADR-0051](../adr/0051-disambiguate-artifact-download-and-understanding.md)。
 
-## 4. Route 与 Codex 接入
+## 4. Route 与 Provider 接入
 
 管理员按生成类型分别绑定 Route，当前仅有图片绑定。调用方不能覆盖该绑定。Route 持久化单一的 `output_modality`，当前为 `text` 或 `image`；新建表单默认文字，管理创建请求必须显式提交用途。Provider Model 可以同时登记文字和图片输出，能接收图片不等于能生成图片。这一用途约束取代先前不引入 Route 输出类型的限制，但不恢复已移除的协议 dispatcher route-type gate，也不改变普通推理与托管图片生成的协议含义。
 
@@ -98,11 +98,29 @@ type ImageGenerateOutput = {
 Codex 参考 [OMP image-gen.ts](https://github.com/can1357/oh-my-pi/blob/main/packages/coding-agent/src/tools/image-gen.ts) 的实现方式：
 
 1. 通过 Route 选择 Target，复用相应 Codex Provider 的账号、认证和连接设置。
-2. Target 上游模型是支持托管图片工具的 GPT 对话模型。
+2. Target 上游模型须明确具备所选 Responses 托管图片工具能力，不按型号名称或版本猜测。
 3. 调用 Responses，以 `tool_choice` 强制选择 `image_generation`；参考图决定生成或编辑操作。
 4. 消费流式响应，提取图片，收存并返回 Artifact 引用及实际规格。
 
+Codex 模型发现只接受来源明确的 `media_image`、`output_modalities` / `modalities.output` 中的 `image`，或 `experimental_supported_tools` 中的 `image_generation` 作为图片资格；不再按模型前缀、主版本或静态型号清单赋予能力。已有真实文字及其他输出保留，显式空输出不补成文字；图片专用型号不因缺省填充获得聊天能力。生成执行同样不做型号名称拒绝，沿用宿主对所选 Target 的资格校验并原样发送其模型身份。
+
+公开 [Codex ModelInfo](https://github.com/openai/codex/blob/main/codex-rs/protocol/src/openai_models.rs) 的 `input_modalities`、`supports_image_detail_original` 仅说明输入，不能作为图片输出证明；未找到可替代上述明确声明的动态账号图片资格接口。OMP 的 [hosted-image 规则](https://github.com/can1357/oh-my-pi/blob/main/packages/catalog/src/compat/rules/classes/openai.kdl) 仍包含静态 lineage/version 推断，不能冒充上游动态能力。缺少证明表示资格未知，不表示服务端一定不支持；先前按名称登记的候选可能在同步后退出图片列表。仅含模型 ID 的静态清单也不自动授予图片输出，需要来源或管理员明确配置模型能力。
+
+更新并重新导入 Codex 插件后，已从来源导入且未经人工编辑的 Provider Model 在下次同步时刷新登记；人工编辑的规格继续由管理员接管，不强制覆盖。目录声明、历史成功调用与当前账号授权是不同事实，不以固定名单维持过时资格。
+
 不运行 Codex CLI，不采用独立的 `images/generations` 或 `images/edits` 调用链，不切换为另行配置的 OpenAI API Key。实际支持的模型、参数映射及错误分类须以选定链路的源码与协议证据核定；目录声明不能代替接入资格验证，保存配置也不代表已经执行过真实生图验证。
+
+### Antigravity 原生图片生成
+
+Antigravity 参考 OMP 的 [原生图片适配器](https://github.com/can1357/oh-my-pi/blob/main/packages/ai/src/images/google-antigravity.ts) 和 [图片模型发现](https://github.com/can1357/oh-my-pi/blob/main/packages/catalog/src/discovery/antigravity.ts)，不借用普通推理请求或 Codex 托管工具：
+
+1. 模型同步读取账号 `fetchAvailableModels` 返回的 `imageGenerationModelIds`，解析已声明的废弃 ID 重定向并过滤禁用目标；图片模型保留真实 ID，不按推理档位折叠，不创建虚拟模型或固定默认型号。广告 ID 缺少详情时保留该模型，但不猜测上下文、图片输入或推理能力。
+2. 图片专用模型登记 `media_image` 和 `modalities.output: ["image"]`；同一 ID 已有 Agent 推理能力时保留文字输出与推理选择表，并增加图片能力。`supportsImages` 只声明图片输入，不能据此赋予图片输出。
+3. 通过图片 Route 选择 Target，复用对应 Provider 的 OAuth、project 和连接设置。调用 `streamGenerateContent?alt=sse`，上游模型取 Target 的真实 selector，不在生成时另选账号广告列表中的首个型号。
+4. 原生请求使用 `responseModalities: ["IMAGE"]`、`candidateCount: 1`；有序参考图编码为 `inlineData`，比例与分辨率直映射到 `imageConfig.aspectRatio` 和 `imageConfig.imageSize`，省略的偏好不补默认值。普通推理的参数白名单保持不变。
+5. 消费 SSE 的图片 `inlineData`，要求成功终态及恰好一张图片，限制解码图片为 32 MiB；空图、非法编码、非图片 MIME、多图、截断或上游错误均不报告成功。Core 继续完整解码图片、校验实际规格并收存为 Artifact；HTTP 和流内错误沿用 Route 错误分类与重试策略。
+
+已安装实例须重新构建并导入独立 `antigravity` 插件，再同步账号模型，随后将发现的图片模型绑定到图片 Route 并在媒体生成中选择该 Route。来源托管的规格可随同步刷新，人工编辑的规格不被强制覆盖；不自动创建、改绑或启用 Route。账号是否广告图片模型、配额与真实生图资格仍由上游决定，本地合约验证不能代替真实账号验证。
 
 ## 5. 失败与重试
 
@@ -128,7 +146,7 @@ Codex 参考 [OMP image-gen.ts](https://github.com/can1357/oh-my-pi/blob/main/pa
 
 实施时须通过产品入口验证以下已确认契约；本节是验收要求，不是已执行的测试报告：
 
-- 统一输入严格按类型校验，图片生成与参考图编辑均可经 Codex 托管工具完成。
+- 统一输入严格按类型校验，图片生成与参考图编辑可经 Codex 托管工具或 Antigravity 原生图片模型完成；Antigravity 调用所选 Target 的真实图片模型，而非自动改选广告列表首项。
 - 图片 Route 的绑定与运行前资格均校验；输出模态漂移保留绑定但排除执行，剩余合格 Target 可继续执行，其他适配器不兼容仍明确失败。
 - SQLite 和 PostgreSQL 升级后，未配置用途的历史 Route 均自动归为文字；已明确保存的用途、身份、绑定和启停偏好保持不变。失效图片生成引用可关闭、解绑，关闭总开关不等于解绑。
 - 平台 Gate、显式调用、MCP 与透明注入组合符合既有高级能力规则，已有 Key 不自动启用媒体生成注入。
@@ -137,4 +155,4 @@ Codex 参考 [OMP image-gen.ts](https://github.com/can1357/oh-my-pi/blob/main/pa
 - 错误分类、重试和切换符合已接受的重复执行风险边界，收存失败不重跑生成。
 - 管理页仅包含本期配置功能；中英文、主题及窄屏行为遵循现有设计规范。
 
-真实 Codex 生成验证会调用外部服务并消耗额度，必须在执行前取得针对测试账号与影响的明确授权；不能把本次设计讨论当作生产服务调用授权。
+真实 Codex 或 Antigravity 生成验证会调用外部服务并消耗额度，必须在执行前取得针对测试账号与影响的明确授权；不能把本次设计讨论当作生产服务调用授权。

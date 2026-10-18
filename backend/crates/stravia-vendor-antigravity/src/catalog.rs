@@ -29,7 +29,15 @@ pub(crate) fn execute(
 
 fn parse(payload: &Value) -> Option<DiscoverResponse> {
     let entries = payload.get("models")?.as_object()?;
-    let sorts = payload.get("agentModelSorts")?.as_array()?;
+    let images = match payload.get("imageGenerationModelIds") {
+        Some(value) => value.as_array()?.as_slice(),
+        None => &[],
+    };
+    let sorts = match payload.get("agentModelSorts") {
+        Some(value) => value.as_array()?.as_slice(),
+        None if payload.get("imageGenerationModelIds").is_some() => &[],
+        None => return None,
+    };
     let reroutes = match payload.get("deprecatedModelIds") {
         Some(value) => Some(value.as_object()?),
         None => None,
@@ -149,6 +157,55 @@ fn parse(payload: &Value) -> Option<DiscoverResponse> {
             metadata,
         });
     }
+    let mut seen_images = BTreeSet::new();
+    for image in images {
+        let id = image.as_str()?;
+        if id.trim().is_empty() {
+            continue;
+        }
+        let id = resolve_reroute(id, reroutes)?;
+        if id.trim().is_empty() || !seen_images.insert(id) {
+            continue;
+        }
+        let details = match entries.get(id) {
+            Some(value) => Some(value.as_object()?),
+            None => None,
+        };
+        if details
+            .and_then(|details| details.get("disabled"))
+            .and_then(Value::as_bool)
+            == Some(true)
+        {
+            continue;
+        }
+        let mut metadata = match details {
+            Some(details) => model_metadata(details)?,
+            None => BTreeMap::from([(
+                "modalities".into(),
+                json!({"input": ["text"], "output": ["text"]}),
+            )]),
+        };
+        // 仅相同公开身份合并能力；图片 effort ID 独立登记，推理保留原选择表。
+        if let Some(model) = models.iter_mut().find(|model| model.id == id) {
+            model.selector = Some(id.into());
+            model.capabilities.push("media_image".into());
+            model.metadata.get_mut("modalities")?["output"] = json!(["text", "image"]);
+            continue;
+        }
+        metadata.get_mut("modalities")?["output"] = json!(["image"]);
+        let name = match details.and_then(|details| details.get("displayName")) {
+            Some(value) => value.as_str()?.trim(),
+            None => id,
+        };
+        models.push(DiscoveredModel {
+            id: id.into(),
+            display_name: if name.is_empty() { id } else { name }.into(),
+            family: Some(id.into()),
+            selector: Some(id.into()),
+            capabilities: vec!["media_image".into()],
+            metadata,
+        });
+    }
     Some(DiscoverResponse {
         models,
         next_cursor: None,
@@ -248,13 +305,16 @@ mod tests {
             json!({"agentModelSorts": [{"groups": [{"modelIds": ["x"]}]}], "models": {"x": {"disabled": "false"}}}),
             json!({"agentModelSorts": [{"groups": [{"modelIds": ["x"]}]}], "models": {"x": {"maxTokens": -1}}}),
             json!({"agentModelSorts": [{"groups": [{"modelIds": [7]}]}], "models": {}}),
+            json!({"imageGenerationModelIds": "image", "models": {}}),
+            json!({"imageGenerationModelIds": [7], "models": {}}),
+            json!({"imageGenerationModelIds": ["image"], "models": {"image": {"supportsImages": "true"}}}),
         ] {
             assert!(parse(&payload).is_none());
         }
     }
 
     #[test]
-    fn agent_families_keep_real_selectors_and_exclude_other_uses() {
+    fn agent_families_keep_real_selectors_alongside_image_models() {
         let payload = json!({
             "defaultAgentModelId": "gemini-3.8-flash-low",
             "agentModelSorts": [{"groups": [{"modelIds": [
@@ -283,7 +343,11 @@ mod tests {
                 .iter()
                 .map(|model| model.id.as_str())
                 .collect::<Vec<_>>(),
-            ["gemini-3.1-pro", "gemini-3.8-flash"]
+            [
+                "gemini-3.1-pro",
+                "gemini-3.8-flash",
+                "gemini-3.1-flash-image"
+            ]
         );
         let flash = &result.models[1];
         assert_eq!(flash.display_name, "Gemini 3.8 Flash");
@@ -304,6 +368,123 @@ mod tests {
                 .unwrap()
                 .id,
             "gemini-pro-agent"
+        );
+        let image = &result.models[2];
+        assert_eq!(image.selector.as_deref(), Some("gemini-3.1-flash-image"));
+        assert_eq!(image.capabilities, ["media_image"]);
+        assert_eq!(
+            image.metadata["modalities"],
+            json!({"input": ["text"], "output": ["image"]})
+        );
+    }
+
+    #[test]
+    fn image_only_catalog_preserves_advertised_ids_without_details() {
+        for sorts in [None, Some(json!([]))] {
+            let mut payload = json!({
+                "imageGenerationModelIds": ["image-low", "image-high", "missing"],
+                "models": {
+                    "image-low": {"displayName": "Low", "supportsImages": true, "maxTokens": 8192},
+                    "image-high": {"displayName": ""}
+                }
+            });
+            if let Some(sorts) = sorts {
+                payload["agentModelSorts"] = sorts;
+            }
+            let result = parse(&payload).unwrap();
+            assert_eq!(
+                result
+                    .models
+                    .iter()
+                    .map(|model| model.id.as_str())
+                    .collect::<Vec<_>>(),
+                ["image-low", "image-high", "missing"]
+            );
+            for model in &result.models {
+                assert_eq!(model.selector.as_deref(), Some(model.id.as_str()));
+                assert_eq!(model.capabilities, ["media_image"]);
+                assert_eq!(model.metadata["modalities"]["output"], json!(["image"]));
+                assert!(!model.metadata.contains_key(selector::EXTENSION_KEY));
+            }
+            assert_eq!(result.models[0].display_name, "Low");
+            assert_eq!(result.models[0].metadata["limit"]["context"], 8192);
+            assert_eq!(
+                result.models[0].metadata["modalities"]["input"],
+                json!(["text", "image"])
+            );
+            assert_eq!(result.models[1].display_name, "image-high");
+            assert_eq!(result.models[2].display_name, "missing");
+            assert_eq!(
+                result.models[2].metadata["modalities"]["input"],
+                json!(["text"])
+            );
+        }
+    }
+
+    #[test]
+    fn image_ids_deduplicate_reroutes_and_filter_disabled_targets() {
+        let mut payload = json!({
+            "imageGenerationModelIds": ["", " ", "old", "live", "old", "disabled", "retired"],
+            "deprecatedModelIds": {
+                "old": {"newModelId": "live"},
+                "retired": {"newModelId": "disabled"}
+            },
+            "models": {"live": {}, "disabled": {"disabled": true}}
+        });
+        let result = parse(&payload).unwrap();
+        assert_eq!(result.models.len(), 1);
+        assert_eq!(result.models[0].id, "live");
+        assert_eq!(result.models[0].selector.as_deref(), Some("live"));
+        payload["deprecatedModelIds"]["live"] = json!({"newModelId": "old"});
+        assert!(parse(&payload).is_none());
+    }
+
+    #[test]
+    fn image_capability_merges_only_exact_agent_ids_and_keeps_infer_selectors() {
+        let result = parse(&json!({
+            "defaultAgentModelId": "dual-high",
+            "agentModelSorts": [{"groups": [{"modelIds": ["dual-low", "dual-high", "vision"]}]}],
+            "imageGenerationModelIds": ["dual", "dual-high"],
+            "models": {
+                "dual": {"supportsImages": true},
+                "dual-low": {},
+                "dual-high": {},
+                "vision": {"supportsImages": true}
+            }
+        }))
+        .unwrap();
+        let dual = result
+            .models
+            .iter()
+            .find(|model| model.id == "dual")
+            .unwrap();
+        assert_eq!(dual.capabilities, ["infer", "media_image"]);
+        assert_eq!(dual.selector.as_deref(), Some("dual"));
+        assert_eq!(
+            dual.metadata["modalities"]["output"],
+            json!(["text", "image"])
+        );
+        assert_eq!(
+            selector::resolve(&dual.metadata[selector::EXTENSION_KEY], None)
+                .unwrap()
+                .id,
+            "dual-high"
+        );
+        let image = result
+            .models
+            .iter()
+            .find(|model| model.id == "dual-high")
+            .unwrap();
+        assert_eq!(image.capabilities, ["media_image"]);
+        let vision = result
+            .models
+            .iter()
+            .find(|model| model.id == "vision")
+            .unwrap();
+        assert_eq!(vision.capabilities, ["infer"]);
+        assert_eq!(
+            vision.metadata["modalities"],
+            json!({"input": ["text", "image"], "output": ["text"]})
         );
     }
 

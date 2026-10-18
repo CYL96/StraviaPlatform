@@ -144,7 +144,9 @@ Antigravity 由专属 `antigravity` 插件提供，不内嵌、不复用普通 G
 
 额度页为 Claude/GPT 与 Gemini 模型组的已知五小时、每周标签提供中英文显示，以及已知标签的 disabled 提示。翻译只在既有展示层识别明确标签，不检测 Vendor 身份、不改持久化 bucket/guard key；未知名称与窗口完整保留上游原文。
 
-模型同步只采用 `agentModelSorts[].groups[].modelIds` 引用的 Agent 选项，不把完整 `models` 目录或图片生成、搜索等其他用途清单直接加入可选模型。解析真实 `deprecatedModelIds` 重定向并排除 disabled 后，按官方显示 slug 的家族与明确档位合并：例如 Gemini 3.1 Pro 登记为 `gemini-3.1-pro`，支持 `low`、`high`，默认实际 selector 为 `gemini-pro-agent`。同名或同 enum 不构成合并依据，Thinking 标签不自动生成离散档位。筛选和映射证据见 [模型映射调研](../research/antigravity-model-mapping.md)。
+推理清单只采用 `agentModelSorts[].groups[].modelIds` 引用的 Agent 选项，不把完整 `models` 目录或搜索等其他用途清单当作可推理模型。解析真实 `deprecatedModelIds` 重定向并排除 disabled 后，按官方显示 slug 的家族与明确档位合并：例如 Gemini 3.1 Pro 登记为 `gemini-3.1-pro`，支持 `low`、`high`，默认实际 selector 为 `gemini-pro-agent`。同名或同 enum 不构成合并依据，Thinking 标签不自动生成离散档位。筛选和映射证据见 [模型映射调研](../research/antigravity-model-mapping.md)。
+
+模型同步同时读取 `imageGenerationModelIds`，按真实图片 ID 独立登记，不按推理档位折叠，也不创建虚拟默认型号。图片专用条目仅声明 `media_image` 和图片输出；仅与相同 ID 的 Agent 条目合并时保留双输出。`supportsImages` 仍只表示图片输入。升级独立插件并重新同步后，可将这些模型绑定到图片 Route，再在媒体生成设置中选用；来源托管规格随同步刷新，人工编辑规格保持不变。生图复用原 OAuth、project 与连接，走原生 SSE，不修改普通 Infer 白名单，不在请求时换成账号广告的另一型号。请求映射、单图与收存契约见[媒体生成](media-generation.md#antigravity-原生图片生成)；新增链路通过本地上游验证，不代表所有真实账号都有生图权限或额度。
 
 合并复用现有 Provider Model 的 `family`、`selector`、`reasoning_efforts` 和插件专有 extensions 契约，不新增前端供应商分支、公共 API 或数据库 schema。`antigravity` 选择表保留每档真实请求 ID、显示 slug 和规格；家族规格只承诺各档共有的输入模态与最小已知上下文，任一档上下文未知时不登记家族上下文。未指定档位时使用上游默认项所在档位，其他家族使用其 Agent 引用顺序中的首项；显式 Effort 必须匹配表中已登记档位，不存在时在网络请求前报错，不编造 ID 或回退到另一档。Effort 通过 envelope 的模型 ID 实现，不同时转换为 Gemini thinking budget；独立的原生 Budget 等控制保持既有行为。
 
