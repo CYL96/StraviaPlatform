@@ -104,13 +104,17 @@ tasks:
 
   dev:server:
     desc: Start the Vite WebUI and standalone server in debug mode.
-    deps: [install:web, build:vendors]
+    deps: [install:web, build:vendors:all]
+    env:
+      STRAVIA_DEV_VENDOR_MANIFEST: "{{.ROOT_DIR}}/target/vendor-plugins-all/manifest.json"
     cmds:
       - bun run dev:server
 
   dev:desktop:
     desc: Start the Stravia desktop application in Tauri development mode.
-    deps: [install:web, build:vendors]
+    deps: [install:web, build:vendors:all]
+    env:
+      STRAVIA_DEV_VENDOR_MANIFEST: "{{.ROOT_DIR}}/target/vendor-plugins-all/manifest.json"
     dir: "{{.DESKTOP_DIR}}"
     cmds:
       - bunx --bun @tauri-apps/cli@{{.TAURI_CLI_VERSION}} dev
@@ -227,7 +231,7 @@ tasks:
 
   build:test:development:
     desc: Prepare an isolated default-feature graph for the real dev:server command.
-    deps: [build:web, build:vendors]
+    deps: [build:web, build:vendors:all]
     sources: *rust_test_sources
     generates: [target/test-artifacts/development/manifest.json]
     status: [bun tests/common/build-test-artifacts.ts --status development]

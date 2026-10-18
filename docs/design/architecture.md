@@ -807,7 +807,9 @@ model_turn/                  ← 路由与尝试策略；只调用 Gateway::exec
 
 这是对 ADR-0069、ADR-0070 中“四个通用协议 Vendor/插件”表述的后续取代性澄清：保留全量 Wasm 与自包含锁定 codec 的决策，但四个标准协议 family 现在是共享 codec，而不是四个 Vendor 包。它与 ADR-0067 的独立 Vendor 身份一致；基础包仍是一个 Vendor，而不是一个包导出多个 Vendor。Command Code 与 Devin 的专有 codec 分别归其 guest，Bedrock、Cohere、Gateway、Watsonx 的专有实现归基础 guest，host 不链接这些专有 codec。
 
-默认 builder 与 `task build:vendors` 只构建 `base`，并在 `target/vendor-plugins/manifest.json` 输出供 Core 内嵌的单项 manifest。Core 直接从程序内存加载内嵌 `base`，不将其 Wasm 字节写入实例 `plugins/artifacts/`；只有管理员本地导入的专属插件或 `base` 替代包使用内容寻址的磁盘产物。Release 使用 builder 的 `--all` 模式（`task build:vendors:all`），在独立的 `target/vendor-plugins-all/manifest.json` 输出五个 Component 的完整构建 manifest；只将四个非 `base` Wasm 以 `stravia-vendor-{vendor_id}-v{version}.wasm` 作为独立附件发布，并纳入统一 `SHA256SUMS`。完整构建 manifest 不发布，避免引用未发布的 `base` 及内容摘要文件名与附件名不一致；普通构建与测试准备不会互相覆盖 manifest。缩减内嵌集合不会自动删除实例中已安装的专属插件或其数据，但专属插件没有随附版本可恢复或随宿主自动升级，必须继续通过本地包更新。该分发策略取代 ADR-0067 中五包均随程序交付的历史描述，不改变其中的 Vendor 身份与协议边界。
+默认 builder 与 `task build:vendors` 只构建 `base`，并在 `target/vendor-plugins/manifest.json` 输出供 Core 内嵌的单项 manifest。Core 直接从程序内存加载内嵌 `base`，不将其 Wasm 字节写入实例 `plugins/artifacts/`；本地导入的专属插件或 `base` 替代包使用内容寻址的磁盘产物。Release 使用 builder 的 `--all` 模式（`task build:vendors:all`），在独立的 `target/vendor-plugins-all/manifest.json` 输出全部 Component 的完整构建 manifest；只将非 `base` Wasm 以 `stravia-vendor-{vendor_id}-v{version}.wasm` 作为独立附件发布，并纳入统一 `SHA256SUMS`。完整构建 manifest 不发布，避免引用未发布的 `base` 及内容摘要文件名与附件名不一致；普通构建与测试准备不会互相覆盖 manifest。缩减内嵌集合不会自动删除实例中已安装的专属插件或其数据，但普通运行时的专属插件没有随附版本可恢复或随宿主自动升级，必须继续通过本地包更新。该分发策略取代 ADR-0067 中五包均随程序交付的历史描述，不改变其中的 Vendor 身份与协议边界。
+
+`task dev:server` 与 `task dev:desktop` 是开发专用例外：启动前构建仓库全部插件，通过 `STRAVIA_DEV_VENDOR_MANIFEST` 把完整 manifest 的绝对路径交给 debug Gateway。在首次设置完成或已有实例启动时，Gateway 先安装专属插件，再处理 `base`，复用真实预览、兼容检查和确认流程；与当前内嵌组件相同的 `base` 保持内嵌来源。构建摘要相同且已可用的组件不重复安装，摘要变化即使版本号未变也会更新；这不是远程最新版查询，也不在进程运行中监听源码变化，修改后重新执行开发任务。需要丢弃已有数据的更新会跳过并记录产物路径，须在插件管理页手动导入并明确确认；manifest 无法读取或解析、待安装组件摘要不符或安装失败会中止启动。发布构建不编译这条开发导入路径，普通构建与运行不启用它。
 
 这条边界禁止长期 native bypass：未知 vendor/channel 不回落到协议家族适配器，未知 wire protocol 也不按品牌猜测。Provider 保存的 channel 必须命中已安装 descriptor；descriptor 未声明协议时保持 `None`，调用方不能擅自补成 Open Responses 或其他协议。
 
@@ -1337,7 +1339,7 @@ Observation metadata、文件 manifest 与 Trace segment 共用 `log_retention_d
 - **Desktop 版**：通过 Tauri IPC 取得动态端口与原生管理会话的 access JWT，随后以 Bearer JWT 通过 loopback HTTP 调用 `/api/v1/*`；refresh token 只保留在原生进程内存中
 - **Server 版**：通过当前页面 origin 的 HTTP 调用 `/api/v1/*`
 
-开发前端的 Vite 默认显式监听 `127.0.0.1:5173`，端口占用时由 Vite 递增选择可用端口。不要以 `localhost` 作为默认监听地址：Windows 上的 Bun 可能在 IPv6 回环地址占用后改绑 IPv4，令不同实例以相同的 `localhost` 端口对外显示。`task dev:server` 将 Vite 实际打印地址的 origin 传给后端，并保留既有管理入口与 CSRF 校验。既有前端进程需重启才能应用新绑定；访问控制台实际打印的 URL。旧 `localhost` 入口的 Cookie 不会迁移到 `127.0.0.1`，需要时重新登录，不影响已保存的实例数据。
+`task dev:web` 及桌面开发前端的 Vite 默认显式监听 `127.0.0.1:5173`；`task dev:server` 使用 `server.host: true`（等效 CLI `--host`）监听全部接口，支持从局域网访问。两者端口占用时均由 Vite 递增选择可用端口。不要以 `localhost` 作为默认监听地址：Windows 上的 Bun 可能在 IPv6 回环地址占用后改绑 IPv4，令不同实例以相同的 `localhost` 端口对外显示；Server 联调采用通配监听并额外打印明确的 `127.0.0.1` Local URL。`task dev:server` 将 Vite 实际打印的全部 Local / Network URL 的 origin 精确传给后端，仍只信任本地 Vite 代理，并保留管理入口、Host 与 CSRF 校验。开发服务经 HTTP 暴露源码与管理入口，只在可信网络使用，不要直接暴露公网。既有前端进程需重启才能应用新绑定；访问控制台实际打印的 URL。不同主机入口的 Cookie 不共享，需要时重新登录，不影响已保存的实例数据。
 
 Request Records 使用 `/api/v1/observations/interactions`、`/interactions/{id}`、`/rejections`、`/rejections/{id}`、`/failed-requests`、`/failed-requests/{kind}/{id}` 和 authenticated fetch SSE `/events?after=<sequence>`；`GET|PUT /debug` 读取或确认切换进程状态，`DELETE /history` 清理非 active 历史。Interaction/Rejection 的 `POST .../debug-bundle-tickets` 固定 snapshot；公开导航路径 `GET /api/v1/observations/debug-bundles/{ticket}` 只消费 60 秒单次 ticket，并返回 `no-store` / `no-referrer`。旧 logs collection/detail 与 flat CSV surface 不保留。
 

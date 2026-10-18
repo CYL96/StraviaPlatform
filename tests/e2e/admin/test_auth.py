@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import errno
+import ipaddress
+import json
 import os
 import re
 import signal
@@ -13,6 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import Iterator
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -32,8 +35,11 @@ from tests.common.helpers import (
 @pytest.mark.e2e
 @pytest.mark.admin
 def test_development_task_accepts_vite_origin_without_bypassing_csrf(
-    repo_root: Path, tmp_path: Path,
+    repo_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # Network URLs are local interfaces, not requests for an environment HTTP proxy.
+    monkeypatch.setenv("NO_PROXY", "*")
+    monkeypatch.setenv("no_proxy", "*")
     port = find_free_port()
     listeners = ExitStack()
     # Occupy both localhost address families without disturbing existing workspaces.
@@ -48,6 +54,7 @@ def test_development_task_accepts_vite_origin_without_bypassing_csrf(
                 raise
     logs: list[str] = []
     origins: list[str] = []
+    network_origins: list[str] = []
     frontend_ready = threading.Event()
     proc = subprocess.Popen(
         ["task", "--color=false", "dev:server"],
@@ -64,10 +71,14 @@ def test_development_task_accepts_vite_origin_without_bypassing_csrf(
         assert proc.stdout is not None
         for line in proc.stdout:
             logs.append(line.rstrip())
-            match = re.search(r"Local:.*?(http://127\.0\.0\.1:\d+)", line)
+            match = re.search(r"(Local|Network):.*?(http://(?:\[[^\]]+\]|[^/:\s]+):\d+)", line)
             if match:
-                origins.append(match.group(1))
-                frontend_ready.set()
+                kind, origin = match.groups()
+                if kind == "Network":
+                    network_origins.append(origin)
+                elif urlsplit(origin).hostname == "127.0.0.1":
+                    origins.append(origin)
+                    frontend_ready.set()
 
     reader = threading.Thread(target=drain, daemon=True)
     reader.start()
@@ -80,22 +91,57 @@ def test_development_task_accepts_vite_origin_without_bypassing_csrf(
         assert status == 200, state
         assert state["mode"] == "setup", state
         token = wait_for_setup_token(logs, proc)
-        origin = base
-        status, body = http_request(
-            "POST", f"{base}/api/v1/setup/claim", payload={"token": token},
-            headers={
-                "origin": "https://attacker.invalid", "x-stravia-csrf": "1",
-                "x-forwarded-host": "localhost:5173",
-            },
-        )
-        assert status == 403, body
-        status, _ = http_request(
-            "POST", f"{base}/api/v1/setup/claim", payload={"token": token},
-            headers={"origin": origin},
-        )
-        assert status == 403
+        # A host with a usable non-loopback interface must advertise Network URLs.
+        # This also makes the old loopback-only dev task fail the regression.
+        try:
+            interface_addresses = socket.getaddrinfo(socket.gethostname(), 0, type=socket.SOCK_STREAM)
+        except socket.gaierror:
+            interface_addresses = []
+        for family, _, _, _, address in set(interface_addresses):
+            if ipaddress.ip_address(address[0]).is_loopback:
+                continue
+            try:
+                with socket.socket(family, socket.SOCK_STREAM) as probe:
+                    probe.bind(address)
+            except OSError:
+                continue
+            assert network_origins, "development WebUI did not advertise a Network URL"
+            break
+        accessible_origins = [base]
+        for candidate in network_origins:
+            address = urlsplit(candidate)
+            assert address.hostname is not None
+            if ipaddress.ip_address(address.hostname).is_loopback:
+                continue
+            try:
+                with socket.create_connection((address.hostname, address.port), timeout=2):
+                    pass
+            except OSError:
+                continue
+            status, state = http_request("GET", f"{candidate}/api/v1/auth/state")
+            assert status == 200, state
+            assert state["mode"] == "setup", state
+            accessible_origins.append(candidate)
+            break
+        for candidate in accessible_origins:
+            status, body = http_request(
+                "POST", f"{candidate}/api/v1/setup/claim", payload={"token": token},
+                headers={
+                    "origin": "https://attacker.invalid", "x-stravia-csrf": "1",
+                    "x-forwarded-host": "attacker.invalid",
+                    "forwarded": "host=attacker.invalid;proto=https",
+                },
+            )
+            assert status == 403, body
+            status, body = http_request(
+                "POST", f"{candidate}/api/v1/setup/claim", payload={"token": token},
+                headers={"origin": candidate},
+            )
+            assert status == 403, body
 
-        operator = WebSession(base)
+        # Prefer a reachable Network URL for the real initialization journey.
+        origin = accessible_origins[-1]
+        operator = WebSession(origin)
         status, body = operator.request(
             "POST", "/api/v1/setup/claim", {"token": token}, headers={"origin": origin},
         )
@@ -103,20 +149,35 @@ def test_development_task_accepts_vite_origin_without_bypassing_csrf(
         status, body = operator.request(
             "POST", "/api/v1/setup/complete",
             {
-                "client_base_url": base,
+                "client_base_url": origin,
                 "database": {"backend": "sqlite"},
                 "username": "owner", "password": "correct horse battery staple",
             },
             headers={"origin": origin}, timeout=SERVER_STARTUP_TIMEOUT,
         )
         assert status == 200, body
-        status, body = operator.request(
-            "POST", "/api/v1/auth/login",
-            {"username": "owner", "password": "correct horse battery staple"},
-            headers={"origin": origin},
-        )
+        for candidate in accessible_origins:
+            session = WebSession(candidate)
+            status, body = session.request(
+                "POST", "/api/v1/auth/login",
+                {"username": "owner", "password": "correct horse battery staple"},
+            )
+            assert status == 200, body
+            assert session.request("GET", "/api/v1/status")[0] == 200
+        status, body = session.request("GET", "/api/v1/vendor-plugins")
         assert status == 200, body
-        assert operator.request("GET", "/api/v1/status")[0] == 200
+        built_plugins = json.loads(
+            (repo_root / "target/vendor-plugins-all/manifest.json").read_text(encoding="utf-8")
+        )
+        assert {
+            plugin["vendor_id"]: (plugin["version"], plugin["status"], plugin["source"])
+            for plugin in body["data"]
+        } == {
+            plugin["vendor_id"]: (
+                plugin["version"], "ready", "builtin" if plugin["vendor_id"] == "base" else "local",
+            )
+            for plugin in built_plugins
+        }
     finally:
         if os.name == "nt":
             subprocess.run(

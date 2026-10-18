@@ -7,7 +7,7 @@ import { createServer } from 'vite'
 
 const webuiRoot = fileURLToPath(new URL('../', import.meta.url))
 const repositoryRoot = resolve(webuiRoot, '../..')
-const webui = await createServer({ root: webuiRoot })
+const webui = await createServer({ root: webuiRoot, server: { host: true } })
 
 try {
   await webui.listen()
@@ -15,12 +15,24 @@ try {
   if (!localUrl) {
     throw new Error('The development WebUI must have a local listening address')
   }
+  // Keep an explicit IPv4 loopback entry even when Vite advertises localhost.
+  // Wildcard binding also avoids Bun's localhost address-family port fallback.
+  const loopbackUrl = new URL(localUrl)
+  loopbackUrl.hostname = '127.0.0.1'
+  webui.resolvedUrls.local = [...new Set([loopbackUrl.href, ...webui.resolvedUrls.local])]
+  const origins = new Set(
+    [...webui.resolvedUrls.local, ...webui.resolvedUrls.network].map((url) => new URL(url).origin),
+  )
   webui.printUrls()
 
   // Vite may select another port when other workspaces are already running.
   const backend = spawn(
     'cargo',
-    ['run', '-p', 'stravia-server', '--', '--admin-origin', new URL(localUrl).origin, '--trusted-proxy', '127.0.0.1'],
+    [
+      'run', '-p', 'stravia-server', '--',
+      ...[...origins].flatMap((origin) => ['--admin-origin', origin]),
+      '--trusted-proxy', '127.0.0.1',
+    ],
     { cwd: repositoryRoot, stdio: 'inherit' },
   )
   const [exitCode] = await once(backend, 'exit')

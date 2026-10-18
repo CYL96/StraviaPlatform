@@ -574,6 +574,13 @@ impl Gateway {
             0,
             None,
         );
+        #[cfg(debug_assertions)]
+        if let Some(manifest) = std::env::var_os("STRAVIA_DEV_VENDOR_MANIFEST") {
+            crate::plugin::development::reconcile(&gw, std::path::Path::new(&manifest)).await?;
+        } else {
+            gw.vendor_plugins.reconcile_bundled(&gw).await?;
+        }
+        #[cfg(not(debug_assertions))]
         gw.vendor_plugins.reconcile_bundled(&gw).await?;
         crate::startup_progress::report("gateway_initialize", "Loading provider catalog", 0, None);
         if let Err(error) = gw.catalog_sync.bootstrap().await {

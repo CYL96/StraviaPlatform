@@ -321,14 +321,15 @@ Canonical `MessageContent` 与 Chat 文本/parts 解码直接接收 owned string
 - `backend/crates/stravia-vendor-base/`、`stravia-vendor-codex/`、`stravia-vendor-grok/`、`stravia-vendor-command-code/`、`stravia-vendor-devin/`、`stravia-vendor-claudecode/` 等 crate 是 guest 实现来源；只有 `stravia-vendor-base` 进入 Core 的默认内嵌集合。
 - `backend/crates/stravia-vendor-common/` 是只提供多个 guest 实际共用辅助代码的 `rlib`。标准 codec 由 guest 在 Rust 源码层链接 `stravia-protocol-codec` 并编入 Component，而非采用 Component composition；Command Code 与 Devin 私有 codec 留在各自 crate，Bedrock、Cohere、Gateway、WatsonX 等私有实现留在 `base`。
 - 默认 builder 与 `task build:vendors` 只构建 `base`，在 `target/vendor-plugins/manifest.json` 生成仅含 `base` 的 manifest，供 Core 内嵌。发布流程通过 `task build:vendors:all`（builder 的 `--all` 模式）在独立的 `target/vendor-plugins-all/manifest.json` 生成全部 Component 的完整构建 manifest，并将其中专属 Wasm 以 `stravia-vendor-{vendor_id}-v{version}.wasm` 独立 Release 附件发布，统一由 `SHA256SUMS` 覆盖，供本地导入；`base` 不作为专属附件重复发布，完整构建 manifest 也不发布。`task build:vendor-fixtures` 依赖完整构建并生成真实测试组件。Core 的 `vendor_*` 契约与生命周期检查通过 Gateway 和本地上游验证行为；浏览器、Desktop 与双数据库验收仍分别使用根 `Taskfile.yml` 中的对应入口。
+- `task dev:server` / `task dev:desktop` 启动前构建全部仓库插件，并通过 `STRAVIA_DEV_VENDOR_MANIFEST` 在 debug Gateway 初始化时自动安装或更新这些本地产物。首次设置完成后同样生效，不需要先逐个手动导入。相同摘要不重复安装；同版本不同摘要也会更新，`base` 保持内嵌来源。需丢弃已有数据的更新仍跳过并记录警告，按日志产物路径手动导入并确认；发布构建不包含这条开发路径。源码变更后重新运行开发任务，不自动热更新运行中的插件。Core 的 `plugin::development::tests::` 覆盖同版本构建替换、重复启动幂等与不兼容数据保护；真实开发任务 E2E 同时验证局域网入口、认证边界和完整插件清单。
 - Core 的 WebSocket 续接回归位于 `src/proxy/dispatcher/inference_run/tests/websocket_continuation.rs`，使用内嵌 `base` 的标准 OpenAI Responses 通道与本地 WebSocket 上游，验证连接复用、精确 tip、淘汰、并发分支、完整历史恢复和重试预算，不安装或加载 Codex。构建 `base` 后，可通过 `cargo test --locked -p stravia-core websocket_continuation::` 独立运行，不要求构建专属插件。
 - Codex 的真实 Component 握手、错误分类和大推理签名回归归属 `stravia-vendor-codex/tests/websocket_contract.rs`，不放入通用 runtime 测试。它们默认标记为 ignored；先运行 `task build:vendors:all`，再通过 `cargo test --locked -p stravia-vendor-codex --test websocket_contract -- --ignored` 显式验收。显式运行时缺少产物会报错，不静默跳过。
 
 ## 已确认的管理与分发范围
 
 - 提供插件管理页面，在其中展示已加载的插件。
-- 插件管理页面提供本地包安装与更新入口，并展示更新结果；只有内嵌的 `base` 可随宿主升级发生内置插件自动更新。
-- `base` 由程序内嵌；专属插件当前仅允许管理员通过本地插件包安装或更新。
+- 插件管理页面提供本地包安装与更新入口，并展示更新结果；普通运行时只有内嵌的 `base` 可随宿主升级发生内置插件自动更新。
+- `base` 由程序内嵌；普通运行时的专属插件仅允许管理员通过本地插件包安装或更新，开发任务可自动安装当前仓库构建的本地包。
 - 当前不做插件市场，不提供在线插件获取流程。
 
 ### 插件卸载
