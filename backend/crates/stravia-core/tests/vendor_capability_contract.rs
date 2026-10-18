@@ -3018,45 +3018,24 @@ async fn manually_installed_codex_component_reuses_one_connection_for_search_and
             },
         )
         .await?;
-    seed_provider_scope(
-        &harness.gateway.config.data_dir,
-        "openai",
-        br#"{
-          "gpt-5.4": {
-            "id": "gpt-5.4",
-            "name": "GPT-5.4",
-            "tool_call": true,
-            "temperature": true,
-            "modalities": { "input": ["text"], "output": ["text", "image"] },
-            "limit": { "context": 272000, "output": 128000 },
-            "cost": { "input": 2.5, "output": 15.0 }
-          }
-        }"#,
-    )?;
-    harness
-        .gateway
-        .admin()
-        .sync_provider_models(&provider.id)
-        .await?;
     // Static IDs do not prove hosted image support; declare the fixture's
     // capabilities explicitly instead of relying on model-name inference.
-    let detail = harness
-        .gateway
-        .admin()
-        .get_provider_model(&provider.id, "gpt-5.4")
-        .await?;
-    let mut metadata = serde_json::to_value(&detail.metadata)?;
-    metadata["capabilities"] = json!(["infer", "search", "media_image"]);
-    metadata["modalities"] = json!({"input": ["text"], "output": ["text", "image"]});
     harness
         .gateway
         .admin()
-        .update_provider_model(
+        .create_manual_provider_model(
             &provider.id,
             "gpt-5.4",
-            stravia_core::provider_models::UpdateProviderModel {
-                metadata,
-                revision: detail.revision,
+            CreateManualProviderModel {
+                metadata: json!({
+                    "id": "gpt-5.4",
+                    "name": "GPT-5.4",
+                    "capabilities": ["infer", "search", "media_image"],
+                    "modalities": {"input": ["text"], "output": ["text", "image"]},
+                    "limit": {"context": 272000, "output": 128000},
+                    "cost": {"input": 2.5, "output": 15.0}
+                }),
+                template_id: None,
             },
         )
         .await?;
