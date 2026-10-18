@@ -92,8 +92,9 @@ impl ResponsesEncoder {
             if item.role == Role::Tool {
                 let mut output = serde_json::json!({
                     "type": "function_call_output",
-                    "call_id": item.tool_call_id.clone().unwrap_or_default(),
                 });
+                output["call_id"] =
+                    Value::String(item.tool_call_id.take().unwrap_or_default().into_string());
                 insert_owned_item_metadata(&mut output, &mut item, true);
                 let Some(content) = encode_tool_output(std::mem::replace(
                     &mut item.content,
@@ -116,12 +117,12 @@ impl ResponsesEncoder {
                 for tool_call in tool_calls {
                     let mut call = serde_json::json!({
                         "type": "function_call",
-                        "call_id": tool_call.id,
                     });
+                    call["call_id"] = Value::String(tool_call.id.into_string());
                     call["name"] = Value::String(tool_call.name);
                     call["arguments"] = Value::String(tool_call.arguments);
                     if single_call {
-                        insert_item_metadata(&mut call, &item, true);
+                        insert_owned_item_metadata(&mut call, &mut item, true);
                     }
                     input.push(call);
                 }
@@ -152,8 +153,12 @@ impl ResponsesEncoder {
                 });
                 message["content"] = Value::Array(content);
                 insert_owned_item_metadata(&mut message, &mut item, true);
-                if let Some(phase) = item.meta.as_ref().and_then(|meta| meta.get("phase")) {
-                    message["phase"] = phase.clone();
+                if let Some(phase) = item
+                    .meta
+                    .as_mut()
+                    .and_then(|meta| meta.remove_extension("phase").ok().flatten())
+                {
+                    message["phase"] = phase;
                 }
                 input.push(message);
             }
@@ -1216,7 +1221,7 @@ fn encode_responses_content_block(block: ContentBlock, text_type: &str) -> Optio
             match source {
                 MediaSource::Base64 { media_type, data } => {
                     encoded["image_url"] =
-                        Value::String(format!("data:{media_type};base64,{data}"));
+                        Value::String(crate::codec::media_data_url(&media_type, data));
                 }
                 MediaSource::Url(url) => {
                     encoded["image_url"] = Value::String(url);
@@ -1250,7 +1255,7 @@ fn encode_responses_content_block(block: ContentBlock, text_type: &str) -> Optio
                         .filter(|value| !value.is_empty())
                         .unwrap_or(&source_media_type);
                     encoded["file_data"] =
-                        Value::String(format!("data:{media_type};base64,{data}"));
+                        Value::String(crate::codec::media_data_url(media_type, data));
                 }
                 MediaSource::Url(url) => {
                     encoded["file_url"] = Value::String(url);
@@ -1271,7 +1276,7 @@ fn encode_responses_content_block(block: ContentBlock, text_type: &str) -> Optio
                         .as_deref()
                         .filter(|value| !value.is_empty())
                         .unwrap_or(&source_media_type);
-                    format!("data:{media_type};base64,{data}")
+                    crate::codec::media_data_url(media_type, data)
                 }
                 MediaSource::Url(url) => url,
                 MediaSource::FileId { .. } => return None,

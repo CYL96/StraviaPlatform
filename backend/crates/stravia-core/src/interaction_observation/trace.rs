@@ -12,7 +12,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::performance::{ResourceLease, ResourceUsage};
 
 use super::redaction::{REDACTED, RedactionKind};
-use super::types::TraceManifest;
+use super::types::{TraceManifest, WirePayload};
 
 pub(crate) const TRACE_SCHEMA_VERSION: u32 = 2;
 const SEGMENT_LIMIT_BYTES: u64 = 8 * 1024 * 1024;
@@ -46,7 +46,7 @@ pub(crate) struct TraceRecord {
     pub url: Option<String>,
     pub headers: Value,
     pub payload_encoding: String,
-    pub payload: Value,
+    pub payload: WirePayload,
     pub error: Option<String>,
     pub redactions: Vec<RedactionKind>,
 }
@@ -68,7 +68,8 @@ impl TraceRecord {
                 "original_wire_bytes": false,
                 "content_capture": "omitted",
                 "reason": "control_frame_payload_omitted"
-            });
+            })
+            .into();
         }
         self.redactions = kinds.into_iter().collect();
     }
@@ -113,6 +114,17 @@ fn wire_value_size(value: &Value) -> usize {
                 .saturating_add(key.len())
                 .saturating_add(wire_value_size(value))
         }),
+    }
+}
+
+fn wire_payload_size(payload: &WirePayload) -> usize {
+    match payload {
+        WirePayload::Json(value) => wire_value_size(value),
+        WirePayload::Bytes(bytes) => match std::str::from_utf8(bytes) {
+            Ok(_) => bytes.len(),
+            Err(_) => bytes.len().div_ceil(3).saturating_mul(4).saturating_add(18),
+        },
+        WirePayload::Base64(bytes) => bytes.len().div_ceil(3).saturating_mul(4),
     }
 }
 
@@ -498,7 +510,7 @@ impl TraceHandle {
         let wire_capture_limit = self.manager.inner.wire_capture_limit_bytes;
         #[cfg(not(feature = "test-support"))]
         let wire_capture_limit = WIRE_CAPTURE_LIMIT_BYTES;
-        if wire_value_size(&record.payload) > wire_capture_limit {
+        if wire_payload_size(&record.payload) > wire_capture_limit {
             #[cfg(feature = "test-support")]
             if wire_capture_limit != WIRE_CAPTURE_LIMIT_BYTES {
                 println!("STRAVIA_TEST_TRACE_WIRE_CAPTURE_LIMIT");
@@ -1320,7 +1332,7 @@ mod tests {
                 url: None,
                 headers: Value::Null,
                 payload_encoding: "json".into(),
-                payload: Value::String(format!("chunk-{sequence}")),
+                payload: Value::String(format!("chunk-{sequence}")).into(),
                 error: None,
                 redactions: Vec::new(),
             };
@@ -1368,14 +1380,15 @@ mod tests {
                 url: None,
                 headers: Value::Null,
                 payload_encoding: "base64".into(),
-                payload: Value::String("control-payload".into()),
+                payload: Value::String("control-payload".into()).into(),
                 error: None,
                 redactions: Vec::new(),
             };
             record.redact_before_queue();
-            assert_eq!(record.payload["content_capture"], "omitted");
-            assert_eq!(record.payload["reason"], "control_frame_payload_omitted");
-            assert!(!record.payload.to_string().contains("control-payload"));
+            let payload = serde_json::to_value(record.payload).unwrap();
+            assert_eq!(payload["content_capture"], "omitted");
+            assert_eq!(payload["reason"], "control_frame_payload_omitted");
+            assert!(!payload.to_string().contains("control-payload"));
         }
     }
 }

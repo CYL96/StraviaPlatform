@@ -14,6 +14,7 @@ use crate::storage::memory::MemoryOAuthCredentialStore;
 #[derive(Clone)]
 pub struct PluginStore {
     backend: PluginStoreBackend,
+    config_projection: Option<Arc<crate::runtime_config::Projection>>,
 }
 
 #[derive(Clone)]
@@ -205,6 +206,16 @@ async fn install_memory(
 }
 
 impl PluginStore {
+    pub(crate) fn with_config_projection(
+        &self,
+        projection: Arc<crate::runtime_config::Projection>,
+    ) -> Self {
+        Self {
+            backend: self.backend.clone(),
+            config_projection: Some(projection),
+        }
+    }
+
     pub(crate) fn is_persistent(&self) -> bool {
         !matches!(self.backend, PluginStoreBackend::Memory(_))
     }
@@ -221,6 +232,7 @@ impl PluginStore {
                 oauth_credentials,
                 data: Arc::new(RwLock::new(MemoryPluginData::default())),
             }),
+            config_projection: None,
         }
     }
 
@@ -237,12 +249,14 @@ impl PluginStore {
     pub(crate) fn sqlite(pool: sqlx::SqlitePool) -> Self {
         Self {
             backend: PluginStoreBackend::Sqlite(pool),
+            config_projection: None,
         }
     }
 
     pub(crate) fn postgres(pool: sqlx::PgPool) -> Self {
         Self {
             backend: PluginStoreBackend::Postgres(pool),
+            config_projection: None,
         }
     }
 
@@ -320,6 +334,23 @@ impl PluginStore {
 
     /// 包替换与预览确定的数据重置原子提交；调用者先持有供应商静默凭证。
     pub(crate) async fn install(
+        &self,
+        next: &InstalledPlugin,
+        expected_revision: Option<i64>,
+        resets: &[ProviderReset],
+    ) -> Result<(), PluginStorageError> {
+        let mutation = self
+            .config_projection
+            .as_ref()
+            .map(|projection| projection.begin());
+        let result = self.install_inner(next, expected_revision, resets).await;
+        if let Some(mutation) = mutation {
+            mutation.finish();
+        }
+        result
+    }
+
+    async fn install_inner(
         &self,
         next: &InstalledPlugin,
         expected_revision: Option<i64>,
@@ -670,6 +701,110 @@ mod tests {
     };
     use rust_decimal::Decimal;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn plugin_transaction_invalidates_runtime_configuration() -> anyhow::Result<()> {
+        use crate::db::models::CreateProviderRecord;
+        use crate::provider_models::NewProviderModelRecord;
+        use crate::storage::{DynStorage, SqliteStorage};
+
+        let directory = tempfile::tempdir()?;
+        let pool = crate::db::init_pool(directory.path()).await?;
+        crate::migrations::migrate_sqlite(&pool, None).await?;
+        let source: DynStorage = Arc::new(SqliteStorage::from_pool(pool));
+        let config = crate::runtime_config::RuntimeConfig::attach(source).await?;
+        let provider = config
+            .providers()
+            .create(CreateProviderRecord {
+                name: "runtime provider".into(),
+                vendor: Some("custom".into()),
+                protocol: "openai-compatible".into(),
+                base_url: "http://127.0.0.1:9".into(),
+                preset_key: None,
+                channel: Some("default".into()),
+                models_source: None,
+                static_models: None,
+                api_key: "local-test-credential".into(),
+                adapter_credentials: "{}".into(),
+                vendor_options: "{\"old\":true}".into(),
+                auth_mode: "apikey".into(),
+                use_proxy: false,
+            })
+            .await?;
+        let mut metadata = ProviderModelMetadata::bare("model");
+        metadata
+            .extensions
+            .insert("plugin-field".into(), json!(true));
+        config
+            .provider_models()
+            .create(
+                NewProviderModelRecord {
+                    provider_id: provider.id.clone(),
+                    model_id: "model".into(),
+                    source_kind: ProviderModelSourceKind::Discovered,
+                    snapshot_state: SnapshotState::Unregistered,
+                    metadata_source_provider_id: None,
+                    presence: ProviderModelPresence::Present,
+                    selection_policy: ProviderModelSelectionPolicy::Auto,
+                    metadata,
+                },
+                None,
+            )
+            .await?;
+        assert_eq!(
+            config.providers().get(&provider.id).await?.unwrap().api_key,
+            "local-test-credential"
+        );
+        assert_eq!(
+            config
+                .provider_models()
+                .find(&provider.id, "MODEL")
+                .await?
+                .unwrap()
+                .presence,
+            ProviderModelPresence::Present
+        );
+        config
+            .vendor_plugins()
+            .install(
+                &InstalledPlugin {
+                    vendor_id: "custom".into(),
+                    version: "test".into(),
+                    source: "local".into(),
+                    descriptor: "{}".into(),
+                    component: Bytes::new(),
+                    digest: "test".into(),
+                    revision: 1,
+                    data_epoch: 1,
+                    installed_at: 1,
+                },
+                None,
+                &[ProviderReset {
+                    impact: DataReset {
+                        provider_id: provider.id.clone(),
+                        options: true,
+                        credentials: true,
+                        models: true,
+                        private_state: false,
+                    },
+                    expected_vendor: "custom".into(),
+                    retained_adapter_credentials: "{}".into(),
+                    retained_options: "{}".into(),
+                }],
+            )
+            .await?;
+        let current = config.providers().get(&provider.id).await?.unwrap();
+        assert!(current.api_key.is_empty());
+        assert_eq!(current.vendor_options, "{}");
+        let model = config
+            .provider_models()
+            .find(&provider.id, "model")
+            .await?
+            .unwrap();
+        assert_eq!(model.presence, ProviderModelPresence::Missing);
+        assert!(!model.metadata.extensions.contains_key("plugin-field"));
+        Ok(())
+    }
 
     fn model(source_kind: ProviderModelSourceKind) -> ProviderModelRecord {
         let metadata = ProviderModelMetadata {

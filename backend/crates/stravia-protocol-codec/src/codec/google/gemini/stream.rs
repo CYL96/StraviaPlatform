@@ -316,13 +316,10 @@ impl GoogleStreamParser {
 
 impl GoogleStreamParser {
     pub(crate) fn parse_chunk(&mut self, raw: &str) -> Result<Vec<AiStreamDelta>> {
-        self.buffer.push_str(raw);
         let mut deltas = Vec::new();
 
-        while let Some(pos) = self.buffer.find("\n\n") {
-            let block = self.buffer[..pos].to_string();
-            self.buffer = self.buffer[pos + 2..].to_string();
-
+        let mut buffer = std::mem::take(&mut self.buffer);
+        let result = crate::consume_sse_frames(&mut buffer, raw, |block| {
             let mut saw_sse_data = false;
             for line in block.lines() {
                 if let Some(data) = line.strip_prefix("data:") {
@@ -337,8 +334,10 @@ impl GoogleStreamParser {
                 let chunk = serde_json::from_str::<Value>(bare)?;
                 parse_gemini_chunk(&chunk, &mut deltas, &mut self.first, &mut self.cursor)?;
             }
-        }
-
+            Ok(())
+        });
+        self.buffer = buffer;
+        result?;
         Ok(deltas)
     }
 
@@ -346,8 +345,8 @@ impl GoogleStreamParser {
         if self.buffer.trim().is_empty() {
             return Ok(vec![]);
         }
-        let remaining = std::mem::take(&mut self.buffer);
-        self.parse_chunk(&format!("{remaining}\n\n"))
+        self.buffer.push_str("\n\n");
+        self.parse_chunk("")
     }
 }
 

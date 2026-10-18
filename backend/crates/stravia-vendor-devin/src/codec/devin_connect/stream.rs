@@ -95,6 +95,11 @@ struct Utf8Pending(Vec<u8>);
 
 impl Utf8Pending {
     fn push(&mut self, bytes: &[u8]) -> anyhow::Result<String> {
+        if self.0.is_empty()
+            && let Ok(text) = std::str::from_utf8(bytes)
+        {
+            return Ok(text.to_string());
+        }
         self.0.extend_from_slice(bytes);
         match std::str::from_utf8(&self.0) {
             Ok(text) => {
@@ -110,17 +115,14 @@ impl Utf8Pending {
                 match error.error_len() {
                     // Incomplete tail sequence — wait for the next frame.
                     None => {
-                        let tail = self.0[valid..].to_vec();
-                        self.0.clear();
-                        self.0 = tail;
+                        self.0.drain(..valid);
                         Ok(prefix)
                     }
                     // Genuinely invalid bytes: keep going with a replacement
                     // char instead of stalling the whole stream.
                     Some(_) => {
-                        let tail = self.0[valid..].to_vec();
                         let mut out = prefix;
-                        out.push_str(&String::from_utf8_lossy(&tail));
+                        out.push_str(&String::from_utf8_lossy(&self.0[valid..]));
                         self.0.clear();
                         Ok(out)
                     }
@@ -208,23 +210,30 @@ impl DevinConnectStreamParser {
         if self.done || self.saw_end_stream {
             return Ok(deltas);
         }
-        for frame in self.reader.push(raw)? {
-            match frame {
-                ConnectFrame::Data(payload) => {
-                    self.parse_data_frame(&payload, &mut deltas);
-                    self.produced_output |= deltas.iter().any(is_model_output);
-                }
-                ConnectFrame::EndStream(payload) => {
-                    self.saw_end_stream = true;
-                    self.parse_trailer(&payload, &mut deltas);
-                    if !self.done && !matches!(self.last_finish, Some(7 | 13)) {
-                        self.finish_items(&mut deltas);
-                        self.finish_tools(&mut deltas);
+        let mut reader = std::mem::replace(&mut self.reader, ConnectFrameReader::new());
+        let frames = reader.push(raw);
+        let result: anyhow::Result<()> = (|| {
+            for frame in frames? {
+                match frame {
+                    ConnectFrame::Data(payload) => {
+                        self.parse_data_frame(&payload, &mut deltas);
+                        self.produced_output |= deltas.iter().any(is_model_output);
                     }
-                    break;
+                    ConnectFrame::EndStream(payload) => {
+                        self.saw_end_stream = true;
+                        self.parse_trailer(&payload, &mut deltas);
+                        if !self.done && !matches!(self.last_finish, Some(7 | 13)) {
+                            self.finish_items(&mut deltas);
+                            self.finish_tools(&mut deltas);
+                        }
+                        break;
+                    }
                 }
             }
-        }
+            Ok(())
+        })();
+        self.reader = reader;
+        result?;
         Ok(deltas)
     }
 

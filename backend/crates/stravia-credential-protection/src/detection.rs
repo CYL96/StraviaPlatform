@@ -47,7 +47,7 @@ pub struct CredentialRule {
     pub confidence: String,
 }
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct CredentialRuleComponent {
     pub id: String,
@@ -223,6 +223,55 @@ struct SourceRule {
 fn default_specificity() -> i64 {
     100
 }
+
+/// Only reviewed identities are candidates. Compare every parsed policy field,
+/// including defaults and validation provenance, before removing an identity.
+/// Keep the first upstream entry, preserving stable scan priority. This is not
+/// regex equivalence and deliberately never crosses the two source adapters.
+fn canonicalize_betterleaks(snapshot: &mut Snapshot) {
+    let duplicate = "bittrex-secret-key";
+    let canonical = "bittrex-access-key";
+    let Some(first) = snapshot.rules.iter().position(|rule| rule.id == canonical) else {
+        return;
+    };
+    let Some(second) = snapshot.rules.iter().position(|rule| rule.id == duplicate) else {
+        return;
+    };
+    let a = &snapshot.rules[first];
+    let b = &snapshot.rules[second];
+    if first >= second
+        || a.description.is_empty()
+        || b.description.is_empty()
+        || a.regex != b.regex
+        || a.path != b.path
+        || a.secret_group != b.secret_group
+        || a.keywords != b.keywords
+        || a.filter != b.filter
+        || a.validate != b.validate
+        || a.components != b.components
+        || a.skip_report != b.skip_report
+        || a.specificity != b.specificity
+        || a.confidence != b.confidence
+    {
+        return;
+    }
+    // A parent requiring both identities could have distinct multiplicity
+    // semantics. Leave both intact rather than collapse that requirement.
+    if snapshot.rules.iter().any(|rule| {
+        rule.components.iter().any(|item| item.id == canonical)
+            && rule.components.iter().any(|item| item.id == duplicate)
+    }) {
+        return;
+    }
+    snapshot.rules.remove(second);
+    for rule in &mut snapshot.rules {
+        for component in &mut rule.components {
+            if component.id == duplicate {
+                component.id = canonical.to_owned();
+            }
+        }
+    }
+}
 struct Component {
     rule: usize,
     lines: Option<usize>,
@@ -270,7 +319,7 @@ struct Composite<'a> {
 
 impl Detector {
     pub(super) fn new() -> Result<Self> {
-        let snapshot: Snapshot = toml::from_str(include_str!("detection/betterleaks.toml"))
+        let mut snapshot: Snapshot = toml::from_str(include_str!("detection/betterleaks.toml"))
             .map_err(|_| RedactionError::Detection)?;
         if snapshot.title.is_empty()
             || snapshot.min_version.is_empty()
@@ -278,6 +327,7 @@ impl Detector {
         {
             return Err(RedactionError::Detection);
         }
+        canonicalize_betterleaks(&mut snapshot);
         let mut ids = HashMap::with_capacity(snapshot.rules.len());
         for (index, rule) in snapshot.rules.iter().enumerate() {
             if rule.id.is_empty() || ids.insert(rule.id.as_str(), index).is_some() {
@@ -679,6 +729,86 @@ impl Component {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn canonical_bittrex_identity_preserves_secret_occurrences() {
+        let secret = "a7b2c9d4e0f6g3h8i1j5k9l2m4n6o8p0";
+        let text = format!("中文😀 bittrex={secret}\nbittrex={secret}");
+        let matches = test_text(
+            text.clone(),
+            Arc::new(CompiledCustomRules::compile([]).unwrap()),
+        )
+        .await
+        .unwrap();
+        let selected: Vec<_> = matches
+            .iter()
+            .filter(|finding| finding.rule_id == "bittrex-access-key")
+            .collect();
+        assert_eq!(selected.len(), 2);
+        assert!(
+            !matches
+                .iter()
+                .any(|finding| finding.rule_id == "bittrex-secret-key")
+        );
+        let utf16: Vec<_> = text.encode_utf16().collect();
+        for finding in selected {
+            assert_eq!(
+                String::from_utf16(&utf16[finding.start..finding.end]).unwrap(),
+                secret
+            );
+        }
+    }
+
+    #[test]
+    fn canonicalization_migrates_components_without_collapsing_distinct_policy() {
+        let mut snapshot: Snapshot =
+            toml::from_str(include_str!("detection/betterleaks.toml")).unwrap();
+        snapshot.rules[0].components.push(CredentialRuleComponent {
+            id: "bittrex-secret-key".into(),
+            within: "5L".into(),
+            optional: false,
+        });
+        canonicalize_betterleaks(&mut snapshot);
+        let component = snapshot.rules[0].components.last().unwrap();
+        assert_eq!(component.id, "bittrex-access-key");
+        assert_eq!(component.within, "5L");
+        assert!(!component.optional);
+        assert!(snapshot.rules.iter().any(|rule| rule.id == component.id));
+        let mut distinct: Snapshot =
+            toml::from_str(include_str!("detection/betterleaks.toml")).unwrap();
+        distinct
+            .rules
+            .iter_mut()
+            .find(|rule| rule.id == "bittrex-secret-key")
+            .unwrap()
+            .skip_report = true;
+        canonicalize_betterleaks(&mut distinct);
+        assert!(
+            distinct
+                .rules
+                .iter()
+                .any(|rule| rule.id == "bittrex-secret-key")
+        );
+    }
+
+    #[test]
+    fn canonical_catalog_keeps_real_component_prerequisites_and_field_isolation() {
+        let detector = detector().unwrap();
+        let secret = format!("AIK_SECRET_{}", "a7B2c9D4e0F6g3H8".repeat(4));
+        let client = "AIK_CLIENT_a7B2c9D4e0F6g3H8i1J5k9L2";
+        let has_secret = |texts: &[&str]| {
+            detector.detect(texts).unwrap().iter().any(|item| {
+                item.secret == secret
+                    && item
+                        .findings
+                        .iter()
+                        .any(|finding| finding.rule_id == "aikido-client-secret")
+            })
+        };
+        assert!(!has_secret(&[&secret]));
+        assert!(!has_secret(&[&secret, client]));
+        assert!(has_secret(&[&format!("{client}\n{secret}")]));
+    }
 
     #[tokio::test]
     async fn tester_locates_repeated_captures_and_multiline_unicode_input() {

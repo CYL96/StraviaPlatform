@@ -553,7 +553,12 @@ fn event_bytes(event: &RunEvent) -> usize {
                 + optional_len(attempt_id)
                 + optional_len(url)
                 + json_bytes(headers)
-                + json_bytes(payload)
+                + match payload {
+                    super::WirePayload::Json(value) => json_bytes(value),
+                    super::WirePayload::Bytes(bytes) | super::WirePayload::Base64(bytes) => {
+                        bytes.len()
+                    }
+                }
         }
         ObservationGap { reason } => reason.len(),
     };
@@ -1050,9 +1055,6 @@ pub(super) fn spawn(deps: WriterDeps) -> (WriterSender, tokio::task::JoinHandle<
                         flush_one(&mut pending_text, &run);
                     }
                     let expires = expires(now, retention_days.load(Ordering::Relaxed));
-                    if let Some(input) = decision.received_input.take() {
-                        attribution.cache_received_input(start.id.clone(), input, expires);
-                    }
                     if decision.replayed_client_tool_results {
                         replayed_tool_results.insert(start.id.clone());
                     }
@@ -1078,6 +1080,9 @@ pub(super) fn spawn(deps: WriterDeps) -> (WriterSender, tokio::task::JoinHandle<
                         .await
                     {
                         Ok(event) => {
+                            if let Some(input) = decision.received_input.take() {
+                                attribution.cache_received_input(start.id.clone(), input, expires);
+                            }
                             if let Some(trace) = trace {
                                 let manifest = trace.manifest();
                                 match debug_trace_index
@@ -1152,6 +1157,8 @@ pub(super) fn spawn(deps: WriterDeps) -> (WriterSender, tokio::task::JoinHandle<
                             }
                         }
                         Err(error) => {
+                            attribution.abandon_admission(&start.id);
+                            replayed_tool_results.remove(&start.id);
                             incomplete_usage = true;
                             unpersisted_gaps.lock().record(&start.id, now);
                             tracing::warn!(run_id=%start.id, %error, "observation admission persistence failed")

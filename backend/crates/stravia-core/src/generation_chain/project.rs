@@ -17,6 +17,7 @@ pub(super) struct ProjectedClientCommit<'a> {
     pub(super) client_output: Vec<AiItem>,
     pub(super) client_history_mutation: Option<EffectiveHistoryMutation<'static>>,
     pub(super) client_history: ClientHistoryState,
+    pub(super) client_item_units: usize,
 }
 
 pub(super) fn project_client_commit<'a>(
@@ -58,13 +59,16 @@ pub(super) fn project_client_commit<'a>(
         client_request_delta.to_mut().items = client_items[parent_items..].to_vec();
     }
     client_items.extend(client_output.clone());
-    let client_history = ClientHistoryState::from_request(&client_request_delta, &client_items);
+    // 输出改写与压缩替换完成后才投影；计数只随这个不可变快照传递，不缓存可变请求。
+    let (client_history, client_item_units) =
+        ClientHistoryState::from_request_with_count(&client_request_delta, &client_items);
     Ok(ProjectedClientCommit {
         client_request_delta,
         client_items,
         client_output,
         client_history_mutation,
         client_history,
+        client_item_units,
     })
 }
 
@@ -75,8 +79,7 @@ impl ClientHistoryState {
         stravia_runtime_contract::turn_chain::ReusablePrefixProjection {
             version: self.projection_version,
             controls_fingerprint: self.controls_fingerprint.clone(),
-            // from_request and replay compute this from actual retained client
-            // items, never effective history or a provider/redaction proof.
+            // 仅由实际保留的客户端历史计算；有效历史或 Provider/脱敏证明不能替代它。
             context_fingerprint: self.context_fingerprint.clone(),
         }
     }

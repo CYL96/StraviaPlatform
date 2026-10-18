@@ -14,6 +14,30 @@ pub(super) struct SqliteUsageStatsStore {
 
 const BASE_BUCKET_MS: i64 = 900_000;
 
+// FILTER 让一小时窗口之外的记录不再参与对应聚合器，但仍只扫描一次日窗口。
+const ROUTE_SCHEDULING_SQL: &str =
+    "SELECT provider_id || ':' || upstream_model AS target_key,
+        CASE WHEN COUNT(input_tokens) = COUNT(*) THEN SUM(input_tokens) END AS input_tokens_24h,
+        CASE WHEN COUNT(output_tokens) = COUNT(*) THEN SUM(output_tokens) END AS output_tokens_24h,
+        CASE WHEN COUNT(cache_read_tokens) = COUNT(*) THEN SUM(cache_read_tokens) END AS cache_read_tokens_24h,
+        CASE WHEN COUNT(cache_write_tokens) = COUNT(*) THEN SUM(cache_write_tokens) END AS cache_write_tokens_24h,
+        COUNT(*) FILTER (WHERE started_at >= ?1) AS attempts_1h,
+        COUNT(*) FILTER (WHERE started_at >= ?1 AND status = 'completed') AS successes_1h,
+        CASE WHEN COUNT(*) FILTER (WHERE started_at >= ?1 AND status = 'completed') > 0
+                   AND COUNT(output_tokens) FILTER (WHERE started_at >= ?1 AND status = 'completed')
+                     = COUNT(*) FILTER (WHERE started_at >= ?1 AND status = 'completed')
+             THEN SUM(output_tokens) FILTER (WHERE started_at >= ?1 AND status = 'completed') END AS successful_output_tokens_1h,
+        CASE WHEN COUNT(*) FILTER (WHERE started_at >= ?1 AND status = 'completed') > 0
+                   AND COUNT(duration_ms) FILTER (WHERE started_at >= ?1 AND status = 'completed')
+                     = COUNT(*) FILTER (WHERE started_at >= ?1 AND status = 'completed')
+             THEN SUM(duration_ms) FILTER (WHERE started_at >= ?1 AND status = 'completed') END AS successful_upstream_ms_1h,
+        NULL AS cost_input, NULL AS cost_output,
+        NULL AS cost_cache_read, NULL AS cost_cache_write
+             FROM target_attempt_observations
+             WHERE started_at >= ?2
+               AND provider_id <> '' AND upstream_model <> ''
+             GROUP BY provider_id, upstream_model";
+
 // Display buckets start at the selected boundary and retain the final partial bucket.
 fn display_bucket_ms(start: i64, end: i64, requested: i64) -> i64 {
     let span = i128::from(end) - i128::from(start);
@@ -28,38 +52,12 @@ impl UsageStatsStore for SqliteUsageStatsStore {
         let now = chrono::Utc::now().timestamp_millis();
         let hour_ago = now.saturating_sub(60 * 60 * 1_000);
         let day_ago = now.saturating_sub(24 * 60 * 60 * 1_000);
-        let result = sqlx::query_as::<_, crate::router::TargetSchedulingSnapshot>(
-            "SELECT provider_id || ':' || upstream_model AS target_key,
-        CASE WHEN COUNT(*) > 0 AND COUNT(input_tokens) = COUNT(*) THEN SUM(input_tokens) END AS input_tokens_24h,
-        CASE WHEN COUNT(*) > 0 AND COUNT(output_tokens) = COUNT(*) THEN SUM(output_tokens) END AS output_tokens_24h,
-        CASE WHEN COUNT(*) > 0 AND COUNT(cache_read_tokens) = COUNT(*) THEN SUM(cache_read_tokens) END AS cache_read_tokens_24h,
-        CASE WHEN COUNT(*) > 0 AND COUNT(cache_write_tokens) = COUNT(*) THEN SUM(cache_write_tokens) END AS cache_write_tokens_24h,
-        SUM(CASE WHEN started_at >= ? THEN 1 ELSE 0 END) AS attempts_1h,
-        SUM(CASE WHEN started_at >= ? AND status = 'completed' THEN 1 ELSE 0 END) AS successes_1h,
-        CASE WHEN SUM(CASE WHEN started_at >= ? AND status = 'completed' THEN 1 ELSE 0 END) > 0
-                   AND SUM(CASE WHEN started_at >= ? AND status = 'completed' AND output_tokens IS NULL THEN 1 ELSE 0 END) = 0
-             THEN SUM(CASE WHEN started_at >= ? AND status = 'completed' THEN output_tokens END) END AS successful_output_tokens_1h,
-        CASE WHEN SUM(CASE WHEN started_at >= ? AND status = 'completed' THEN 1 ELSE 0 END) > 0
-                   AND SUM(CASE WHEN started_at >= ? AND status = 'completed' AND duration_ms IS NULL THEN 1 ELSE 0 END) = 0
-             THEN SUM(CASE WHEN started_at >= ? AND status = 'completed' THEN duration_ms END) END AS successful_upstream_ms_1h,
-        NULL AS cost_input, NULL AS cost_output,
-        NULL AS cost_cache_read, NULL AS cost_cache_write
-             FROM target_attempt_observations
-             WHERE started_at >= ?
-               AND provider_id <> '' AND upstream_model <> ''
-             GROUP BY provider_id, upstream_model",
-        )
-        .bind(hour_ago)
-        .bind(hour_ago)
-        .bind(hour_ago)
-        .bind(hour_ago)
-        .bind(hour_ago)
-        .bind(hour_ago)
-        .bind(hour_ago)
-        .bind(hour_ago)
-        .bind(day_ago)
-        .fetch_all(&self.pool)
-        .await;
+        let result =
+            sqlx::query_as::<_, crate::router::TargetSchedulingSnapshot>(ROUTE_SCHEDULING_SQL)
+                .bind(hour_ago)
+                .bind(day_ago)
+                .fetch_all(&self.pool)
+                .await;
         match result {
             Ok(targets) => {
                 *self.last_route_snapshot.write() = targets.clone();
@@ -502,6 +500,293 @@ mod tests {
             store.stats_by_provider(StatsWindow::default()).await?[0].error_count,
             4
         );
+        pool.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn route_scheduling_preserves_windows_status_and_unknown_usage() -> anyhow::Result<()> {
+        use sqlx::Row;
+        use std::collections::BTreeMap;
+
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await?;
+        crate::migrations::migrate_sqlite(&pool, None).await?;
+        let now = 1_800_000_000_000_i64;
+        let hour_ago = now - 3_600_000;
+        let day_ago = now - 86_400_000;
+        insert_turn(&pool, "run", now, "model", "key").await?;
+        for (id, provider, model, started_at, status, output, duration) in [
+            (
+                "day-boundary",
+                "known",
+                "model",
+                day_ago,
+                "completed",
+                Some(3_i64),
+                Some(10_i64),
+            ),
+            (
+                "before-day",
+                "known",
+                "model",
+                day_ago - 1,
+                "completed",
+                Some(3),
+                Some(10),
+            ),
+            (
+                "before-hour",
+                "known",
+                "model",
+                hour_ago - 1,
+                "completed",
+                Some(3),
+                Some(10),
+            ),
+            (
+                "hour-boundary",
+                "known",
+                "model",
+                hour_ago,
+                "completed",
+                Some(3),
+                Some(10),
+            ),
+            (
+                "recent",
+                "known",
+                "model",
+                now - 1,
+                "completed",
+                Some(3),
+                Some(10),
+            ),
+            // 现有契约只有窗口下界，不因本机与记录时钟偏差丢弃未来时间。
+            (
+                "future",
+                "known",
+                "model",
+                now + 1,
+                "completed",
+                Some(3),
+                Some(10),
+            ),
+            (
+                "failed-known",
+                "known",
+                "model",
+                now - 1,
+                "failed",
+                Some(3),
+                Some(10),
+            ),
+            (
+                "missing-output",
+                "unknown-output",
+                "model",
+                now,
+                "completed",
+                None,
+                Some(10),
+            ),
+            (
+                "known-output",
+                "unknown-output",
+                "model",
+                now,
+                "completed",
+                Some(3),
+                Some(10),
+            ),
+            (
+                "missing-duration",
+                "unknown-duration",
+                "model",
+                now,
+                "completed",
+                Some(3),
+                None,
+            ),
+            (
+                "known-duration",
+                "unknown-duration",
+                "model",
+                now,
+                "completed",
+                Some(3),
+                Some(10),
+            ),
+            (
+                "failed-unknown",
+                "unknown-duration",
+                "model",
+                now,
+                "failed",
+                None,
+                None,
+            ),
+            (
+                "no-success",
+                "no-success",
+                "model",
+                now,
+                "failed",
+                None,
+                None,
+            ),
+            (
+                "day-only",
+                "day-only",
+                "model",
+                hour_ago - 1,
+                "completed",
+                Some(3),
+                Some(10),
+            ),
+            (
+                "expired",
+                "expired",
+                "model",
+                day_ago - 1,
+                "completed",
+                Some(3),
+                Some(10),
+            ),
+            (
+                "missing-provider",
+                "",
+                "model",
+                now,
+                "completed",
+                Some(3),
+                Some(10),
+            ),
+            (
+                "missing-model",
+                "provider",
+                "",
+                now,
+                "completed",
+                Some(3),
+                Some(10),
+            ),
+        ] {
+            insert_attempt(&pool, id, "run", started_at, 10, Some(2)).await?;
+            sqlx::query(
+                "UPDATE target_attempt_observations
+                 SET provider_id=?,upstream_model=?,status=?,output_tokens=?,duration_ms=?,cache_write_tokens=1
+                 WHERE id=?",
+            )
+            .bind(provider)
+            .bind(model)
+            .bind(status)
+            .bind(output)
+            .bind(duration)
+            .bind(id)
+            .execute(&pool)
+            .await?;
+        }
+        sqlx::query("UPDATE target_attempt_observations SET cache_read_tokens=NULL WHERE id='missing-output'")
+            .execute(&pool).await?;
+        let rows = sqlx::query(ROUTE_SCHEDULING_SQL)
+            .bind(hour_ago)
+            .bind(day_ago)
+            .fetch_all(&pool)
+            .await?;
+        let columns = [
+            "input_tokens_24h",
+            "output_tokens_24h",
+            "cache_read_tokens_24h",
+            "cache_write_tokens_24h",
+            "attempts_1h",
+            "successes_1h",
+            "successful_output_tokens_1h",
+            "successful_upstream_ms_1h",
+        ];
+        let actual = rows
+            .iter()
+            .map(|row| {
+                let values = columns
+                    .iter()
+                    .map(|column| row.try_get::<Option<i64>, _>(*column))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok((row.try_get::<String, _>("target_key")?, values))
+            })
+            .collect::<Result<BTreeMap<_, _>, sqlx::Error>>()?;
+        let expected = [
+            (
+                "known:model",
+                vec![
+                    Some(60),
+                    Some(18),
+                    Some(12),
+                    Some(6),
+                    Some(4),
+                    Some(3),
+                    Some(9),
+                    Some(30),
+                ],
+            ),
+            (
+                "unknown-output:model",
+                vec![
+                    Some(20),
+                    None,
+                    None,
+                    Some(2),
+                    Some(2),
+                    Some(2),
+                    None,
+                    Some(20),
+                ],
+            ),
+            (
+                "unknown-duration:model",
+                vec![
+                    Some(30),
+                    None,
+                    Some(6),
+                    Some(3),
+                    Some(3),
+                    Some(2),
+                    Some(6),
+                    None,
+                ],
+            ),
+            (
+                "no-success:model",
+                vec![
+                    Some(10),
+                    None,
+                    Some(2),
+                    Some(1),
+                    Some(1),
+                    Some(0),
+                    None,
+                    None,
+                ],
+            ),
+            (
+                "day-only:model",
+                vec![
+                    Some(10),
+                    Some(3),
+                    Some(2),
+                    Some(1),
+                    Some(0),
+                    Some(0),
+                    None,
+                    None,
+                ],
+            ),
+        ]
+        .into_iter()
+        .map(|(key, values)| (key.to_owned(), values))
+        .collect();
+        assert_eq!(actual, expected);
         pool.close().await;
         Ok(())
     }

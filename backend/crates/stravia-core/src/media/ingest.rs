@@ -1,6 +1,7 @@
 //! Structured attachment admission and per-attempt transfer representations.
 use base64::Engine;
 use bytes::Bytes;
+use serde::Deserialize;
 use std::sync::Arc;
 use std::time::Duration;
 use stravia_runtime_contract::artifact::{
@@ -461,7 +462,7 @@ fn normalize_blocks<'a>(
                     content_kind: Some(ToolResultContentKind::ContentBlocks),
                     ..
                 } => {
-                    let mut nested: Vec<ContentBlock> = serde_json::from_value(content.clone())
+                    let mut nested = Vec::<ContentBlock>::deserialize(&*content)
                         .map_err(|e| ArtifactError::Invalid(e.to_string()))?;
                     normalize_blocks(gateway, principal, &mut nested, cancellation, retention)
                         .await?;
@@ -661,7 +662,7 @@ fn materialize_blocks<'a>(
                     content_kind: Some(ToolResultContentKind::ContentBlocks),
                     ..
                 } => {
-                    let mut nested: Vec<ContentBlock> = serde_json::from_value(content.clone())
+                    let mut nested = Vec::<ContentBlock>::deserialize(&*content)
                         .map_err(|e| ArtifactError::Invalid(e.to_string()))?;
                     materialize_blocks(access, &mut nested, protocol, transfers).await?;
                     *content = serde_json::to_value(nested)

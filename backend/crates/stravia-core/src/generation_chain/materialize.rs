@@ -221,19 +221,11 @@ fn materialize_generation_replay<'a>(
     // upstream proof: that proof may describe a reversible-redaction view.
     let mut client_item_units = 0usize;
     if let Some(history) = client_history.as_mut() {
-        let mut context =
-            stravia_runtime_contract::protocol::ir::canonical::history_context_hash(&[]);
-        for item in &client_items {
-            let values =
-                stravia_runtime_contract::protocol::ir::canonical::history_item_values(item);
-            client_item_units += values.len();
-            for value in values {
-                context =
-                    stravia_runtime_contract::protocol::ir::canonical::append_history_value_hash(
-                        context, value,
-                    );
-            }
-        }
+        let (context, units) =
+            stravia_runtime_contract::protocol::ir::canonical::history_context_hash_with_count(
+                &client_items,
+            );
+        client_item_units = units;
         history.context_fingerprint =
             stravia_runtime_contract::protocol::ir::canonical::hash_hex(&context);
         history.context_messages = client_items.len();
@@ -316,19 +308,15 @@ impl PrefixRebuild {
             .unwrap_or_else(|| generic_client_history_output(&persisted.effective_output));
         // 只折叠此节点的客户端增量；分支复制固定大小的父摘要，不物化或保留祖先正文。
         for item in input.iter().chain(&output) {
-            let values =
-                stravia_runtime_contract::protocol::ir::canonical::history_item_values(item);
+            let (hash, units) =
+                stravia_runtime_contract::protocol::ir::canonical::append_history_context_hash_with_count(
+                    &context.hash, item,
+                );
             context.units = context
                 .units
-                .checked_add(u32::try_from(values.len()).map_err(|error| error.to_string())?)
+                .checked_add(u32::try_from(units).map_err(|error| error.to_string())?)
                 .ok_or_else(|| "generation history exceeds prefix item count".to_string())?;
-            for value in values {
-                context.hash =
-                    stravia_runtime_contract::protocol::ir::canonical::append_history_value_hash(
-                        context.hash,
-                        value,
-                    );
-            }
+            context.hash = hash;
         }
         self.contexts.insert(id, context);
         let (Some(mut history), Some(completed_at)) = (persisted.client_history, completed_at)

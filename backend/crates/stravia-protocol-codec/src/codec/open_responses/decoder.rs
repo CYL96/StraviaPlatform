@@ -802,6 +802,12 @@ fn decode_message_item(item: &Value, allow_video: bool) -> Result<Option<AiItem>
     let content = match item.get("content") {
         Some(Value::String(text)) => MessageContent::Text(text.clone().into()),
         Some(Value::Array(blocks)) => {
+            let needs_blocks = blocks.iter().any(|block| {
+                !matches!(
+                    block.get("type").and_then(Value::as_str),
+                    Some("input_text" | "output_text" | "text")
+                )
+            });
             let mut texts = Vec::new();
             let mut content_blocks = Vec::new();
             let mut has_media = false;
@@ -818,11 +824,13 @@ fn decode_message_item(item: &Value, allow_video: bool) -> Result<Option<AiItem>
                         let text = object.get("text").and_then(Value::as_str).ok_or_else(|| {
                             anyhow::anyhow!("Responses {block_type} content block text is required")
                         })?;
-                        texts.push(text.to_owned());
-                        content_blocks.push(ContentBlock::Text {
-                            text: text.to_owned().into(),
-                            cache_control: None,
-                        });
+                        texts.push(text);
+                        if needs_blocks {
+                            content_blocks.push(ContentBlock::Text {
+                                text: text.to_owned().into(),
+                                cache_control: None,
+                            });
+                        }
                     }
                     "input_image" => {
                         let object = block

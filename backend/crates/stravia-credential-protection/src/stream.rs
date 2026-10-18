@@ -1,8 +1,65 @@
 //! Incremental restoration. Only an incomplete reference and JSON escape are retained.
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::{RedactionError, marker, store::Mapping, text};
 use stravia_runtime_contract::protocol::ir::AiStreamDelta;
+
+trait TextOutput {
+    fn push_str(&mut self, text: &str);
+}
+
+impl TextOutput for String {
+    fn push_str(&mut self, text: &str) {
+        String::push_str(self, text);
+    }
+}
+
+// Keep the input borrowed until emitted bytes actually differ, including when a
+// candidate prefix is withheld for the next fragment.
+struct Output<'a> {
+    input: &'a str,
+    unchanged: usize,
+    changed: Option<String>,
+}
+
+impl<'a> Output<'a> {
+    fn new(input: &'a str) -> Self {
+        Self {
+            input,
+            unchanged: 0,
+            changed: None,
+        }
+    }
+
+    fn push(&mut self, ch: char) {
+        self.push_str(ch.encode_utf8(&mut [0; 4]));
+    }
+
+    fn finish(self) -> Cow<'a, str> {
+        match self.changed {
+            Some(output) => Cow::Owned(output),
+            None if self.unchanged == self.input.len() => Cow::Borrowed(self.input),
+            None => Cow::Owned(self.input[..self.unchanged].to_owned()),
+        }
+    }
+}
+
+impl TextOutput for Output<'_> {
+    fn push_str(&mut self, text: &str) {
+        if let Some(output) = &mut self.changed {
+            output.push_str(text);
+        } else if self.input[self.unchanged..].starts_with(text) {
+            self.unchanged += text.len();
+        } else {
+            let mut output =
+                String::with_capacity(self.input.len().max(self.unchanged + text.len()));
+            output.push_str(&self.input[..self.unchanged]);
+            output.push_str(text);
+            self.changed = Some(output);
+        }
+    }
+}
 
 #[derive(Default)]
 struct ReferenceScanner {
@@ -12,7 +69,51 @@ struct ReferenceScanner {
 }
 
 impl ReferenceScanner {
-    fn flush(&mut self, output: &mut String) {
+    fn text(
+        &mut self,
+        input: &mut String,
+        mappings: &[Mapping],
+        used: &mut BTreeSet<String>,
+    ) -> Result<(), RedactionError> {
+        if self.pending.is_empty() && !input.contains('<') {
+            return Ok(());
+        }
+        let mut output = Output::new(input);
+        let mut position = 0;
+        while position < input.len() {
+            if self.pending.is_empty() {
+                let rest = &input[position..];
+                let end = rest
+                    .find('<')
+                    .map_or(input.len(), |offset| position + offset);
+                output.push_str(&input[position..end]);
+                position = end;
+                if position == input.len() {
+                    break;
+                }
+            }
+            let ch = input[position..]
+                .chars()
+                .next()
+                .expect("character boundary");
+            let end = position + ch.len_utf8();
+            self.push(
+                ch,
+                &input[position..end],
+                false,
+                mappings,
+                used,
+                &mut output,
+            )?;
+            position = end;
+        }
+        if let Cow::Owned(output) = output.finish() {
+            *input = output;
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self, output: &mut impl TextOutput) {
         output.push_str(&self.spelling);
         self.pending.clear();
         self.spelling.clear();
@@ -25,7 +126,7 @@ impl ReferenceScanner {
         json: bool,
         mappings: &[Mapping],
         used: &mut BTreeSet<String>,
-        output: &mut String,
+        output: &mut impl TextOutput,
     ) -> Result<(), RedactionError> {
         let position = self.pending.len();
         let matches = ch.is_ascii() && marker::matches_byte(position, ch as u8);
@@ -78,13 +179,13 @@ struct JsonScanner {
 }
 
 impl JsonScanner {
-    fn push(
+    fn push<'a>(
         &mut self,
-        input: &str,
+        input: &'a str,
         mappings: &[Mapping],
         used: &mut BTreeSet<String>,
-    ) -> Result<String, RedactionError> {
-        let mut output = String::with_capacity(input.len());
+    ) -> Result<Cow<'a, str>, RedactionError> {
+        let mut output = Output::new(input);
         for ch in input.chars() {
             if !self.inside {
                 match ch {
@@ -172,13 +273,17 @@ impl JsonScanner {
                 }
             }
         }
-        Ok(output)
+        Ok(output.finish())
     }
 
     fn finish(&mut self) -> String {
-        let mut output = String::new();
-        self.references.flush(&mut output);
-        output.push_str(&std::mem::take(&mut self.escape));
+        self.references.pending.clear();
+        let mut output = std::mem::take(&mut self.references.spelling);
+        if output.is_empty() {
+            return std::mem::take(&mut self.escape);
+        }
+        output.push_str(&self.escape);
+        self.escape.clear();
         output
     }
 }
@@ -207,9 +312,7 @@ impl PendingField {
         let output = if matches!(self.template, AiStreamDelta::ToolCallDelta { .. }) {
             self.json.finish()
         } else {
-            let mut output = String::new();
-            self.plain.flush(&mut output);
-            output
+            std::mem::take(&mut self.plain.spelling)
         };
         if output.is_empty() {
             return None;
@@ -378,23 +481,13 @@ impl StreamRestorer {
                 template: empty_template(&delta),
             });
             let input = delta_text(&mut delta).expect("readable delta");
-            let restored = if key.kind == 5 {
-                pending.json.push(input, mappings, &mut self.used)?
-            } else {
-                let mut restored = String::with_capacity(input.len());
-                for ch in input.chars() {
-                    pending.plain.push(
-                        ch,
-                        ch.encode_utf8(&mut [0; 4]),
-                        false,
-                        mappings,
-                        &mut self.used,
-                        &mut restored,
-                    )?;
+            if key.kind == 5 {
+                if let Cow::Owned(restored) = pending.json.push(input, mappings, &mut self.used)? {
+                    *input = restored;
                 }
-                restored
-            };
-            *input = restored;
+            } else {
+                pending.plain.text(input, mappings, &mut self.used)?;
+            }
             // Even an empty readable delta can carry logprobs or obfuscation.
             output.push(delta);
             return Ok(output);
@@ -484,7 +577,104 @@ impl StreamRestorer {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn json_scanner_keeps_unknown_escaped_atoms_and_restores_across_every_boundary() {
+        let reference = "<!--sr:abcdefghijklmnopqrstuvwxyzab-->";
+        let unknown = "<!--sr:zzzzzzzzzzzzzzzzzzzzzzzzzzzz-->";
+        let secret = "密钥\"\\\n";
+        let mappings = [Mapping {
+            reference: reference.into(),
+            secret: secret.into(),
+            expires_at: i64::MAX,
+        }];
+        let input = format!(
+            "{{\"{reference}\":\"前缀\\u003c!--sr:abcdefghijklmnopqrstuvwxyzab-->尾部\",\"other\":\"\\u003c{}\"}}",
+            &unknown[1..],
+        );
+        let encoded = serde_json::to_string(secret).unwrap();
+        let expected = input.replace(
+            "\\u003c!--sr:abcdefghijklmnopqrstuvwxyzab-->",
+            &encoded[1..encoded.len() - 1],
+        );
+        for split in input
+            .char_indices()
+            .map(|(index, _)| index)
+            .chain([input.len()])
+        {
+            let mut scanner = JsonScanner::default();
+            let mut used = BTreeSet::new();
+            let mut output = String::new();
+            for chunk in [&input[..split], &input[split..]] {
+                output.push_str(&scanner.push(chunk, &mappings, &mut used).unwrap());
+            }
+            output.push_str(&scanner.finish());
+            assert_eq!(output, expected, "split at {split}");
+            assert_eq!(used, BTreeSet::from([reference.to_owned()]));
+        }
+    }
+
     use super::*;
+
+    #[test]
+    fn gemini_response_metadata_preserves_fragmented_client_text() {
+        let reference = "<!--sr:abcdefghijklmnopqrstuvwxyzab-->";
+        let mappings = [Mapping {
+            reference: reference.into(),
+            secret: "restored-credential".into(),
+            expires_at: i64::MAX,
+        }];
+        for split in 1..reference.len() {
+            let mut restorer = StreamRestorer::new();
+            let metadata = AiStreamDelta::Unknown {
+                raw: serde_json::json!({
+                    "__google_response_metadata": {
+                        "responseId": "gemini-response",
+                        "modelVersion": "gemini-model"
+                    }
+                })
+                .to_string(),
+            };
+            let mut client_text = String::new();
+            let mut completed_text = None;
+            let mut saw_metadata = false;
+            for delta in [
+                AiStreamDelta::TextDelta(format!("before {}", &reference[..split])),
+                metadata.clone(),
+                AiStreamDelta::TextDelta(format!("{} after", &reference[split..])),
+                AiStreamDelta::ItemDone {
+                    index: 0,
+                    item: stravia_runtime_contract::protocol::ir::AiItem::output_text(format!(
+                        "before {reference} after"
+                    )),
+                },
+                AiStreamDelta::Done {
+                    stop_reason: "stop".into(),
+                },
+            ] {
+                for restored in restorer.push(delta, &mappings).unwrap() {
+                    match restored {
+                        AiStreamDelta::TextDelta(text) => client_text.push_str(&text),
+                        AiStreamDelta::ItemDone { item, .. } => {
+                            completed_text = item.output_text_ref().map(str::to_owned);
+                        }
+                        AiStreamDelta::Unknown { raw } => {
+                            let AiStreamDelta::Unknown { raw: expected } = &metadata else {
+                                unreachable!()
+                            };
+                            assert_eq!(&raw, expected);
+                            saw_metadata = true;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            assert!(saw_metadata);
+            assert_eq!(client_text, "before restored-credential after");
+            assert_eq!(completed_text.as_deref(), Some(client_text.as_str()));
+            assert_eq!(restorer.take_restored_references(), vec![reference]);
+            assert!(restorer.finish(&mappings).unwrap().is_empty());
+        }
+    }
 
     #[test]
     fn inline_marker_restoration_preserves_paths_at_every_split() {

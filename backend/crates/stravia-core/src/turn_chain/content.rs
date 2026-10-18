@@ -8,7 +8,7 @@
 //! content ids a node references — paths live solely inside the envelope and
 //! are never read back during restore.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::{self, Write};
 
 use anyhow::{Context, ensure};
@@ -147,7 +147,7 @@ fn walk(value: &mut Value, path: &str, state: &mut Extraction) -> anyhow::Result
                     // materialized parent.
                     let first = state.slots.len();
                     walk(child, &path, state)?;
-                    if externalize(child, path.clone(), state)? && state.slots.len() > first + 1 {
+                    if externalize(child, path, state)? && state.slots.len() > first + 1 {
                         state.slots[first..].rotate_right(1);
                     }
                 } else {
@@ -175,20 +175,55 @@ pub(super) fn encode(mut payload: Value) -> anyhow::Result<Encoded> {
         index: HashMap::new(),
     };
     walk(&mut payload, "", &mut state)?;
-    let envelope = serde_json::json!({
-        "data": payload,
-        "slots": state
-            .slots
-            .iter()
-            .map(|(pointer, index)| serde_json::json!([pointer, index]))
-            .collect::<Vec<_>>(),
-        "contents": state
-            .contents
-            .iter()
-            .map(|(key, _)| key.as_str())
-            .collect::<Vec<_>>(),
-    });
-    let payload = crate::storage_codec::encode(&serde_json::to_vec(&envelope)?)?;
+    // Keep the JSON map's established ordering (also with preserve_order),
+    // without constructing another Value tree or copying keys and pointers.
+    struct Envelope<'a> {
+        data: &'a Value,
+        slots: &'a [(String, usize)],
+        contents: ContentKeys<'a>,
+    }
+    struct ContentKeys<'a>(&'a [(String, Vec<u8>)]);
+    impl serde::Serialize for ContentKeys<'_> {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            use serde::ser::SerializeSeq;
+            let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+            for (key, _) in self.0 {
+                sequence.serialize_element(key)?;
+            }
+            sequence.end()
+        }
+    }
+    impl serde::Serialize for Envelope<'_> {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            use serde::ser::SerializeMap;
+            static FIELDS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+            let fields = FIELDS.get_or_init(|| {
+                ["data", "slots", "contents"]
+                    .into_iter()
+                    .map(|key| (key.to_owned(), Value::Null))
+                    .collect::<serde_json::Map<_, _>>()
+                    .into_iter()
+                    .map(|(key, _)| key)
+                    .collect()
+            });
+            let mut map = serializer.serialize_map(Some(3))?;
+            for key in fields {
+                match key.as_str() {
+                    "data" => map.serialize_entry(key, self.data)?,
+                    "slots" => map.serialize_entry(key, self.slots)?,
+                    "contents" => map.serialize_entry(key, &self.contents)?,
+                    _ => unreachable!("envelope field"),
+                }
+            }
+            map.end()
+        }
+    }
+    let envelope = Envelope {
+        data: &payload,
+        slots: &state.slots,
+        contents: ContentKeys(&state.contents),
+    };
+    let payload = crate::storage_codec::encode(serde_json::to_vec(&envelope)?.into())?;
     Ok(Encoded {
         payload,
         stored: vec![false; state.contents.len()],
@@ -215,7 +250,7 @@ pub(super) async fn prepare_missing(
     let prepared = tokio::task::spawn_blocking(move || {
         pending
             .into_iter()
-            .map(|(index, raw)| Ok((index, crate::storage_codec::encode(&raw)?)))
+            .map(|(index, raw)| Ok((index, crate::storage_codec::encode(raw.into())?)))
             .collect::<anyhow::Result<Vec<_>>>()
     })
     .await
@@ -237,6 +272,13 @@ impl RestoredContent {
         match self {
             Self::Owned(value) => value,
             Self::Shared(value) => value,
+        }
+    }
+
+    fn into_value(self) -> Value {
+        match self {
+            Self::Owned(value) => value,
+            Self::Shared(value) => std::sync::Arc::unwrap_or_clone(value),
         }
     }
 }
@@ -462,7 +504,7 @@ macro_rules! backend {
             mut context: Option<&mut stravia_runtime_contract::turn_chain::TurnReadContext>,
         ) -> anyhow::Result<()> {
             let mut plans: Vec<Vec<(String, String)>> = Vec::with_capacity(nodes.len());
-            let mut needed: HashSet<String> = HashSet::new();
+            let mut uses: HashMap<String, usize> = HashMap::new();
             for node in nodes.iter() {
                 let envelope = &node.payload;
                 let contents = envelope
@@ -474,8 +516,7 @@ macro_rules! backend {
                     keys.push(
                         entry
                             .as_str()
-                            .context("invalid history content key")?
-                            .to_owned(),
+                            .context("invalid history content key")?,
                     );
                 }
                 let slots = envelope
@@ -496,21 +537,21 @@ macro_rules! backend {
                     let key = keys
                         .get(index)
                         .context("history slot index out of range")?
-                        .clone();
-                    needed.insert(key.clone());
+                        .to_string();
+                    *uses.entry(key.clone()).or_default() += 1;
                     plan.push((pointer, key));
                 }
                 plans.push(plan);
             }
-            let mut needed: Vec<String> = needed.into_iter().collect();
+            let mut needed: Vec<&String> = uses.keys().collect();
             needed.sort_unstable();
             let mut values: HashMap<String, RestoredContent> = HashMap::with_capacity(needed.len());
             if let Some(context) = context.as_deref() {
                 for key in &needed {
-                    if let Some(value) = context.cached_content(key) { values.insert(key.clone(), RestoredContent::Shared(value)); }
+                    if let Some(value) = context.cached_content(key) { values.insert((*key).clone(), RestoredContent::Shared(value)); }
                 }
             }
-            let missing: Vec<_> = needed.iter().filter(|key| !values.contains_key(*key)).collect();
+            let missing: Vec<_> = needed.iter().copied().filter(|key| !values.contains_key(*key)).collect();
             let mut content_reads = 0u64;
             for chunk in missing.chunks(400) {
                 let mut query = sqlx::QueryBuilder::<$db>::new(
@@ -541,8 +582,9 @@ macro_rules! backend {
                 }
             }
             for key in &needed {
-                ensure!(values.contains_key(key), "missing history content");
+                ensure!(values.contains_key(*key), "missing history content");
             }
+            drop(needed);
             for (node, plan) in nodes.iter_mut().zip(plans) {
                 let mut data = node
                     .payload
@@ -552,7 +594,16 @@ macro_rules! backend {
                 for (pointer, key) in plan {
                     let slot = data.pointer_mut(&pointer).context("invalid history slot")?;
                     ensure!(slot.is_null(), "history slot overwrites data");
-                    *slot = values.get(&key).context("missing history content")?.value().clone();
+                    let remaining = uses.get_mut(&key).context("missing history content")?;
+                    *remaining -= 1;
+                    // Each JSON slot needs an independent Value, but the final
+                    // occurrence can consume an uncached decoded tree instead
+                    // of cloning it and immediately dropping the original.
+                    *slot = if *remaining == 0 {
+                        values.remove(&key).context("missing history content")?.into_value()
+                    } else {
+                        values.get(&key).context("missing history content")?.value().clone()
+                    };
                 }
                 node.payload = data;
             }

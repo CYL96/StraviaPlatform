@@ -31,17 +31,104 @@ fn complete_snapshot_compiles_and_hidden_context_never_becomes_a_secret() {
         .iter()
         .filter(|rule| rule.id.starts_with("kingfisher."))
         .collect();
-    assert_eq!(imported.len(), 1013);
-    assert_eq!(
-        imported.iter().filter(|rule| !rule.skip_report).count(),
-        861
+    assert!(
+        imported
+            .iter()
+            .any(|rule| rule.id == "kingfisher.artifactory.2" && rule.skip_report)
     );
-    assert_eq!(detector.catalog.rules.len(), 1475);
+    for obsolete in [
+        "kingfisher.jfrog.1",
+        "kingfisher.plaid.3",
+        "bittrex-secret-key",
+    ] {
+        assert!(
+            !detector
+                .catalog
+                .rules
+                .iter()
+                .any(|rule| rule.id == obsolete)
+        );
+    }
     assert!(
         detector
             .detect(&["https://tenant.azure-api.net ordinary text"])
             .unwrap()
             .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn canonical_plaid_identity_keeps_every_secret_and_unicode_range() {
+    let secret = "a7b2c9d4e0f6g3h8i1j5k9l2m4n6o8";
+    let text = format!("中文😀 plaid secret={secret}\nplaid secret={secret}");
+    let matches = test_text(text.clone()).await.unwrap();
+    let selected: Vec<_> = matches
+        .iter()
+        .filter(|finding| finding.rule_id == "kingfisher.plaid.2")
+        .collect();
+    assert_eq!(selected.len(), 2);
+    assert!(
+        !matches
+            .iter()
+            .any(|finding| finding.rule_id == "kingfisher.plaid.3")
+    );
+    let utf16: Vec<_> = text.encode_utf16().collect();
+    for finding in selected {
+        assert_eq!(
+            String::from_utf16(&utf16[finding.start..finding.end]).unwrap(),
+            secret
+        );
+    }
+}
+
+#[test]
+fn reviewed_pairs_keep_distinct_requirements_and_reporting_policies() {
+    let make = |id: &str| {
+        serde_json::from_value::<SourceRule>(serde_json::json!({
+            "id": id, "name": id, "pattern": "(?P<TOKEN>[a-z0-9]{30})"
+        }))
+        .unwrap()
+    };
+    let comments = Regex::new(r"(?m)(\(\?#[^)]*\))|(\s\#[\sa-zA-Z]*$)").unwrap();
+    let mut rules = vec![make("kingfisher.plaid.2"), make("kingfisher.plaid.3")];
+    rules[1].pattern_requirements.min_digits = 2;
+    canonicalize(&mut rules, &comments);
+    assert!(rules.iter().any(|rule| rule.id == "kingfisher.plaid.3"));
+    rules[1].pattern_requirements.min_digits = 0;
+    rules[1].visible = false;
+    canonicalize(&mut rules, &comments);
+    assert!(rules.iter().any(|rule| rule.id == "kingfisher.plaid.3"));
+    rules[1].visible = true;
+    canonicalize(&mut rules, &comments);
+    assert!(!rules.iter().any(|rule| rule.id == "kingfisher.plaid.3"));
+}
+
+#[test]
+fn same_pattern_with_distinct_confidence_keeps_both_live_identities() {
+    let secret = format!(
+        "xkeysib-{}-{}",
+        "a7B2c9D4e0F6".repeat(5) + "a7B2",
+        "q8W2e9R4t0Y6u3I5"
+    );
+    for id in ["kingfisher.brevo.1", "kingfisher.sendinblue.1"] {
+        assert_eq!(matched(id, &secret), vec![secret.clone()]);
+    }
+    let catalog = &detector().unwrap().catalog.rules;
+    assert_eq!(
+        catalog
+            .iter()
+            .find(|rule| rule.id == "kingfisher.brevo.1")
+            .unwrap()
+            .confidence,
+        "high"
+    );
+    assert_eq!(
+        catalog
+            .iter()
+            .find(|rule| rule.id == "kingfisher.sendinblue.1")
+            .unwrap()
+            .confidence,
+        "medium"
     );
 }
 

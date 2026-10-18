@@ -78,6 +78,10 @@ pub(super) struct GroupingIndex {
 }
 
 impl GroupingIndex {
+    pub(super) fn forget_run(&mut self, run_id: &str) {
+        self.runs.remove(run_id);
+    }
+
     pub fn forget_interactions(&mut self, interactions: &[String]) {
         let removed: std::collections::HashSet<_> =
             interactions.iter().map(String::as_str).collect();

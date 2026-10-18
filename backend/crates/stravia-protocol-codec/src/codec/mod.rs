@@ -77,18 +77,80 @@ pub(crate) fn content_block_wire_value(block: &ContentBlock) -> serde_json::Valu
 ///
 /// Unrecognized data URLs remain ordinary URLs so protocol validation can
 /// report the unsupported source instead of silently discarding it.
-pub(crate) fn parse_data_url_source(url: String) -> MediaSource {
+pub(crate) fn parse_data_url_source(mut url: String) -> MediaSource {
     if let Some(rest) = url.strip_prefix("data:")
         && let Some(semi) = rest.find(';')
     {
-        let media_type = rest[..semi].to_string();
         let after = &rest[semi + 1..];
-        if let Some(data) = after.strip_prefix("base64,") {
+        if after.starts_with("base64,") {
+            let media_type = rest[..semi].to_string();
+            let prefix_len = "data:".len() + semi + 1 + "base64,".len();
+            url.drain(..prefix_len);
             return MediaSource::Base64 {
                 media_type,
-                data: data.to_string(),
+                data: url,
             };
         }
     }
     MediaSource::Url(url)
+}
+
+/// Reuse the owned payload buffer when forming a vendor data URL.
+pub(crate) fn media_data_url(media_type: &str, mut data: String) -> String {
+    let prefix = format!("data:{media_type};base64,");
+    data.reserve_exact(prefix.len());
+    data.insert_str(0, &prefix);
+    data
+}
+
+#[cfg(test)]
+mod media_tests {
+    use super::*;
+
+    #[test]
+    fn data_urls_preserve_payload_and_unrecognized_sources() {
+        for (mime, data) in [
+            ("image/png", "aGVsbG8=+/"),
+            ("application/pdf", ""),
+            ("text/plain;charset=utf-8", "YWJj"),
+        ] {
+            let url = media_data_url(mime, data.into());
+            // Only the first semicolon introduces the Base64 marker.
+            if mime.contains(';') {
+                let MediaSource::Url(actual) = parse_data_url_source(url.clone()) else {
+                    panic!("unsupported data URL must retain its source");
+                };
+                assert_eq!(actual, url);
+            } else {
+                let MediaSource::Base64 {
+                    media_type,
+                    data: actual,
+                } = parse_data_url_source(url)
+                else {
+                    panic!("base64 data URL must decode");
+                };
+                assert_eq!(media_type, mime);
+                assert_eq!(actual, data);
+            }
+        }
+        for url in [
+            "https://example.test/image",
+            "data:image/png;other,abc",
+            "data:é;base64,YQ==",
+        ] {
+            let source = parse_data_url_source(url.into());
+            if url == "data:é;base64,YQ==" {
+                let MediaSource::Base64 { media_type, data } = source else {
+                    panic!("UTF-8 media type must retain its payload");
+                };
+                assert_eq!(media_type, "é");
+                assert_eq!(data, "YQ==");
+            } else {
+                let MediaSource::Url(actual) = source else {
+                    panic!("unrecognized source must remain a URL");
+                };
+                assert_eq!(actual, url);
+            }
+        }
+    }
 }

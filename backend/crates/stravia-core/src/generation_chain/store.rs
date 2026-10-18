@@ -606,16 +606,13 @@ impl GenerationChainStore {
             stravia_runtime_contract::protocol::ir::canonical::history_context_hash(&[]);
         let mut semantic_units = 0usize;
         for item in &client_request.items[..limit] {
-            // 单遍投影：units 计数与 hash 折叠共享同一次 canonical Value 构建。
-            let values =
-                stravia_runtime_contract::protocol::ir::canonical::history_item_values(item);
-            semantic_units += values.len();
-            for value in values {
-                context =
-                    stravia_runtime_contract::protocol::ir::canonical::append_history_value_hash(
-                        context, value,
-                    );
-            }
+            // 计数与摘要共用借用投影，不为大文本生成临时 Value 副本。
+            let (next, units) =
+                stravia_runtime_contract::protocol::ir::canonical::append_history_context_hash_with_count(
+                    &context, item,
+                );
+            context = next;
+            semantic_units += units;
             let units = u32::try_from(semantic_units).unwrap_or(u32::MAX);
             prefix_units.push(units);
             context_fingerprints.push((
@@ -1315,10 +1312,11 @@ impl GenerationChainStore {
         }
         let ProjectedClientCommit {
             client_request_delta,
-            client_items,
+            client_items: _,
             client_output,
             client_history_mutation,
             client_history,
+            client_item_units,
         } = projected_client;
         let effective_history_mutation = if effective_inline || parent.replace_effective_history {
             EffectiveHistoryMutation::Replace {
@@ -1339,10 +1337,8 @@ impl GenerationChainStore {
                 items: Cow::Borrowed(&effective_request.items),
             }
         };
-        let item_count = u32::try_from(
-            stravia_runtime_contract::protocol::ir::canonical::history_unit_count(&client_items),
-        )
-        .map_err(|error| TurnCommitError::Storage(error.to_string()))?;
+        let item_count = u32::try_from(client_item_units)
+            .map_err(|error| TurnCommitError::Storage(error.to_string()))?;
         let reusable_prefix = Some(ReusablePrefixMetadata {
             namespace: client_history.reusable_namespace(),
             fingerprint: client_history

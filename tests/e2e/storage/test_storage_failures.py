@@ -19,8 +19,9 @@ from tests.common.helpers import (
     SERVER_STARTUP_TIMEOUT, find_free_port, http_request, initialize_server,
     stop_stravia_server, wait_for_setup_token, wait_until_ready,
 )
+from tests.common.measure_protocol_http import Catalog
 from tests.e2e.admin.test_observations import (
-    _create_route, _detail, _finished_detail, _route_interactions, _wait_for,
+    _create_route, _detail, _finished_detail, _forest, _route_interactions, _wait_for,
 )
 
 pytestmark = [pytest.mark.e2e, pytest.mark.storage]
@@ -84,6 +85,8 @@ def isolated_host(host, backend, stravia_binary, storage_runtime, tmp_path, cont
     process = None
     log = None
     native_root = None
+    catalog = None
+    catalog_thread = None
     try:
         if host == 'desktop':
             if os.environ.get('STRAVIA_RUN_NATIVE_STORAGE_TESTS') != '1':
@@ -103,8 +106,14 @@ def isolated_host(host, backend, stravia_binary, storage_runtime, tmp_path, cont
         else:
             port = find_free_port()
             base = f'http://127.0.0.1:{port}'
+            catalog = ThreadingHTTPServer(('127.0.0.1', 0), Catalog)
+            catalog.arrivals = []
+            catalog_thread = threading.Thread(target=catalog.serve_forever, daemon=True)
+            catalog_thread.start()
             command = [str(stravia_binary), '--data-dir', str(tmp_path / 'data'),
-                       '--host', '127.0.0.1', '--port', str(port)] + storage_runtime['server_args'](backend)
+                       '--host', '127.0.0.1', '--port', str(port),
+                       '--test-catalog-base-url', f'http://127.0.0.1:{catalog.server_port}',
+                       ] + storage_runtime['server_args'](backend)
         process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                    text=True, encoding='utf-8', env={**os.environ, **controls})
         log = HostLog(process)
@@ -121,6 +130,10 @@ def isolated_host(host, backend, stravia_binary, storage_runtime, tmp_path, cont
     finally:
         if process is not None:
             stop_stravia_server(process, log.lines if log else [], print_tail=0)
+        if catalog is not None:
+            catalog.shutdown()
+            catalog.server_close()
+            catalog_thread.join()
         if native_root is not None:
             native_root.cleanup()
         if schema is not None:
@@ -215,6 +228,22 @@ def test_diagnostic_limits_preserve_real_host_inference(
                     log.wait('STRAVIA_TEST_OBSERVATION_QUEUE_RELEASED')
                     log.wait('STRAVIA_TEST_OBSERVATION_QUEUE_DRAINED')
             assert process.poll() is None, 'diagnostic loss must not fail the owning host'
+            if control == 'queue-full':
+                # 丢失 Turn 开始后没有模型执行投影，不能用模型筛选排除这条缺口记录。
+                interaction = _wait_for(
+                    'queue loss is visible without losing the completed Run',
+                    lambda: next(
+                        (item for root in _forest(env)['roots']
+                         for item in root['interactions']
+                         if item['observation_gap']),
+                        None,
+                    ),
+                )
+                run = _finished_detail(env, interaction['id'])['runs'][0]
+                assert run['status'] == 'completed'
+                assert run['client_output_committed'] is True
+                assert run['finished_at'] is not None
+                assert run['generation_node_id'] is not None
             # Fresh inference must cross admission and reach the actual upstream:
             # a responding status endpoint alone is not proof of business survival.
             status, body = http_request('POST', env['proxy'] + '/v1/chat/completions',

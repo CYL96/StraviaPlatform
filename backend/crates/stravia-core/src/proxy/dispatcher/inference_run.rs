@@ -1,4 +1,5 @@
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
 
 mod engine;
@@ -298,7 +299,7 @@ impl WebSocketRunDelivery {
             status_code: None,
             url: None,
             headers: serde_json::Value::Null,
-            payload: serde_json::Value::String(text.to_owned()),
+            payload: serde_json::Value::String(text.to_owned()).into(),
         });
     }
 
@@ -402,7 +403,7 @@ pub(super) struct RunTerminalContext {
 struct TerminalDelivery {
     delivery_completed_at: Option<i64>,
     waiting_client: bool,
-    visible_text: Vec<(usize, usize, String)>,
+    visible_text: Vec<(usize, usize, Arc<String>)>,
     visible_stream_started: bool,
     visible_item_offset: usize,
     visible_model_leg: Option<usize>,
@@ -793,12 +794,12 @@ impl RunTerminalContext {
 
     pub(super) fn extend_visible_text(
         &self,
-        texts: impl IntoIterator<Item = (usize, usize, String)>,
+        texts: impl IntoIterator<Item = (usize, usize, Arc<String>)>,
     ) {
         self.shared().visible_text.extend(texts);
     }
 
-    fn take_visible_text(&self) -> Vec<(usize, usize, String)> {
+    fn take_visible_text(&self) -> Vec<(usize, usize, Arc<String>)> {
         std::mem::take(&mut self.shared().visible_text)
     }
 
@@ -1057,11 +1058,11 @@ impl Stream for ObservedDeliveryStream {
                     self.terminal.shared().visible_committed = true;
                     self.observer.record(RunEvent::ClientOutputCommitted);
                     for (item_ordinal, part_index, text) in self.terminal.take_visible_text() {
-                        self.observer.record(RunEvent::ClientVisibleContentDelta {
+                        self.observer.record_visible_delta(
                             item_ordinal,
-                            part_index: (false, part_index),
-                            text,
-                        });
+                            (false, part_index),
+                            text.as_str(),
+                        );
                     }
                 }
                 self.observer.record_debug(|| RunEvent::Wire {
@@ -1074,7 +1075,7 @@ impl Stream for ObservedDeliveryStream {
                     status_code: Some(self.status_code),
                     url: None,
                     headers: serde_json::Value::Null,
-                    payload: crate::interaction_observation::wire_bytes_value(&bytes),
+                    payload: crate::interaction_observation::WirePayload::Bytes(bytes.clone()),
                 });
                 Poll::Ready(Some(Ok(bytes)))
             }
@@ -1135,7 +1136,7 @@ fn wrap_observed_delivery(
             status_code: Some(status_code),
             url: None,
             headers,
-            payload: serde_json::Value::Null,
+            payload: serde_json::Value::Null.into(),
         }
     });
     let transport = response
@@ -1183,7 +1184,8 @@ pub(super) fn execute(input: RunInput) -> impl std::future::Future<Output = Resp
                 crate::performance::ResourceUsage::new("requests", "inference_run")
             });
         let request_usage = REQUESTS.lease(1, 0);
-        let root = tracing::info_span!(target: "stravia::perf", "proxy.inference_run", status = tracing::field::Empty);
+        let root = tracing::info_span!(target: "stravia::perf", "proxy.inference_run",
+            request_id = input.context.request_id.as_str(), status = tracing::field::Empty);
         execute_observed(input, root.clone(), request_usage)
             .instrument(root)
             .await

@@ -48,8 +48,10 @@ pub(crate) fn input_preview(mut text: Cow<'_, str>, protected: &ProtectedSecrets
     if !protected.0.read().is_empty() {
         protected.text(text.to_mut());
     }
-    if text_may_need_redaction(&text) {
-        text = Cow::Owned(redact_text(&text));
+    if text_may_need_redaction(&text)
+        && let Cow::Owned(redacted) = redact_text_with_report(&text).0
+    {
+        text = Cow::Owned(redacted);
     }
     let end = text
         .char_indices()
@@ -453,8 +455,8 @@ impl VisibleTextRedactor {
         }
     }
 
-    pub(crate) fn push(&mut self, text: String) -> Option<String> {
-        let text = self.protected_stream.push(&text, &self.protected);
+    pub(crate) fn push(&mut self, text: impl AsRef<str>) -> Option<String> {
+        let text = self.protected_stream.push(text.as_ref(), &self.protected);
         let mut output = String::new();
         let remainder = self.consume_continuation(&text, &mut output);
         self.pending.push_str(remainder);
@@ -836,7 +838,7 @@ pub(crate) fn redact_run_event(event: &mut RunEvent) -> RedactionReport {
 }
 
 pub(crate) fn redact_text(message: &str) -> String {
-    redact_text_with_report(message).0
+    redact_text_with_report(message).0.into_owned()
 }
 
 fn redact_string(value: &mut String, report: &mut RedactionReport) {
@@ -844,7 +846,9 @@ fn redact_string(value: &mut String, report: &mut RedactionReport) {
         return;
     }
     let (redacted, text_report) = redact_text_with_report(value);
-    *value = redacted;
+    if let Cow::Owned(redacted) = redacted {
+        *value = redacted;
+    }
     report.merge(text_report);
 }
 
@@ -875,7 +879,9 @@ fn redact_structured_text(text: &mut String, report: &mut RedactionReport) {
         report.merge(url_report);
     } else {
         let (redacted, text_report) = redact_text_with_report(text);
-        *text = redacted;
+        if let Cow::Owned(redacted) = redacted {
+            *text = redacted;
+        }
         report.merge(text_report);
     }
 }
@@ -1006,22 +1012,32 @@ fn ambiguous_credential_suffix(value: &str) -> Option<usize> {
     }
 }
 
-fn redact_text_with_report(message: &str) -> (String, RedactionReport) {
-    let scrubbed = crate::agent::upload_grant::scrub_upload_grants(message);
-    let (redacted, mut report) = redact_quoted_credential_fields(&scrubbed);
-    if scrubbed != message {
+fn redact_text_with_report(message: &str) -> (Cow<'_, str>, RedactionReport) {
+    let mut redacted = crate::agent::upload_grant::scrub_upload_grants(message);
+    let mut report = RedactionReport::default();
+    if redacted != message {
         report.record(RedactionKind::CredentialText);
     }
-    let redacted = redact_credential_text(&redacted, &mut report);
-    let (redacted, form_report) = redact_form_encoded(&redacted);
+    let (quoted, quoted_report) = redact_quoted_credential_fields(&redacted);
+    report.merge(quoted_report);
+    if let Cow::Owned(quoted) = quoted {
+        redacted = Cow::Owned(quoted);
+    }
+    if let Cow::Owned(credentials) = redact_credential_text(&redacted, &mut report) {
+        redacted = Cow::Owned(credentials);
+    }
+    let (form, form_report) = redact_form_encoded(&redacted);
     report.merge(form_report);
+    if let Cow::Owned(form) = form {
+        redacted = Cow::Owned(form);
+    }
     (redacted, report)
 }
 
-fn redact_quoted_credential_fields(message: &str) -> (String, RedactionReport) {
+fn redact_quoted_credential_fields(message: &str) -> (Cow<'_, str>, RedactionReport) {
     let bytes = message.as_bytes();
     let mut report = RedactionReport::default();
-    let mut output = String::with_capacity(message.len());
+    let mut output = String::new();
     let mut copied_through = 0usize;
     let mut cursor = 0usize;
 
@@ -1087,6 +1103,9 @@ fn redact_quoted_credential_fields(message: &str) -> (String, RedactionReport) {
             }
         };
 
+        if output.capacity() == 0 {
+            output.reserve_exact(message.len());
+        }
         output.push_str(&message[copied_through..replacement_start]);
         output.push_str(replacement);
         copied_through = replacement_end;
@@ -1095,10 +1114,10 @@ fn redact_quoted_credential_fields(message: &str) -> (String, RedactionReport) {
     }
 
     if report.kinds.is_empty() {
-        return (message.to_owned(), report);
+        return (Cow::Borrowed(message), report);
     }
     output.push_str(&message[copied_through..]);
-    (output, report)
+    (Cow::Owned(output), report)
 }
 
 fn quoted_value_end(bytes: &[u8], start: usize, quote: u8) -> Option<usize> {
@@ -1146,10 +1165,10 @@ fn structured_value_end(bytes: &[u8], start: usize) -> usize {
     bytes.len()
 }
 
-fn redact_form_encoded(value: &str) -> (String, RedactionReport) {
+fn redact_form_encoded(value: &str) -> (Cow<'_, str>, RedactionReport) {
     let report = RedactionReport::default();
     if !value.contains('=') || value.contains(char::is_whitespace) {
-        return (value.to_owned(), report);
+        return (Cow::Borrowed(value), report);
     }
     if marker::find_reference(value).is_some() {
         return redact_form_encoded_with_markers(value);
@@ -1157,17 +1176,17 @@ fn redact_form_encoded(value: &str) -> (String, RedactionReport) {
     redact_form_encoded_without_markers(value)
 }
 
-fn redact_form_encoded_without_markers(value: &str) -> (String, RedactionReport) {
+fn redact_form_encoded_without_markers(value: &str) -> (Cow<'_, str>, RedactionReport) {
     let mut report = RedactionReport::default();
     let Ok(mut url) = reqwest::Url::parse(&format!("http://redaction.invalid/?{value}")) else {
-        return (value.to_owned(), report);
+        return (Cow::Borrowed(value), report);
     };
     let pairs: Vec<(String, String)> = url
         .query_pairs()
         .map(|(key, value)| (key.into_owned(), value.into_owned()))
         .collect();
     if !pairs.iter().any(|(key, _)| is_credential_key(key)) {
-        return (value.to_owned(), report);
+        return (Cow::Borrowed(value), report);
     }
     {
         let mut query = url.query_pairs_mut();
@@ -1181,40 +1200,55 @@ fn redact_form_encoded_without_markers(value: &str) -> (String, RedactionReport)
             }
         }
     }
-    (url.query().unwrap_or_default().to_owned(), report)
+    (
+        Cow::Owned(url.query().unwrap_or_default().to_owned()),
+        report,
+    )
 }
 
-fn redact_form_encoded_with_markers(value: &str) -> (String, RedactionReport) {
-    let mut output = String::with_capacity(value.len());
+fn redact_form_encoded_with_markers(value: &str) -> (Cow<'_, str>, RedactionReport) {
+    let mut output = String::new();
     let mut report = RedactionReport::default();
-    for component in value.split_inclusive('&') {
-        let (component, separator) = component
-            .strip_suffix('&')
-            .map_or((component, ""), |component| (component, "&"));
+    let mut position = 0;
+    let mut copied_through = 0;
+    for part in value.split_inclusive('&') {
+        let component = part.strip_suffix('&').unwrap_or(part);
         let (redacted, component_report) = redact_form_component_with_markers(component);
-        output.push_str(&redacted);
-        output.push_str(separator);
+        if let Cow::Owned(redacted) = redacted {
+            if output.capacity() == 0 {
+                output.reserve_exact(value.len());
+            }
+            output.push_str(&value[copied_through..position]);
+            output.push_str(&redacted);
+            copied_through = position + component.len();
+        }
+        position += part.len();
         report.merge(component_report);
     }
-    (output, report)
+    if copied_through == 0 {
+        (Cow::Borrowed(value), report)
+    } else {
+        output.push_str(&value[copied_through..]);
+        (Cow::Owned(output), report)
+    }
 }
 
-fn redact_form_component_with_markers(component: &str) -> (String, RedactionReport) {
+fn redact_form_component_with_markers(component: &str) -> (Cow<'_, str>, RedactionReport) {
     if marker::find_reference(component).is_none() {
         return redact_form_encoded_without_markers(component);
     }
     let mut report = RedactionReport::default();
     let Some((raw_key, raw_value)) = component.split_once('=') else {
-        return (component.to_owned(), report);
+        return (Cow::Borrowed(component), report);
     };
     let Ok(url) = reqwest::Url::parse(&format!("http://redaction.invalid/?{raw_key}=")) else {
-        return (component.to_owned(), report);
+        return (Cow::Borrowed(component), report);
     };
     let Some((key, _)) = url.query_pairs().next() else {
-        return (component.to_owned(), report);
+        return (Cow::Borrowed(component), report);
     };
     if !is_credential_key(&key) {
-        return (component.to_owned(), report);
+        return (Cow::Borrowed(component), report);
     }
 
     let redacted = redact_credential_value_with_markers(
@@ -1222,7 +1256,11 @@ fn redact_form_component_with_markers(component: &str) -> (String, RedactionRepo
         &mut report,
         RedactionKind::CredentialField,
     );
-    (format!("{raw_key}={redacted}"), report)
+    if redacted == raw_value {
+        (Cow::Borrowed(component), report)
+    } else {
+        (Cow::Owned(format!("{raw_key}={redacted}")), report)
+    }
 }
 
 fn redact_credential_value_with_markers(
@@ -1438,8 +1476,9 @@ fn normalize(value: &str) -> String {
         .collect()
 }
 
-fn redact_credential_text(input: &str, report: &mut RedactionReport) -> String {
-    let mut output = String::with_capacity(input.len());
+fn redact_credential_text<'a>(input: &'a str, report: &mut RedactionReport) -> Cow<'a, str> {
+    let mut output = String::new();
+    let mut copied_through = 0;
     let mut cursor = 0usize;
     let mut redact_next_token = false;
 
@@ -1447,7 +1486,6 @@ fn redact_credential_text(input: &str, report: &mut RedactionReport) -> String {
         let whitespace = input[cursor..]
             .find(|character: char| !character.is_whitespace())
             .unwrap_or(input.len() - cursor);
-        output.push_str(&input[cursor..cursor + whitespace]);
         cursor += whitespace;
         if cursor == input.len() {
             break;
@@ -1455,39 +1493,53 @@ fn redact_credential_text(input: &str, report: &mut RedactionReport) -> String {
         let token_len = credential_text_token_len(&input[cursor..]);
         let token = &input[cursor..cursor + token_len];
 
-        if redact_next_token {
-            let lower = token.to_ascii_lowercase();
+        let replacement = if redact_next_token {
             if marker::find_reference(token).is_some() {
-                output.push_str(&redact_header_credential_with_marker(token, report));
                 redact_next_token = false;
-            } else if matches!(lower.as_str(), "bearer" | "basic") {
-                output.push_str(token);
+                Some(Cow::Owned(redact_header_credential_with_marker(
+                    token, report,
+                )))
+            } else if token.eq_ignore_ascii_case("bearer") || token.eq_ignore_ascii_case("basic") {
+                None
             } else if token.trim_matches(text_wrapper) == REDACTED {
-                output.push_str(token);
                 redact_next_token = false;
-            } else if token.trim_matches(text_wrapper).starts_with(REDACTED) {
-                output.push_str(REDACTED);
-                report.record(RedactionKind::CredentialText);
+                None
             } else {
-                output.push_str(REDACTED);
                 report.record(RedactionKind::CredentialText);
-                redact_next_token = false;
+                redact_next_token = token.trim_matches(text_wrapper).starts_with(REDACTED);
+                Some(Cow::Borrowed(REDACTED))
             }
+        } else if token.eq_ignore_ascii_case("bearer")
+            || token.eq_ignore_ascii_case("basic")
+            || credential_header_scheme(token)
+            || (token.ends_with(':') && is_credential_key(token[..token.len() - 1].trim()))
+        {
+            redact_next_token = true;
+            None
         } else {
-            let lower = token.to_ascii_lowercase();
-            if matches!(lower.as_str(), "bearer" | "basic")
-                || credential_header_scheme(token)
-                || (token.ends_with(':') && is_credential_key(token[..token.len() - 1].trim()))
-            {
-                output.push_str(token);
-                redact_next_token = true;
-            } else {
-                output.push_str(&redact_text_token(token, report));
+            match redact_text_token(token, report) {
+                Cow::Borrowed(_) => None,
+                Cow::Owned(redacted) => Some(Cow::Owned(redacted)),
             }
+        };
+        if let Some(replacement) = replacement
+            && replacement != token
+        {
+            if output.capacity() == 0 {
+                output.reserve_exact(input.len());
+            }
+            output.push_str(&input[copied_through..cursor]);
+            output.push_str(&replacement);
+            copied_through = cursor + token_len;
         }
         cursor += token_len;
     }
-    output
+    if copied_through == 0 {
+        Cow::Borrowed(input)
+    } else {
+        output.push_str(&input[copied_through..]);
+        Cow::Owned(output)
+    }
 }
 
 fn redact_header_credential_with_marker(token: &str, report: &mut RedactionReport) -> String {
@@ -1534,13 +1586,11 @@ fn credential_header_scheme(token: &str) -> bool {
         return false;
     };
     is_credential_key(token[..separator].trim_matches(text_wrapper))
-        && matches!(
-            token[separator + 1..].to_ascii_lowercase().as_str(),
-            "bearer" | "basic"
-        )
+        && (token[separator + 1..].eq_ignore_ascii_case("bearer")
+            || token[separator + 1..].eq_ignore_ascii_case("basic"))
 }
 
-fn redact_text_token(token: &str, report: &mut RedactionReport) -> String {
+fn redact_text_token<'a>(token: &'a str, report: &mut RedactionReport) -> Cow<'a, str> {
     let Some(first_marker) = marker::find_reference(token) else {
         return redact_text_token_without_markers(token, report);
     };
@@ -1578,7 +1628,11 @@ fn redact_text_token(token: &str, report: &mut RedactionReport) -> String {
         next_marker = marker::find_reference(&token[cursor..]);
     }
     output.push_str(&redact_text_token_without_markers(&token[cursor..], report));
-    output
+    if output == token {
+        Cow::Borrowed(token)
+    } else {
+        Cow::Owned(output)
+    }
 }
 
 fn credential_marker_component_start(value: &str) -> Option<usize> {
@@ -1596,7 +1650,10 @@ fn credential_marker_component_start(value: &str) -> Option<usize> {
         .then_some(component_start)
 }
 
-fn redact_text_token_without_markers(token: &str, report: &mut RedactionReport) -> String {
+fn redact_text_token_without_markers<'a>(
+    token: &'a str,
+    report: &mut RedactionReport,
+) -> Cow<'a, str> {
     let trimmed_start = token.trim_start_matches(text_wrapper);
     let leading = token.len() - trimmed_start.len();
     let trimmed = trimmed_start.trim_end_matches(text_wrapper);
@@ -1616,15 +1673,16 @@ fn redact_text_token_without_markers(token: &str, report: &mut RedactionReport) 
             output.push_str(&redacted);
             output.push_str(&token[leading + trimmed.len()..]);
             report.merge(url_report);
-            return output;
+            return Cow::Owned(output);
         }
     }
 
-    let mut output = String::with_capacity(token.len());
+    let mut output = String::new();
     let mut copied_through = 0usize;
+    let mut scanned_through = 0usize;
     let mut component_start = 0usize;
     for (index, character) in token.char_indices() {
-        if index < copied_through {
+        if index < scanned_through {
             continue;
         }
         if matches!(character, '&' | ',' | ';' | '{' | '[') {
@@ -1640,18 +1698,25 @@ fn redact_text_token_without_markers(token: &str, report: &mut RedactionReport) 
         let value_end = token[value_start..]
             .find(['&', ',', ';', '}', ']'])
             .map_or(token.len(), |offset| value_start + offset);
-        output.push_str(&token[copied_through..value_start]);
-        if token[value_start..value_end].trim_matches(text_wrapper) == REDACTED {
-            output.push_str(&token[value_start..value_end]);
-        } else {
-            output.push_str(REDACTED);
-            report.record(RedactionKind::CredentialText);
-        }
-        copied_through = value_end;
+        scanned_through = value_end;
         component_start = value_end;
+        if token[value_start..value_end].trim_matches(text_wrapper) == REDACTED {
+            continue;
+        }
+        if output.capacity() == 0 {
+            output.reserve_exact(token.len());
+        }
+        output.push_str(&token[copied_through..value_start]);
+        output.push_str(REDACTED);
+        report.record(RedactionKind::CredentialText);
+        copied_through = value_end;
     }
-    output.push_str(&token[copied_through..]);
-    output
+    if copied_through == 0 {
+        Cow::Borrowed(token)
+    } else {
+        output.push_str(&token[copied_through..]);
+        Cow::Owned(output)
+    }
 }
 
 fn text_wrapper(character: char) -> bool {
@@ -1867,6 +1932,51 @@ mod tests {
     }
 
     #[test]
+    fn lazy_redaction_preserves_masked_prefixes_delimiters_and_whitespace() {
+        let reference = redaction_marker();
+        for (input, expected) in [
+            (
+                "  safe\r\napi_key=***;token=secret&name=Ada\t尾部  ".to_owned(),
+                "  safe\r\napi_key=***;token=***&name=Ada\t尾部  ".to_owned(),
+            ),
+            (
+                "BEARER BASIC secret  public\n".to_owned(),
+                "BEARER BASIC ***  public\n".to_owned(),
+            ),
+            (
+                format!("&api_key={reference}&name=Ada&token=secret&&tail=yes&"),
+                format!("&api_key={reference}&name=Ada&token=***&&tail=yes&"),
+            ),
+        ] {
+            assert_eq!(redact_text(&input), expected);
+        }
+    }
+
+    #[test]
+    fn client_visible_prose_redacts_bare_credential_schemes_without_losing_suffix() {
+        let mut event = RunEvent::ClientVisibleContentDelta {
+            item_ordinal: 0,
+            part_index: (false, 0),
+            text: "ordinary prefix bearer candidate ordinary middle basic another ordinary suffix"
+                .to_owned(),
+        };
+
+        let report = redact_run_event(&mut event);
+        let RunEvent::ClientVisibleContentDelta { text, .. } = event else {
+            unreachable!();
+        };
+
+        assert_eq!(
+            text,
+            "ordinary prefix bearer *** ordinary middle basic *** ordinary suffix"
+        );
+        assert_eq!(
+            report.kinds.into_iter().collect::<Vec<_>>(),
+            vec![RedactionKind::CredentialText]
+        );
+    }
+
+    #[test]
     fn buffered_visible_fragments_remove_credentials_across_queue_flushes() {
         let fragments = [
             "retain Authorization: Bear",
@@ -1882,7 +1992,7 @@ mod tests {
         let mut redactor = VisibleTextRedactor::new();
         let mut text = String::new();
         for fragment in fragments {
-            if let Some(emitted) = redactor.push(fragment.to_owned()) {
+            if let Some(emitted) = redactor.push(fragment) {
                 text.push_str(&emitted);
             }
         }
@@ -1915,7 +2025,7 @@ mod tests {
             "vate-mapped",
             "-value ordinary-after",
         ] {
-            if let Some(text) = redactor.push(fragment.to_owned()) {
+            if let Some(text) = redactor.push(fragment) {
                 observed.push_str(&text);
             }
             assert!(!observed.contains("private"));
@@ -2067,7 +2177,7 @@ mod tests {
             let mut redactor = VisibleTextRedactor::with_protected(protected);
             let mut observed = String::new();
             for fragment in [&input[..split], &input[split..]] {
-                if let Some(text) = redactor.push(fragment.to_owned()) {
+                if let Some(text) = redactor.push(fragment) {
                     observed.push_str(&text);
                 }
             }
@@ -2135,7 +2245,7 @@ mod tests {
         let mut redactor = VisibleTextRedactor::new();
 
         let emitted = redactor
-            .push("hello world ".to_owned())
+            .push("hello world ")
             .expect("completed safe prose emits immediately");
 
         assert_eq!(emitted, "hello world ");
@@ -2150,16 +2260,16 @@ mod tests {
 
         emitted.push_str(
             &redactor
-                .push("safe access_".to_owned())
+                .push("safe access_")
                 .expect("safe prefix emits before split key"),
         );
-        assert!(redactor.push("token=".to_owned()).is_none());
+        assert!(redactor.push("token=").is_none());
         emitted.push_str(
             &redactor
-                .push(secret.clone())
+                .push(&secret)
                 .expect("recognized credential emits a marker"),
         );
-        if let Some(text) = redactor.push("&name=Ada finish".to_owned()) {
+        if let Some(text) = redactor.push("&name=Ada finish") {
             emitted.push_str(&text);
         }
         if let Some(text) = redactor.finish() {

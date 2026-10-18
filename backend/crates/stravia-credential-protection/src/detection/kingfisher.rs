@@ -44,7 +44,7 @@ fn visible() -> bool {
     true
 }
 
-#[derive(Default, Deserialize, Serialize)]
+#[derive(Default, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct Requirements {
     #[serde(default)]
@@ -61,7 +61,7 @@ struct Requirements {
     checksum: Option<ChecksumSource>,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct ChecksumSource {
     actual: ChecksumActual,
@@ -70,7 +70,7 @@ struct ChecksumSource {
     skip_if_missing: bool,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct ChecksumActual {
     template: String,
@@ -101,8 +101,42 @@ fn invalid() -> RedactionError {
     RedactionError::Detection
 }
 
+fn same_policy(a: &SourceRule, a_pattern: &[u8], b: &SourceRule, b_pattern: &[u8]) -> bool {
+    !a.name.is_empty()
+        && !b.name.is_empty()
+        && a_pattern == b_pattern
+        && a.min_entropy == b.min_entropy
+        && a.confidence == b.confidence
+        && a.visible == b.visible
+        && a.pattern_requirements == b.pattern_requirements
+}
+
+fn canonicalize(rules: &mut Vec<SourceRule>, comments: &Regex) {
+    for (canonical, duplicate) in [
+        ("kingfisher.artifactory.2", "kingfisher.jfrog.1"),
+        ("kingfisher.plaid.2", "kingfisher.plaid.3"),
+    ] {
+        let Some(first) = rules.iter().position(|rule| rule.id == canonical) else {
+            continue;
+        };
+        let Some(second) = rules.iter().position(|rule| rule.id == duplicate) else {
+            continue;
+        };
+        if first < second
+            && same_policy(
+                &rules[first],
+                &comments.replace_all(rules[first].pattern.as_bytes(), &b""[..]),
+                &rules[second],
+                &comments.replace_all(rules[second].pattern.as_bytes(), &b""[..]),
+            )
+        {
+            rules.remove(second);
+        }
+    }
+}
+
 pub(super) fn extend(detector: &mut Detector) -> Result<()> {
-    let snapshot: Snapshot =
+    let mut snapshot: Snapshot =
         serde_json::from_str(include_str!("kingfisher.json")).map_err(|_| invalid())?;
     if snapshot.version != "v1.109.0"
         || snapshot.commit != "9ffb8969c4ad5a5c6c24e686cb252c434bc8adce"
@@ -118,6 +152,10 @@ pub(super) fn extend(detector: &mut Detector) -> Result<()> {
     // Match the upstream comment removal and byte/ASCII regex mode. Betterleaks'
     // RE2 translation is deliberately not applied to these Rust-native patterns.
     let comments = Regex::new(r"(?m)(\(\?#[^)]*\))|(\s\#[\sa-zA-Z]*$)").map_err(|_| invalid())?;
+    // Reviewed pairs only; retain the first upstream identity and its ordering.
+    // Both entries share this adapter's capture, safe-list and priority policy.
+    // If an upstream update changes any effective condition, keep both rules.
+    canonicalize(&mut snapshot.rules, &comments);
     for source in snapshot.rules {
         if !source.id.starts_with("kingfisher.")
             || source.name.is_empty()

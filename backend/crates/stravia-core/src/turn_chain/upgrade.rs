@@ -149,7 +149,7 @@ macro_rules! converter {
                     }
                 }
                 let contents: HashMap<String, Vec<u8>> = blocking_chunks(raw.into_iter().collect(), |(key, bytes)| {
-                    Ok((key, crate::storage_codec::encode(&bytes)?))
+                    Ok((key, crate::storage_codec::encode(bytes.into())?))
                 }).await?.into_iter().collect();
                 let mut transaction = connection.begin().await?;
                 for (node, principal, encoded) in &prepared {

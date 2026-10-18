@@ -2,6 +2,9 @@
 
 Run with: uv run --with pyyaml==6.0.3 python <this script> <upstream directory>
 This is a development-time importer; the Rust runtime never runs Python or YAML.
+Keep every pinned upstream identity here for provenance/hash reproducibility.
+The Rust adapter folds reviewed, policy-identical identities before compiling
+rule regexes; this snapshot's count is not the effective catalog count.
 """
 from __future__ import annotations
 

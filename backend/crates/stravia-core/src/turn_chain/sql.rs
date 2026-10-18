@@ -526,7 +526,9 @@ impl TurnChainStore for SqlTurnChainStore {
                 .await
                 .map_err(|error| TurnCommitError::Storage(error.to_string()))?;
         }
-        let payload = &encoded.payload;
+        // SQLite can retain this owned blob in its arguments. Borrowing the
+        // Vec here makes SQLx copy the entire envelope before the insert.
+        let payload = std::mem::take(&mut encoded.payload);
         let payload_version = i64::from(commit.payload_version);
         let prefix_namespace = commit
             .reusable_prefix

@@ -62,7 +62,7 @@ pub(crate) fn reject(
         status_code: Some(status_code),
         url: None,
         headers: crate::interaction_observation::wire_headers_value(response.headers()),
-        payload: Value::Null,
+        payload: Value::Null.into(),
     });
     let (parts, body) = response.into_parts();
     // 观察实际发送的错误体；保留 observer 到响应体结束，确保关闭不会越过消息。
@@ -78,7 +78,7 @@ pub(crate) fn reject(
                 status_code: Some(status_code),
                 url: None,
                 headers: Value::Null,
-                payload: crate::interaction_observation::wire_bytes_value(bytes),
+                payload: crate::interaction_observation::WirePayload::Bytes(bytes.clone()),
             }),
             Err(_) => observer.record(RunEvent::ObservationGap {
                 reason: "rejection_delivery_failed".into(),

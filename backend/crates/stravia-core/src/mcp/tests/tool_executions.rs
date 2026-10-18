@@ -110,10 +110,14 @@ async fn background(reader: &ReadTool, owner: &str, upstream: &ControlledSearch)
     path
 }
 
-async fn assert_pending<F: Future>(future: std::pin::Pin<&mut F>) {
+async fn assert_pending<F: Future>(future: std::pin::Pin<&mut F>, phase: &str)
+where
+    F::Output: std::fmt::Debug,
+{
     let mut future = future;
     std::future::poll_fn(|cx| {
-        assert!(future.as_mut().poll(cx).is_pending());
+        let result = future.as_mut().poll(cx);
+        assert!(result.is_pending(), "{phase}: {result:?}");
         std::task::Poll::Ready(())
     })
     .await;
@@ -132,7 +136,7 @@ async fn search_queries_wait_independently_and_preserve_the_original_report() {
     let mut short = Box::pin(read(&reader, &app.key_id, &short_path));
     // Memory authentication is ready on this poll. The real query captures its
     // wait deadline before yielding to SQL; advance only after that boundary.
-    assert_pending(short.as_mut()).await;
+    assert_pending(short.as_mut(), "short query registration").await;
     tokio::time::pause();
     tokio::time::advance(Duration::from_secs(7)).await;
     tokio::time::resume();
@@ -152,15 +156,15 @@ async fn search_queries_wait_independently_and_preserve_the_original_report() {
     ));
     let long_path = format!("{path}?wait=120");
     let mut survivor = Box::pin(read(&reader, &app.key_id, &long_path));
-    assert_pending(cancelled.as_mut()).await;
-    assert_pending(survivor.as_mut()).await;
+    assert_pending(cancelled.as_mut(), "cancelled query registration").await;
+    assert_pending(survivor.as_mut(), "surviving query registration").await;
     cancellation.cancel();
     assert!(cancelled.await.unwrap().is_error);
     // A >60-second query must not itself hand off or reset the original deadline.
     tokio::time::pause();
     tokio::time::advance(Duration::from_secs(61)).await;
     tokio::time::resume();
-    assert_pending(survivor.as_mut()).await;
+    assert_pending(survivor.as_mut(), "surviving query after time advance").await;
     assert_eq!(upstream.calls.load(Ordering::SeqCst), 1);
     upstream.release.notify_one();
     let completed = survivor.await;

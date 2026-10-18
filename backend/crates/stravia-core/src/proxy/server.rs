@@ -139,7 +139,7 @@ async fn observe_inference_ingress(
             status_code: None,
             url: Some(request.uri().to_string()),
             headers: crate::interaction_observation::wire_headers_value(request.headers()),
-            payload: serde_json::Value::Null,
+            payload: serde_json::Value::Null.into(),
         });
         if let Some(capture) = observer.capture() {
             let body = std::mem::replace(request.body_mut(), Body::empty());
@@ -172,15 +172,16 @@ impl CapturedBodyStream {
         }
     }
 
-    fn capture_chunk(&mut self, chunk: &[u8]) {
+    fn capture_chunk(&mut self, chunk: &bytes::Bytes) {
         if self.overflowed {
             return;
         }
         let limit = PROXY_JSON_BODY_LIMIT_BYTES.min(IngressCapture::MAX_BODY_BYTES);
         let remaining = limit.saturating_sub(self.captured_bytes);
-        let captured = &chunk[..chunk.len().min(remaining)];
+        let captured = chunk.slice(..chunk.len().min(remaining));
+        let captured_len = captured.len();
         if !captured.is_empty() {
-            self.captured_bytes += captured.len();
+            self.captured_bytes += captured_len;
             self.capture.record(RunEvent::Wire {
                 direction: "client_to_platform".into(),
                 transport: "http".into(),
@@ -191,10 +192,10 @@ impl CapturedBodyStream {
                 status_code: None,
                 url: None,
                 headers: serde_json::Value::Null,
-                payload: crate::interaction_observation::wire_bytes_value(captured),
+                payload: crate::interaction_observation::WirePayload::Bytes(captured),
             });
         }
-        if captured.len() != chunk.len() {
+        if captured_len != chunk.len() {
             self.overflowed = true;
             self.capture.mark_partial("run_size_limit");
         }

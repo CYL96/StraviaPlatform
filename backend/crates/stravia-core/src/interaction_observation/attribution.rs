@@ -574,6 +574,11 @@ impl<E: AttributionEvidence> RunAttribution<E> {
         self.grouping.forget_interactions(removed);
     }
 
+    pub(super) fn abandon_admission(&mut self, run_id: &str) {
+        // SQL 准入失败后不能继续把内存分组当作已经存在的外键父项。
+        self.grouping.forget_run(run_id);
+    }
+
     pub(super) fn interaction_for_run(&self, run_id: &str) -> Option<&str> {
         self.grouping.interaction_for_run(run_id)
     }

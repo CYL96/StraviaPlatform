@@ -906,21 +906,28 @@ struct ClientHistoryState {
 const GENERATION_PREFIX_NAMESPACE: &str = "stravia-generation-history-v5:";
 
 impl ClientHistoryState {
-    fn from_request(request: &AiRequest, items: &[AiItem]) -> Self {
-        Self {
-            projection_version:
-                stravia_runtime_contract::turn_chain::REUSABLE_PREFIX_PROJECTION_VERSION,
-            controls_fingerprint: stravia_runtime_contract::protocol::ir::canonical::hash_hex(
-                &stravia_runtime_contract::protocol::ir::canonical::history_request_controls_hash(
-                    request,
+    fn from_request_with_count(request: &AiRequest, items: &[AiItem]) -> (Self, usize) {
+        let (context, units) =
+            stravia_runtime_contract::protocol::ir::canonical::history_context_hash_with_count(
+                items,
+            );
+        (
+            Self {
+                projection_version:
+                    stravia_runtime_contract::turn_chain::REUSABLE_PREFIX_PROJECTION_VERSION,
+                controls_fingerprint: stravia_runtime_contract::protocol::ir::canonical::hash_hex(
+                    &stravia_runtime_contract::protocol::ir::canonical::history_request_controls_hash(
+                        request,
+                    ),
                 ),
-            ),
-            context_fingerprint: stravia_runtime_contract::protocol::ir::canonical::hash_hex(
-                &stravia_runtime_contract::protocol::ir::canonical::history_context_hash(items),
-            ),
-            context_messages: items.len(),
-            session_fingerprint: generation_session_fingerprint(request),
-        }
+                context_fingerprint: stravia_runtime_contract::protocol::ir::canonical::hash_hex(
+                    &context,
+                ),
+                context_messages: items.len(),
+                session_fingerprint: generation_session_fingerprint(request),
+            },
+            units,
+        )
     }
 
     fn reusable_namespace(&self) -> String {

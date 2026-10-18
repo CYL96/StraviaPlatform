@@ -61,6 +61,33 @@ fn payload() -> Value {
     })
 }
 
+#[test]
+fn envelope_serialization_preserves_existing_bytes() -> anyhow::Result<()> {
+    let item = json!({"role":"user","content":"保留\n \"history\" ".repeat(40)});
+    let system = json!("shared instructions ".repeat(40));
+    let encoded = content::encode(json!({
+        "messages": [item.clone(), item.clone()],
+        "system": system.clone(),
+        "untouched": {"unicode": "界", "null": null},
+    }))?;
+    let item_key = content::content_key(&serde_json::to_vec(&item)?);
+    let system_key = content::content_key(&serde_json::to_vec(&system)?);
+    let expected = json!({
+        "data": {
+            "messages": [null, null],
+            "system": null,
+            "untouched": {"unicode": "界", "null": null},
+        },
+        "slots": [["/messages/0", 0], ["/messages/1", 0], ["/system", 1]],
+        "contents": [item_key, system_key],
+    });
+    assert_eq!(
+        crate::storage_codec::decode(&encoded.payload)?.as_ref(),
+        serde_json::to_vec(&expected)?.as_slice(),
+    );
+    Ok(())
+}
+
 async fn contract(store: SqlTurnChainStore) {
     let original = payload();
     let mut different = original.clone();

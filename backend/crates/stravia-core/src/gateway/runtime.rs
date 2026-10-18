@@ -296,6 +296,11 @@ impl Gateway {
             0,
             None,
         );
+        let storage = if storage_kind == RuntimeStorageKind::Postgres {
+            storage
+        } else {
+            crate::runtime_config::RuntimeConfig::attach(storage).await?
+        };
         let model_cache = Arc::new(tokio::sync::RwLock::new(
             router::RouteCache::load(storage.routes()).await?,
         ));

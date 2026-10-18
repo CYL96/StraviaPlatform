@@ -138,6 +138,7 @@ struct SqlActivity {
 
 struct ActiveSpan {
     name: &'static str,
+    request_id: Option<String>,
     id: u64,
     parent_id: Option<u64>,
     started: Instant,
@@ -157,6 +158,7 @@ struct ActiveSpan {
 #[derive(Clone)]
 struct TraceRecord {
     name: &'static str,
+    request_id: Option<String>,
     id: u64,
     parent_id: Option<u64>,
     started: Instant,
@@ -178,6 +180,7 @@ impl ActiveSpan {
                 .map_or(Duration::ZERO, |start| end.saturating_duration_since(start));
         TraceRecord {
             name: self.name,
+            request_id: self.request_id.clone(),
             id: self.id,
             parent_id: self.parent_id,
             started: self.started,
@@ -193,8 +196,10 @@ impl ActiveSpan {
 
     fn into_record(mut self, finished: Option<Instant>) -> TraceRecord {
         let detail = std::mem::take(&mut self.detail);
+        let request_id = self.request_id.take();
         let mut record = self.record(finished);
         record.detail = detail;
+        record.request_id = request_id;
         record
     }
 }
@@ -446,6 +451,9 @@ pub fn timeline_snapshot() -> Value {
 
 fn trace_event(span: TraceRecord, capture_state: &str) -> Value {
     let mut args = json!({ "span_id": span.id, "capture_state": capture_state });
+    if let Some(request_id) = span.request_id {
+        args["request_id"] = json!(request_id);
+    }
     if let Some(parent_id) = span.parent_id {
         args["parent_id"] = json!(parent_id);
     }
@@ -633,6 +641,9 @@ pub fn init_metrics() -> bool {
 
 #[derive(Default)]
 struct StatusVisitor {
+    // Only enabled for inference root creation while Debug capture is active.
+    capture_request_id: bool,
+    request_id: Option<String>,
     status: Option<&'static str>,
     work: [Option<u64>; 4],
     detail: SqlDetails,
@@ -664,7 +675,11 @@ impl Visit for StatusVisitor {
     }
 
     fn record_str(&mut self, field: &Field, value: &str) {
-        if field.name() == "status" {
+        if field.name() == "request_id" {
+            if self.capture_request_id && stravia_runtime_contract::identifier::valid_id(value) {
+                self.request_id = Some(value.to_owned());
+            }
+        } else if field.name() == "status" {
             self.status = match value {
                 "completed" => Some("completed"),
                 "error" => Some("error"),
@@ -680,7 +695,8 @@ impl Visit for StatusVisitor {
     fn record_debug(&mut self, _field: &Field, _value: &dyn std::fmt::Debug) {}
 }
 
-/// 静态 span 名称是唯一 operation 标签；仅接受状态和工作量数值白名单。
+/// 静态 span 名称是唯一 operation 标签；根请求的内部 ID 只进入 Debug 时间线，
+/// 不进入指标标签；其余字段仍仅接受状态、工作量数值和 SQL 白名单。
 /// 活动 span、有界历史缓冲和短写队列驻留内存；溢出历史写入本轮匿名临时文件。
 /// STRAVIA_PERF_TRACE_ACTIVE_CAPACITY 保护活动并发；满额的活动 span 不导出也不记指标。
 pub struct PerformanceLayer;
@@ -717,7 +733,11 @@ where
                     .map(|perf| (perf.id, perf.operation, perf.owner_id, perf.epoch))
             })
         });
-        let mut status = StatusVisitor::default();
+        let mut status = StatusVisitor {
+            capture_request_id: attrs.metadata().name() == "proxy.inference_run"
+                && kind == SpanKind::Operation,
+            ..StatusVisitor::default()
+        };
         attrs.record(&mut status);
         let Some(span) = ctx.span(id) else { return };
         let rejected_epoch = parent_context
@@ -755,6 +775,7 @@ where
             span_id,
             ActiveSpan {
                 name: attrs.metadata().name(),
+                request_id: status.request_id,
                 id: span_id,
                 parent_id,
                 started,
@@ -962,6 +983,7 @@ pub(crate) fn record_wait(
     let finished = Instant::now();
     TIMELINE.lock().push(TraceRecord {
         name: operation,
+        request_id: None,
         id: NEXT_SPAN_ID.fetch_add(1, Ordering::Relaxed),
         parent_id: (context.span_id != 0).then_some(context.span_id),
         started,
@@ -1188,6 +1210,60 @@ mod tests {
                 drop(stale);
                 set_debug(&debug, true);
                 emit_reused_callsite();
+                let first_request_id = stravia_runtime_contract::identifier::new_id();
+                let second_request_id = stravia_runtime_contract::identifier::new_id();
+                let roots: Vec<_> = [
+                    first_request_id.as_str(),
+                    second_request_id.as_str(),
+                    "secret-request-id",
+                ]
+                .into_iter()
+                .map(|request_id| {
+                    tracing::info_span!(target: "stravia::perf", "proxy.inference_run",
+                        request_id = request_id, password = "secret-password")
+                })
+                .collect();
+                roots[0].record("request_id", second_request_id.as_str());
+                roots[0].in_scope(|| {
+                    let child = tracing::info_span!(target: "stravia::perf",
+                        "test.identity_child", request_id = second_request_id.as_str());
+                    drop(child);
+                });
+                drop(roots);
+                let identity_snapshot = timeline_snapshot();
+                let identity_events = identity_snapshot["traceEvents"].as_array().unwrap();
+                let roots: Vec<_> = identity_events
+                    .iter()
+                    .filter(|event| event["name"] == "proxy.inference_run" && event["ph"] == "X")
+                    .collect();
+                assert_eq!(roots.len(), 3);
+                for request_id in [&first_request_id, &second_request_id] {
+                    assert_eq!(
+                        roots
+                            .iter()
+                            .filter(|root| root["args"]["request_id"] == request_id.as_str())
+                            .count(),
+                        1
+                    );
+                    assert!(!handle.render().contains(request_id));
+                }
+                assert_eq!(
+                    roots
+                        .iter()
+                        .filter(|root| root["args"].get("request_id").is_none())
+                        .count(),
+                    1
+                );
+                let child = identity_events
+                    .iter()
+                    .find(|event| event["name"] == "test.identity_child")
+                    .unwrap();
+                assert!(child["args"].get("request_id").is_none());
+                let first_root = roots
+                    .iter()
+                    .find(|root| root["args"]["request_id"] == first_request_id.as_str())
+                    .unwrap();
+                assert_eq!(child["args"]["parent_id"], first_root["args"]["span_id"]);
                 std::thread::sleep(Duration::from_millis(2));
                 let parent = tracing::info_span!(target: "stravia::perf", "test.parent",
                     status = tracing::field::Empty, password = "secret-password",
@@ -1284,6 +1360,7 @@ mod tests {
             "secret-error",
             "SELECT",
             "not-a-valid-status",
+            "secret-request-id",
         ] {
             assert!(!serialized.contains(secret), "sensitive field leaked");
         }

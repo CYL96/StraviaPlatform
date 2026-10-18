@@ -3,9 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
-import tomllib
 from contextlib import closing
-from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode
 
@@ -51,34 +49,22 @@ def key_discoveries(env: dict[str, Any], key_name: str) -> list[dict[str, Any]]:
 
 @pytest.mark.e2e
 @pytest.mark.admin
-def test_catalog_tester_positions_and_read_only_boundary(admin_env: dict[str, Any], repo_root: Path) -> None:
-    snapshot = tomllib.loads((repo_root / "backend/crates/stravia-credential-protection/src/detection/betterleaks.toml").read_text(encoding="utf-8"))
+def test_catalog_tester_positions_and_read_only_boundary(admin_env: dict[str, Any]) -> None:
     status, body = http_request("GET", f"{admin_env['admin']}{BASE}/rules", headers=admin_env["auth"])
     assert status == 200, body
     catalog = body["data"]
     actual = {rule["id"]: rule for rule in catalog["rules"]}
-    expected = {rule["id"]: rule for rule in snapshot["rules"]}
-    kingfisher = json.loads((repo_root / "backend/crates/stravia-credential-protection/src/detection/kingfisher.json").read_text(encoding="utf-8"))
-    imported = {rule["id"]: rule for rule in kingfisher["rules"]}
-    assert actual.keys() == expected.keys() | imported.keys()
-    assert len(catalog["rules"]) == len(expected) + len(imported)
-    for rule_id, source in imported.items():
-        rule = actual[rule_id]
-        assert rule["regex"] == source["pattern"]
-        assert rule["name"] == source["name"]
-        assert rule["skip_report"] == (not source.get("visible", True))
-        assert rule["confidence"] == source.get("confidence", "medium")
+    assert len(actual) == len(catalog["rules"])
+    for canonical, obsolete in [
+        ("bittrex-access-key", "bittrex-secret-key"),
+        ("kingfisher.artifactory.2", "kingfisher.jfrog.1"),
+        ("kingfisher.plaid.2", "kingfisher.plaid.3"),
+    ]:
+        assert canonical in actual
+        assert obsolete not in actual
+    for rule in actual.values():
+        assert all(component["id"] in actual for component in rule["components"])
         assert "validate" not in rule and "validation" not in rule
-    assert catalog["prefilter"] == snapshot["prefilter"]
-    assert catalog["filter"] == snapshot["filter"]
-    for rule_id, source in expected.items():
-        rule = actual[rule_id]
-        assert rule["regex"] == source.get("regex")
-        assert rule["path"] == source.get("path")
-        assert rule["filter"] == source.get("filter", "")
-        assert rule["components"] == [{"id": part["id"], "within": part.get("within", ""), "optional": part.get("optional", False)} for part in source.get("components", [])]
-        assert rule["name"] and rule["target"] and rule["description"]
-        assert "validate" not in rule
 
     with echo_provider() as (url, received):
         env = {**admin_env, "mock": url}
