@@ -8,6 +8,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
 };
+use base64::Engine;
 use parking_lot::Mutex;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -28,7 +29,8 @@ use stravia_vendor_runtime::{
 };
 use stravia_vendor_sdk::{
     AllowanceRequest, AuthRequest, AuthResponse, AuthStep, DiscoverRequest, ErrorKind,
-    OperationInput, OperationOutput, ProviderSnapshot,
+    MediaImageAspectRatio, MediaImageRequest, MediaImageResolution, MediaReference, OperationInput,
+    OperationOutput, ProviderSnapshot,
 };
 
 fn failure(error: reqwest::Error) -> HostFailure {
@@ -135,7 +137,7 @@ async fn upstream(
                     "gemini-3.8-flash-high", "gemini-3.8-flash-medium", "gemini-3.8-flash-low"
                 ]}]}],
                 "deprecatedModelIds": {"gemini-3.1-pro-high": {"newModelId": "gemini-pro-agent"}},
-                "imageGenerationModelIds": ["gemini-3.1-flash-image"],
+                "imageGenerationModelIds": ["gemini-3.1-flash-image", "account-image"],
                 "models":{
                 "account-model":{"displayName":"Account model","supportsImages":true,"maxTokens":131072},
                 "hidden-model":{"isInternal":true},
@@ -146,6 +148,7 @@ async fn upstream(
                 "gemini-3.8-flash-medium":{"displayName":"Gemini 3.8 Flash (Medium)","supportsThinking":true,"thinkingBudget":4000},
                 "gemini-3.8-flash-low":{"displayName":"Gemini 3.8 Flash (Low)","supportsThinking":true,"thinkingBudget":1024},
                 "gemini-3.1-flash-image":{"displayName":"Gemini 3.1 Flash Image"},
+                "account-image":{"displayName":"Account image","supportsImages":true},
                 "gemini-2.5-pro":{"displayName":"Gemini 2.5 Pro"}
             }});
             // 真实上游按 CLI 客户端身份返回新 Flash 档位，完整目录夹具会漏掉这个边界。
@@ -168,10 +171,30 @@ async fn upstream(
         "/v1internal:streamGenerateContent" => {
             if fixture.error_stream.load(Ordering::Relaxed) {
                 return (
-                    [("content-type", "text/event-stream")],
+                    [("content-type", "text/event-stream"), ("retry-after", "9")],
                     "data: {\"error\":{\"code\":429,\"message\":\"rate limit\"}}\n\n",
                 )
                     .into_response();
+            }
+            let request: Value = serde_json::from_slice(&body).unwrap();
+            if request.pointer("/request/generationConfig/responseModalities")
+                == Some(&json!(["IMAGE"]))
+            {
+                let image = json!({"response":{
+                    "candidates":[{"index":0,"content":{"role":"model","parts":[{
+                        "inlineData":{"mimeType":"image/png","data":IMAGE_PNG}
+                    }]}}],
+                    "usageMetadata":{"promptTokenCount":7,"candidatesTokenCount":13,"totalTokenCount":20}
+                }});
+                let finish = json!({"response":{
+                    "candidates":[{"index":0,"finishReason":"STOP"}],
+                    "usageMetadata":{"promptTokenCount":7,"candidatesTokenCount":13,"totalTokenCount":20}
+                }});
+                let mut stream = format!("data: {image}\r\n\r\n");
+                if !fixture.truncated.load(Ordering::Relaxed) {
+                    stream.push_str(&format!("data: {finish}\n\n"));
+                }
+                return ([("content-type", "text/event-stream")], stream).into_response();
             }
             let first = "data: {\"response\":{\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"真实 HTTP 冒烟\"}]}}],\"usageMetadata\":{\"promptTokenCount\":5,\"candidatesTokenCount\":8,\"totalTokenCount\":13}}}\r\n\r\n";
             let last = "data: {\"response\":{\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"functionCall\":{\"name\":\"read\",\"args\":{\"metadata\":{\"seed\":7}}},\"thoughtSignature\":\"genuine-signature\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":5,\"candidatesTokenCount\":8,\"totalTokenCount\":13}}}\n\n";
@@ -327,6 +350,177 @@ fn artifact() -> std::path::PathBuf {
         .find(|entry| entry["vendor_id"] == "antigravity")
         .unwrap();
     dir.join(entry["file"].as_str().unwrap())
+}
+
+const IMAGE_PNG: &str =
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires task build:vendors:all"]
+async fn native_images_preserve_selected_model_and_references_at_real_http_boundary() {
+    let fixture = Arc::new(Fixture::default());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let app = Router::new()
+        .fallback(upstream)
+        .with_state(Arc::clone(&fixture));
+    let services = Arc::new(Services {
+        root: format!("http://{}", listener.local_addr().unwrap()),
+        client: reqwest::Client::builder().no_proxy().build().unwrap(),
+        state: Mutex::new(None),
+        deltas: Mutex::new(Vec::new()),
+    });
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let runtime = VendorRuntime::new().unwrap();
+    let plugin = runtime
+        .load(&std::fs::read(artifact()).unwrap())
+        .await
+        .unwrap();
+    let mut provider = provider();
+    provider.credentials = BTreeMap::from([
+        ("access_token".into(), json!("test-token")),
+        ("project_id".into(), json!("test-project")),
+    ]);
+    let OperationOutput::Discover(catalog) = run(
+        &runtime,
+        &plugin,
+        &services,
+        OperationInput::Discover {
+            provider: provider.clone(),
+            request: DiscoverRequest { cursor: None },
+        },
+    )
+    .await
+    .unwrap() else {
+        panic!("catalog")
+    };
+    let model = catalog
+        .models
+        .iter()
+        .find(|model| model.id == "account-image")
+        .unwrap();
+    assert_eq!(model.capabilities, ["media_image"]);
+    assert_eq!(
+        model.metadata["modalities"],
+        json!({"input":["text","image"],"output":["image"]})
+    );
+    provider.model = Some(model.id.clone());
+    provider.model_metadata = Some(stravia_vendor_sdk::ModelMetadata {
+        selector: model.selector.clone(),
+        ..Default::default()
+    });
+    let png = base64::engine::general_purpose::STANDARD
+        .decode(IMAGE_PNG)
+        .unwrap();
+    for references in [
+        Vec::new(),
+        vec![
+            MediaReference {
+                media_type: "image/png".into(),
+                bytes: png.clone(),
+            },
+            MediaReference {
+                media_type: "image/webp".into(),
+                bytes: b"second reference bytes".to_vec(),
+            },
+        ],
+    ] {
+        let request = MediaImageRequest {
+            prompt: "Draw a lighthouse using the references in order".into(),
+            references: references.clone(),
+            aspect_ratio: Some(MediaImageAspectRatio::Wide),
+            resolution: Some(MediaImageResolution::TwoK),
+        };
+        let OperationOutput::MediaImage(output) = run(
+            &runtime,
+            &plugin,
+            &services,
+            OperationInput::MediaImage {
+                provider: provider.clone(),
+                request,
+            },
+        )
+        .await
+        .unwrap() else {
+            panic!("image output")
+        };
+        assert_eq!(output.artifacts.len(), 1);
+        assert_eq!(output.artifacts[0].media_type, "image/png");
+        assert_eq!(output.artifacts[0].bytes, png);
+        let usage = output.usage.as_ref().unwrap();
+        assert_eq!(usage.prompt_tokens, 7);
+        assert_eq!(usage.completion_tokens, 13);
+        let received = fixture.received.lock();
+        let (url, headers, bytes) = received.last().unwrap();
+        assert_eq!(url, "/v1internal:streamGenerateContent?alt=sse");
+        assert_eq!(headers["authorization"], "Bearer test-token");
+        assert!(!headers.contains_key("x-downstream-secret"));
+        let envelope: Value = serde_json::from_slice(bytes).unwrap();
+        assert_eq!(envelope["model"], "account-image");
+        assert_eq!(envelope["project"], "test-project");
+        assert_eq!(
+            envelope["request"]["generationConfig"],
+            json!({
+                "responseModalities":["IMAGE"],"candidateCount":1,
+                "imageConfig":{"aspectRatio":"16:9","imageSize":"2K"}
+            })
+        );
+        let parts = envelope["request"]["contents"][0]["parts"]
+            .as_array()
+            .unwrap();
+        let returned_references: Vec<_> = parts
+            .iter()
+            .filter_map(|part| part.get("inlineData"))
+            .collect();
+        assert_eq!(returned_references.len(), references.len());
+        for (part, reference) in returned_references.iter().zip(&references) {
+            assert_eq!(part["mimeType"], reference.media_type);
+            assert_eq!(
+                base64::engine::general_purpose::STANDARD
+                    .decode(part["data"].as_str().unwrap())
+                    .unwrap(),
+                reference.bytes,
+            );
+        }
+    }
+    let request = MediaImageRequest {
+        prompt: "Draw a lighthouse".into(),
+        references: Vec::new(),
+        aspect_ratio: None,
+        resolution: None,
+    };
+    fixture.truncated.store(true, Ordering::Relaxed);
+    let error = run(
+        &runtime,
+        &plugin,
+        &services,
+        OperationInput::MediaImage {
+            provider: provider.clone(),
+            request: request.clone(),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(&error, stravia_vendor_runtime::RuntimeError::Plugin {kind, ..}
+        if kind.model_error_kind() == Some(AiErrorKind::UnexpectedEof))
+    );
+    fixture.error_stream.store(true, Ordering::Relaxed);
+    let error = run(
+        &runtime,
+        &plugin,
+        &services,
+        OperationInput::MediaImage { provider, request },
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(&error, stravia_vendor_runtime::RuntimeError::Plugin {kind, ..}
+        if kind.model_error_kind() == Some(AiErrorKind::RateLimitError))
+    );
+    assert_eq!(error.retry_after(), Some(Duration::from_secs(9)));
+    server.abort();
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -494,14 +688,22 @@ async fn oauth_and_inference_enforce_native_wire_at_real_http_boundary() {
     .unwrap() else {
         panic!("catalog")
     };
+    let chat = catalog
+        .models
+        .iter()
+        .find(|model| model.id == "account-model")
+        .unwrap();
     assert_eq!(
-        catalog
-            .models
-            .iter()
-            .map(|model| model.id.as_str())
-            .collect::<Vec<_>>(),
-        ["account-model", "gemini-3.1-pro", "gemini-3.8-flash"]
+        chat.metadata["modalities"],
+        json!({"input":["text","image"],"output":["text"]})
     );
+    let image = catalog
+        .models
+        .iter()
+        .find(|model| model.id == "gemini-3.1-flash-image")
+        .unwrap();
+    assert_eq!(image.capabilities, ["media_image"]);
+    assert_eq!(image.metadata["modalities"]["output"], json!(["image"]));
     let OperationOutput::Allowance(quota) = run(
         &runtime,
         &plugin,

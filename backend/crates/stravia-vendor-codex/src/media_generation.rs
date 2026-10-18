@@ -56,11 +56,6 @@ pub(super) fn generate(
         tool["quality"] = Value::String(quality.into());
     }
     let model = required_model(provider)?;
-    if !supported_model(model) {
-        return Err(invalid(
-            "Codex image generation requires a GPT-5 or newer model",
-        ));
-    }
     let mut instructions = if action == "edit" {
         "Use the available image generation tool to edit or create exactly one PNG image for the user request. Treat the provided input images as ordered edit/reference images. Do not use any other tool.".to_owned()
     } else {
@@ -226,15 +221,4 @@ fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
         u32::from_be_bytes(bytes[16..20].try_into().ok()?),
         u32::from_be_bytes(bytes[20..24].try_into().ok()?),
     ))
-}
-
-pub(super) fn supported_model(model: &str) -> bool {
-    let Some(version) = model.trim().strip_prefix("gpt-") else {
-        return false;
-    };
-    version
-        .split(|character: char| !character.is_ascii_digit())
-        .next()
-        .and_then(|major| major.parse::<u32>().ok())
-        .is_some_and(|major| major >= 5)
 }
