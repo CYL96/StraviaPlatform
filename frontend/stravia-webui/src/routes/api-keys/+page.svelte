@@ -83,6 +83,9 @@ const resourceError = $derived.by(() => {
   const models = modelsQuery.error
   return apiKeys ?? models
 })
+const resourcesEmpty = $derived(
+  !resourcesPending && apiKeysQuery.data !== undefined && modelsQuery.data !== undefined && apiKeys.length === 0,
+)
 const tableLabels = $derived(getDataTableLabels())
 const apiKeyColumnHelper = createDataTableColumnHelper<ApiKey>()
 const apiKeyColumns = apiKeyColumnHelper.columns([
@@ -271,7 +274,7 @@ async function deleteKey(): Promise<void> {
   <div class="flex justify-end gap-1">{@render keyActions(context.row.original)}</div>
 {/snippet}
 
-<div class="route-page">
+<div class={['route-page', { 'route-page-empty': resourcesEmpty }]}>
   <PageHeader
     eyebrow={m.common_setup()}
     title={m.api_keys_api_keys()}
@@ -296,8 +299,8 @@ async function deleteKey(): Promise<void> {
             <Skeleton class="h-6" /><Skeleton class="h-6" /><Skeleton class="h-6" /><Skeleton class="h-6" />
           </div>{/each}
       </div>
-    {:else if apiKeysQuery.data !== undefined && modelsQuery.data !== undefined && apiKeys.length === 0}
-      <Empty.Root class="border-y py-10"
+    {:else if resourcesEmpty}
+      <Empty.Root class="mx-auto my-auto w-full max-w-xl py-10"
         ><Empty.Header
           ><Empty.Title>{m.api_keys_no_api_keys_created()}</Empty.Title><Empty.Description
             >{m.api_keys_secret_copy_notice()}</Empty.Description

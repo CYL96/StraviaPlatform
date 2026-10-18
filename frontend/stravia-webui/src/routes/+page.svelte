@@ -453,7 +453,7 @@ async function submitEdit(id: string) {
           ></Alert.Description
         ></Alert.Root>
     {:else if guide}
-      <Empty.Root class="mx-auto my-auto w-full max-w-xl border" aria-labelledby="chat-setup-title"
+      <Empty.Root class="mx-auto my-auto w-full max-w-xl" aria-labelledby="chat-setup-title"
         ><Empty.Header
           ><Empty.Title><h2 id="chat-setup-title">{guide.title}</h2></Empty.Title><Empty.Description
             >{guide.description}</Empty.Description

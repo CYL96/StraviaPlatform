@@ -360,6 +360,18 @@ html[lang='zh-CN'] .font-structural {
   padding-top: 1rem;
 }
 
+.route-page-empty {
+  min-height: calc(100svh - 5rem);
+}
+
+.route-page-empty > .route-section {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  border-top: 0;
+  padding-top: 0;
+}
+
 .route-section-header {
   display: flex;
   flex-wrap: wrap;
@@ -690,6 +702,10 @@ html[lang='zh-CN'] .font-structural {
 }
 
 @media (max-width: 767px) {
+  .route-page-empty {
+    min-height: calc(100svh - 4.5rem);
+  }
+
   .route-page-header {
     align-items: flex-start;
     flex-direction: column;

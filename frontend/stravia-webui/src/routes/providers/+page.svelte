@@ -461,7 +461,6 @@ async function copyProvider(): Promise<void> {
         <Button class="mt-3" variant="outline" onclick={() => void providersQuery.refetch()}>{m.common_retry()}</Button>
       </div>
     {:else if providers.length === 0}
-      {@render modelChangesAction()}
       <Empty.Root class="py-10">
         <Empty.Header
           ><Empty.Title>{m.providers_no_model_services_connected()}</Empty.Title><Empty.Description

@@ -73,6 +73,9 @@ const resourceError = $derived.by(() => {
 
   return models ?? providers
 })
+const resourcesEmpty = $derived(
+  !resourcesPending && modelsQuery.data !== undefined && providersQuery.data !== undefined && models.length === 0,
+)
 
 const apiKeys = $derived(apiKeysQuery.data ?? [])
 const tableLabels = $derived(getDataTableLabels())
@@ -303,7 +306,7 @@ async function deleteModel(): Promise<void> {
   <div class="flex justify-end gap-1">{@render modelActions(context.row.original)}</div>
 {/snippet}
 
-<div class="route-page">
+<div class={['route-page', { 'route-page-empty': resourcesEmpty }]}>
   <PageHeader
     eyebrow={m.common_setup()}
     title={m.common_models()}
@@ -328,8 +331,8 @@ async function deleteModel(): Promise<void> {
             <Skeleton class="h-6" /><Skeleton class="h-6" /><Skeleton class="h-6" /><Skeleton class="h-6" />
           </div>{/each}
       </div>
-    {:else if modelsQuery.data !== undefined && providersQuery.data !== undefined && models.length === 0}
-      <Empty.Root class="border-y py-10">
+    {:else if resourcesEmpty}
+      <Empty.Root class="mx-auto my-auto w-full max-w-xl py-10">
         <Empty.Header
           ><Empty.Title
             >{providers.length === 0
