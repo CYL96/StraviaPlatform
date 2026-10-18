@@ -174,6 +174,64 @@ function harness(
 }
 
 describe('selection and onboarding', () => {
+  test('only text output is selectable, including when a remembered choice is an image route', async () => {
+    const store = new MemoryStore()
+    store.preferences = { apiKeyId: 'key-a', modelId: 'image-route' }
+    const h = harness({
+      store,
+      models: [
+        model('route-a', { supports_image_input: true }),
+        model('image-route', { output_modality: 'image' }),
+        model('unknown-route', { output_modality: null }),
+      ],
+    })
+    await h.controller.start()
+    expect(h.controller.snapshot.modelCandidates.map((candidate) => candidate.id)).toEqual(['route-a'])
+    expect(h.controller.snapshot.selectedModelId).toBe('route-a')
+    expect(h.controller.snapshot.modelSupportsImages).toBe(true)
+    h.controller.selectModel('image-route')
+    expect(await h.controller.send('Cannot send to image output')).toBe(false)
+    expect(h.requests).toEqual([])
+    h.controller.selectModel('route-a')
+    expect(await h.controller.send('Text response')).toBe(true)
+    expect(h.requests[0].request.model).toBe('model-a')
+  })
+  test('an image-only or unconfigured catalog requires a text model before requesting a Key', async () => {
+    const h = harness({
+      keys: [],
+      models: [model('image-route', { output_modality: 'image' }), model('unknown', { output_modality: null })],
+    })
+    await h.controller.start()
+    expect(h.controller.snapshot.blocker).toBe('no-models')
+    expect(h.controller.snapshot.modelCandidates).toEqual([])
+    expect(await h.controller.send('No text model')).toBe(false)
+    expect(h.requests).toEqual([])
+  })
+  test('a persisted conversation cannot retry a route converted to image output', async () => {
+    const original = harness({
+      models: [model('route-a'), model('route-b')],
+      script: () => [
+        { type: 'response.failed', response: { status: 'failed', error: { message: 'Synthetic failure' } } },
+      ],
+    })
+    await original.controller.start()
+    original.controller.selectModel('route-a')
+    await original.controller.send('Original question')
+    const id = original.controller.snapshot.currentConversationId!
+    const restored = harness({
+      store: original.store,
+      models: [model('route-a', { output_modality: 'image' }), model('route-b')],
+    })
+    await restored.controller.start()
+    restored.controller.openConversation(id)
+    expect(restored.controller.snapshot.selectedModelId).toBe('route-b')
+    expect(restored.controller.snapshot.retryModelAvailable).toBe(false)
+    await restored.controller.retry()
+    expect(restored.requests).toEqual([])
+    await restored.controller.regenerate()
+    expect(restored.requests[0].request.model).toBe('model-b')
+    expect(restored.requests[0].request.input).toEqual([{ role: 'user', content: 'Original question' }])
+  })
   test('enabled models without an enabled target on an enabled service require configuration recovery', async () => {
     const h = harness({ models: [model('route-a', { targets: [] })] })
     await h.controller.start()

@@ -22,6 +22,7 @@ const model = {
   id: 'console-model',
   model_id: 'console-model',
   display_name: 'Console model',
+  output_modality: 'text',
   is_enabled: true,
   supported_thinking_levels: ['low', 'high'],
   default_thinking_level: 'low',
@@ -1025,7 +1026,11 @@ test('missing addresses recover and Chinese mobile users can send and stop from 
 test('keyboard selection determines the identity, model and reasoning used for a turn', async ({ page }) => {
   const catalog = await prepareChat(page)
   catalog.keys = [key, { ...key, id: 'key-second', name: 'Second key', key: 'sk-second-only', model_ids: [] }]
-  catalog.models = [model, { ...model, id: 'second-model', model_id: 'second-model', display_name: 'Second model' }]
+  catalog.models = [
+    model,
+    { ...model, id: 'second-model', model_id: 'second-model', display_name: 'Second model' },
+    { ...model, id: 'image-model', model_id: 'image-model', display_name: 'Image model', output_modality: 'image' },
+  ]
   await page.goto('/')
   const keySelector = page.getByRole('button', { name: 'API Key', exact: true })
   await expect(keySelector).toContainText('Choose an API Key')

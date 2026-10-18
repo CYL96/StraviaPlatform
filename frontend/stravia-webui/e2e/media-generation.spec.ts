@@ -109,9 +109,11 @@ for (const enabled of [false, true]) {
     await page.getByRole('button', { name: 'Save settings', exact: true }).click()
     await expect.poll(() => config).toEqual({ enabled: false, image: { route_id: null } })
     await expect(page.getByRole('switch', { name: 'Enable media generation' })).not.toBeChecked()
-    await expect(page.getByRole('button', { name: 'Unlink route and disable', exact: true })).toHaveCount(0)
 
-    await page.getByRole('link', { name: 'Manage models', exact: true }).click()
+    await page
+      .getByRole('navigation', { name: 'Primary navigation' })
+      .getByRole('link', { name: 'Models', exact: true })
+      .click()
     await page.getByRole('row').filter({ hasText: 'Historical image route' }).click()
     await page.getByRole('button', { name: 'Output type', exact: true }).click()
     await page.getByRole('option', { name: 'Text', exact: true }).click()
@@ -156,14 +158,13 @@ for (const locale of ['en-US', 'zh-CN'] as const) {
     await page.getByRole('switch', { name: zh ? '启用媒体生成' : 'Enable media generation' }).click()
     await expect.poll(() => writes.length).toBe(1)
     expect(writes[0]).toEqual({ enabled: false, image: { route_id: 'historical-image-route' } })
-    await page
-      .getByRole('button', { name: zh ? '解除路由引用并关闭' : 'Unlink route and disable', exact: true })
-      .click()
+    const routeSelect = page.getByRole('button', { name: zh ? '模型路由' : 'Model Route', exact: true })
+    await routeSelect.click()
+    await page.getByRole('option', { name: zh ? '未选择路由' : 'No route selected', exact: true }).click()
+    expect(writes).toHaveLength(1)
+    await page.getByRole('button', { name: zh ? '保存设置' : 'Save settings', exact: true }).click()
     await expect.poll(() => writes.length).toBe(2)
     expect(writes[1]).toEqual({ enabled: false, image: { route_id: null } })
-    await expect(
-      page.getByRole('button', { name: zh ? '解除路由引用并关闭' : 'Unlink route and disable', exact: true }),
-    ).toHaveCount(0)
     await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true)
   })
 }
@@ -266,6 +267,71 @@ test('empty media generation configuration stays usable in Chinese dark mode at 
   await expect(page.locator('html')).toHaveClass(/\bdark\b/)
   await expect(page.getByRole('heading', { name: '媒体生成', exact: true })).toBeVisible()
   await expect(page.getByRole('switch', { name: '启用媒体生成' })).toBeDisabled()
-  await expect(page.getByRole('link', { name: '管理模型', exact: true })).toHaveAttribute('href', '/models')
+  const gateHint = page.getByRole('switch', { name: '启用媒体生成', exact: true })
+  await gateHint.focus()
+  await expect(page.getByRole('tooltip')).toContainText('请先选择并保存图片路由')
+  await expect(gateHint).toHaveAccessibleDescription(/请先选择并保存图片路由/)
+  await page.keyboard.press('Escape')
+  await expect(page.getByRole('tooltip')).toHaveCount(0)
   await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true)
+})
+
+test.describe('media generation switch guidance', () => {
+  test.use({ hasTouch: true })
+
+  test('a blocked switch explains its prerequisite without changing configuration and recovers after saving', async ({
+    page,
+  }) => {
+    let config = { enabled: false, image: { route_id: null as string | null } }
+    const writes: (typeof config)[] = []
+    await page.route('**/api/v1/media-generation/config', async (route) => {
+      if (route.request().method() === 'PUT') {
+        config = route.request().postDataJSON()
+        writes.push(structuredClone(config))
+      }
+      await route.fulfill({
+        json: {
+          data: {
+            config,
+            validation: {
+              valid: Boolean(config.image.route_id),
+              code: config.image.route_id ? null : 'media_generation_route_missing',
+              message: null,
+            },
+          },
+        },
+      })
+    })
+    await page.route('**/api/v1/media-generation/eligible-routes', (route) =>
+      route.fulfill({ json: { data: [{ id: 'image', name: 'Image model' }] } }),
+    )
+    await page.goto('/media-generation')
+
+    const gate = page.getByRole('switch', { name: 'Enable media generation' })
+    const tooltip = page.getByRole('tooltip')
+    await expect(gate).toBeDisabled()
+    await expect(tooltip).toHaveCount(0)
+    await gate.hover()
+    await expect(tooltip).toContainText('Choose and save an image route')
+    await page.keyboard.press('Escape')
+    await expect(tooltip).toHaveCount(0)
+    const bounds = (await gate.boundingBox())!
+    await page.touchscreen.tap(bounds.x + bounds.width / 2, bounds.y + bounds.height / 2)
+    await expect(tooltip).toContainText('Choose and save an image route')
+    expect(writes).toEqual([])
+
+    await page.getByRole('button', { name: 'Model Route', exact: true }).click()
+    await page.getByRole('option', { name: 'Image model' }).click()
+    await expect(gate).toBeDisabled()
+    await page.getByRole('button', { name: 'Save settings', exact: true }).click()
+    await expect(gate).toBeEnabled()
+    await gate.hover()
+    await expect(tooltip).toHaveCount(0)
+    await gate.click()
+    await expect(gate).toBeChecked()
+    expect(writes).toEqual([
+      { enabled: false, image: { route_id: 'image' } },
+      { enabled: true, image: { route_id: 'image' } },
+    ])
+  })
 })

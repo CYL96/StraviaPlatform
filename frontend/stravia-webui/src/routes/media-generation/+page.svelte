@@ -1,6 +1,5 @@
 <script lang="ts">
 import * as m from '#lib/paraglide/messages.js'
-import { resolve } from '$app/paths'
 import { createQuery, useQueryClient } from '@tanstack/svelte-query'
 import { toast } from 'svelte-sonner'
 import { admin } from '#lib/admin-client.js'
@@ -16,6 +15,7 @@ import * as Select from '#lib/components/ui/select/index.js'
 import { Skeleton } from '#lib/components/ui/skeleton/index.js'
 import { Spinner } from '#lib/components/ui/spinner/index.js'
 import { Switch } from '#lib/components/ui/switch/index.js'
+import * as Tooltip from '#lib/components/ui/tooltip/index.js'
 
 const UNBOUND_ROUTE = '__media_generation_unbound__'
 const queryClient = useQueryClient()
@@ -33,6 +33,7 @@ let initialized = $state(false)
 let routeId = $state<string | null>(null)
 let toggleSaving = $state(false)
 let toggleError = $state('')
+let validationTooltipOpen = $state(false)
 let saving = $state(false)
 let saveError = $state('')
 const eligibleRoutes = $derived(eligibleRoutesQuery.data ?? [])
@@ -40,6 +41,9 @@ const savedRouteId = $derived(configQuery.data?.config.image.route_id ?? null)
 const hasChanges = $derived(Boolean(configQuery.data) && routeId !== savedRouteId)
 const savedConfigurationValid = $derived(
   Boolean(configQuery.data?.validation.valid && configQuery.data.config.image.route_id),
+)
+const toggleDisabled = $derived(
+  saving || toggleSaving || (!configQuery.data?.config.enabled && !savedConfigurationValid),
 )
 const canSave = $derived(Boolean(configQuery.data) && hasChanges && !saving && !toggleSaving)
 const selectedRoute = $derived(eligibleRoutes.find((route) => route.id === routeId))
@@ -54,11 +58,6 @@ const validationMessage = $derived.by(() => {
 
   return localizeBackendErrorMessage({ code: validation.code, message: validation.message ?? undefined })
 })
-
-const validationNeedsProvider = $derived(
-  configQuery.data?.validation.code === 'media_generation_provider_missing' ||
-    configQuery.data?.validation.code === 'media_generation_target_incompatible',
-)
 
 $effect(() => {
   const view = configQuery.data
@@ -122,23 +121,6 @@ async function saveRoute(): Promise<void> {
     saving = false
   }
 }
-
-async function clearReference(): Promise<void> {
-  if (!configQuery.data || saving || toggleSaving) return
-  saving = true
-  saveError = ''
-  try {
-    const view = await admin.mediaGeneration.config.update({ enabled: false, image: { route_id: null } })
-    routeId = view.config.image.route_id
-    updateCachedConfig(view)
-    await queryClient.invalidateQueries({ queryKey: ['models'] })
-    toast.success(m.media_generation_settings_saved())
-  } catch (error) {
-    saveError = localizeBackendErrorMessage(error)
-  } finally {
-    saving = false
-  }
-}
 </script>
 
 <svelte:head><title>{m.media_generation_title()} · Stravia</title></svelte:head>
@@ -171,39 +153,60 @@ async function clearReference(): Promise<void> {
         </div>
         <div class="flex shrink-0 items-center gap-3">
           {#if toggleSaving}<Spinner aria-label={m.media_generation_saving_enabled_state()} />{/if}
-          <Switch
-            bind:checked={
-              () => configQuery.data?.config.enabled ?? false, (value: boolean) => void toggleEnabled(value)
-            }
-            disabled={saving || toggleSaving || (!configQuery.data.config.enabled && !savedConfigurationValid)}
-            aria-busy={toggleSaving}
-            aria-labelledby="media-generation-gate-title"
-            aria-describedby="media-generation-gate-description" />
+          <Tooltip.Root
+            open={validationTooltipOpen && !savedConfigurationValid}
+            onOpenChange={(open: boolean) => (validationTooltipOpen = open)}
+            disabled={savedConfigurationValid}
+            delayDuration={0}
+            disableCloseOnTriggerClick>
+            <Tooltip.Trigger onpointerdown={() => (validationTooltipOpen = true)}>
+              {#snippet child({ props })}
+                {#if toggleDisabled}
+                  <span
+                    {...props}
+                    role="switch"
+                    aria-checked={configQuery.data?.config.enabled ?? false}
+                    aria-disabled="true"
+                    aria-busy={toggleSaving}
+                    tabindex="0"
+                    aria-labelledby="media-generation-gate-title"
+                    aria-describedby="media-generation-gate-description media-generation-validation-hint"
+                    class="inline-flex cursor-not-allowed rounded-md focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring">
+                    <Switch
+                      checked={configQuery.data?.config.enabled ?? false}
+                      disabled
+                      aria-hidden="true"
+                      tabindex={-1}
+                      class="pointer-events-none" />
+                  </span>
+                {:else}
+                  <Switch
+                    {...props}
+                    bind:checked={
+                      () => configQuery.data?.config.enabled ?? false, (value: boolean) => void toggleEnabled(value)
+                    }
+                    aria-busy={toggleSaving}
+                    aria-labelledby="media-generation-gate-title"
+                    aria-describedby={savedConfigurationValid
+                      ? 'media-generation-gate-description'
+                      : 'media-generation-gate-description media-generation-validation-hint'} />
+                {/if}
+              {/snippet}
+            </Tooltip.Trigger>
+            <Tooltip.Content
+              id="media-generation-validation-hint"
+              role="tooltip"
+              sideOffset={4}
+              class="max-w-[min(20rem,calc(100vw-2rem))]">
+              {validationMessage || m.media_generation_route_required()}
+            </Tooltip.Content>
+          </Tooltip.Root>
         </div>
       </div>
 
-      <div class="flex flex-col gap-3">
-        {#if toggleError}
-          <Alert.Root variant="destructive"><Alert.Description>{toggleError}</Alert.Description></Alert.Root>
-        {/if}
-        {#if !configQuery.data.validation.valid || !savedRouteId}
-          <Alert.Root variant="warning" role="status">
-            <Alert.Title>{m.media_generation_saved_configuration_needs_attention()}</Alert.Title>
-            <Alert.Description>
-              <p>{validationMessage || m.media_generation_route_required()}</p>
-              <div class="flex flex-wrap gap-2">
-                <Button href={resolve('models')} variant="outline" size="sm"
-                  >{m.media_generation_manage_routes()}</Button>
-
-                {#if validationNeedsProvider}
-                  <Button href={resolve('providers')} variant="outline" size="sm"
-                    >{m.media_generation_manage_model_services()}</Button>
-                {/if}
-              </div>
-            </Alert.Description>
-          </Alert.Root>
-        {/if}
-      </div>
+      {#if toggleError}
+        <Alert.Root variant="destructive"><Alert.Description>{toggleError}</Alert.Description></Alert.Root>
+      {/if}
     </section>
 
     <section class="route-section" aria-labelledby="media-generation-image-route-title">
@@ -229,16 +232,6 @@ async function clearReference(): Promise<void> {
           <Alert.Root variant="destructive"><Alert.Description>{saveError}</Alert.Description></Alert.Root>
         {/if}
       </div>
-
-      {#if savedRouteId}
-        <div class="flex flex-wrap items-center gap-3">
-          <p class="min-w-0 break-all text-sm">{m.route_output_bound_reference({ route: savedRouteId })}</p>
-          <Button variant="outline" disabled={saving || toggleSaving} onclick={() => void clearReference()}>
-            {m.route_output_clear_reference()}
-          </Button>
-          <p class="w-full text-sm text-muted-foreground">{m.route_output_clear_reference_help()}</p>
-        </div>
-      {/if}
 
       {#if eligibleRoutesQuery.isPending}
         <div class="flex flex-col gap-3" aria-label={m.media_generation_routes_loading()} aria-busy="true">

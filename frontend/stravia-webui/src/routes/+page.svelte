@@ -313,7 +313,7 @@ async function submitEdit(id: string) {
                         void submitEdit(message.id)
                       }
                     }} />
-                  <p class="text-xs text-muted-foreground">{m.console_chat_edit_effect()}</p>
+
                   <div class="flex justify-end gap-2">
                     <Button type="button" variant="ghost" onclick={() => (editingId = null)}
                       >{m.common_cancel()}</Button>

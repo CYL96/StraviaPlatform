@@ -9,9 +9,7 @@
   "route_output_unlink_first": "媒体生成仍引用此路由，即使功能已关闭。请先清空该引用，再切换为文字输出。",
   "route_output_open_media": "打开媒体生成配置",
   "route_output_no_candidates": "没有符合此输出用途的模型。请到供应商登记模型的输出规格，或选择其他输出用途。",
-  "route_output_bound_reference": "已保存的路由引用：{route}",
-  "route_output_clear_reference": "解除路由引用并关闭",
-  "route_output_clear_reference_help": "清空已保存的路由引用并关闭媒体生成。仅关闭开关不会解除引用。",
+
   "model_sync_pause_preference": "自动同步已关闭",
   "model_sync_pause_provider": "供应商已停用",
   "model_sync_pause_credentials": "供应商凭据失效",
@@ -107,7 +105,7 @@
   "console_chat_copy": "复制回答",
   "console_chat_copy_message": "复制消息",
   "console_chat_edit_message": "编辑消息",
-  "console_chat_edit_effect": "重新发送会替换这条消息之后的全部内容，并用当前模型生成新回答。",
+
   "console_chat_resend": "重新发送",
   "console_chat_generating": "正在生成…",
   "console_chat_stopped": "已停止",
@@ -882,9 +880,7 @@
   "media_generation_enable": "启用媒体生成",
   "media_generation_enable_help": "使用已保存的图片路由，统一控制显式调用、自动开放和 MCP 访问。",
   "media_generation_saving_enabled_state": "正在保存媒体生成状态",
-  "media_generation_saved_configuration_needs_attention": "已保存的配置需要处理",
-  "media_generation_manage_routes": "管理模型",
-  "media_generation_manage_model_services": "管理供应商",
+
   "media_generation_image_route_title": "图片路由",
   "media_generation_image_route_help": "选择 Stravia 专用于图片生成的模型路由。",
   "media_generation_route_unsaved": "路由选择尚未保存；启停开关仍会使用已保存的路由。",

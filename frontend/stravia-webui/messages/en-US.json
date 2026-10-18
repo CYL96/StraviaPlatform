@@ -9,9 +9,7 @@
   "route_output_unlink_first": "This route is referenced by media generation, even when generation is disabled. Clear that reference before switching to text.",
   "route_output_open_media": "Open media generation",
   "route_output_no_candidates": "No models qualify for this output. Register the model's output specification in its provider, or choose another output.",
-  "route_output_bound_reference": "Saved route reference: {route}",
-  "route_output_clear_reference": "Unlink route and disable",
-  "route_output_clear_reference_help": "Clears the saved route reference and disables media generation. Turning off the switch alone does not unlink the route.",
+
   "model_sync_pause_preference": "Automatic synchronization is disabled",
   "model_sync_pause_provider": "Provider is disabled",
   "model_sync_pause_credentials": "Provider credentials are invalid",
@@ -107,7 +105,7 @@
   "console_chat_copy": "Copy response",
   "console_chat_copy_message": "Copy message",
   "console_chat_edit_message": "Edit message",
-  "console_chat_edit_effect": "Resending replaces everything after this message and generates a new answer with the current model.",
+
   "console_chat_resend": "Resend",
   "console_chat_generating": "Generating…",
   "console_chat_stopped": "Stopped",
@@ -888,9 +886,7 @@
   "media_generation_enable": "Enable media generation",
   "media_generation_enable_help": "Controls explicit calls, automatic exposure, and MCP access using the saved image route.",
   "media_generation_saving_enabled_state": "Saving media generation status",
-  "media_generation_saved_configuration_needs_attention": "Saved configuration needs attention",
-  "media_generation_manage_routes": "Manage models",
-  "media_generation_manage_model_services": "Manage providers",
+
   "media_generation_image_route_title": "Image route",
   "media_generation_image_route_help": "Choose the dedicated Model Route Stravia uses for image generation.",
   "media_generation_route_unsaved": "The route selection has unsaved changes. The enable switch continues to use the saved route.",
