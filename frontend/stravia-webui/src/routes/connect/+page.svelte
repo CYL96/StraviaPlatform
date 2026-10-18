@@ -1,8 +1,8 @@
 <script lang="ts">
-import * as m from '$lib/paraglide/messages.js'
-import RequestFailure from '$lib/components/request-failure.svelte'
-import * as Alert from '$lib/components/ui/alert'
-import { Spinner } from '$lib/components/ui/spinner'
+import * as m from '#lib/paraglide/messages.js'
+import RequestFailure from '#lib/components/request-failure.svelte'
+import * as Alert from '#lib/components/ui/alert/index.js'
+import { Spinner } from '#lib/components/ui/spinner/index.js'
 import { resolve } from '$app/paths'
 import { goto } from '$app/navigation'
 import { untrack } from 'svelte'
@@ -13,12 +13,12 @@ import Code2Icon from '@lucide/svelte/icons/code-2'
 import TerminalSquareIcon from '@lucide/svelte/icons/terminal-square'
 import { toast } from 'svelte-sonner'
 
-import { admin, isTauri, proxyBase } from '$lib/admin-client'
-import { getConnectSetup } from '$lib/connect-setup'
-import { localizeBackendErrorMessage } from '$lib/backend-error'
-import { applyConnectClient, asConnectClientApplyError, planConnectClient } from '$lib/connect-client-apply'
-import { effectiveModelDisplayName, logicalModelSecondaryId, sortLogicalModels } from '$lib/logical-model'
-import type { Route } from '$lib/types'
+import { admin, isTauri, proxyBase } from '#lib/admin-client.js'
+import { getConnectSetup } from '#lib/connect-setup.js'
+import { localizeBackendErrorMessage } from '#lib/backend-error.js'
+import { applyConnectClient, asConnectClientApplyError, planConnectClient } from '#lib/connect-client-apply.js'
+import { effectiveModelDisplayName, logicalModelSecondaryId, sortLogicalModels } from '#lib/logical-model.js'
+import type { Route } from '#lib/types.js'
 import {
   apiKeyAllowsModel,
   buildCode,
@@ -32,14 +32,14 @@ import {
   type CodeLanguage,
   type ConnectClientApplyRequest,
   type GatewayProtocol,
-} from '$lib/connect'
-import PageHeader from '$lib/components/page-header.svelte'
-import { Button } from '$lib/components/ui/button'
-import * as Empty from '$lib/components/ui/empty'
-import * as Field from '$lib/components/ui/field'
-import * as Select from '$lib/components/ui/select'
-import { Skeleton } from '$lib/components/ui/skeleton'
-import * as Tabs from '$lib/components/ui/tabs'
+} from '#lib/connect.js'
+import PageHeader from '#lib/components/page-header.svelte'
+import { Button } from '#lib/components/ui/button/index.js'
+import * as Empty from '#lib/components/ui/empty/index.js'
+import * as Field from '#lib/components/ui/field/index.js'
+import * as Select from '#lib/components/ui/select/index.js'
+import { Skeleton } from '#lib/components/ui/skeleton/index.js'
+import * as Tabs from '#lib/components/ui/tabs/index.js'
 
 const emptyKey = 'sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'
 const setup = getConnectSetup()

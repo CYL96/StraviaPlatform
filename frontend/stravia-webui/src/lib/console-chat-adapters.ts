@@ -1,6 +1,6 @@
 import { createParser } from 'eventsource-parser'
-import { admin } from '$lib/admin-client'
-import { apiBase } from '$lib/auth'
+import { admin } from '#lib/admin-client.js'
+import { apiBase } from '#lib/auth.js'
 import type {
   ConsoleAdminCatalog,
   ConsoleChatError,
@@ -9,7 +9,7 @@ import type {
   ConsoleResponsesEvent,
   ConversationStore,
   ResponsesTransport,
-} from '$lib/console-chat-types'
+} from '#lib/console-chat-types.js'
 
 const DATABASE_NAME = 'stravia-console-chat'
 const DATABASE_VERSION = 2

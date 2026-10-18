@@ -1,9 +1,9 @@
-import type { StatsWindow } from '$lib/types/stats'
-import { apiBase, authenticatedFetch, decodeAdmin, isTauri } from '$lib/auth'
-import type { ConnectClientApplyPlan } from '$lib/connect-client-apply'
-import type { ConnectClientApplyRequest } from '$lib/connect'
-import type { Locale } from '$lib/paraglide/runtime.js'
-import type { UpdateStatus } from '$lib/product-update'
+import type { StatsWindow } from '#lib/types/stats.js'
+import { apiBase, authenticatedFetch, decodeAdmin, isTauri } from '#lib/auth.js'
+import type { ConnectClientApplyPlan } from '#lib/connect-client-apply.js'
+import type { ConnectClientApplyRequest } from '#lib/connect.js'
+import type { Locale } from '#lib/paraglide/runtime.js'
+import type { UpdateStatus } from '#lib/product-update.js'
 import type {
   ApiKey,
   CredentialRuleCatalog,
@@ -87,7 +87,7 @@ import type {
   ConfirmPluginUpdate,
   PluginPreview,
   PluginSummary,
-} from '$lib/types'
+} from '#lib/types.js'
 
 export { isTauri }
 

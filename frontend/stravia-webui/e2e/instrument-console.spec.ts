@@ -298,6 +298,32 @@ for (const routePath of ['/stats']) {
 
 test.describe('touch metric explanations', () => {
   test.use({ hasTouch: true })
+
+  test('touch chart readings stay above the contact point and inside the viewport', async ({ page }) => {
+    await stubTraffic(page, { requests: 12, errors: 0 })
+    await page.setViewportSize({ width: 320, height: 800 })
+    await page.goto('/stats')
+    const chart = page.getByLabel('Latency and speed chart', { exact: true })
+    await chart.scrollIntoViewIfNeeded()
+    const bounds = (await chart.boundingBox())!
+    const contact = { x: bounds.x + bounds.width / 2, y: bounds.y + bounds.height * 0.7 }
+    const session = await page.context().newCDPSession(page)
+    try {
+      await session.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [contact] })
+      const tooltip = page.getByRole('tooltip')
+      await expect(tooltip).toBeVisible()
+      await expect(tooltip).toContainText('tok/s')
+      const tooltipBounds = (await tooltip.boundingBox())!
+      expect(tooltipBounds.x).toBeGreaterThanOrEqual(0)
+      expect(tooltipBounds.x + tooltipBounds.width).toBeLessThanOrEqual(320)
+      expect(tooltipBounds.y).toBeGreaterThanOrEqual(0)
+      expect(tooltipBounds.y + tooltipBounds.height).toBeLessThanOrEqual(contact.y - 24)
+    } finally {
+      await session.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] })
+      await session.detach()
+    }
+  })
+
   for (const routePath of ['/stats']) {
     test(`${routePath} touch opens and dismisses the latency definition`, async ({ page }) => {
       await stubTraffic(page, { requests: 12, errors: 0 })

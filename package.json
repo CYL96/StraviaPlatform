@@ -24,7 +24,10 @@
     "format:check:web": "bun run --filter stravia-webui format:check",
     "preview:web": "bun run --filter stravia-webui preview"
   },
+  "overrides": {
+    "@tauri-apps/api": "~2.12.4"
+  },
   "patchedDependencies": {
-    "@wdio/tauri-service@1.4.0": "patches/@wdio%2Ftauri-service@1.4.0.patch"
+    "@wdio/tauri-service@1.5.0": "patches/@wdio%2Ftauri-service@1.5.0.patch"
   }
 }

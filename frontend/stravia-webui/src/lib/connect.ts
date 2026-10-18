@@ -1,6 +1,6 @@
-import * as m from '$lib/paraglide/messages.js'
-import { effectiveModelDisplayName } from '$lib/logical-model'
-import type { ApiKey, Route, RouteOutputModality, ThinkingLevel } from '$lib/types'
+import * as m from '#lib/paraglide/messages.js'
+import { effectiveModelDisplayName } from '#lib/logical-model.js'
+import type { ApiKey, Route, RouteOutputModality, ThinkingLevel } from '#lib/types.js'
 
 export type CodeLanguage = 'python' | 'typescript' | 'curl'
 export type GatewayProtocol = 'openai-compatible' | 'open-responses' | 'anthropic-messages' | 'google-gemini'

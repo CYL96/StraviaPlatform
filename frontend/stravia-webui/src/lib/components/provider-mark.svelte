@@ -1,8 +1,8 @@
 <script lang="ts">
 import PlugIcon from '@lucide/svelte/icons/plug'
 import { icons } from '../../assets/icons'
-import { catalogLogoUrl } from '$lib/admin-client'
-import { cn } from '$lib/utils'
+import { catalogLogoUrl } from '#lib/admin-client.js'
+import { cn } from '#lib/utils.js'
 
 interface Props {
   class?: string

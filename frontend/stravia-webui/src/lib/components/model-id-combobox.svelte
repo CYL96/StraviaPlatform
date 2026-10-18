@@ -2,11 +2,11 @@
 import XIcon from '@lucide/svelte/icons/x'
 import { tick } from 'svelte'
 
-import * as Command from '$lib/components/ui/command'
-import * as InputGroup from '$lib/components/ui/input-group'
-import * as Popover from '$lib/components/ui/popover'
-import { localeState } from '$lib/localization.svelte'
-import { inputValue } from '$lib/utils.js'
+import * as Command from '#lib/components/ui/command/index.js'
+import * as InputGroup from '#lib/components/ui/input-group/index.js'
+import * as Popover from '#lib/components/ui/popover/index.js'
+import { localeState } from '#lib/localization.svelte.js'
+import { inputValue } from '#lib/utils.js'
 
 interface CatalogModel {
   id: string

@@ -1,7 +1,7 @@
 <script lang="ts">
 import wordmarkMarkup from '../../assets/logos/stravia-wordmark.svg?raw'
 
-import { cn } from '$lib/utils.js'
+import { cn } from '#lib/utils.js'
 
 interface Props {
   class?: string

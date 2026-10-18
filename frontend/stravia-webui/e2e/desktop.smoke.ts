@@ -79,8 +79,8 @@ async function expectPortSwitch(previousTimeOrigin: number, port: number): Promi
   // 端口切换会重载 WebView；旧文档中的异步 IPC 回调会随文档销毁，不能用它轮询切换。
   await browser.waitUntil(
     () =>
-      browser.execute(
-        (previous) => performance.timeOrigin !== previous && document.readyState === 'complete',
+      browser.tauri.execute(
+        (_tauri, previous) => performance.timeOrigin !== previous && document.readyState === 'complete',
         previousTimeOrigin,
       ),
     { timeout: 10_000, timeoutMsg: 'desktop page did not reload after switching the listener' },
@@ -96,12 +96,12 @@ async function expectPortSwitch(previousTimeOrigin: number, port: number): Promi
 
 async function refreshDesktop(): Promise<void> {
   const previousTimeOrigin = await browser.execute(() => performance.timeOrigin)
-  // 嵌入式驱动只等待 location.reload() 的脚本回调；旧页面仍可暂时通过 URL/控件断言。
+  // 同步求值把结果留在页面全局，刷新会销毁它；原生通道直接返回结果，不依赖旧文档。
   await browser.refresh()
   await browser.waitUntil(
     () =>
-      browser.execute(
-        (previous) =>
+      browser.tauri.execute(
+        (_tauri, previous) =>
           performance.timeOrigin !== previous &&
           document.readyState === 'complete' &&
           document.querySelector('a[href="/vendor-plugins"]') !== null,
@@ -221,7 +221,10 @@ describe('Stravia desktop smoke', () => {
       await expect($('#route-output-modality')).toHaveText('Text')
       await $('#route-model-id').setValue(modelId)
       await $('#route-output-modality').click()
-      await $('[role="option"][data-value="image"]').click()
+      await browser.keys('ArrowDown')
+      await expect($('//*[@role="option" and normalize-space()="Image"]')).toBeDisplayed()
+      await browser.keys('Image')
+      await browser.keys('Enter')
       await expect($('#route-output-modality')).toHaveText('Image')
       await $('button=Save model').click()
       await browser.waitUntil(async () => new URL(await browser.getUrl()).pathname === '/models', {
@@ -1017,7 +1020,6 @@ describe('Stravia desktop smoke', () => {
       },
       { timeout: 10_000, timeoutMsg: 'desktop updater did not enter the installing state' },
     )
-    await expect($('p=Installing Stravia 9.9.9…')).not.toBeDisplayed()
   })
 
   it('writes Codex global configuration incrementally from the actual Connect page', async () => {

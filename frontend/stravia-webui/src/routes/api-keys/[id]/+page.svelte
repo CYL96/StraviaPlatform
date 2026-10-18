@@ -1,21 +1,21 @@
 <script lang="ts">
-import * as m from '$lib/paraglide/messages.js'
+import * as m from '#lib/paraglide/messages.js'
 import { goto } from '$app/navigation'
 import { resolve } from '$app/paths'
 import { page } from '$app/state'
 import { createQuery } from '@tanstack/svelte-query'
-
-import { admin } from '$lib/admin-client'
-import { localizeBackendErrorMessage } from '$lib/backend-error'
-import ApiKeyEditor from '$lib/components/api-key-editor.svelte'
-import PageHeader from '$lib/components/page-header.svelte'
-import RequestFailure from '$lib/components/request-failure.svelte'
-import { Button } from '$lib/components/ui/button'
-import { Spinner } from '$lib/components/ui/spinner'
+import { admin } from '#lib/admin-client.js'
+import { localizeBackendErrorMessage } from '#lib/backend-error.js'
+import ApiKeyEditor from '#lib/components/api-key-editor.svelte'
+import PageHeader from '#lib/components/page-header.svelte'
+import RequestFailure from '#lib/components/request-failure.svelte'
+import { Button } from '#lib/components/ui/button/index.js'
+import { Spinner } from '#lib/components/ui/spinner/index.js'
 
 const apiKeyId = $derived(page.params.id ?? '')
 const apiKeysQuery = createQuery(() => ({ queryKey: ['api-keys'], queryFn: admin.apiKeys.list }))
 const modelsQuery = createQuery(() => ({ queryKey: ['models'], queryFn: admin.models.list }))
+
 const webSearchQuery = createQuery(() => ({ queryKey: ['web-search-config'], queryFn: admin.webSearch.config.get }))
 const mediaUnderstandingQuery = createQuery(() => ({
   queryKey: ['media-understanding-config'],
@@ -25,6 +25,7 @@ const mediaGenerationQuery = createQuery(() => ({
   queryKey: ['media-generation-config'],
   queryFn: admin.mediaGeneration.config.get,
 }))
+
 const mediaGenerationStatus = $derived(
   mediaGenerationQuery.isPending
     ? ('loading' as const)
@@ -34,10 +35,11 @@ const mediaGenerationStatus = $derived(
         ? ('enabled' as const)
         : ('disabled' as const),
 )
+
 const apiKey = $derived(apiKeysQuery.data?.find((item) => item.id === apiKeyId))
 
 async function returnToApiKeys(): Promise<void> {
-  await goto(resolve('/api-keys'))
+  await goto(resolve('api-keys'))
 }
 </script>
 

@@ -1,6 +1,6 @@
-import * as m from '$lib/paraglide/messages.js'
-import { formatList } from '$lib/format'
-import { getLocale, type Locale } from '$lib/paraglide/runtime.js'
+import * as m from '#lib/paraglide/messages.js'
+import { formatList } from '#lib/format.js'
+import { getLocale, type Locale } from '#lib/paraglide/runtime.js'
 
 type ErrorPayload = { code?: string; message?: string; params?: Record<string, unknown> }
 

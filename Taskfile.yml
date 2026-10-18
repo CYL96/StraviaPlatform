@@ -2,7 +2,7 @@ version: "3"
 
 vars:
   DESKTOP_DIR: backend/apps/stravia-desktop
-  TAURI_CLI_VERSION: 2.12.0
+  TAURI_CLI_VERSION: 2.12.3
 
 tasks:
   brand:generate:
@@ -125,7 +125,7 @@ tasks:
       - package.json
       - bun.lock
       - frontend/stravia-webui/package.json
-      - frontend/stravia-webui/svelte.config.js
+
       - frontend/stravia-webui/vite.config.ts
       - frontend/stravia-webui/tsconfig*.json
       - .env*

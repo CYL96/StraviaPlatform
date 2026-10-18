@@ -1,5 +1,5 @@
-import * as m from '$lib/paraglide/messages.js'
-import type { CustomCredentialRule, CustomCredentialRuleInput } from '$lib/types'
+import * as m from '#lib/paraglide/messages.js'
+import type { CustomCredentialRule, CustomCredentialRuleInput } from '#lib/types.js'
 
 export type CustomRuleMode = 'simple' | 'pattern'
 export type CustomRuleField = 'name' | 'description' | 'text' | 'regex' | 'secret_group' | 'keywords' | 'min_entropy'

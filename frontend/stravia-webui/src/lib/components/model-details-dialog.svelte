@@ -1,13 +1,13 @@
 <script lang="ts">
-import * as m from '$lib/paraglide/messages.js'
-import { admin } from '$lib/admin-client'
-import { localizeBackendErrorMessage } from '$lib/backend-error'
-import { formatNumber } from '$lib/format'
-import type { ProviderModelDetail, ProviderModelMetadata, ProviderModelPrices } from '$lib/types'
-import ModelSpecification from '$lib/components/model-specification.svelte'
-import { Button } from '$lib/components/ui/button'
-import * as Dialog from '$lib/components/ui/dialog'
-import { Spinner } from '$lib/components/ui/spinner'
+import * as m from '#lib/paraglide/messages.js'
+import { admin } from '#lib/admin-client.js'
+import { localizeBackendErrorMessage } from '#lib/backend-error.js'
+import { formatNumber } from '#lib/format.js'
+import type { ProviderModelDetail, ProviderModelMetadata, ProviderModelPrices } from '#lib/types.js'
+import ModelSpecification from '#lib/components/model-specification.svelte'
+import { Button } from '#lib/components/ui/button/index.js'
+import * as Dialog from '#lib/components/ui/dialog/index.js'
+import { Spinner } from '#lib/components/ui/spinner/index.js'
 
 interface Props {
   providerId: string

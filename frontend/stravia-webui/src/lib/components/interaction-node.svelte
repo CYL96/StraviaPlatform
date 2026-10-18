@@ -1,12 +1,12 @@
 <script lang="ts">
-import * as m from '$lib/paraglide/messages.js'
+import * as m from '#lib/paraglide/messages.js'
 import { Handle, Position, type NodeProps } from '@xyflow/svelte'
 import InteractionPreview from './interaction-preview.svelte'
 
-import { formatCompactCount, formatLogTime } from '$lib/format'
-import { hasHistoricalFailure, interactionDisplayStatus } from '$lib/observation-chain-visibility'
-import { observationStatusLabel } from '$lib/observation-labels'
-import type { InteractionNodeData } from '$lib/types'
+import { formatCompactCount, formatLogTime } from '#lib/format.js'
+import { hasHistoricalFailure, interactionDisplayStatus } from '#lib/observation-chain-visibility.js'
+import { observationStatusLabel } from '#lib/observation-labels.js'
+import type { InteractionNodeData } from '#lib/types.js'
 
 type InteractionNode = import('@xyflow/svelte').Node<InteractionNodeData, 'interaction'>
 let { data, selected }: NodeProps<InteractionNode> = $props()

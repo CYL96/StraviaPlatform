@@ -30,6 +30,11 @@ tokio::task_local! {
     static ACCEPTED_AT: tokio::time::Instant;
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    pub(crate) static QUERY_WAITING: Arc<Notify>;
+}
+
 pub(crate) fn current_deadline() -> Option<Instant> {
     EXECUTION_DEADLINE.try_with(|deadline| *deadline).ok()
 }
@@ -494,6 +499,11 @@ impl Gateway {
             if wait.is_zero() || tokio::time::Instant::now() >= until {
                 return snapshot(execution);
             }
+            // 测试等 SQL 读取完成后再推进虚拟时钟；普通调用没有安装观察者。
+            #[cfg(test)]
+            QUERY_WAITING
+                .try_with(|registered| registered.notify_one())
+                .unwrap_or_default();
             tokio::select! {
                 _ = cancellation.cancelled() => return Err(failure("Tool execution query cancelled")),
                 _ = tokio::time::sleep_until(until) => {},

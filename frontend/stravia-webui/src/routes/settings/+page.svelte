@@ -1,5 +1,5 @@
 <script lang="ts">
-import * as m from '$lib/paraglide/messages.js'
+import * as m from '#lib/paraglide/messages.js'
 import { createQuery, useQueryClient } from '@tanstack/svelte-query'
 import DownloadIcon from '@lucide/svelte/icons/download'
 import SaveIcon from '@lucide/svelte/icons/save'
@@ -8,27 +8,33 @@ import { setMode, userPrefersMode } from 'mode-watcher'
 import { toast } from 'svelte-sonner'
 import { onDestroy, onMount } from 'svelte'
 
-import { admin, isTauri, type ArtifactSettings, type ArtifactS3Settings, type ProxySettings } from '$lib/admin-client'
-import SecretInput from '$lib/components/secret-input.svelte'
-import { changeCredentials, getAuthState } from '$lib/auth'
-import { localizeBackendErrorMessage } from '$lib/backend-error'
-import { formatBytes } from '$lib/format'
-import DesktopClientSettings from '$lib/components/desktop-client-settings.svelte'
-import LanguageSelector from '$lib/components/language-selector.svelte'
-import PageHeader from '$lib/components/page-header.svelte'
-import ProductUpdateSettings from '$lib/components/product-update-settings.svelte'
-import RpmManagement from '$lib/components/rpm-management.svelte'
-import RequestFailure from '$lib/components/request-failure.svelte'
-import { Badge } from '$lib/components/ui/badge'
-import * as AlertDialog from '$lib/components/ui/alert-dialog'
-import { Button } from '$lib/components/ui/button'
-import * as Field from '$lib/components/ui/field'
-import { Input } from '$lib/components/ui/input'
-import * as Select from '$lib/components/ui/select'
-import { Spinner } from '$lib/components/ui/spinner'
-import { Skeleton } from '$lib/components/ui/skeleton'
-import { Switch } from '$lib/components/ui/switch'
-import { inputValue } from '$lib/utils.js'
+import {
+  admin,
+  isTauri,
+  type ArtifactSettings,
+  type ArtifactS3Settings,
+  type ProxySettings,
+} from '#lib/admin-client.js'
+import SecretInput from '#lib/components/secret-input.svelte'
+import { changeCredentials, getAuthState } from '#lib/auth.js'
+import { localizeBackendErrorMessage } from '#lib/backend-error.js'
+import { formatBytes } from '#lib/format.js'
+import DesktopClientSettings from '#lib/components/desktop-client-settings.svelte'
+import LanguageSelector from '#lib/components/language-selector.svelte'
+import PageHeader from '#lib/components/page-header.svelte'
+import ProductUpdateSettings from '#lib/components/product-update-settings.svelte'
+import RpmManagement from '#lib/components/rpm-management.svelte'
+import RequestFailure from '#lib/components/request-failure.svelte'
+import { Badge } from '#lib/components/ui/badge/index.js'
+import * as AlertDialog from '#lib/components/ui/alert-dialog/index.js'
+import { Button } from '#lib/components/ui/button/index.js'
+import * as Field from '#lib/components/ui/field/index.js'
+import { Input } from '#lib/components/ui/input/index.js'
+import * as Select from '#lib/components/ui/select/index.js'
+import { Spinner } from '#lib/components/ui/spinner/index.js'
+import { Skeleton } from '#lib/components/ui/skeleton/index.js'
+import { Switch } from '#lib/components/ui/switch/index.js'
+import { inputValue } from '#lib/utils.js'
 
 const queryClient = useQueryClient()
 const artifactQuery = createQuery(() => ({ queryKey: ['artifact-settings'], queryFn: admin.settings.artifacts }))

@@ -1,8 +1,8 @@
-import { computeTps, formatDuration, formatList, formatTime } from '$lib/format'
-import { observationEventSummary } from '$lib/observation-event-summary'
-import { payloadCount, payloadRecord, payloadString } from '$lib/observation-payload'
-import * as m from '$lib/paraglide/messages.js'
-import type { FailedRequestDetail, InteractionDetail, ObservationEvent, RunDetail } from '$lib/types/observation'
+import { computeTps, formatDuration, formatList, formatTime } from '#lib/format.js'
+import { observationEventSummary } from '#lib/observation-event-summary.js'
+import { payloadCount, payloadRecord, payloadString } from '#lib/observation-payload.js'
+import * as m from '#lib/paraglide/messages.js'
+import type { FailedRequestDetail, InteractionDetail, ObservationEvent, RunDetail } from '#lib/types/observation.js'
 
 export type StreamItem =
   | { type: 'event'; event: ObservationEvent }

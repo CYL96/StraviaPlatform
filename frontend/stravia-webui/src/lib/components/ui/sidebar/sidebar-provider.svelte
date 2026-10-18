@@ -1,6 +1,6 @@
 <script lang="ts">
-import * as Tooltip from '$lib/components/ui/tooltip/index.js'
-import { cn, type WithElementRef } from '$lib/utils.js'
+import * as Tooltip from '#lib/components/ui/tooltip/index.js'
+import { cn, type WithElementRef } from '#lib/utils.js'
 import { SIDEBAR_WIDTH, SIDEBAR_WIDTH_ICON } from './constants.js'
 import { setSidebar } from './context.svelte.js'
 import type { HTMLAttributes } from 'svelte/elements'

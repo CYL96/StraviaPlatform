@@ -1,4 +1,4 @@
-import type { Route } from '$lib/types'
+import type { Route } from '#lib/types.js'
 
 export type LogicalModelIdentity = Pick<Route, 'model_id' | 'display_name'>
 

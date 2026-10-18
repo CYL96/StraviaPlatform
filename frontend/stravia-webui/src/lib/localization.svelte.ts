@@ -1,8 +1,8 @@
 import { invoke } from '@tauri-apps/api/core'
 
-import { isTauri } from '$lib/auth'
-import { locales, overwriteGetLocale, setLocale } from '$lib/paraglide/runtime.js'
-import type { Locale } from '$lib/paraglide/runtime.js'
+import { isTauri } from '#lib/auth.js'
+import { locales, overwriteGetLocale, setLocale } from '#lib/paraglide/runtime.js'
+import type { Locale } from '#lib/paraglide/runtime.js'
 
 export type { Locale }
 

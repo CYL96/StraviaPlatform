@@ -1,8 +1,8 @@
 <script lang="ts">
-import * as m from '$lib/paraglide/messages.js'
+import * as m from '#lib/paraglide/messages.js'
 import { page } from '$app/state'
 
-import { Button } from '$lib/components/ui/button'
+import { Button } from '#lib/components/ui/button/index.js'
 
 const status = $derived(page.status || 500)
 

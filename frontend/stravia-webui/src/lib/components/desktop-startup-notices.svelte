@@ -3,12 +3,12 @@ import AlertTriangleIcon from '@lucide/svelte/icons/alert-triangle'
 import FileTextIcon from '@lucide/svelte/icons/file-text'
 import XIcon from '@lucide/svelte/icons/x'
 
-import * as Alert from '$lib/components/ui/alert'
-import { Button } from '$lib/components/ui/button'
-import { Spinner } from '$lib/components/ui/spinner'
-import { openDesktopLogs } from '$lib/desktop-startup'
-import type { DesktopStartupState, DesktopStartupWarning } from '$lib/desktop-startup'
-import * as m from '$lib/paraglide/messages.js'
+import * as Alert from '#lib/components/ui/alert/index.js'
+import { Button } from '#lib/components/ui/button/index.js'
+import { Spinner } from '#lib/components/ui/spinner/index.js'
+import { openDesktopLogs } from '#lib/desktop-startup.js'
+import type { DesktopStartupState, DesktopStartupWarning } from '#lib/desktop-startup.js'
+import * as m from '#lib/paraglide/messages.js'
 
 let { state: startup }: { state: DesktopStartupState } = $props()
 

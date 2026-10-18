@@ -1,8 +1,8 @@
 <script lang="ts">
-import * as m from '$lib/paraglide/messages.js'
-import { localeState } from '$lib/localization.svelte'
-import * as Field from '$lib/components/ui/field'
-import * as Select from '$lib/components/ui/select'
+import * as m from '#lib/paraglide/messages.js'
+import { localeState } from '#lib/localization.svelte.js'
+import * as Field from '#lib/components/ui/field/index.js'
+import * as Select from '#lib/components/ui/select/index.js'
 
 interface Props {
   class?: string

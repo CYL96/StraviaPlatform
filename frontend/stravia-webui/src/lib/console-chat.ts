@@ -1,4 +1,4 @@
-import { apiKeyAllowsModel, apiKeyReadOnlyReason } from '$lib/connect'
+import { apiKeyAllowsModel, apiKeyReadOnlyReason } from '#lib/connect.js'
 import type {
   ConsoleApiKey,
   ConsoleAssistantMessage,
@@ -17,9 +17,9 @@ import type {
   ConsoleResponsesEvent,
   ConsoleThinkingSelection,
   ConsoleTokenUsage,
-} from '$lib/console-chat-types'
-import type { Route } from '$lib/types'
-import type { ThinkingActivity } from '$lib/observation-activities'
+} from '#lib/console-chat-types.js'
+import type { Route } from '#lib/types.js'
+import type { ThinkingActivity } from '#lib/observation-activities.js'
 
 /** 隐藏普通 HTML 注释及尚未收完的流式注释；不解释 Core 私有历史语法。 */
 export function consoleVisibleText(text: string): string {

@@ -18,7 +18,7 @@ export type MarkerVariant = VariantProps<typeof markerVariants>['variant']
 </script>
 
 <script lang="ts">
-import { cn, type WithElementRef } from '$lib/utils.js'
+import { cn, type WithElementRef } from '#lib/utils.js'
 import type { Snippet } from 'svelte'
 import type { HTMLAttributes } from 'svelte/elements'
 

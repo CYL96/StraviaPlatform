@@ -26,23 +26,23 @@ stravia-web-access-contract = { path = "backend/crates/stravia-web-access-contra
 tokio = { version = "1", default-features = false }
 ammonia = "4.1.4"
 axum = { version = "0.8", default-features = false }
-rmcp = { version = "=3.5.0", default-features = false }
+rmcp = { version = "=3.5.1", default-features = false }
 # 与桌面更新器统一 TLS/代理编译特性；运行时代理由客户端显式选择。
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "system-proxy", "socks"] }
 reqwest-websocket = "0.6"
 tungstenite = { version = "0.28", default-features = false }
-tower-http = { version = "0.6.11", features = ["cors", "trace"] }
+tower-http = { version = "0.7.1", features = ["cors", "trace"] }
 sqlx = { package = "stravia-sql", path = "backend/crates/stravia-sql" }
 sqlx-native = { package = "sqlx", version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite-bundled", "postgres", "tls-rustls", "migrate", "macros", "rust_decimal", "json"] }
 sqlx-core = { version = "=0.9.0", default-features = false }
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 semver = { version = "1", features = ["serde"] }
-wasmtime = { version = "=49.0.1", default-features = false, features = ["std", "runtime", "cranelift", "component-model", "component-model-async", "async", "parallel-compilation"] }
-wasmtime-wasi = { version = "=49.0.1", default-features = false, features = ["p2"] }
-wasmprinter = "=0.258.0"
-wat = "=1.258.0"
-serde-saphyr = "1"
+wasmtime = { version = "=49.0.3", default-features = false, features = ["std", "runtime", "cranelift", "component-model", "component-model-async", "async", "parallel-compilation"] }
+wasmtime-wasi = { version = "=49.0.3", default-features = false, features = ["p2"] }
+wasmprinter = "=0.258.3"
+wat = "=1.258.3"
+serde-saphyr = "2"
 json5 = "1"
 async-trait = "0.1"
 tracing = "0.1"
@@ -50,7 +50,7 @@ tracing-appender = "0.2"
 tracing-subscriber = "0.3"
 metrics = "0.24.2"
 metrics-exporter-prometheus = { version = "0.18.1", default-features = false }
-sysinfo = { version = "0.37.2", default-features = false, features = ["system"] }
+sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
 log = "0.4"
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", default-features = false }
@@ -65,7 +65,7 @@ http-body-util = "0.1"
 htmd = "0.5"
 bytes = "1"
 flate2 = { version = "=1.1.10", default-features = false, features = ["rust_backend"] }
-zstd = { version = "=0.13.3", default-features = false }
+zstd = { version = "=0.14.3", default-features = false }
 # 与 shellexpand 复用 dirs 6；相同的 home_dir 实现无需在服务端额外编译 dirs 7。
 dirs = "6"
 dom_smoothie = "0.18"
@@ -78,8 +78,8 @@ jsonwebtoken = { version = "11", default-features = false }
 rpassword = "7.5"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 office_oxide = "0.1.11"
-cfb = "0.14"
-zip = { version = "=8.6.0", default-features = false }
+cfb = "0.15"
+zip = { version = "=9.0.5", default-features = false }
 dashmap = "6"
 inventory = "0.3"
 aws-credential-types = "1.3.0"
@@ -109,19 +109,17 @@ shellexpand = "3"
 rust-embed = { version = "8", features = ["compression"] }
 listeners = "0.6.1"
 local-ip-address = "0.6"
-# WebDriver 1.4.0 uses WebView2 0.38 / windows 0.61; Tauri 2.12 upgrades
-# WebView2 to 0.39, which makes its Windows bridge types incompatible.
-tauri = { version = "=2.11.2", features = ["tray-icon"] }
-tauri-plugin-autostart = "2"
-tauri-plugin-dialog = "2"
-tauri-plugin-single-instance = "2"
-tauri-plugin-opener = "2.5.4"
-tauri-plugin-process = "2"
-tauri-plugin-store = "2"
-tauri-plugin-updater = "2"
-tauri-build = { version = "2", features = [] }
-tauri-plugin-wdio = "1"
-tauri-plugin-wdio-webdriver = "1"
+tauri = { version = "=2.12.4", features = ["tray-icon"] }
+tauri-plugin-autostart = "2.7.0"
+tauri-plugin-dialog = "2.8.3"
+tauri-plugin-single-instance = "2.5.4"
+tauri-plugin-opener = "2.7.2"
+tauri-plugin-process = "2.4.0"
+tauri-plugin-store = "2.5.0"
+tauri-plugin-updater = "2.14.0"
+tauri-build = { version = "2.7.3", features = [] }
+tauri-plugin-wdio = "1.5.0"
+tauri-plugin-wdio-webdriver = "1.5.0"
 
 # 多版本依赖以独立键区分；crate 只继承版本并声明自身所需特性。
 bitflags = "2.13.2"
@@ -143,9 +141,9 @@ toml_parser = "1.1.3"
 winnow = "1.0.4"
 objc2-core-foundation = { version = "0.3.2", default-features = false }
 objc2 = "0.6.4"
-jsonschema = { version = "0.58.1", default-features = false }
+jsonschema = { version = "0.59.0", default-features = false }
 rcgen = "0.14.5"
-wit-bindgen = "0.62.0"
+wit-bindgen = "0.63.0"
 stable_deref_trait = "1.2.1"
 
 [workspace.lints.rust]

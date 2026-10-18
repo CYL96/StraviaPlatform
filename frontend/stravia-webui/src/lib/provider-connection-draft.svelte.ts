@@ -5,10 +5,10 @@ import {
   type ProviderConnectionDraftFields,
   type ProviderConnectionDraftSnapshot,
   type ProviderConnectionSubmitOutcome,
-} from '$lib/provider-connection-draft'
-import type { OAuthCandidateConfiguration, ProviderConfigurationPreview } from '$lib/types'
+} from '#lib/provider-connection-draft.js'
+import type { OAuthCandidateConfiguration, ProviderConfigurationPreview } from '#lib/types.js'
 
-export { ProviderConnectionDraftController, emptyProviderConnectionDraft } from '$lib/provider-connection-draft'
+export { ProviderConnectionDraftController, emptyProviderConnectionDraft } from '#lib/provider-connection-draft.js'
 export type {
   ProviderConnectionDraftDeps,
   ProviderConnectionDraftFields,
@@ -19,7 +19,7 @@ export type {
   ProviderConnectionSubmission,
   ProviderConnectionSubmitOutcome,
   ProviderConnectionWriter,
-} from '$lib/provider-connection-draft'
+} from '#lib/provider-connection-draft.js'
 
 /**
  * ProviderConnectionDraftController 的 Svelte 壳：快照字段镜像为 $state；

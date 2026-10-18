@@ -1,6 +1,6 @@
 <script lang="ts">
 import { untrack } from 'svelte'
-import MarkdownContent from '$lib/components/markdown-content.svelte'
+import MarkdownContent from '#lib/components/markdown-content.svelte'
 
 let {
   text,

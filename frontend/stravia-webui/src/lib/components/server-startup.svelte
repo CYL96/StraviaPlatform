@@ -1,10 +1,10 @@
 <script lang="ts">
-import BrandMark from '$lib/components/brand-mark.svelte'
-import BrandWordmark from '$lib/components/brand-wordmark.svelte'
-import StartupProgress from '$lib/components/startup-progress.svelte'
-import { Button } from '$lib/components/ui/button'
-import * as m from '$lib/paraglide/messages.js'
-import type { ServerStartupState } from '$lib/server-startup'
+import BrandMark from '#lib/components/brand-mark.svelte'
+import BrandWordmark from '#lib/components/brand-wordmark.svelte'
+import StartupProgress from '#lib/components/startup-progress.svelte'
+import { Button } from '#lib/components/ui/button/index.js'
+import * as m from '#lib/paraglide/messages.js'
+import type { ServerStartupState } from '#lib/server-startup.js'
 
 let { state, connectionError = false }: { state: ServerStartupState; connectionError?: boolean } = $props()
 const failed = $derived(state.status === 'failed' || connectionError)

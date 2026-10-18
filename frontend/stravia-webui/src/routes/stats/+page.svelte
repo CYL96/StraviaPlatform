@@ -5,19 +5,19 @@ import {
   localStatsDateTime,
   parseLocalStatsDateTime,
   statsPresentationBucket,
-} from '$lib/stats-window'
-import type { StatsWindow } from '$lib/types/stats'
-import * as Dialog from '$lib/components/ui/dialog'
-import * as Field from '$lib/components/ui/field'
-import { Input } from '$lib/components/ui/input'
-import * as m from '$lib/paraglide/messages.js'
-import RequestFailure from '$lib/components/request-failure.svelte'
+} from '#lib/stats-window.js'
+import type { StatsWindow } from '#lib/types/stats.js'
+import * as Dialog from '#lib/components/ui/dialog/index.js'
+import * as Field from '#lib/components/ui/field/index.js'
+import { Input } from '#lib/components/ui/input/index.js'
+import * as m from '#lib/paraglide/messages.js'
+import RequestFailure from '#lib/components/request-failure.svelte'
 import { createQuery } from '@tanstack/svelte-query'
 import { BarChart, PieChart } from 'layerchart'
 
-import { admin } from '$lib/admin-client'
-import { localizeBackendErrorMessage } from '$lib/backend-error'
-import { getDataTableLabels } from '$lib/data-table-labels'
+import { admin } from '#lib/admin-client.js'
+import { localizeBackendErrorMessage } from '#lib/backend-error.js'
+import { getDataTableLabels } from '#lib/data-table-labels.js'
 import {
   formatCompactCount,
   formatDuration,
@@ -26,20 +26,20 @@ import {
   formatPercent,
   formatTime,
   formatTps,
-} from '$lib/format'
-import { buildActivityGrid, buildLatencyChart, planActivityGrid } from '$lib/stats-chart'
-import type { ApiKeyStats, ProviderStats } from '$lib/types'
-import MetricStrip from '$lib/components/metric-strip.svelte'
-import LatencySpeedChart from '$lib/components/latency-speed-chart.svelte'
-import LatencySpeedSummary from '$lib/components/latency-speed-summary.svelte'
-import TokenActivityGrid from '$lib/components/token-activity-grid.svelte'
-import PageHeader from '$lib/components/page-header.svelte'
-import StatusIndicator from '$lib/components/status-indicator.svelte'
-import { Button } from '$lib/components/ui/button'
-import { DataTable, createDataTableColumnHelper } from '$lib/components/ui/data-table'
-import TimeWindowControls from '$lib/components/time-window-controls.svelte'
-import { Skeleton } from '$lib/components/ui/skeleton'
-import * as Empty from '$lib/components/ui/empty'
+} from '#lib/format.js'
+import { buildActivityGrid, buildLatencyChart, planActivityGrid } from '#lib/stats-chart.js'
+import type { ApiKeyStats, ProviderStats } from '#lib/types.js'
+import MetricStrip from '#lib/components/metric-strip.svelte'
+import LatencySpeedChart from '#lib/components/latency-speed-chart.svelte'
+import LatencySpeedSummary from '#lib/components/latency-speed-summary.svelte'
+import TokenActivityGrid from '#lib/components/token-activity-grid.svelte'
+import PageHeader from '#lib/components/page-header.svelte'
+import StatusIndicator from '#lib/components/status-indicator.svelte'
+import { Button } from '#lib/components/ui/button/index.js'
+import { DataTable, createDataTableColumnHelper } from '#lib/components/ui/data-table/index.js'
+import TimeWindowControls from '#lib/components/time-window-controls.svelte'
+import { Skeleton } from '#lib/components/ui/skeleton/index.js'
+import * as Empty from '#lib/components/ui/empty/index.js'
 
 let hours = $state('24')
 const HOUR_MS = 3_600_000

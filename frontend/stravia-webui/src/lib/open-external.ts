@@ -1,4 +1,4 @@
-import { isTauri } from '$lib/admin-client'
+import { isTauri } from '#lib/admin-client.js'
 
 export async function openExternalUrl(url: string): Promise<void> {
   if (isTauri) {

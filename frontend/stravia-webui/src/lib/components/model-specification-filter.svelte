@@ -1,15 +1,15 @@
 <script lang="ts">
-import * as m from '$lib/paraglide/messages.js'
+import * as m from '#lib/paraglide/messages.js'
 import {
   formatSpecificationTokens,
   specificationModalities,
   specificationReasoningEfforts,
-} from '$lib/model-specification'
-import type { SpecificationFilter } from '$lib/model-specification-filter'
-import { Checkbox } from '$lib/components/ui/checkbox'
-import * as Field from '$lib/components/ui/field'
-import { Input } from '$lib/components/ui/input'
-import * as Select from '$lib/components/ui/select'
+} from '#lib/model-specification.js'
+import type { SpecificationFilter } from '#lib/model-specification-filter.js'
+import { Checkbox } from '#lib/components/ui/checkbox/index.js'
+import * as Field from '#lib/components/ui/field/index.js'
+import { Input } from '#lib/components/ui/input/index.js'
+import * as Select from '#lib/components/ui/select/index.js'
 
 interface Props {
   value: SpecificationFilter

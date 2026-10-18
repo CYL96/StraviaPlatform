@@ -1,6 +1,6 @@
-import { resolveProtocol } from '$lib/protocol'
-import type { Provider } from '$lib/types/provider'
-import type { TargetThinkingControl, ThinkingLevel, ThinkingLevelMapping } from '$lib/types/route'
+import { resolveProtocol } from '#lib/protocol.js'
+import type { Provider } from '#lib/types/provider.js'
+import type { TargetThinkingControl, ThinkingLevel, ThinkingLevelMapping } from '#lib/types/route.js'
 
 export type ThinkingControlKind = TargetThinkingControl['type']
 

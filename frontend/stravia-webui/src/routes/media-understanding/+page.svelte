@@ -1,24 +1,24 @@
 <script lang="ts">
-import * as m from '$lib/paraglide/messages.js'
-import RequestFailure from '$lib/components/request-failure.svelte'
+import * as m from '#lib/paraglide/messages.js'
+import RequestFailure from '#lib/components/request-failure.svelte'
 import { resolve } from '$app/paths'
 import { createQuery, useQueryClient } from '@tanstack/svelte-query'
 import { toast } from 'svelte-sonner'
-
-import { admin } from '$lib/admin-client'
-import { localizeBackendErrorMessage } from '$lib/backend-error'
-import { logicalModelSecondaryId, sortLogicalModels } from '$lib/logical-model'
-import PageHeader from '$lib/components/page-header.svelte'
-import * as Alert from '$lib/components/ui/alert'
-import { Button } from '$lib/components/ui/button'
-import * as Field from '$lib/components/ui/field'
-import * as Empty from '$lib/components/ui/empty'
-import * as Select from '$lib/components/ui/select'
-import { Spinner } from '$lib/components/ui/spinner'
-import { Switch } from '$lib/components/ui/switch'
-import type { EligibleMediaModel, ThinkingLevel } from '$lib/types'
+import { admin } from '#lib/admin-client.js'
+import { localizeBackendErrorMessage } from '#lib/backend-error.js'
+import { logicalModelSecondaryId, sortLogicalModels } from '#lib/logical-model.js'
+import PageHeader from '#lib/components/page-header.svelte'
+import * as Alert from '#lib/components/ui/alert/index.js'
+import { Button } from '#lib/components/ui/button/index.js'
+import * as Field from '#lib/components/ui/field/index.js'
+import * as Empty from '#lib/components/ui/empty/index.js'
+import * as Select from '#lib/components/ui/select/index.js'
+import { Spinner } from '#lib/components/ui/spinner/index.js'
+import { Switch } from '#lib/components/ui/switch/index.js'
+import type { EligibleMediaModel, ThinkingLevel } from '#lib/types.js'
 
 const queryClient = useQueryClient()
+
 const configQuery = createQuery(() => ({
   queryKey: ['media-understanding-config'],
   queryFn: admin.mediaUnderstanding.get,
@@ -35,15 +35,19 @@ const hasChanges = $derived(
   configQuery.data !== undefined &&
     (modelId !== (configQuery.data.model_id ?? '') || thinkingLevel !== (configQuery.data.thinking_level ?? '')),
 )
-
 const eligibleModels = $derived(sortLogicalModels(configQuery.data?.eligible_models ?? []))
 const selectedModel = $derived(configQuery.data?.eligible_models.find((model) => model.id === modelId))
+
 const savedBindingReady = $derived.by(() => {
   const config = configQuery.data
+
   if (!config) return false
+
   const model = config.eligible_models.find((candidate) => candidate.id === config.model_id)
+
   return Boolean(model && config.thinking_level && model.supported_thinking_levels.includes(config.thinking_level))
 })
+
 const canSave = $derived(
   Boolean(configQuery.data) &&
     hasChanges &&
@@ -65,9 +69,13 @@ function supportedThinkingLevel(
 
 $effect(() => {
   const config = configQuery.data
+
   if (!config || initialized) return
+
   initialized = true
+
   const model = config.eligible_models.find((candidate) => candidate.id === config.model_id)
+
   modelId = model?.id ?? ''
   thinkingLevel = supportedThinkingLevel(model, config.thinking_level)
 })
@@ -197,11 +205,11 @@ function selectThinkingLevel(value?: string): void {
           >{/if}
       </div>
       {#if configQuery.data?.eligible_models.length === 0}
-        <Empty.Root class="border-y py-6"
-          ><Empty.Header
-            ><Empty.Description>{m.media_understanding_add_logical_model()}</Empty.Description></Empty.Header
-          ><Empty.Content><Button href={resolve('/models')}>{m.connect_add_a_model()}</Button></Empty.Content
-          ></Empty.Root>
+        <Empty.Root class="border-y py-6">
+          <Empty.Header
+            ><Empty.Description>{m.media_understanding_add_logical_model()}</Empty.Description></Empty.Header>
+          <Empty.Content><Button href={resolve('models')}>{m.connect_add_a_model()}</Button></Empty.Content>
+        </Empty.Root>
       {:else}
         <Field.Group>
           <Field.Field size="select">

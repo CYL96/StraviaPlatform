@@ -2,7 +2,7 @@
 import type { Dialog as DialogPrimitive } from 'bits-ui'
 import type { Snippet } from 'svelte'
 
-import { cn, type WithoutChildrenOrChild } from '$lib/utils.js'
+import { cn, type WithoutChildrenOrChild } from '#lib/utils.js'
 import Content from './dialog-content.svelte'
 
 let {

@@ -1,5 +1,5 @@
 <script lang="ts">
-import * as m from '$lib/paraglide/messages.js'
+import * as m from '#lib/paraglide/messages.js'
 import { createQuery, useQueryClient } from '@tanstack/svelte-query'
 import CircleAlertIcon from '@lucide/svelte/icons/circle-alert'
 import PackageOpenIcon from '@lucide/svelte/icons/package-open'
@@ -7,31 +7,31 @@ import RefreshCwIcon from '@lucide/svelte/icons/refresh-cw'
 import UploadIcon from '@lucide/svelte/icons/upload'
 import { toast } from 'svelte-sonner'
 
-import { admin } from '$lib/admin-client'
-import { localizeBackendErrorMessage } from '$lib/backend-error'
+import { admin } from '#lib/admin-client.js'
+import { localizeBackendErrorMessage } from '#lib/backend-error.js'
 import type {
   PluginBindingImpact,
   PluginNetworkPermission,
   PluginPreview,
   PluginSource,
   PluginSummary,
-} from '$lib/types'
-import PageHeader from '$lib/components/page-header.svelte'
-import ProviderMark from '$lib/components/provider-mark.svelte'
-import RequestFailure from '$lib/components/request-failure.svelte'
-import StatusIndicator from '$lib/components/status-indicator.svelte'
-import * as Alert from '$lib/components/ui/alert'
-import * as AlertDialog from '$lib/components/ui/alert-dialog'
-import { Badge } from '$lib/components/ui/badge'
-import { Button } from '$lib/components/ui/button'
-import { Checkbox } from '$lib/components/ui/checkbox'
-import * as Dialog from '$lib/components/ui/dialog'
-import * as Empty from '$lib/components/ui/empty'
-import { Label } from '$lib/components/ui/label'
-import * as Sheet from '$lib/components/ui/sheet'
-import { Skeleton } from '$lib/components/ui/skeleton'
-import { Spinner } from '$lib/components/ui/spinner'
-import { cn } from '$lib/utils'
+} from '#lib/types.js'
+import PageHeader from '#lib/components/page-header.svelte'
+import ProviderMark from '#lib/components/provider-mark.svelte'
+import RequestFailure from '#lib/components/request-failure.svelte'
+import StatusIndicator from '#lib/components/status-indicator.svelte'
+import * as Alert from '#lib/components/ui/alert/index.js'
+import * as AlertDialog from '#lib/components/ui/alert-dialog/index.js'
+import { Badge } from '#lib/components/ui/badge/index.js'
+import { Button } from '#lib/components/ui/button/index.js'
+import { Checkbox } from '#lib/components/ui/checkbox/index.js'
+import * as Dialog from '#lib/components/ui/dialog/index.js'
+import * as Empty from '#lib/components/ui/empty/index.js'
+import { Label } from '#lib/components/ui/label/index.js'
+import * as Sheet from '#lib/components/ui/sheet/index.js'
+import { Skeleton } from '#lib/components/ui/skeleton/index.js'
+import { Spinner } from '#lib/components/ui/spinner/index.js'
+import { cn } from '#lib/utils.js'
 
 const MAX_PLUGIN_BYTES = 64 * 1024 * 1024
 const queryClient = useQueryClient()

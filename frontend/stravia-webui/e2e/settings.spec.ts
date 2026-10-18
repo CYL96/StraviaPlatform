@@ -1,6 +1,7 @@
 import { expect, test } from '@playwright/test'
 
 import type {
+  CredentialDiscoveryPage,
   CredentialRuleCatalog,
   MediaUnderstandingConfigView,
   WebAccessSettings,
@@ -1146,6 +1147,11 @@ test('credential protection table keeps its header above the draggable body scro
   await page.setViewportSize({ width: 1280, height: 800 })
   await page.route('**/api/v1/reversible-redaction/rules', (route) =>
     route.fulfill({ json: { data: credentialCatalog } }),
+  )
+  await page.route('**/api/v1/reversible-redaction/discoveries?**', (route) =>
+    route.fulfill({
+      json: { data: { items: [], next_cursor: null, observation_gap: false } satisfies CredentialDiscoveryPage },
+    }),
   )
   await page.goto('/reversible-redaction')
   const table = page.getByRole('table')

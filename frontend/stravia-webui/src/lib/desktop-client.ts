@@ -1,7 +1,7 @@
-import * as m from '$lib/paraglide/messages.js'
+import * as m from '#lib/paraglide/messages.js'
 
 import { invoke } from '@tauri-apps/api/core'
-import { isTauri } from '$lib/admin-client'
+import { isTauri } from '#lib/admin-client.js'
 
 export type DesktopPortMode = 'fixed' | 'fallback' | 'configError'
 export type BindingFailureKind = 'addrInUse' | 'other'

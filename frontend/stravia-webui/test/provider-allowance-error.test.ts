@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 
-import { localizeBackendErrorMessage } from '$lib/backend-error'
+import { localizeBackendErrorMessage } from '#lib/backend-error.js'
 
 describe('route output recovery errors', () => {
   test('preserves Core error destination and route identities through encoded error messages', () => {

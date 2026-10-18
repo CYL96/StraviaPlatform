@@ -5,8 +5,8 @@ import {
   thinkingControlWritable,
   unrepresentableThinkingLevels,
   writableThinkingControlKinds,
-} from '$lib/thinking-control'
-import type { ThinkingLevelMapping } from '$lib/types'
+} from '#lib/thinking-control.js'
+import type { ThinkingLevelMapping } from '#lib/types.js'
 
 const toggleMap: ThinkingLevelMapping[] = [
   { level: 'off', control: { type: 'disabled' }, source: 'generated' },

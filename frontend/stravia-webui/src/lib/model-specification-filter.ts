@@ -1,4 +1,4 @@
-import type { ModelSpecification } from '$lib/types'
+import type { ModelSpecification } from '#lib/types.js'
 
 export interface SpecificationFilter {
   context?: number

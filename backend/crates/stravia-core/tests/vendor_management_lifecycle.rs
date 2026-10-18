@@ -436,6 +436,30 @@ async fn allowance_sample_count(data_dir: &Path, provider_id: &str) -> anyhow::R
     )
 }
 
+async fn mark_credential_invalid(gateway: &Gateway, provider_id: &str) -> anyhow::Result<()> {
+    // 夹具也经过存储接口写入，保持凭据代际与当前实例的配置投影一致。
+    let provider = gateway
+        .storage
+        .providers()
+        .get(provider_id)
+        .await?
+        .context("missing test provider")?;
+    let oauth = gateway.storage.oauth_credentials().get(provider_id).await?;
+    let expected = stravia_core::db::models::ProviderCredentialVersion {
+        provider_revision: provider.revision,
+        oauth_status_version: oauth.map(|credential| credential.status_version),
+    };
+    anyhow::ensure!(
+        gateway
+            .storage
+            .providers()
+            .mark_credential_invalid(provider_id, expected)
+            .await?,
+        "test provider credential version changed before invalidation"
+    );
+    Ok(())
+}
+
 async fn set_guards(
     gateway: &Gateway,
     upstream: &mut TestUpstream,
@@ -1241,17 +1265,7 @@ async fn allowance_guards_preserve_enabled_intent_models_and_credential_invalid_
     assert_eq!(request.operation(), "allowance");
     request.reply(UpstreamReply::allowance("0"));
     assert!(enable.await??.is_enabled);
-    let mut connection = sqlx::SqliteConnection::connect_with(
-        &sqlx::sqlite::SqliteConnectOptions::new()
-            .filename(DataPaths::new(directory.path()).database()),
-    )
-    .await?;
-    sqlx::query(
-        "UPDATE providers SET credential_status = 'invalid', revision = revision + 1 WHERE id = ?",
-    )
-    .bind(&provider.id)
-    .execute(&mut connection)
-    .await?;
+    mark_credential_invalid(&gateway, &provider.id).await?;
     let held = gateway
         .admin()
         .replace_provider_allowance_guards(&provider.id, vec!["requests".into()])
@@ -1671,17 +1685,7 @@ async fn invalid_credentials_pause_cached_and_inflight_allowances_until_repaired
     let fresh = seed.await??.expect("fresh allowance");
     assert_eq!(fresh.status, ProviderAllowanceStatus::Fresh);
 
-    let mut connection = sqlx::SqliteConnection::connect_with(
-        &sqlx::sqlite::SqliteConnectOptions::new()
-            .filename(DataPaths::new(directory.path()).database()),
-    )
-    .await?;
-    sqlx::query(
-        "UPDATE providers SET credential_status = 'invalid', revision = revision + 1 WHERE id = ?",
-    )
-    .bind(&provider.id)
-    .execute(&mut connection)
-    .await?;
+    mark_credential_invalid(&gateway, &provider.id).await?;
     let admin = gateway.admin();
     let paused = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         let get = admin
@@ -1723,12 +1727,11 @@ async fn invalid_credentials_pause_cached_and_inflight_allowances_until_repaired
     }
     upstream.assert_no_request();
 
-    sqlx::query(
-        "UPDATE providers SET credential_status = 'ok', revision = revision + 1 WHERE id = ?",
-    )
-    .bind(&provider.id)
-    .execute(&mut connection)
-    .await?;
+    gateway
+        .storage
+        .providers()
+        .clear_credential_invalid(&provider.id)
+        .await?;
     let gw = gateway.clone();
     let id = provider.id.clone();
     let repaired = tokio::spawn(async move { gw.admin().get_provider_allowance(&id).await });
@@ -1747,12 +1750,7 @@ async fn invalid_credentials_pause_cached_and_inflight_allowances_until_repaired
     let id = provider.id.clone();
     let inflight = tokio::spawn(async move { gw.admin().refresh_provider_allowance(&id).await });
     let request = upstream.next().await;
-    sqlx::query(
-        "UPDATE providers SET credential_status = 'invalid', revision = revision + 1 WHERE id = ?",
-    )
-    .bind(&provider.id)
-    .execute(&mut connection)
-    .await?;
+    mark_credential_invalid(&gateway, &provider.id).await?;
     let paused_get = tokio::time::timeout(
         std::time::Duration::from_secs(5),
         admin.get_provider_allowance(&provider.id),

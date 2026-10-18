@@ -1,6 +1,6 @@
 <script lang="ts">
-import * as m from '$lib/paraglide/messages.js'
-import RequestFailure from '$lib/components/request-failure.svelte'
+import * as m from '#lib/paraglide/messages.js'
+import RequestFailure from '#lib/components/request-failure.svelte'
 import { createQuery, useQueryClient } from '@tanstack/svelte-query'
 import ArrowDownIcon from '@lucide/svelte/icons/arrow-down'
 import ArrowUpIcon from '@lucide/svelte/icons/arrow-up'
@@ -9,29 +9,29 @@ import Globe2Icon from '@lucide/svelte/icons/globe-2'
 import PlusIcon from '@lucide/svelte/icons/plus'
 import { toast } from 'svelte-sonner'
 
-import { admin, isTauri } from '$lib/admin-client'
-import { localizeBackendErrorMessage } from '$lib/backend-error'
-import { formatDuration } from '$lib/format'
+import { admin, isTauri } from '#lib/admin-client.js'
+import { localizeBackendErrorMessage } from '#lib/backend-error.js'
+import { formatDuration } from '#lib/format.js'
 import type {
   LocalSearchEngineConfigs,
   LocalSearchEngineId,
   WebAccessSettings,
   WebProvider,
   WebProviderKind,
-} from '$lib/types'
-import * as Alert from '$lib/components/ui/alert'
-import * as AlertDialog from '$lib/components/ui/alert-dialog'
-import * as Empty from '$lib/components/ui/empty'
-import SecretInput from '$lib/components/secret-input.svelte'
-import { Badge } from '$lib/components/ui/badge'
-import { Checkbox } from '$lib/components/ui/checkbox'
-import { Button, buttonVariants } from '$lib/components/ui/button'
-import * as Field from '$lib/components/ui/field'
-import { Input } from '$lib/components/ui/input'
-import * as Select from '$lib/components/ui/select'
-import * as Sheet from '$lib/components/ui/sheet'
-import { Spinner } from '$lib/components/ui/spinner'
-import { Switch } from '$lib/components/ui/switch'
+} from '#lib/types.js'
+import * as Alert from '#lib/components/ui/alert/index.js'
+import * as AlertDialog from '#lib/components/ui/alert-dialog/index.js'
+import * as Empty from '#lib/components/ui/empty/index.js'
+import SecretInput from '#lib/components/secret-input.svelte'
+import { Badge } from '#lib/components/ui/badge/index.js'
+import { Checkbox } from '#lib/components/ui/checkbox/index.js'
+import { Button, buttonVariants } from '#lib/components/ui/button/index.js'
+import * as Field from '#lib/components/ui/field/index.js'
+import { Input } from '#lib/components/ui/input/index.js'
+import * as Select from '#lib/components/ui/select/index.js'
+import * as Sheet from '#lib/components/ui/sheet/index.js'
+import { Spinner } from '#lib/components/ui/spinner/index.js'
+import { Switch } from '#lib/components/ui/switch/index.js'
 
 const queryClient = useQueryClient()
 const providersQuery = createQuery(() => ({ queryKey: ['web-providers'], queryFn: admin.webAccess.providers.list }))

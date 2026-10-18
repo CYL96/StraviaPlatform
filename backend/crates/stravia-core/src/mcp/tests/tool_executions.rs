@@ -1,6 +1,6 @@
 use super::*;
 use crate::mcp::read::ReadTool;
-use std::future::Future;
+use std::{future::Future, pin::Pin};
 use stravia_runtime_contract::{
     CancellationToken,
     hook::{PlatformTool, PlatformToolError, StraviaReadDomain, ToolExecutionContext, ToolId},
@@ -123,6 +123,20 @@ where
     .await;
 }
 
+async fn registered_query<F: Future>(future: F) -> Pin<Box<impl Future<Output = F::Output>>>
+where
+    F::Output: std::fmt::Debug,
+{
+    let registered = Arc::new(tokio::sync::Notify::new());
+    let mut future =
+        Box::pin(crate::tool_execution::QUERY_WAITING.scope(registered.clone(), future));
+    tokio::select! {
+        output = future.as_mut() => panic!("query completed before waiting: {output:?}"),
+        _ = registered.notified() => {}
+    }
+    future
+}
+
 #[tokio::test]
 async fn search_queries_wait_independently_and_preserve_the_original_report() {
     let (app, reader, upstream) = fixture(false).await;
@@ -133,10 +147,7 @@ async fn search_queries_wait_independently_and_preserve_the_original_report() {
     assert_eq!(zero.structured_content, immediate.structured_content);
 
     let short_path = format!("{path}?wait=7");
-    let mut short = Box::pin(read(&reader, &app.key_id, &short_path));
-    // Memory authentication is ready on this poll. The real query captures its
-    // wait deadline before yielding to SQL; advance only after that boundary.
-    assert_pending(short.as_mut(), "short query registration").await;
+    let short = registered_query(read(&reader, &app.key_id, &short_path)).await;
     tokio::time::pause();
     tokio::time::advance(Duration::from_secs(7)).await;
     tokio::time::resume();
@@ -149,15 +160,14 @@ async fn search_queries_wait_independently_and_preserve_the_original_report() {
         cancellation.clone(),
         std::time::Instant::now() + Duration::from_secs(900),
     );
-    let mut cancelled = Box::pin(McpTool::call(
+    let cancelled = registered_query(McpTool::call(
         &reader,
         json!({"path":format!("{path}?wait=120")}),
         &cancelled_context,
-    ));
+    ))
+    .await;
     let long_path = format!("{path}?wait=120");
-    let mut survivor = Box::pin(read(&reader, &app.key_id, &long_path));
-    assert_pending(cancelled.as_mut(), "cancelled query registration").await;
-    assert_pending(survivor.as_mut(), "surviving query registration").await;
+    let mut survivor = registered_query(read(&reader, &app.key_id, &long_path)).await;
     cancellation.cancel();
     assert!(cancelled.await.unwrap().is_error);
     // A >60-second query must not itself hand off or reset the original deadline.

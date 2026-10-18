@@ -1,7 +1,7 @@
 <script lang="ts">
-import * as m from '$lib/paraglide/messages.js'
+import * as m from '#lib/paraglide/messages.js'
 import Loader2Icon from '@lucide/svelte/icons/loader-2'
-import { cn } from '$lib/utils.js'
+import { cn } from '#lib/utils.js'
 import type { SVGAttributes } from 'svelte/elements'
 
 let {

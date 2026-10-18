@@ -1,14 +1,14 @@
 <script lang="ts">
 import type { Snippet } from 'svelte'
-import * as m from '$lib/paraglide/messages.js'
-import { formatLogTime } from '$lib/format'
-import { observationConversationMessages, type ObservationChatMessage } from '$lib/observation-conversation'
-import { observationConversationActivities } from '$lib/observation-activities'
-import ObservationActivity from '$lib/components/observation-activity.svelte'
-import ConversationMessage from '$lib/components/conversation-message.svelte'
-import type { InteractionDetail, LiveContentBlock } from '$lib/types'
-import StreamingMarkdown from '$lib/components/streaming-markdown.svelte'
-import ObservationLogViewport from '$lib/components/observation-log-viewport.svelte'
+import * as m from '#lib/paraglide/messages.js'
+import { formatLogTime } from '#lib/format.js'
+import { observationConversationMessages, type ObservationChatMessage } from '#lib/observation-conversation.js'
+import { observationConversationActivities } from '#lib/observation-activities.js'
+import ObservationActivity from '#lib/components/observation-activity.svelte'
+import ConversationMessage from '#lib/components/conversation-message.svelte'
+import type { InteractionDetail, LiveContentBlock } from '#lib/types.js'
+import StreamingMarkdown from '#lib/components/streaming-markdown.svelte'
+import ObservationLogViewport from '#lib/components/observation-log-viewport.svelte'
 
 let {
   detail,

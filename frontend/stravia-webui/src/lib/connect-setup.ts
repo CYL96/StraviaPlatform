@@ -1,5 +1,5 @@
 import { createContext } from 'svelte'
-import type { ClaudeModelMappings, CliToolId, CodeLanguage, GatewayProtocol } from '$lib/connect'
+import type { ClaudeModelMappings, CliToolId, CodeLanguage, GatewayProtocol } from '#lib/connect.js'
 
 export interface ConnectDraft {
   tab: 'cli' | 'code'

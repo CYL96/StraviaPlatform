@@ -1,17 +1,17 @@
 <script lang="ts">
-import * as m from '$lib/paraglide/messages.js'
+import * as m from '#lib/paraglide/messages.js'
 import { beforeNavigate } from '$app/navigation'
 import { createQuery, useQueryClient } from '@tanstack/svelte-query'
 import RefreshCwIcon from '@lucide/svelte/icons/refresh-cw'
 import SearchIcon from '@lucide/svelte/icons/search'
 import { onDestroy } from 'svelte'
 import { toast } from 'svelte-sonner'
+import { admin } from '#lib/admin-client.js'
+import { localizeBackendErrorMessage } from '#lib/backend-error.js'
+import { localeState } from '#lib/localization.svelte.js'
+import { resolvePluginText } from '#lib/plugin-text.js'
+import { ProviderConnectionDraft, type ProviderConnectionSubmission } from '#lib/provider-connection-draft.svelte.js'
 
-import { admin } from '$lib/admin-client'
-import { localizeBackendErrorMessage } from '$lib/backend-error'
-import { localeState } from '$lib/localization.svelte'
-import { resolvePluginText } from '$lib/plugin-text'
-import { ProviderConnectionDraft, type ProviderConnectionSubmission } from '$lib/provider-connection-draft.svelte'
 import {
   buildProviderOptions,
   defaultProviderName,
@@ -19,22 +19,23 @@ import {
   optionLabel,
   providerNameAfterOptionChange,
   type ProviderOption,
-} from '$lib/provider-options'
-import type { CreateProvider, Provider } from '$lib/types'
-import ProviderConfigFields from '$lib/components/provider-config-fields.svelte'
-import ProviderOAuthAuthorization from '$lib/components/provider-oauth-authorization.svelte'
-import * as Alert from '$lib/components/ui/alert'
-import { Button, buttonVariants } from '$lib/components/ui/button'
-import ProviderMark from '$lib/components/provider-mark.svelte'
-import * as Field from '$lib/components/ui/field'
-import * as Empty from '$lib/components/ui/empty'
-import * as InputGroup from '$lib/components/ui/input-group'
-import { Input } from '$lib/components/ui/input'
-import * as Select from '$lib/components/ui/select'
-import * as Sheet from '$lib/components/ui/sheet'
-import { Spinner } from '$lib/components/ui/spinner'
-import { Switch } from '$lib/components/ui/switch'
-import * as Tabs from '$lib/components/ui/tabs'
+} from '#lib/provider-options.js'
+
+import type { CreateProvider, Provider } from '#lib/types.js'
+import ProviderConfigFields from '#lib/components/provider-config-fields.svelte'
+import ProviderOAuthAuthorization from '#lib/components/provider-oauth-authorization.svelte'
+import * as Alert from '#lib/components/ui/alert/index.js'
+import { Button, buttonVariants } from '#lib/components/ui/button/index.js'
+import ProviderMark from '#lib/components/provider-mark.svelte'
+import * as Field from '#lib/components/ui/field/index.js'
+import * as Empty from '#lib/components/ui/empty/index.js'
+import * as InputGroup from '#lib/components/ui/input-group/index.js'
+import { Input } from '#lib/components/ui/input/index.js'
+import * as Select from '#lib/components/ui/select/index.js'
+import * as Sheet from '#lib/components/ui/sheet/index.js'
+import { Spinner } from '#lib/components/ui/spinner/index.js'
+import { Switch } from '#lib/components/ui/switch/index.js'
+import * as Tabs from '#lib/components/ui/tabs/index.js'
 
 interface Props {
   open?: boolean
@@ -47,6 +48,7 @@ let search = $state('')
 let focusedOptionKey = $state('')
 let selectedOptionKey = $state('')
 let refreshingServices = $state(false)
+
 let oauthAuthorization = $state<{
   cancel: () => Promise<void>
   consume: () => void
@@ -67,8 +69,10 @@ const providerOptions = $derived.by(() => {
   const query = search.trim().toLocaleLowerCase(localeState.current)
   return options.filter((option) => {
     if (!query) return true
+
     const auth = option.channel.auth ? 'oauth account 账号' : 'api key'
     const text = `${option.descriptor.provider_id} ${option.descriptor.catalog_id ?? ''} ${optionLabel(option, localeState.current)} ${option.channel.id} ${resolvePluginText(option.channel.name, localeState.current)} ${optionDescription(option, localeState.current)} ${auth}`
+
     return text.toLocaleLowerCase(localeState.current).includes(query)
   })
 })
@@ -116,6 +120,7 @@ const draft = new ProviderConnectionDraft({
         queryClient.invalidateQueries({ queryKey: ['providers'] }),
         queryClient.invalidateQueries({ queryKey: ['models'] }),
       ])
+
       toast.success(m.provider_editor_service_connected())
       onSaved?.(savedProvider)
       open = false
@@ -126,6 +131,7 @@ const draft = new ProviderConnectionDraft({
 const oauthSessionSecretFields = $derived(
   draft.oauthReady ? configFields.filter((field) => field.secret && field.required).map((field) => field.key) : [],
 )
+
 const previewIssues = $derived(draft.preview?.issues ?? [])
 const previewIssueError = $derived(
   previewIssues
@@ -136,6 +142,7 @@ const previewIssueError = $derived(
 
 // 提交期间（preview → write → bind）封住应用内导航；刷新/关页由 onbeforeunload 原生提示。
 beforeNavigate((navigation) => {
+  if (navigation.shallow && navigation.type === 'goto') return
   if (draft.submitting) navigation.cancel()
 })
 
@@ -143,6 +150,7 @@ onDestroy(() => draft.dispose())
 
 $effect(() => {
   const error = draft.submitError
+
   if (error !== undefined) toast.error(localizeBackendErrorMessage(error))
 })
 
@@ -165,6 +173,7 @@ async function chooseOption(option: ProviderOption): Promise<void> {
     useProxy: draft.fields.useProxy,
     values,
   }
+
   selectedOptionKey = option.key
   await draft.resetConnection(fields)
   step = 'configure'
@@ -259,8 +268,7 @@ function saveProvider(): void {
     escapeKeydownBehavior={draft.submitting ? 'ignore' : 'close'}
     interactOutsideBehavior={draft.submitting ? 'ignore' : 'close'}>
     <Sheet.Header class="border-b">
-      <Sheet.Title
-        >{step === 'select' ? m.providers_add() : m.provider_editor_connection_details()}</Sheet.Title>
+      <Sheet.Title>{step === 'select' ? m.providers_add() : m.provider_editor_connection_details()}</Sheet.Title>
       <Sheet.Description>
         {step === 'select'
           ? m.provider_editor_choose_ai_service_how_want_sign()
@@ -328,9 +336,8 @@ function saveProvider(): void {
             </Empty.Header>
             <Empty.Content>
               {#if search.trim()}
-                <Button type="button" variant="outline" size="sm" onclick={() => (search = '')}>
-                  {m.provider_editor_clear_search()}
-                </Button>
+                <Button type="button" variant="outline" size="sm" onclick={() => (search = '')}
+                  >{m.provider_editor_clear_search()}</Button>
               {:else}
                 <Button href="/vendor-plugins" variant="outline" size="sm">
                   {m.provider_config_manage_plugins()}

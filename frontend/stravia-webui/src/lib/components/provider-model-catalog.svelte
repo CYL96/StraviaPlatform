@@ -1,8 +1,8 @@
 <script lang="ts">
-import * as m from '$lib/paraglide/messages.js'
+import * as m from '#lib/paraglide/messages.js'
 import { beforeNavigate, goto } from '$app/navigation'
-import { base, resolve } from '$app/paths'
-import type { Pathname } from '$app/types'
+import { resolve } from '$app/paths'
+import type { Path } from '$app/types'
 import { page } from '$app/state'
 import { createQuery, useQueryClient } from '@tanstack/svelte-query'
 import { renderSnippet, type ColumnFiltersState } from '@tanstack/svelte-table'
@@ -14,8 +14,8 @@ import { onDestroy, tick } from 'svelte'
 import SearchIcon from '@lucide/svelte/icons/search'
 import { SvelteURLSearchParams } from 'svelte/reactivity'
 import { toast } from 'svelte-sonner'
+import { admin } from '#lib/admin-client.js'
 
-import { admin } from '$lib/admin-client'
 import {
   getModelChanges,
   summaryDescription,
@@ -23,43 +23,44 @@ import {
   syncToast,
   syncErrorToast,
   modelChangeReason,
-} from '$lib/model-changes'
-import { Switch } from '$lib/components/ui/switch'
-import { localizeBackendErrorMessage } from '$lib/backend-error'
-import { ProviderModelEditing } from '$lib/provider-model-editing.svelte'
-import type { ProviderModelEditingOperation } from '$lib/provider-model-editing'
-import { getDataTableLabels } from '$lib/data-table-labels'
-import { formatLogTime } from '$lib/format'
-import { formatSpecificationTokens } from '$lib/model-specification'
-import FormSection from '$lib/components/form-section.svelte'
-import ModalityIcons from '$lib/components/modality-icons.svelte'
-import { localeState } from '$lib/localization.svelte'
+} from '#lib/model-changes.js'
+import { Switch } from '#lib/components/ui/switch/index.js'
+import { localizeBackendErrorMessage } from '#lib/backend-error.js'
+import { ProviderModelEditing } from '#lib/provider-model-editing.svelte.js'
+import type { ProviderModelEditingOperation } from '#lib/provider-model-editing.js'
+import { getDataTableLabels } from '#lib/data-table-labels.js'
+import { formatLogTime } from '#lib/format.js'
+import { formatSpecificationTokens } from '#lib/model-specification.js'
+import FormSection from '#lib/components/form-section.svelte'
+import ModalityIcons from '#lib/components/modality-icons.svelte'
+import { localeState } from '#lib/localization.svelte.js'
 import {
   emptySpecificationFilter,
   matchesSpecification,
   specificationFilterCount,
   type SpecificationFilter,
-} from '$lib/model-specification-filter'
-import ModelSpecificationFilter from '$lib/components/model-specification-filter.svelte'
-import type { Route, ProviderModelSelectionPolicy, ProviderModelSummary, ProviderModelSyncSummary } from '$lib/types'
-import ProviderModelEditor from '$lib/components/provider-model-editor.svelte'
-import { Badge } from '$lib/components/ui/badge'
-import { Button } from '$lib/components/ui/button'
+} from '#lib/model-specification-filter.js'
+import ModelSpecificationFilter from '#lib/components/model-specification-filter.svelte'
+import type { Route, ProviderModelSelectionPolicy, ProviderModelSummary, ProviderModelSyncSummary } from '#lib/types.js'
+import ProviderModelEditor from '#lib/components/provider-model-editor.svelte'
+import { Badge } from '#lib/components/ui/badge/index.js'
+import { Button } from '#lib/components/ui/button/index.js'
 import {
   DataTable,
   createDataTableColumnHelper,
   type DataTableCellContext,
   type DataTableFilterGroup,
   type DataTableRowPointerEvent,
-} from '$lib/components/ui/data-table'
-import * as DropdownMenu from '$lib/components/ui/dropdown-menu'
-import * as InputGroup from '$lib/components/ui/input-group'
-import * as Empty from '$lib/components/ui/empty'
-import RequestFailure from '$lib/components/request-failure.svelte'
-import StatusIndicator from '$lib/components/status-indicator.svelte'
-import TechnicalValue from '$lib/components/technical-value.svelte'
+} from '#lib/components/ui/data-table/index.js'
+
+import * as DropdownMenu from '#lib/components/ui/dropdown-menu/index.js'
+import * as InputGroup from '#lib/components/ui/input-group/index.js'
+import * as Empty from '#lib/components/ui/empty/index.js'
+import RequestFailure from '#lib/components/request-failure.svelte'
+import StatusIndicator from '#lib/components/status-indicator.svelte'
+import TechnicalValue from '#lib/components/technical-value.svelte'
 import { allCatalogFilterValue, catalogFilterOptions } from './provider-model-catalog/filter-options'
-import { Spinner } from '$lib/components/ui/spinner'
+import { Spinner } from '#lib/components/ui/spinner/index.js'
 import CatalogConfirmations from './provider-model-catalog/confirmations.svelte'
 import CatalogEditorDrawer from './provider-model-catalog/editor-drawer.svelte'
 import CatalogFilterSheet from './provider-model-catalog/filter-sheet.svelte'
@@ -103,6 +104,7 @@ let editor = $state<{ submit: () => void }>()
 let rpmForm = $state<{ save: () => Promise<void> }>()
 // 详情页底部只有一个「保存模型」：模型规格与 RPM 限额是两个独立资源，按各自是否有改动分别提交。
 let specificationDirty = $state(false)
+
 let rpmDirty = $state(false)
 let rpmSaving = $state(false)
 let addingRouteModelId = $state('')
@@ -160,6 +162,7 @@ const editing = new ProviderModelEditing({
     if (phase !== 'refresh') toast.error(localizeBackendErrorMessage(error))
   },
 })
+
 const modelEditing = $derived(editing.state)
 const displayedSyncSummary = $derived(syncStateQuery.data?.last_check)
 const models = $derived(modelsQuery.data?.models ?? [])
@@ -171,10 +174,12 @@ const specificationFilter = $derived(
   (columnFilters.find((filter) => filter.id === 'specification')?.value as SpecificationFilter | undefined) ??
     emptySpecificationFilter,
 )
+
 const filteredModels = $derived.by(() => {
   const query = search.trim().toLocaleLowerCase(localeState.current)
   return models.filter((model) => {
     const references = modelReferences(model.id)
+
     return (
       (!query || `${model.name} ${model.id}`.toLocaleLowerCase(localeState.current).includes(query)) &&
       (availabilityFilter === 'all' || model.available === (availabilityFilter === 'available')) &&
@@ -184,6 +189,7 @@ const filteredModels = $derived.by(() => {
     )
   })
 })
+
 const activeFilterCount = $derived(
   Number(availabilityFilter !== 'all') +
     Number(sourceFilter !== 'all') +
@@ -195,6 +201,7 @@ const selectedReferences = $derived(modelEditing.detail ? modelReferences(modelE
 const tableLabels = $derived(getDataTableLabels())
 const providerModelColumnHelper = createDataTableColumnHelper<ProviderModelSummary>()
 const filterOptions = $derived(catalogFilterOptions())
+
 const providerModelColumns = $derived(
   providerModelColumnHelper.columns([
     providerModelColumnHelper.accessor((model) => `${model.name} ${model.id}`, {
@@ -270,6 +277,7 @@ const providerModelColumns = $derived(
       },
       size: 160,
     }),
+
     providerModelColumnHelper.accessor(
       (model) => (modelReferences(model.id).length > 0 ? 'referenced' : 'unreferenced'),
       {
@@ -298,13 +306,16 @@ $effect(() => {
 })
 
 beforeNavigate((navigation) => {
+  if (navigation.shallow && navigation.type === 'goto') return
   if (internalNavigation) return
   if (!modelEditing.busy && !modelEditing.dirty) return
+
   navigation.cancel()
+
   // SvelteKit 对卸载取消使用原生提示；页内导航复用同一丢弃确认。
   if (navigation.willUnload || modelEditing.busy || !navigation.to) return
   const { pathname, search, hash } = navigation.to.url
-  const destination = resolve(`${pathname.slice(base.length)}${search}${hash}` as Pathname)
+  const destination = resolve(`${pathname.slice(resolve('').length)}${search}${hash}` as Path)
   const delta = navigation.type === 'popstate' ? navigation.delta : null
   editing.requestLeave(() => {
     if (delta != null) window.history.go(delta)
@@ -364,7 +375,7 @@ function setSpecificationFilter(value: SpecificationFilter): void {
 }
 
 function modelEditorSearch(modelId: string): string {
-  const search = new SvelteURLSearchParams(page.url.searchParams)
+  const search = new SvelteURLSearchParams(page.url.search)
   search.set('view', 'models')
   search.set('model', modelId)
   return search.toString()
@@ -372,7 +383,7 @@ function modelEditorSearch(modelId: string): string {
 
 function openProviderModel(model: ProviderModelSummary, event: MouseEvent): void {
   if (event.target instanceof Element && event.target.closest('a, button, [role="button"]')) return
-  void goto(resolve(`/providers/${encodeURIComponent(providerId)}?${modelEditorSearch(model.id)}`))
+  void goto(resolve(`providers/${encodeURIComponent(providerId)}?${modelEditorSearch(model.id)}`))
 }
 
 function handleProviderModelTableRowClick({ event, original }: DataTableRowPointerEvent<ProviderModelSummary>): void {
@@ -406,16 +417,12 @@ function availabilityReason(model: ProviderModelSummary): string | null {
 }
 
 async function updateModelQuery(modelId?: string): Promise<void> {
-  const search = new SvelteURLSearchParams(page.url.searchParams)
+  const search = new SvelteURLSearchParams(page.url.search)
   if (modelId) search.set('model', modelId)
   else search.delete('model')
   internalNavigation = true
   try {
-    await goto(resolve(`/providers/${encodeURIComponent(providerId)}?${search}`), {
-      replaceState: true,
-      noScroll: true,
-      keepFocus: true,
-    })
+    await goto(resolve(`providers/${encodeURIComponent(providerId)}?${search}`), { replace: true, reset: false })
   } finally {
     internalNavigation = false
   }
@@ -568,9 +575,11 @@ function clearManualTemplate(): void {
 
 {#snippet modelContext(model: ProviderModelSummary)}
   {@const value = model.specification.limit?.context}
+
   <ModelCellEditor {providerId} {model} field="context">
-    <span class="font-technical text-sm"
-      >{value == null ? m.model_specification_not_registered() : formatSpecificationTokens(value)}</span>
+    <span class="font-technical text-sm">
+      {value == null ? m.model_specification_not_registered() : formatSpecificationTokens(value)}
+    </span>
   </ModelCellEditor>
 {/snippet}
 
@@ -580,6 +589,7 @@ function clearManualTemplate(): void {
 
 {#snippet modelModalities(model: ProviderModelSummary)}
   {@const modalities = model.specification.modalities}
+
   <ModelCellEditor {providerId} {model} field="modalities">
     <span class="flex flex-col gap-0.5 text-xs">
       <span role="group" aria-label={m.model_specification_input()} class="flex items-center gap-1.5">
@@ -600,9 +610,11 @@ function clearManualTemplate(): void {
 
 {#snippet modelEfforts(model: ProviderModelSummary)}
   {@const efforts = model.specification.reasoning_efforts}
+
   <ModelCellEditor {providerId} {model} field="efforts">
-    <span class="break-words font-technical text-xs"
-      >{efforts?.length ? efforts.join(', ') : m.model_specification_not_registered()}</span>
+    <span class="break-words font-technical text-xs">
+      {efforts?.length ? efforts.join(', ') : m.model_specification_not_registered()}
+    </span>
   </ModelCellEditor>
 {/snippet}
 
@@ -612,6 +624,7 @@ function clearManualTemplate(): void {
 
 {#snippet modelAvailability(model: ProviderModelSummary)}
   {@const reason = availabilityReason(model)}
+
   <ModelCellEditor {providerId} {model} field="availability">
     <Badge variant={model.available ? 'secondary' : 'outline'}>
       {model.available ? m.model_specification_available() : m.common_unavailable()}
@@ -640,9 +653,8 @@ function clearManualTemplate(): void {
   {#if references.length > 0}
     <a
       class="inline-flex min-h-10 w-fit items-center rounded-md px-2 text-sm font-medium hover:bg-muted"
-      href={resolve(`/providers/${encodeURIComponent(providerId)}?view=routes`)}>
-      {m.provider_model_catalog_used_by_models({ count: references.length })}
-    </a>
+      href={resolve(`providers/${encodeURIComponent(providerId)}?view=routes`)}
+      >{m.provider_model_catalog_used_by_models({ count: references.length })}</a>
   {:else if routeReferencesReady}
     <button
       type="button"
@@ -750,11 +762,10 @@ function clearManualTemplate(): void {
                 onSelect={() =>
                   void goto(
                     resolve(
-                      `/models/new?provider=${encodeURIComponent(providerId)}&model=${encodeURIComponent(modelEditing.detail!.id)}`,
+                      `models/new?provider=${encodeURIComponent(providerId)}&model=${encodeURIComponent(modelEditing.detail!.id)}`,
                     ),
-                  )}>
-                {m.provider_model_catalog_use_new_model()}
-              </DropdownMenu.Item>
+                  )}>{m.provider_model_catalog_use_new_model()}</DropdownMenu.Item>
+
               {#if modelEditing.detail.can_reimport}
                 <DropdownMenu.Item onSelect={() => editing.requestReimport()}
                   >{m.provider_model_catalog_restore_details_service()}</DropdownMenu.Item>
@@ -823,10 +834,19 @@ function clearManualTemplate(): void {
       <div class="flex flex-wrap gap-2">
         <Button data-model-changes-trigger variant="outline" onclick={() => changesSheet.show(providerId)}
           >{m.model_changes_title()}</Button>
-        <Button variant="outline" onclick={() => (manualOpen = true)}
-          ><PlusIcon data-icon="inline-start" />{m.provider_model_catalog_add_model_manually()}</Button>
+
+        <Button variant="outline" onclick={() => (manualOpen = true)}>
+          <PlusIcon data-icon="inline-start" />
+          {m.provider_model_catalog_add_model_manually()}
+        </Button>
+
         <Button variant="outline" onclick={requestSync} disabled={syncing}>
-          {#if syncing}<Spinner data-icon="inline-start" />{:else}<RefreshCwIcon data-icon="inline-start" />{/if}
+          {#if syncing}
+            <Spinner data-icon="inline-start" />
+          {:else}
+            <RefreshCwIcon data-icon="inline-start" />
+          {/if}
+
           {m.provider_model_catalog_sync_models()}
         </Button>
       </div>
@@ -876,6 +896,7 @@ function clearManualTemplate(): void {
             placeholder={m.provider_model_catalog_search_name_model_id()} />
           <InputGroup.Addon><SearchIcon /></InputGroup.Addon>
         </InputGroup.Root>
+
         <div class="mt-2 flex flex-wrap items-center justify-between gap-2">
           <Button variant="outline" onclick={() => (filtersOpen = true)}>
             <SlidersHorizontalIcon data-icon="inline-start" />
@@ -899,7 +920,7 @@ function clearManualTemplate(): void {
           <div class="route-mobile-row">
             <a
               class="col-span-2 min-h-10 min-w-0 text-left"
-              href={resolve(`/providers/${encodeURIComponent(providerId)}?${modelEditorSearch(model.id)}`)}
+              href={resolve(`providers/${encodeURIComponent(providerId)}?${modelEditorSearch(model.id)}`)}
               aria-label={`${model.name} ${model.id}`}>
               <span class="block truncate font-medium">{model.name}</span>
               <span class="block truncate font-technical text-xs text-muted-foreground">{model.id}</span>
@@ -913,13 +934,14 @@ function clearManualTemplate(): void {
               {@render modelAvailability(model)}
               <Badge variant="outline"
                 >{model.source_kind === 'manual' ? m.common_added_manually() : m.common_synced()}</Badge>
+
               <RpmLimit {providerId} modelId={model.id} modelName={model.name} showLabel />
+
               {#if references.length > 0}
                 <a
                   class="inline-flex min-h-10 items-center rounded-md px-2 text-sm font-medium hover:bg-muted"
-                  href={resolve(`/providers/${encodeURIComponent(providerId)}?view=routes`)}>
-                  {m.provider_model_catalog_used_by_models({ count: references.length })}
-                </a>
+                  href={resolve(`providers/${encodeURIComponent(providerId)}?view=routes`)}
+                  >{m.provider_model_catalog_used_by_models({ count: references.length })}</a>
               {:else if routeReferencesReady}
                 <button
                   type="button"

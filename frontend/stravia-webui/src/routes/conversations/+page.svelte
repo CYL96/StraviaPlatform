@@ -2,19 +2,23 @@
 import { goto } from '$app/navigation'
 import { resolve } from '$app/paths'
 import { renderSnippet } from '@tanstack/svelte-table'
-import { getConsoleChat } from '$lib/console-chat.svelte'
-import type { ConsoleConversation } from '$lib/console-chat-types'
-import { localizeBackendErrorMessage } from '$lib/backend-error'
-import { formatLogTime, formatNumber } from '$lib/format'
-import { getDataTableLabels } from '$lib/data-table-labels'
-import * as m from '$lib/paraglide/messages.js'
-import ConsoleChatActions from '$lib/components/console-chat-actions.svelte'
-import PageHeader from '$lib/components/page-header.svelte'
-import { Button } from '$lib/components/ui/button'
-import { Input } from '$lib/components/ui/input'
-import * as Empty from '$lib/components/ui/empty'
-import * as Field from '$lib/components/ui/field'
-import { DataTable, createDataTableColumnHelper, type DataTableCellContext } from '$lib/components/ui/data-table'
+import { getConsoleChat } from '#lib/console-chat.svelte.js'
+import type { ConsoleConversation } from '#lib/console-chat-types.js'
+import { localizeBackendErrorMessage } from '#lib/backend-error.js'
+import { formatLogTime, formatNumber } from '#lib/format.js'
+import { getDataTableLabels } from '#lib/data-table-labels.js'
+import * as m from '#lib/paraglide/messages.js'
+import ConsoleChatActions from '#lib/components/console-chat-actions.svelte'
+import PageHeader from '#lib/components/page-header.svelte'
+import { Button } from '#lib/components/ui/button/index.js'
+import { Input } from '#lib/components/ui/input/index.js'
+import * as Empty from '#lib/components/ui/empty/index.js'
+import * as Field from '#lib/components/ui/field/index.js'
+import {
+  DataTable,
+  createDataTableColumnHelper,
+  type DataTableCellContext,
+} from '#lib/components/ui/data-table/index.js'
 const chat = getConsoleChat()
 let query = $state('')
 const snapshot = $derived(chat.snapshot)
@@ -74,8 +78,8 @@ function lastModel(item: ConsoleConversation) {
     clearAll />{/snippet}
 {#snippet titleCell(context: DataTableCellContext<ConsoleConversation>)}
   {@const item = context.row.original}
-  <a href={resolve(`/?conversation=${encodeURIComponent(item.id)}`)} class="font-medium hover:underline"
-    >{item.title}</a>
+
+  <a href={resolve(`?conversation=${encodeURIComponent(item.id)}`)} class="font-medium hover:underline">{item.title}</a>
   {#if chat.readOnlyReasonFor(item.id)}<p class="text-xs text-muted-foreground">{m.console_chat_read_only()}</p>{/if}
   {#if snapshot.generations[item.id]}<span role="status" class="text-xs">{m.console_chat_generating()}</span>{/if}
 {/snippet}
@@ -122,7 +126,7 @@ function lastModel(item: ConsoleConversation) {
         getRowId={(item: ConsoleConversation) => item.id}
         onRowClick={({ original, event }: { original: ConsoleConversation; event: MouseEvent }) => {
           if (!(event.target instanceof Element && event.target.closest('a,button,[role="button"]')))
-            void goto(resolve(`/?conversation=${encodeURIComponent(original.id)}`))
+            void goto(resolve(`?conversation=${encodeURIComponent(original.id)}`))
         }} />
     </div>
     <div class="route-mobile-list">
@@ -130,11 +134,16 @@ function lastModel(item: ConsoleConversation) {
         <article class="flex flex-col gap-3 border-b py-4">
           <a
             class="block min-h-10 font-medium break-words hover:underline"
-            href={resolve(`/?conversation=${encodeURIComponent(item.id)}`)}>{item.title}</a>
-          {#if chat.readOnlyReasonFor(item.id)}<p class="text-sm text-muted-foreground">
-              {m.console_chat_read_only()}
-            </p>{/if}
-          {#if snapshot.generations[item.id]}<p role="status">{m.console_chat_generating()}</p>{/if}
+            href={resolve(`?conversation=${encodeURIComponent(item.id)}`)}>{item.title}</a>
+
+          {#if chat.readOnlyReasonFor(item.id)}
+            <p class="text-sm text-muted-foreground">{m.console_chat_read_only()}</p>
+          {/if}
+
+          {#if snapshot.generations[item.id]}
+            <p role="status">{m.console_chat_generating()}</p>
+          {/if}
+
           <dl class="grid grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-1 text-sm">
             <dt class="text-muted-foreground">{m.console_chat_key()}</dt>
             <dd class="break-words">{item.apiKeyName}</dd>

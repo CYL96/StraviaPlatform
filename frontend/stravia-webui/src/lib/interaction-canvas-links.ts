@@ -1,5 +1,5 @@
-import { payloadRecord } from '$lib/observation-payload'
-import type { InteractionSummary } from '$lib/types'
+import { payloadRecord } from '#lib/observation-payload.js'
+import type { InteractionSummary } from '#lib/types.js'
 
 export type CanvasLinkKind = 'confirmed' | 'inferred' | 'native'
 

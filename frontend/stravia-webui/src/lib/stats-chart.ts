@@ -1,4 +1,4 @@
-import type { StatsSeries } from '$lib/types'
+import type { StatsSeries } from '#lib/types.js'
 
 type LatencyStats = Pick<StatsSeries, 'bucket_start' | 'avg_first_token_ms' | 'avg_output_tps'>
 type TokenStats = Pick<

@@ -1,4 +1,4 @@
-import { admin } from '$lib/admin-client'
+import { admin } from '#lib/admin-client.js'
 
 export interface DestinationRpmLimit {
   provider_id: string

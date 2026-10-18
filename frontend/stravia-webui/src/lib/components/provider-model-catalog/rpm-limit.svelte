@@ -1,11 +1,11 @@
 <script lang="ts">
-import * as m from '$lib/paraglide/messages.js'
+import * as m from '#lib/paraglide/messages.js'
 import { createQuery } from '@tanstack/svelte-query'
 
-import { loadRpm, rpmQueryKey } from '$lib/rpm'
-import { Button } from '$lib/components/ui/button'
-import * as Popover from '$lib/components/ui/popover'
-import { Spinner } from '$lib/components/ui/spinner'
+import { loadRpm, rpmQueryKey } from '#lib/rpm.js'
+import { Button } from '#lib/components/ui/button/index.js'
+import * as Popover from '#lib/components/ui/popover/index.js'
+import { Spinner } from '#lib/components/ui/spinner/index.js'
 import RpmForm from './rpm-form.svelte'
 
 // 移动端行没有表头，showLabel 让摘要自带「RPM」前缀。

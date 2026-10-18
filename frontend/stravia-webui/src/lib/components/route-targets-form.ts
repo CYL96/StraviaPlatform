@@ -1,4 +1,4 @@
-import type { CreateTarget, ProviderModelSummary, Route, ThinkingLevel, ThinkingLevelMapping } from '$lib/types'
+import type { CreateTarget, ProviderModelSummary, Route, ThinkingLevel, ThinkingLevelMapping } from '#lib/types.js'
 
 export interface RouteTargetForm {
   key: string

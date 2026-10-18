@@ -1,12 +1,12 @@
 <script lang="ts">
-import * as m from '$lib/paraglide/messages.js'
+import * as m from '#lib/paraglide/messages.js'
 import ClipboardCopyIcon from '@lucide/svelte/icons/clipboard-copy'
 import { onDestroy } from 'svelte'
 import { toast } from 'svelte-sonner'
 
-import { cn } from '$lib/utils'
-import { Button } from '$lib/components/ui/button'
-import * as Tooltip from '$lib/components/ui/tooltip'
+import { cn } from '#lib/utils.js'
+import { Button } from '#lib/components/ui/button/index.js'
+import * as Tooltip from '#lib/components/ui/tooltip/index.js'
 
 interface Props {
   value: string

@@ -147,6 +147,8 @@ test('HTTP management and HTTPS proxy sessions retain browser cookie boundaries'
     const secureOrigin = `https://entry.test:${httpsPort}`
     // 仅此临时证书公钥受信，不修改系统信任库或全局关闭证书校验。
     browser = await chromium.launch({
+      // Chromium 的环境代理可覆盖 --no-proxy-server；测试域名必须直连本地夹具。
+      env: Object.fromEntries(Object.entries(process.env).filter(([name]) => !/^(https?|all|no)_proxy$/i.test(name))),
       args: [
         '--host-resolver-rules=MAP entry.test 127.0.0.1, MAP denied.test 127.0.0.1',
         '--no-proxy-server',

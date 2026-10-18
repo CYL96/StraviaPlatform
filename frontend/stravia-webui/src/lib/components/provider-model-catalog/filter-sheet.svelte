@@ -1,12 +1,12 @@
 <script lang="ts">
-import * as m from '$lib/paraglide/messages.js'
+import * as m from '#lib/paraglide/messages.js'
 
-import ModelSpecificationFilter from '$lib/components/model-specification-filter.svelte'
-import type { SpecificationFilter } from '$lib/model-specification-filter'
-import { Button } from '$lib/components/ui/button'
-import * as Field from '$lib/components/ui/field'
-import * as Select from '$lib/components/ui/select'
-import * as Sheet from '$lib/components/ui/sheet'
+import ModelSpecificationFilter from '#lib/components/model-specification-filter.svelte'
+import type { SpecificationFilter } from '#lib/model-specification-filter.js'
+import { Button } from '#lib/components/ui/button/index.js'
+import * as Field from '#lib/components/ui/field/index.js'
+import * as Select from '#lib/components/ui/select/index.js'
+import * as Sheet from '#lib/components/ui/sheet/index.js'
 import { allCatalogFilterValue, catalogFilterOptions } from './filter-options'
 
 interface Props {

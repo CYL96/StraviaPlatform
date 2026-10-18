@@ -6,7 +6,7 @@ import {
   type ObservationWorkspaceSnapshot,
   type ObservationWorkspaceSubscribe,
   type ObservationWorkspaceSubscribeLive,
-} from '$lib/observation-workspace'
+} from '#lib/observation-workspace.js'
 import type {
   BundleResourceKind,
   FailedRequestDetail,
@@ -15,7 +15,7 @@ import type {
   InteractionDetail,
   InteractionSummary,
   LiveContentBlock,
-} from '$lib/types/observation'
+} from '#lib/types/observation.js'
 
 export {
   isValidObservationRange,
@@ -23,12 +23,12 @@ export {
   OBSERVATION_MAX_WINDOW_MS,
   OBSERVATION_MIN_TOKEN_STOPS,
   OBSERVATION_PRESET_MINUTES,
-} from '$lib/observation-workspace'
+} from '#lib/observation-workspace.js'
 export type {
   ObservationWorkspaceApi,
   ObservationWorkspaceHooks,
   ObservationWorkspaceSnapshot,
-} from '$lib/observation-workspace'
+} from '#lib/observation-workspace.js'
 
 /**
  * ObservationWorkspaceController 的 Svelte 壳：把推送快照镜像为 $state 字段，

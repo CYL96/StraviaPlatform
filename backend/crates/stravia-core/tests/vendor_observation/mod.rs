@@ -73,7 +73,7 @@ pub(super) async fn observation_bundle_records(
     let mut records = Vec::new();
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index)?;
-        if !entry.name().ends_with("/events.jsonl") {
+        if !entry.name()?.ends_with("/events.jsonl") {
             continue;
         }
         let mut text = String::new();

@@ -1,7 +1,8 @@
 <script lang="ts">
-import * as m from '$lib/paraglide/messages.js'
+import * as m from '#lib/paraglide/messages.js'
 import { beforeNavigate, goto } from '$app/navigation'
-import { base, resolve } from '$app/paths'
+import { resolve } from '$app/paths'
+import type { Path } from '$app/types'
 import { createQuery, useQueryClient } from '@tanstack/svelte-query'
 import CirclePlusIcon from '@lucide/svelte/icons/circle-plus'
 import GripVerticalIcon from '@lucide/svelte/icons/grip-vertical'
@@ -11,20 +12,20 @@ import Trash2Icon from '@lucide/svelte/icons/trash-2'
 import WaypointsIcon from '@lucide/svelte/icons/waypoints'
 import { tick, untrack } from 'svelte'
 import { toast } from 'svelte-sonner'
+import { admin } from '#lib/admin-client.js'
+import { modelIdFromCatalogId } from '#lib/catalog-model-id.js'
+import { localizeBackendErrorMessage, unrepresentableThinkingTarget } from '#lib/backend-error.js'
+import { formatList } from '#lib/format.js'
+import { specificationModality } from '#lib/model-specification.js'
+import { inputValue } from '#lib/utils.js'
 
-import { admin } from '$lib/admin-client'
-import { modelIdFromCatalogId } from '$lib/catalog-model-id'
-import { localizeBackendErrorMessage, unrepresentableThinkingTarget } from '$lib/backend-error'
-import { formatList } from '$lib/format'
-import { specificationModality } from '$lib/model-specification'
-import { inputValue } from '$lib/utils.js'
 import {
   thinkingControlContext,
   thinkingControlWritable,
   unrepresentableThinkingLevels,
   writableThinkingControlKinds,
   type ThinkingControlKind,
-} from '$lib/thinking-control'
+} from '#lib/thinking-control.js'
 import type {
   Provider,
   ProviderModelSummary,
@@ -34,7 +35,7 @@ import type {
   TargetThinkingControl,
   ThinkingLevel,
   ThinkingLevelMapping,
-} from '$lib/types'
+} from '#lib/types.js'
 import {
   addRouteTarget,
   buildRouteTargets,
@@ -50,22 +51,23 @@ import {
   type RouteTargetForm,
   type RouteTargetInsertion,
 } from './route-targets-form.js'
-import ModelCombobox from '$lib/components/model-combobox.svelte'
-import ModelIdCombobox from '$lib/components/model-id-combobox.svelte'
-import ModelDetailsDialog from '$lib/components/model-details-dialog.svelte'
-import ModelSpecification from '$lib/components/model-specification.svelte'
-import PageHeader from '$lib/components/page-header.svelte'
-import StatusIndicator from '$lib/components/status-indicator.svelte'
-import * as AlertDialog from '$lib/components/ui/alert-dialog'
-import { Badge } from '$lib/components/ui/badge'
-import { Button } from '$lib/components/ui/button'
-import * as Dialog from '$lib/components/ui/dialog'
-import * as Field from '$lib/components/ui/field'
-import { Input } from '$lib/components/ui/input'
-import * as Select from '$lib/components/ui/select'
-import { Spinner } from '$lib/components/ui/spinner'
-import { Switch } from '$lib/components/ui/switch'
-import * as Tooltip from '$lib/components/ui/tooltip'
+
+import ModelCombobox from '#lib/components/model-combobox.svelte'
+import ModelIdCombobox from '#lib/components/model-id-combobox.svelte'
+import ModelDetailsDialog from '#lib/components/model-details-dialog.svelte'
+import ModelSpecification from '#lib/components/model-specification.svelte'
+import PageHeader from '#lib/components/page-header.svelte'
+import StatusIndicator from '#lib/components/status-indicator.svelte'
+import * as AlertDialog from '#lib/components/ui/alert-dialog/index.js'
+import { Badge } from '#lib/components/ui/badge/index.js'
+import { Button } from '#lib/components/ui/button/index.js'
+import * as Dialog from '#lib/components/ui/dialog/index.js'
+import * as Field from '#lib/components/ui/field/index.js'
+import { Input } from '#lib/components/ui/input/index.js'
+import * as Select from '#lib/components/ui/select/index.js'
+import { Spinner } from '#lib/components/ui/spinner/index.js'
+import { Switch } from '#lib/components/ui/switch/index.js'
+import * as Tooltip from '#lib/components/ui/tooltip/index.js'
 
 interface Props {
   model?: Route
@@ -89,6 +91,7 @@ let form = $state({
   enabled: initialModel?.is_enabled ?? true,
   defaultThinkingLevel: initialModel?.default_thinking_level ?? UNSPECIFIED_THINKING_LEVEL,
 })
+
 let targets = $state<RouteTargetForm[]>(
   untrack(() => createRouteTargetForms(initialModel, initialProviderId, initialModelId)),
 )
@@ -132,13 +135,18 @@ let savedDraft = $state.raw(untrack(draftSnapshot))
 const draftChanged = $derived(JSON.stringify(draftSnapshot()) !== JSON.stringify(savedDraft))
 
 beforeNavigate((navigation) => {
+  if (navigation.shallow && navigation.type === 'goto') return
   if (!draftChanged) return
+
   navigation.cancel()
+
   if (navigation.willUnload || !navigation.to?.url) return
 
   const { pathname, search, hash } = navigation.to.url
-  const href = `/${pathname.slice(base.length + 1)}${search}${hash}` as const
+  const href = `${pathname.slice(resolve('').length)}${search}${hash}` as Path
+
   pendingNavigation = navigation.type === 'popstate' ? () => history.go(navigation.delta) : () => goto(resolve(href))
+
   leaveConfirmOpen = true
 })
 
@@ -146,10 +154,12 @@ const availableProviders = $derived(providers)
 const targetLanes = $derived(priorityLanes(targets))
 const disabledTargets = $derived(targets.filter((target) => !target.enabled))
 const isDraggingTarget = $derived(Boolean(draggedTargetKey))
+
 const canonicalModelsQuery = createQuery(() => ({
   queryKey: ['catalog', 'canonical-models'],
   queryFn: () => admin.catalog.canonicalModels(),
 }))
+
 const canonicalModels = $derived(canonicalModelsQuery.data?.models ?? [])
 
 // Destination runtime status is a read-only projection of the saved route's circuit state;
@@ -395,8 +405,10 @@ function acceptImmediateThinkingMap(target: RouteTargetForm, thinkingLevelMap: T
 
 async function discardDraftAndLeave(): Promise<void> {
   const navigate = pendingNavigation
+
   pendingNavigation = undefined
   leaveConfirmOpen = false
+
   if (!navigate) return
 
   savedDraft = draftSnapshot()
@@ -707,6 +719,7 @@ async function saveModel(): Promise<void> {
       default_thinking_level:
         form.defaultThinkingLevel === UNSPECIFIED_THINKING_LEVEL ? null : (form.defaultThinkingLevel as ThinkingLevel),
     }
+
     if (initialModel) {
       await admin.models.update(initialModel.model_id, {
         ...input,
@@ -738,7 +751,7 @@ async function saveModel(): Promise<void> {
     await tick()
     toast.success(m.model_editor_model_saved())
     onSaved?.()
-    if (!onSaved) await goto(resolve('/models'))
+    if (!onSaved) await goto(resolve('models'))
   } catch (error) {
     saveError = localizeBackendErrorMessage(error)
     toast.error(localizeBackendErrorMessage(error))
@@ -901,7 +914,8 @@ async function saveModel(): Promise<void> {
       {#if imageBindingBlocksSwitch}
         <p class="text-sm text-warning" role="status">
           {m.route_output_unlink_first()}
-          <a class="underline underline-offset-2" href={resolve('/media-generation')}>{m.route_output_open_media()}</a>
+
+          <a class="underline underline-offset-2" href={resolve('media-generation')}>{m.route_output_open_media()}</a>
         </p>
       {/if}
       {#if saveError}<p class="text-sm text-destructive" role="alert">{saveError}</p>{/if}
@@ -971,6 +985,7 @@ async function saveModel(): Promise<void> {
           {#if targetLanes.length === 0}
             <div class={['mx-auto h-5 w-px', isDraggingTarget ? 'bg-primary/50' : 'bg-border']} aria-hidden="true">
             </div>
+
             <div
               data-slot="target-priority-connector"
               data-position="empty"
@@ -1448,9 +1463,9 @@ async function saveModel(): Promise<void> {
                 </p>{/if}
             </div>
             {#snippet footer()}
-              <Button type="button" variant="outline" onclick={() => closeTargetEditor(false)}>
-                {m.common_cancel()}
-              </Button>
+              <Button type="button" variant="outline" onclick={() => closeTargetEditor(false)}
+                >{m.common_cancel()}</Button>
+
               <Button
                 type="button"
                 disabled={target.enabled && !targetConfigured(target)}

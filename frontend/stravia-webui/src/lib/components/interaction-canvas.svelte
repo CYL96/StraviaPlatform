@@ -1,5 +1,5 @@
 <script lang="ts">
-import * as m from '$lib/paraglide/messages.js'
+import * as m from '#lib/paraglide/messages.js'
 import { onMount, tick, untrack } from 'svelte'
 import ChevronDownIcon from '@lucide/svelte/icons/chevron-down'
 import CrosshairIcon from '@lucide/svelte/icons/crosshair'
@@ -23,15 +23,15 @@ import {
 } from '@xyflow/svelte'
 import '@xyflow/svelte/dist/style.css'
 
-import { canvasLinks } from '$lib/interaction-canvas-links'
-import { interactionNodeWidth, interactionNodeHeight } from '$lib/interaction-node-geometry'
-import type { LayoutPosition } from '$lib/interaction-layout.worker'
-import { hasHistoricalFailure, interactionDisplayStatus } from '$lib/observation-chain-visibility'
-import { observationStatusLabel } from '$lib/observation-labels'
-import type { ForestRoot, InteractionNodeData, InteractionSummary, ObservationOutputPreview } from '$lib/types'
-import InteractionNode from '$lib/components/interaction-node.svelte'
-import { Button } from '$lib/components/ui/button'
-import { Progress } from '$lib/components/ui/progress'
+import { canvasLinks } from '#lib/interaction-canvas-links.js'
+import { interactionNodeWidth, interactionNodeHeight } from '#lib/interaction-node-geometry.js'
+import type { LayoutPosition } from '#lib/interaction-layout.worker.js'
+import { hasHistoricalFailure, interactionDisplayStatus } from '#lib/observation-chain-visibility.js'
+import { observationStatusLabel } from '#lib/observation-labels.js'
+import type { ForestRoot, InteractionNodeData, InteractionSummary, ObservationOutputPreview } from '#lib/types.js'
+import InteractionNode from '#lib/components/interaction-node.svelte'
+import { Button } from '#lib/components/ui/button/index.js'
+import { Progress } from '#lib/components/ui/progress/index.js'
 
 type FlowInteractionNode = Node<InteractionNodeData, 'interaction'>
 
@@ -188,7 +188,7 @@ function cameraDuration(duration: number): number {
 }
 
 async function acceptLayout(
-  message: MessageEvent<import('$lib/interaction-layout.worker').LayoutResponse>,
+  message: MessageEvent<import('#lib/interaction-layout.worker.js').LayoutResponse>,
 ): Promise<void> {
   if (message.data.requestId !== requestId) return
   positions = new Map(message.data.positions.map((position) => [position.id, position]))

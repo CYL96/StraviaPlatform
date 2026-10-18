@@ -1,5 +1,5 @@
 <script lang="ts">
-import * as m from '$lib/paraglide/messages.js'
+import * as m from '#lib/paraglide/messages.js'
 import { goto } from '$app/navigation'
 import { resolve } from '$app/paths'
 import { page } from '$app/state'
@@ -7,34 +7,39 @@ import { createQuery, useQueryClient } from '@tanstack/svelte-query'
 import ArrowLeftIcon from '@lucide/svelte/icons/arrow-left'
 import PlusIcon from '@lucide/svelte/icons/plus'
 import RefreshCwIcon from '@lucide/svelte/icons/refresh-cw'
-import { getModelChanges, syncToast, syncErrorToast, modelChangeReason } from '$lib/model-changes'
 
-import { admin } from '$lib/admin-client'
-import { localizeBackendErrorMessage } from '$lib/backend-error'
-import { effectiveModelDisplayName, logicalModelSecondaryId } from '$lib/logical-model'
-import type { Provider, ProviderModelSyncSummary } from '$lib/types'
-import PageHeader from '$lib/components/page-header.svelte'
-import RequestFailure from '$lib/components/request-failure.svelte'
-import ProviderConnectionView from '$lib/components/provider-connection-view.svelte'
-import ProviderMark from '$lib/components/provider-mark.svelte'
-import ProviderModelCatalog from '$lib/components/provider-model-catalog.svelte'
-import StatusIndicator from '$lib/components/status-indicator.svelte'
-import AllowanceSuspension from '$lib/components/allowance-suspension.svelte'
-import TechnicalValue from '$lib/components/technical-value.svelte'
-import { Badge } from '$lib/components/ui/badge'
-import { Button } from '$lib/components/ui/button'
-import { Spinner } from '$lib/components/ui/spinner'
-import { tabsListVariants, tabsTriggerVariants } from '$lib/components/ui/tabs'
+import { getModelChanges, syncToast, syncErrorToast, modelChangeReason } from '#lib/model-changes.js'
+
+import { admin } from '#lib/admin-client.js'
+import { localizeBackendErrorMessage } from '#lib/backend-error.js'
+import { effectiveModelDisplayName, logicalModelSecondaryId } from '#lib/logical-model.js'
+import type { Provider, ProviderModelSyncSummary } from '#lib/types.js'
+import PageHeader from '#lib/components/page-header.svelte'
+import RequestFailure from '#lib/components/request-failure.svelte'
+import ProviderConnectionView from '#lib/components/provider-connection-view.svelte'
+import ProviderMark from '#lib/components/provider-mark.svelte'
+import ProviderModelCatalog from '#lib/components/provider-model-catalog.svelte'
+import StatusIndicator from '#lib/components/status-indicator.svelte'
+import AllowanceSuspension from '#lib/components/allowance-suspension.svelte'
+import TechnicalValue from '#lib/components/technical-value.svelte'
+import { Badge } from '#lib/components/ui/badge/index.js'
+import { Button } from '#lib/components/ui/button/index.js'
+import { Spinner } from '#lib/components/ui/spinner/index.js'
+import { tabsListVariants, tabsTriggerVariants } from '#lib/components/ui/tabs/index.js'
 
 const providerId = $derived(page.params.id ?? '')
+
 type ProviderDetailView = 'connection' | 'models' | 'routes'
+
 const view = $derived(parseProviderDetailView(page.url.searchParams.get('view')))
 const queryClient = useQueryClient()
 const providersQuery = createQuery(() => ({ queryKey: ['providers'], queryFn: admin.providers.list }))
+
 const providerDescriptorsQuery = createQuery(() => ({
   queryKey: ['provider-descriptors'],
   queryFn: admin.providers.descriptors,
 }))
+
 const routesQuery = createQuery(() => ({ queryKey: ['models'], queryFn: admin.models.list }))
 let syncStatus = $state<'idle' | 'syncing' | 'success' | 'error'>('idle')
 let syncProviderId = $state('')
@@ -42,7 +47,6 @@ const changesSheet = getModelChanges()
 let syncError = $state('')
 let autoSyncStarted = $state(false)
 let savedProvider = $state<Provider>()
-
 const provider = $derived(savedProvider ?? providersQuery.data?.find((item) => item.id === providerId))
 const descriptor = $derived(providerDescriptorsQuery.data?.find((item) => item.provider_id === provider?.vendor))
 const channel = $derived(descriptor?.channels.find((item) => item.id === provider?.channel))
@@ -54,11 +58,13 @@ const usesProviderModels = $derived(
     channel?.capabilities.includes('search'),
   ),
 )
+
 const detailTabs = $derived([
   { id: 'connection', label: m.provider_detail_tab_connection },
   ...(usesProviderModels ? [{ id: 'models', label: m.provider_detail_tab_models }] : []),
   { id: 'routes', label: m.provider_detail_tab_routes },
 ])
+
 const routeReferences = $derived(
   (routesQuery.data ?? []).flatMap((route) =>
     route.targets.filter((target) => target.provider_id === providerId).map((target) => ({ route, target })),
@@ -89,13 +95,10 @@ async function syncModels(id = providerId): Promise<ProviderModelSyncSummary | u
     await queryClient.invalidateQueries({ queryKey: ['provider-models', id] })
     await queryClient.invalidateQueries({ queryKey: ['provider-model-sync-state', id] })
     if (page.params.id === id && page.url.searchParams.get('sync') === 'created') {
-      const url = new URL(page.url)
+      const url = new URL(page.url.href)
+
       url.searchParams.delete('sync')
-      await goto(resolve(`/providers/${encodeURIComponent(id)}${url.search}`), {
-        replaceState: true,
-        noScroll: true,
-        keepFocus: true,
-      })
+      await goto(resolve(`providers/${encodeURIComponent(id)}${url.search}`), { replace: true, reset: false })
     }
     syncToast(summary, changesSheet.reveal, () => void syncModels(id))
     return summary
@@ -175,7 +178,7 @@ async function syncModels(id = providerId): Promise<ProviderModelSyncSummary | u
           class={tabsTriggerVariants()}
           data-state={view === item.id ? 'active' : 'inactive'}
           aria-current={view === item.id ? 'page' : undefined}
-          href={resolve(`/providers/${encodeURIComponent(providerId)}?view=${encodeURIComponent(item.id)}`)}
+          href={resolve(`providers/${encodeURIComponent(providerId)}?view=${encodeURIComponent(item.id)}`)}
           >{item.label()}</a>
       {/each}
     </nav>
@@ -241,7 +244,7 @@ async function syncModels(id = providerId): Promise<ProviderModelSyncSummary | u
           <div class="flex flex-col items-center gap-3 rounded-xl border border-dashed px-4 py-10 text-center">
             <p class="text-sm text-muted-foreground">{m.providers_no_models_use_model_service_yet()}</p>
             {#if usesProviderModels}
-              <Button variant="outline" href={resolve(`/providers/${encodeURIComponent(providerId)}?view=models`)}
+              <Button variant="outline" href={resolve(`providers/${encodeURIComponent(providerId)}?view=models`)}
                 >{m.providers_browse_service_models()}</Button>
             {/if}
           </div>

@@ -1,8 +1,8 @@
 <script lang="ts">
 import { ToggleGroup as ToggleGroupPrimitive } from 'bits-ui'
 
-import { cn } from '$lib/utils.js'
-import type { ToggleVariants } from '$lib/components/ui/toggle/index.js'
+import { cn } from '#lib/utils.js'
+import type { ToggleVariants } from '#lib/components/ui/toggle/index.js'
 import { setToggleGroupCtx } from './context.js'
 
 let {

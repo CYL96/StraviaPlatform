@@ -1,6 +1,6 @@
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
-import type { StartupProgress } from '$lib/startup-progress'
+import type { StartupProgress } from '#lib/startup-progress.js'
 
 export type DesktopStartupStatus = 'starting' | 'ready' | 'failed'
 export type DesktopStartupStage = 'data_directory' | 'gateway' | 'session' | 'http' | 'desktop'

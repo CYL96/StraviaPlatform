@@ -3,9 +3,9 @@ import EyeIcon from '@lucide/svelte/icons/eye'
 import EyeOffIcon from '@lucide/svelte/icons/eye-off'
 import type { ComponentProps, Snippet } from 'svelte'
 
-import * as m from '$lib/paraglide/messages.js'
-import { Input } from '$lib/components/ui/input'
-import * as InputGroup from '$lib/components/ui/input-group'
+import * as m from '#lib/paraglide/messages.js'
+import { Input } from '#lib/components/ui/input/index.js'
+import * as InputGroup from '#lib/components/ui/input-group/index.js'
 
 type Props = Omit<ComponentProps<typeof Input>, 'type' | 'files'> & {
   resetKey?: unknown

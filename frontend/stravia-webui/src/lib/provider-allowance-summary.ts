@@ -1,4 +1,4 @@
-import type { Allowance, AllowanceCondition } from '$lib/types'
+import type { Allowance, AllowanceCondition } from '#lib/types.js'
 
 export type ForecastBucket = 'exhausted' | 'will_exhaust' | 'no_risk' | 'unknown'
 

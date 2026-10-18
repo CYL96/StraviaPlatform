@@ -1,7 +1,7 @@
 import { execFileSync } from 'node:child_process'
 import { join } from 'node:path'
 
-// tauri-service 1.4.0 has no persistent cache option. Provision through its supported
+// tauri-service 1.5.0 has no persistent cache option. Provision through its supported
 // PATH contract, then let the service independently check runtime compatibility.
 // The Bun patch handles Windows PATH discovery and both official Microsoft banners;
 // it executes the native binary directly without bypassing compatibility checks.

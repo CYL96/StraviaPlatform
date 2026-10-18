@@ -1,5 +1,5 @@
-import { payloadRecord, payloadString } from '$lib/observation-payload'
-import * as m from '$lib/paraglide/messages.js'
+import { payloadRecord, payloadString } from '#lib/observation-payload.js'
+import * as m from '#lib/paraglide/messages.js'
 
 type LabelMessage = () => string
 

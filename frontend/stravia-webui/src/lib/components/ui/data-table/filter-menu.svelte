@@ -4,11 +4,11 @@ import FunnelIcon from '@lucide/svelte/icons/funnel'
 import PlusIcon from '@lucide/svelte/icons/plus'
 import XIcon from '@lucide/svelte/icons/x'
 
-import { Button } from '$lib/components/ui/button'
-import { Input } from '$lib/components/ui/input'
-import * as Popover from '$lib/components/ui/popover'
-import * as Select from '$lib/components/ui/select'
-import { cn, inputValue } from '$lib/utils.js'
+import { Button } from '#lib/components/ui/button/index.js'
+import { Input } from '#lib/components/ui/input/index.js'
+import * as Popover from '#lib/components/ui/popover/index.js'
+import * as Select from '#lib/components/ui/select/index.js'
+import { cn, inputValue } from '#lib/utils.js'
 import {
   dataTableCellText,
   dataTableFeatures,

@@ -4,37 +4,34 @@ import { resolve } from '$app/paths'
 import { page } from '$app/state'
 import { onMount, tick, untrack } from 'svelte'
 import { toast } from 'svelte-sonner'
-import { isTauri } from '$lib/admin-client'
-import { getConsoleChat } from '$lib/console-chat.svelte'
-import { consoleAssistantContent, consoleReasoningActivities, consoleVisibleText } from '$lib/console-chat'
-import type {
-  ConsoleChatSnapshot,
-  ConsoleConversation,
-  ConsoleImageAttachment,
-  ConsoleTokenUsage,
-} from '$lib/console-chat-types'
-import { localizeBackendErrorMessage } from '$lib/backend-error'
-import { formatLogTime, formatNumber } from '$lib/format'
-import * as m from '$lib/paraglide/messages.js'
-import ConsoleChatActions from '$lib/components/console-chat-actions.svelte'
-import ConsoleChatComposer from '$lib/components/console-chat-composer.svelte'
-import ConversationMessage from '$lib/components/conversation-message.svelte'
-import ObservationActivity from '$lib/components/observation-activity.svelte'
-import DesktopPortNotice from '$lib/components/desktop-port-notice.svelte'
-import MarkdownContent from '$lib/components/markdown-content.svelte'
-import StreamingMarkdown from '$lib/components/streaming-markdown.svelte'
-import { Button, buttonVariants } from '$lib/components/ui/button'
-import * as Tooltip from '$lib/components/ui/tooltip'
-import BrandMark from '$lib/components/brand-mark.svelte'
+import { isTauri } from '#lib/admin-client.js'
+import { getConsoleChat } from '#lib/console-chat.svelte.js'
+import { consoleAssistantContent, consoleReasoningActivities, consoleVisibleText } from '#lib/console-chat.js'
+import type { ConsoleChatSnapshot, ConsoleConversation, ConsoleImageAttachment } from '#lib/console-chat-types.js'
+
+import { localizeBackendErrorMessage } from '#lib/backend-error.js'
+import { formatLogTime, formatNumber } from '#lib/format.js'
+import * as m from '#lib/paraglide/messages.js'
+import ConsoleChatActions from '#lib/components/console-chat-actions.svelte'
+import ConsoleChatComposer from '#lib/components/console-chat-composer.svelte'
+import ConversationMessage from '#lib/components/conversation-message.svelte'
+import ObservationActivity from '#lib/components/observation-activity.svelte'
+import DesktopPortNotice from '#lib/components/desktop-port-notice.svelte'
+import MarkdownContent from '#lib/components/markdown-content.svelte'
+import StreamingMarkdown from '#lib/components/streaming-markdown.svelte'
+import { Button, buttonVariants } from '#lib/components/ui/button/index.js'
+import * as Tooltip from '#lib/components/ui/tooltip/index.js'
+import BrandMark from '#lib/components/brand-mark.svelte'
 import ArrowDownIcon from '@lucide/svelte/icons/arrow-down'
 import CopyIcon from '@lucide/svelte/icons/copy'
 import PencilIcon from '@lucide/svelte/icons/pencil'
 import RefreshCwIcon from '@lucide/svelte/icons/refresh-cw'
 import SquarePenIcon from '@lucide/svelte/icons/square-pen'
-import { Skeleton } from '$lib/components/ui/skeleton'
-import { Textarea } from '$lib/components/ui/textarea'
-import * as Alert from '$lib/components/ui/alert'
-import * as Empty from '$lib/components/ui/empty'
+import { Skeleton } from '#lib/components/ui/skeleton/index.js'
+import { Textarea } from '#lib/components/ui/textarea/index.js'
+import * as Alert from '#lib/components/ui/alert/index.js'
+import * as Empty from '#lib/components/ui/empty/index.js'
+
 const chat = getConsoleChat()
 const snapshot: ConsoleChatSnapshot = $derived(chat.snapshot)
 const conversation: ConsoleConversation | null = $derived(snapshot.currentConversation)
@@ -42,7 +39,6 @@ const generation = $derived(conversation ? snapshot.generations[conversation.id]
 const lastMessage = $derived(conversation?.messages.at(-1))
 const title = $derived(conversation?.title ?? m.console_chat_new())
 const heading = $derived(snapshot.missingConversation ? m.console_chat_missing() : title)
-
 let text = $state('')
 let images = $state<ConsoleImageAttachment[]>([])
 let composer = $state<HTMLTextAreaElement | null>(null)
@@ -55,6 +51,7 @@ let scroller: HTMLElement | null = null
 let previousConversation: string | null = null
 let previousAddress: string | null | undefined
 let preservedNavigation: string | null | undefined
+
 const guide = $derived.by(() => {
   switch (snapshot.blocker) {
     case 'no-services':
@@ -181,7 +178,7 @@ async function send() {
     // 首次发送建立对话身份不是用户切换对话，不能清掉生成期间写下的下一条。
     if (id && page.url.searchParams.get('conversation') !== id) {
       preservedNavigation = id
-      await goto(resolve(`/?conversation=${encodeURIComponent(id)}`), { noScroll: true, keepFocus: true })
+      await goto(resolve(`?conversation=${encodeURIComponent(id)}`), { reset: false })
     }
     sent = await pending
     if (
@@ -192,7 +189,7 @@ async function send() {
     ) {
       preservedNavigation = null
       rolledBack = true
-      await goto(resolve('/'), { noScroll: true, keepFocus: true })
+      await goto(resolve('/'), { reset: false })
     }
   } catch (cause) {
     toast.error(localizeBackendErrorMessage(cause))
@@ -259,8 +256,8 @@ async function submitEdit(id: string) {
   <header class="flex min-w-0 items-center gap-2">
     <h1 class="min-w-0 flex-1 truncate text-base font-medium" title={heading}>{heading}</h1>
     <div class="flex shrink-0 items-center gap-1">
-      {@render iconAction(m.console_chat_new(), SquarePenIcon, () => void newConversation())}<ConsoleChatActions
-        {conversation} />
+      {@render iconAction(m.console_chat_new(), SquarePenIcon, () => void newConversation())}
+      <ConsoleChatActions {conversation} />
     </div>
   </header>
   {#if snapshot.storageError}<p role="alert" class="text-destructive">
@@ -318,8 +315,10 @@ async function submitEdit(id: string) {
                     }} />
                   <p class="text-xs text-muted-foreground">{m.console_chat_edit_effect()}</p>
                   <div class="flex justify-end gap-2">
-                    <Button type="button" variant="ghost" onclick={() => (editingId = null)}>{m.common_cancel()}</Button
-                    ><Button
+                    <Button type="button" variant="ghost" onclick={() => (editingId = null)}
+                      >{m.common_cancel()}</Button>
+
+                    <Button
                       type="submit"
                       disabled={!editText.trim() ||
                         Boolean(generation) ||
@@ -354,11 +353,12 @@ async function submitEdit(id: string) {
             </ConversationMessage>
           {:else}
             {@const content = consoleAssistantContent(message)}
-            {@const usage = message.usage as ConsoleTokenUsage | undefined}
+            {@const usage = message.usage}
             {@const live = generation && message === lastMessage}
             {@const activities = live ? generation.activities : consoleReasoningActivities(message)}
             <ConversationMessage label={m.console_chat_assistant_response()}>
-              {#each activities as activity (activity.id)}<ObservationActivity
+              {#each activities as activity (activity.id)}
+                <ObservationActivity
                   {activity}
                   expansionPolicy="chat"
                   followed={live && generation.followedThinkingIds.includes(activity.id)}
@@ -371,24 +371,31 @@ async function submitEdit(id: string) {
               {:else}<MarkdownContent
                   text={consoleVisibleText(content.text)}
                   minimumHeadingLevel={2}
-                  variant="document" />{/if}
-              {#if message.status === 'failed' && !live}<div role="alert" class="text-destructive">
+                  variant="document" />
+              {/if}
+
+              {#if message.status === 'failed' && !live}
+                <div role="alert" class="text-destructive">
                   {localizeBackendErrorMessage(
                     message.error ?? m.console_chat_request_failed(),
-                  )}{#if message === lastMessage && !snapshot.retryModelAvailable}<p class="mt-1 text-sm">
-                      {m.console_chat_model_recovery()}
-                    </p>{/if}
-                </div>{/if}
+                  )}{#if message === lastMessage && !snapshot.retryModelAvailable}
+                    <p class="mt-1 text-sm">{m.console_chat_model_recovery()}</p>
+                  {/if}
+                </div>
+              {/if}
 
-              {#if live}<span role="status" class="sr-only">{m.console_chat_generating()}</span>
-              {:else}<div class="flex items-center gap-1">
+              {#if live}
+                <span role="status" class="sr-only">{m.console_chat_generating()}</span>
+              {:else}
+                <div class="flex items-center gap-1">
                   {@render iconAction(m.console_chat_copy(), CopyIcon, () => void copy(content.text), false, true)}
                   {#if message === lastMessage && !generation && !snapshot.readOnlyReason}
                     {#if message.status === 'failed'}<Button
                         variant="outline"
                         disabled={!snapshot.retryModelAvailable || Boolean(guide) || Boolean(snapshot.catalogError)}
-                        onclick={() => void command(() => chat.retry())}>{m.console_chat_retry()}</Button
-                      >{/if}
+                        onclick={() => void command(() => chat.retry())}>{m.console_chat_retry()}</Button>
+                    {/if}
+
                     {@render iconAction(
                       m.console_chat_regenerate(),
                       RefreshCwIcon,
@@ -400,6 +407,7 @@ async function submitEdit(id: string) {
                       true,
                     )}
                   {/if}
+
                   <div
                     class="flex min-w-0 flex-1 flex-wrap items-center gap-x-2 gap-y-0.5 px-1 text-xs text-muted-foreground tabular-nums">
                     <span class="font-technical break-all">{message.routeId}</span><span

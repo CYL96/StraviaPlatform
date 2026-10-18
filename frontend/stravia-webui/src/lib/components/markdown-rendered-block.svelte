@@ -1,7 +1,7 @@
 <script lang="ts">
-import type { MarkdownBlock } from '$lib/markdown'
-import { createMarkdownBlockRenderer } from '$lib/markdown-dom'
-import * as m from '$lib/paraglide/messages.js'
+import type { MarkdownBlock } from '#lib/markdown.js'
+import { createMarkdownBlockRenderer } from '#lib/markdown-dom.js'
+import * as m from '#lib/paraglide/messages.js'
 
 let { block, streaming = false }: { block: MarkdownBlock; streaming?: boolean } = $props()
 function renderBlock(element: HTMLDivElement) {

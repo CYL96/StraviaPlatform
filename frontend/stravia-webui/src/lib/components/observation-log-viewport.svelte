@@ -1,9 +1,9 @@
 <script lang="ts">
 import { tick, untrack, type Snippet } from 'svelte'
 import ArrowDownIcon from '@lucide/svelte/icons/arrow-down'
-import * as m from '$lib/paraglide/messages.js'
-import { Button } from '$lib/components/ui/button'
-import { Spinner } from '$lib/components/ui/spinner'
+import * as m from '#lib/paraglide/messages.js'
+import { Button } from '#lib/components/ui/button/index.js'
+import { Spinner } from '#lib/components/ui/spinner/index.js'
 
 let {
   label,

@@ -1,16 +1,16 @@
 <script lang="ts">
-import * as m from '$lib/paraglide/messages.js'
+import * as m from '#lib/paraglide/messages.js'
 import { createQuery, useQueryClient } from '@tanstack/svelte-query'
 import { untrack } from 'svelte'
 import { toast } from 'svelte-sonner'
 
-import { localizeBackendErrorMessage } from '$lib/backend-error'
-import { loadRpm, rpmQueryKey, saveRpm } from '$lib/rpm'
-import { cn, inputValue } from '$lib/utils'
-import { Button } from '$lib/components/ui/button'
-import * as Field from '$lib/components/ui/field'
-import { Input } from '$lib/components/ui/input'
-import { Spinner } from '$lib/components/ui/spinner'
+import { localizeBackendErrorMessage } from '#lib/backend-error.js'
+import { loadRpm, rpmQueryKey, saveRpm } from '#lib/rpm.js'
+import { cn, inputValue } from '#lib/utils.js'
+import { Button } from '#lib/components/ui/button/index.js'
+import * as Field from '#lib/components/ui/field/index.js'
+import { Input } from '#lib/components/ui/input/index.js'
+import { Spinner } from '#lib/components/ui/spinner/index.js'
 
 let {
   providerId,

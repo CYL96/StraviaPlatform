@@ -2,10 +2,10 @@
 import type { Snippet } from 'svelte'
 import CalendarRangeIcon from '@lucide/svelte/icons/calendar-range'
 
-import * as m from '$lib/paraglide/messages.js'
-import { formatLogTime } from '$lib/format'
-import { Button } from '$lib/components/ui/button'
-import * as Select from '$lib/components/ui/select'
+import * as m from '#lib/paraglide/messages.js'
+import { formatLogTime } from '#lib/format.js'
+import { Button } from '#lib/components/ui/button/index.js'
+import * as Select from '#lib/components/ui/select/index.js'
 
 interface PresetOption {
   value: string

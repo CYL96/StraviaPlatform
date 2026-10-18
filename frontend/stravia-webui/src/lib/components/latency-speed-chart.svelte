@@ -1,9 +1,9 @@
 <script lang="ts">
 import { Axis, Chart, Path, Svg, Tooltip, type ChartState } from 'layerchart'
 
-import * as m from '$lib/paraglide/messages.js'
-import { formatNumber, formatTime } from '$lib/format'
-import type { LatencyChartPoint } from '$lib/stats-chart'
+import * as m from '#lib/paraglide/messages.js'
+import { formatNumber, formatTime } from '#lib/format.js'
+import type { LatencyChartPoint } from '#lib/stats-chart.js'
 
 type LatencyChartContext = ChartState<LatencyChartPoint>
 
@@ -161,15 +161,7 @@ function metricValue(value: number | null, unit: string): string {
           {/if}
         {/each}
       </Svg>
-      <!-- 窄屏绘图区不足以在指针两侧容纳读数；水平居中避免翻转后越出视口。 -->
-      <Tooltip.Root
-        context={chart}
-        x={chart.containerWidth / 2}
-        xOffset={0}
-        anchor="top"
-        motion="none"
-        fadeDuration={0}
-        props={{ root: { role: 'tooltip' } }}>
+      <Tooltip.Root context={chart} motion="none" fadeDuration={0} props={{ root: { role: 'tooltip' } }}>
         {#snippet children({ data: point }: { data: LatencyChartPoint })}
           <div class="font-technical text-xs tabular-nums">
             <p class="mb-1">{formatBucket(point.bucket)}</p>

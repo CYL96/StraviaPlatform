@@ -23,7 +23,7 @@ Stravia 是本地运行、可自托管的 Agent 基础设施，协议网关只�
 | `stravia-core` | Gateway、路由、模型执行、平台工具、内置 Agent、持久化与管理业务 | [依赖清单](../../backend/crates/stravia-core/Cargo.toml)（15–24 行）、[模块入口](../../backend/crates/stravia-core/src/lib.rs)（1–40 行） |
 | `stravia-server` | 共享 HTTP application、独立服务进程、可选 WebUI 嵌入 | [HTTP application](../../backend/apps/stravia-server/src/lib.rs)（78–108 行）、[特性配置](../../backend/apps/stravia-server/Cargo.toml)（13–27 行） |
 | `stravia-desktop` | Tauri 壳、同一 Core/HTTP application 的生命周期、原生管理会话与本地 IPC | [实际组装](../../backend/apps/stravia-desktop/src/lib.rs)（468–545 行）、[依赖](../../backend/apps/stravia-desktop/Cargo.toml)（15–29 行） |
-| `frontend/stravia-webui` | Server/Desktop 共用的静态管理客户端 | [依赖](../../frontend/stravia-webui/package.json)（14–84 行）、[静态 adapter](../../frontend/stravia-webui/svelte.config.js)（1–14 行） |
+| `frontend/stravia-webui` | Server/Desktop 共用的静态管理客户端 | [依赖及子路径导入](../../frontend/stravia-webui/package.json)、[静态 adapter](../../frontend/stravia-webui/vite.config.ts) |
 
 Core 不拥有 HTTP listener；Desktop 复用 Server crate 的 HTTP application，而不是再实现一套管理业务。[架构约束](../design/architecture.md)（33–36 行）、[Desktop 实现](../../backend/apps/stravia-desktop/src/lib.rs)（468–545 行）。
 
@@ -41,7 +41,7 @@ Core 不拥有 HTTP listener；Desktop 复用 Server crate 的 HTTP application�
 
 ## 前端现状与边界
 
-前端使用 Svelte 5、SvelteKit 2、TypeScript、Vite、Tailwind CSS 4、shadcn-svelte/Bits UI；TanStack Query/Table 管理数据，Paraglide 提供 `en-US` / `zh-CN`，静态 adapter 输出共用客户端。[依赖](../../frontend/stravia-webui/package.json)（14–84 行）、[i18n 配置](../../frontend/stravia-webui/project.inlang/settings.json)（1–5 行）、[adapter](../../frontend/stravia-webui/svelte.config.js)（1–14 行）。
+前端使用 Svelte 5、SvelteKit 3、TypeScript、Vite、Tailwind CSS 4、shadcn-svelte/Bits UI；TanStack Query/Table 管理数据，Paraglide 提供 `en-US` / `zh-CN`，静态 adapter 输出共用客户端。框架配置由 Vite 插件承载，内部模块使用原生 `#lib` 子路径导入。[依赖及导入映射](../../frontend/stravia-webui/package.json)、[i18n 配置](../../frontend/stravia-webui/project.inlang/settings.json)（1–5 行）、[adapter](../../frontend/stravia-webui/vite.config.ts)。
 
 实际导航覆盖：Console Chat/对话、Providers、Models/Routes、API Keys、接入客户端；媒体理解/生成、Web Search、可逆脱敏、Vendor 插件；日志、统计、额度；设置以及登录/首次设置入口。[AppShell](../../frontend/stravia-webui/src/lib/components/app-shell.svelte)（95–125 行）、[根布局](../../frontend/stravia-webui/src/routes/+layout.svelte)（35–38、157–210 行）、[对话页面](../../frontend/stravia-webui/src/routes/conversations/+page.svelte)（46–50 行）。
 

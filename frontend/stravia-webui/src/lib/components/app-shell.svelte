@@ -1,5 +1,5 @@
 <script lang="ts">
-import * as m from '$lib/paraglide/messages.js'
+import * as m from '#lib/paraglide/messages.js'
 import { resolve } from '$app/paths'
 import { goto } from '$app/navigation'
 import { page } from '$app/state'
@@ -23,24 +23,22 @@ import { userPrefersMode } from 'mode-watcher'
 import { onMount } from 'svelte'
 import type { Snippet } from 'svelte'
 import { toast } from 'svelte-sonner'
-
-import { admin, isTauri } from '$lib/admin-client'
-import { logout } from '$lib/auth'
-import { getConsoleChat } from '$lib/console-chat.svelte'
-import { localizeBackendErrorMessage } from '$lib/backend-error'
-import { createWindowChrome } from '$lib/window-chrome'
-import BrandMark from '$lib/components/brand-mark.svelte'
-import BrandWordmark from '$lib/components/brand-wordmark.svelte'
-import StatusIndicator from '$lib/components/status-indicator.svelte'
-import WindowControls from '$lib/components/window-controls.svelte'
-import { Badge } from '$lib/components/ui/badge'
-import { Button } from '$lib/components/ui/button'
-import * as Sidebar from '$lib/components/ui/sidebar'
-import * as Breadcrumb from '$lib/components/ui/breadcrumb'
+import { admin, isTauri } from '#lib/admin-client.js'
+import { logout } from '#lib/auth.js'
+import { getConsoleChat } from '#lib/console-chat.svelte.js'
+import { localizeBackendErrorMessage } from '#lib/backend-error.js'
+import { createWindowChrome } from '#lib/window-chrome.js'
+import BrandMark from '#lib/components/brand-mark.svelte'
+import BrandWordmark from '#lib/components/brand-wordmark.svelte'
+import StatusIndicator from '#lib/components/status-indicator.svelte'
+import WindowControls from '#lib/components/window-controls.svelte'
+import { Badge } from '#lib/components/ui/badge/index.js'
+import { Button } from '#lib/components/ui/button/index.js'
+import * as Sidebar from '#lib/components/ui/sidebar/index.js'
+import * as Breadcrumb from '#lib/components/ui/breadcrumb/index.js'
 
 let { children }: { children: Snippet } = $props()
 const chat = getConsoleChat()
-
 const shellMode = $derived(
   page.url.pathname === '/login' ||
     page.url.pathname === '/setup' ||
@@ -49,11 +47,9 @@ const shellMode = $derived(
     ? ('titlebar-only' as const)
     : ('navigation' as const),
 )
-
 const SIDEBAR_STORAGE_KEY = 'stravia-sidebar-state'
 const windowChrome = createWindowChrome()
 const materialAvailable = windowChrome.material !== 'opaque'
-
 let navigationOpen = $state(false)
 let navigationPanel = $state<HTMLElement | null>(null)
 let navigationTrigger = $state<HTMLButtonElement | null>(null)
@@ -63,18 +59,21 @@ let conversationGroupHovered = $state(false)
 let conversationGroupFocused = $state(false)
 let isWindowMaximized = $state(false)
 let translucentChrome = $state(false)
-
 const hasNavigation = $derived(shellMode === 'navigation')
+
 const statusQuery = createQuery(() => ({
   queryKey: ['gateway-status'],
   queryFn: admin.settings.status,
   enabled: hasNavigation,
   refetchInterval: 10_000,
 }))
+
 const gatewayRunning = $derived(statusQuery.data?.status === 'running')
+
 const gatewayTone = $derived(
   gatewayRunning ? ('healthy' as const) : statusQuery.isError ? ('error' as const) : ('neutral' as const),
 )
+
 const currentPath = $derived(page.url.pathname)
 const conversationRouteActive = $derived(currentPath === '/' || currentPath === '/conversations')
 const recentConversationsId = $props.id()
@@ -85,12 +84,16 @@ const showRecentConversations = $derived(
 const RECENT_CONVERSATION_LIMIT = 3
 const recentConversations = $derived(chat.snapshot.conversations.slice(0, RECENT_CONVERSATION_LIMIT))
 const showAllConversations = $derived(chat.snapshot.conversations.length > RECENT_CONVERSATION_LIMIT)
+
 // 对话区只高亮当前可见的最具体一项；子项被折叠隐藏或当前对话不在最近列表时，回退到父项。
 const activeConversationId = $derived.by(() => {
   if (currentPath !== '/' || !showRecentConversations) return null
+
   const id = page.url.searchParams.get('conversation')
+
   return recentConversations.some((conversation) => conversation.id === id) ? id : null
 })
+
 const allConversationsActive = $derived(
   currentPath === '/conversations' && showRecentConversations && showAllConversations,
 )
@@ -98,6 +101,7 @@ const chatNavigationActive = $derived(
   (currentPath === '/' || currentPath === '/conversations') && !activeConversationId && !allConversationsActive,
 )
 const breadcrumbProviderId = $derived(page.route.id === '/providers/[id]' ? (page.params.id ?? '') : '')
+
 const navigationTriggerLabel = $derived(
   isDesktopNavigation
     ? sidebarCollapsed
@@ -108,6 +112,7 @@ const navigationTriggerLabel = $derived(
 
 $effect(() => {
   const themePreference = userPrefersMode.current
+
   windowChrome.syncTheme(themePreference === 'system' ? null : themePreference)
 })
 
@@ -117,31 +122,40 @@ const navigationGroups = [
     items: [
       { href: '/providers', label: m.app_shell_nav_model_services, icon: PlugZapIcon },
       { href: '/models', label: m.app_shell_nav_models, icon: ListTreeIcon },
+
       { href: '/api-keys', label: m.app_shell_nav_api_keys, icon: KeyRoundIcon },
+
       { href: '/connect', label: m.app_shell_nav_connect_apps, icon: RadioTowerIcon },
     ],
   },
+
   {
     label: m.app_shell_nav_advanced_features,
     items: [
       { href: '/media-understanding', label: m.app_shell_nav_media_understanding, icon: ImagesIcon, beta: true },
       { href: '/media-generation', label: m.app_shell_nav_media_generation, icon: ImagePlusIcon, beta: true },
+
       { href: '/web-search', label: m.app_shell_nav_web_search, icon: SearchCheckIcon, beta: true },
+
       { href: '/reversible-redaction', label: m.reversible_redaction_title, icon: KeyRoundIcon },
     ],
   },
+
   {
     label: m.app_shell_nav_monitor,
     items: [
       { href: '/logs', label: m.app_shell_nav_request_history, icon: ScrollTextIcon },
       { href: '/stats', label: m.app_shell_nav_usage, icon: ChartNoAxesCombinedIcon },
+
       { href: '/allowances', label: m.app_shell_nav_allowances, icon: GaugeIcon },
     ],
   },
+
   {
     label: m.app_shell_nav_system,
     items: [
       { href: '/vendor-plugins', label: m.app_shell_nav_vendor_plugins, icon: PackageOpenIcon },
+
       { href: '/settings', label: m.app_shell_nav_settings, icon: CogIcon },
     ],
   },
@@ -157,12 +171,16 @@ const breadcrumbProvidersQuery = createQuery(() => ({
 }))
 const breadcrumbItems = $derived.by((): BreadcrumbItem[] => {
   if (currentPath === '/') return [{ label: m.console_chat_chat() }]
+
   if (currentPath === '/conversations')
     return [{ label: m.console_chat_chat(), href: '/' }, { label: m.console_chat_all() }]
+
   const navigationItem = findNavigationItem(currentPath)
+
   if (!navigationItem) return []
 
   const parent = { label: navigationItem.label() }
+
   if (currentPath === navigationItem.href) return [parent]
 
   if (breadcrumbProviderId) {
@@ -206,7 +224,7 @@ function isCurrent(href: string): boolean {
 async function signOut(): Promise<void> {
   try {
     await logout()
-    await goto(resolve('/login'))
+    await goto(resolve('login'))
   } catch (error) {
     toast.error(localizeBackendErrorMessage(error))
   }
@@ -261,13 +279,13 @@ onMount(() => {
   const media = window.matchMedia('(min-width: 768px)')
   const syncNavigationMode = () => {
     isDesktopNavigation = media.matches
+
     if (media.matches) navigationOpen = false
   }
+
   syncNavigationMode()
   media.addEventListener('change', syncNavigationMode)
-
   sidebarCollapsed = localStorage.getItem(SIDEBAR_STORAGE_KEY) === 'collapsed'
-
   translucentChrome = materialAvailable
   document.documentElement.classList.toggle('window-material', translucentChrome)
 
@@ -320,7 +338,8 @@ onMount(() => {
                     aria-controls={isDesktopNavigation && !sidebarCollapsed ? recentConversationsId : undefined}
                     aria-current={chatNavigationActive ? 'page' : undefined}
                     onclick={() => (navigationOpen = false)}>
-                    <MessageSquareIcon /><span>{m.console_chat_chat()}</span>
+                    <MessageSquareIcon />
+                    <span>{m.console_chat_chat()}</span>
                   </a>
                 {/snippet}
               </Sidebar.MenuButton>
@@ -337,7 +356,7 @@ onMount(() => {
                         ? 'bg-sidebar-accent text-sidebar-accent-foreground'
                         : '',
                     ]}
-                    href={resolve(`/?conversation=${encodeURIComponent(conversation.id)}`)}
+                    href={resolve(`?conversation=${encodeURIComponent(conversation.id)}`)}
                     aria-current={activeConversationId === conversation.id ? 'page' : undefined}
                     onclick={() => (navigationOpen = false)}>
                     <span class="min-w-0 flex-1 truncate">{conversation.title}</span>
@@ -352,7 +371,7 @@ onMount(() => {
               {#if showAllConversations}
                 <li>
                   <a
-                    href={resolve('/conversations')}
+                    href={resolve('conversations')}
                     class={[
                       'flex min-h-10 items-center rounded-md px-3 text-sm hover:bg-sidebar-accent',
                       allConversationsActive ? 'bg-sidebar-accent text-sidebar-accent-foreground' : '',
@@ -380,7 +399,7 @@ onMount(() => {
                         {...props}
                         href={resolve(item.href)}
                         aria-label={'beta' in item ? `${label} ${m.common_beta()}` : label}
-                        data-sveltekit-keepfocus={!isDesktopNavigation ? true : undefined}
+                        data-sveltekit-reset={!isDesktopNavigation ? false : undefined}
                         aria-current={current ? 'page' : undefined}
                         onclick={() => {
                           navigationOpen = false
