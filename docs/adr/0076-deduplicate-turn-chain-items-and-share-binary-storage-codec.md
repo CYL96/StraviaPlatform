@@ -14,7 +14,9 @@ Turn Chain 的不可变节点继续拥有模型历史事实，存储表示改为
 
 同一 Gateway 的 SQLite 历史与普通 Observation 写入口共享异步写锁，在取得连接与写事务前排队，持有到提交完成，避免两类写入在 SQLite busy handler 中竞争。历史清理、引用重建与 Observation 生命周期写入使用同一锁；独立只读查询与文件 I/O 不持有它，也不在外部持锁后调用写入口。其他业务存储和其他进程不由此锁协调；PostgreSQL 不使用它，仍遵循数据库锁协议。
 
-节点 envelope、内容行及 Observation payload 共用 `crate::storage_codec::{encode,decode}`。body 后固定追加 14 字节 trailer：第 0 字节 codec（0 raw / 1 zstd），第 1–4 字节 little-endian `u32 dict_id`（当前必须为 0），第 5–12 字节 little-endian `u64` 原始字节长度，第 13 字节版本（1）。原始载荷至少 128 字节且压缩 body 确实更小时才选择 zstd level 3；压缩帧开启 checksum。压缩与解压上下文按线程复用，不共享全局热锁。读取拒绝未知版本、codec、字典、长度不符、损坏帧和多余帧字节。字典槽只是格式预留，不启用字典压缩。
+节点 envelope、内容行及 Observation payload 共用 `crate::storage_codec::{encode,decode}`。body 后固定追加 14 字节 trailer：第 0 字节 codec（0 raw / 1 zstd），第 1–4 字节 little-endian `u32 dict_id`（当前必须为 0），第 5–12 字节 little-endian `u64` 原始字节长度，第 13 字节版本（1）。原始载荷至少 128 字节且压缩 body 确实更小时才选择 zstd level 1；压缩帧开启 checksum。压缩与解压上下文按线程复用，不共享全局热锁。读取拒绝未知版本、codec、字典、长度不符、损坏帧和多余帧字节。字典槽只是格式预留，不启用字典压缩。
+
+压缩默认等级由 3 调整为 1，只影响新写入帧的编码成本；等级不作为 trailer 的版本或解码条件。存量 level 3 帧原样读取，不触发数据重写、schema 迁移或指纹重算，历史与普通 Observation 均保持启用。选择依据及实测限制见[协议 HTTP 基准](../research/protocol-http-benchmark.md#生产默认切换为-level-1-与-sha256-后端筛选)。
 
 ## 升级与回退
 

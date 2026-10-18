@@ -96,7 +96,7 @@ in
     openssl
     docker-client
   ] ++ cDevelopmentPackages
-    ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux ([ pkgs.mold ] ++ desktopPackages);
+    ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux ([ pkgs.mold pkgs.perf ] ++ desktopPackages);
 
   services.postgres = {
     enable = true;

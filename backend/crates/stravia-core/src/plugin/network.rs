@@ -398,7 +398,11 @@ impl VendorNetwork {
         }));
     }
 
-    fn wire(&self, diagnostic: WireDiagnostic<'_>, payload: impl FnOnce() -> Value) {
+    fn wire<P: Into<crate::interaction_observation::WirePayload>>(
+        &self,
+        diagnostic: WireDiagnostic<'_>,
+        payload: impl FnOnce() -> P,
+    ) {
         let Some(observer) = &self.observer else {
             return;
         };
@@ -415,7 +419,7 @@ impl VendorNetwork {
             status_code: diagnostic.status_code,
             url: Some(diagnostic.url.as_str().to_owned()),
             headers: diagnostic.headers.map(headers_value).unwrap_or(Value::Null),
-            payload: payload(),
+            payload: payload().into(),
         });
     }
 
@@ -477,7 +481,7 @@ impl VendorNetwork {
                     status_code: None,
                     headers: Some(&headers),
                 },
-                || bytes_value(&body),
+                || crate::interaction_observation::WirePayload::Bytes(body.clone()),
             );
             let response = async { tokio::select! {
                 _ = self.cancelled() => Err(cancelled()),
@@ -688,6 +692,7 @@ impl VendorNetwork {
                     let Some(chunk) = chunk else { break };
                     body.extend_from_slice(&chunk);
                 }
+                let body = Bytes::from(body);
                 self.wire(
                     WireDiagnostic {
                         direction: "upstream_response",
@@ -697,7 +702,7 @@ impl VendorNetwork {
                         status_code: Some(status),
                         headers: None,
                     },
-                    || bytes_value(&body),
+                    || crate::interaction_observation::WirePayload::Bytes(body.clone()),
                 );
                 return Err(match status {
                     401 | 403 | 408 | 429 | 500..=599 => {
@@ -993,7 +998,7 @@ impl HostHttpResponse for PendingHttp {
                             status_code: Some(response.status()),
                             headers: None,
                         },
-                        || bytes_value(chunk),
+                        || crate::interaction_observation::WirePayload::Bytes(chunk.clone()),
                     );
                 }
                 Ok(chunk.map(|chunk| chunk.to_vec()))
@@ -1186,6 +1191,7 @@ impl HostWebSocket for ScopedWebSocket {
             self.invalidate();
             return Err(failure);
         };
+        let binary_captured = matches!(&message, Message::Binary(_));
         let message = match message {
             Message::Text(text) => {
                 self.application_message_seen.store(true, Ordering::Release);
@@ -1193,6 +1199,19 @@ impl HostWebSocket for ScopedWebSocket {
             }
             Message::Binary(bytes) => {
                 self.application_message_seen.store(true, Ordering::Release);
+                if let Ok(url) = Url::parse(&self.wire_url) {
+                    self.network.wire(
+                        WireDiagnostic {
+                            direction: "upstream_response",
+                            transport: "websocket",
+                            message_type: "binary",
+                            url: &url,
+                            status_code: None,
+                            headers: None,
+                        },
+                        || crate::interaction_observation::WirePayload::Bytes(bytes.clone()),
+                    );
+                }
                 WebSocketMessage::Binary(bytes.to_vec())
             }
             Message::Ping(bytes) => WebSocketMessage::Ping(bytes.to_vec()),
@@ -1213,7 +1232,9 @@ impl HostWebSocket for ScopedWebSocket {
                 return Ok(Some(message));
             }
         };
-        self.wire_message("upstream_response", &message);
+        if !binary_captured {
+            self.wire_message("upstream_response", &message);
+        }
         Ok(Some(message))
     }
 
@@ -1334,9 +1355,9 @@ fn ws_message_type(message: &WebSocketMessage) -> &'static str {
 fn ws_payload(message: &WebSocketMessage) -> Value {
     match message {
         WebSocketMessage::Text(text) => Value::String(text.clone()),
-        WebSocketMessage::Binary(bytes)
-        | WebSocketMessage::Ping(bytes)
-        | WebSocketMessage::Pong(bytes) => bytes_value(bytes),
+        WebSocketMessage::Binary(bytes) => bytes_value(bytes),
+        // Trace policy replaces control-frame payloads with omission metadata.
+        WebSocketMessage::Ping(_) | WebSocketMessage::Pong(_) => Value::Null,
         WebSocketMessage::Close(Some((code, reason))) => {
             serde_json::json!({ "code": code, "reason": reason })
         }

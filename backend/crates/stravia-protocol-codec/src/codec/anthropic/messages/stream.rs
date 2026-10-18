@@ -293,6 +293,51 @@ impl AnthropicResponseFormatter {
 
 pub struct AnthropicStreamParser {
     buffer: String,
+    usage: AnthropicStreamUsage,
+}
+
+/// Anthropic reports cumulative usage fields across message_start/message_delta,
+/// rather than repeating the complete usage object in every event.
+#[derive(Default)]
+struct AnthropicStreamUsage {
+    usage: Usage,
+    input_tokens: Option<u32>,
+    output_tokens: Option<u32>,
+}
+
+impl AnthropicStreamUsage {
+    fn update(&mut self, value: &Value) -> Usage {
+        let Some(raw) = value.get("usage") else {
+            return self.usage.clone();
+        };
+        let count = |key| raw.get(key).and_then(Value::as_u64).map(|n| n as u32);
+        self.input_tokens = count("input_tokens").or(self.input_tokens);
+        self.output_tokens = count("output_tokens").or(self.output_tokens);
+        let reported = extract_anthropic_usage(value);
+        self.usage.cache_read_tokens = reported.cache_read_tokens.or(self.usage.cache_read_tokens);
+        self.usage.cache_creation_tokens = reported
+            .cache_creation_tokens
+            .or(self.usage.cache_creation_tokens);
+        if reported.server_tool_use.is_some() {
+            self.usage.server_tool_use = reported.server_tool_use;
+        }
+        self.usage.prompt_tokens = self
+            .input_tokens
+            .unwrap_or(0)
+            .saturating_add(self.usage.cache_read_tokens.unwrap_or(0))
+            .saturating_add(self.usage.cache_creation_tokens.unwrap_or(0));
+        self.usage.completion_tokens = self.output_tokens.unwrap_or(0);
+        self.usage.required_components_known =
+            self.input_tokens.is_some() && self.output_tokens.is_some();
+        self.usage.total_tokens = if self.usage.required_components_known {
+            self.usage
+                .prompt_tokens
+                .saturating_add(self.usage.completion_tokens)
+        } else {
+            0
+        };
+        self.usage.clone()
+    }
 }
 
 impl Default for AnthropicStreamParser {
@@ -305,37 +350,37 @@ impl AnthropicStreamParser {
     pub fn new() -> Self {
         Self {
             buffer: String::new(),
+            usage: AnthropicStreamUsage::default(),
         }
     }
 }
 
 impl AnthropicStreamParser {
     pub(crate) fn parse_chunk(&mut self, raw: &str) -> Result<Vec<AiStreamDelta>> {
-        self.buffer.push_str(raw);
         let mut deltas = Vec::new();
 
-        while let Some(pos) = self.buffer.find("\n\n") {
-            let block = self.buffer[..pos].to_string();
-            self.buffer = self.buffer[pos + 2..].to_string();
-
+        let mut buffer = std::mem::take(&mut self.buffer);
+        let result = crate::consume_sse_frames(&mut buffer, raw, |block| {
             let mut event_type = None;
             let mut data_str = None;
 
             for line in block.lines() {
                 if let Some(ev) = line.strip_prefix("event: ") {
-                    event_type = Some(ev.trim().to_string());
+                    event_type = Some(ev.trim());
                 } else if let Some(d) = line.strip_prefix("data: ") {
-                    data_str = Some(d.trim().to_string());
+                    data_str = Some(d.trim());
                 }
             }
 
             if let Some(data) = data_str
-                && let Ok(json) = serde_json::from_str::<Value>(&data)
+                && let Ok(json) = serde_json::from_str::<Value>(data)
             {
-                parse_anthropic_event(event_type.as_deref(), &json, &mut deltas);
+                parse_anthropic_event(event_type, &json, &mut self.usage, &mut deltas);
             }
-        }
-
+            Ok(())
+        });
+        self.buffer = buffer;
+        result?;
         Ok(deltas)
     }
 
@@ -343,12 +388,17 @@ impl AnthropicStreamParser {
         if self.buffer.trim().is_empty() {
             return Ok(vec![]);
         }
-        let remaining = std::mem::take(&mut self.buffer);
-        self.parse_chunk(&format!("{remaining}\n\n"))
+        self.buffer.push_str("\n\n");
+        self.parse_chunk("")
     }
 }
 
-fn parse_anthropic_event(event_type: Option<&str>, data: &Value, deltas: &mut Vec<AiStreamDelta>) {
+fn parse_anthropic_event(
+    event_type: Option<&str>,
+    data: &Value,
+    usage: &mut AnthropicStreamUsage,
+    deltas: &mut Vec<AiStreamDelta>,
+) {
     match event_type {
         Some("message_start") => {
             if let Some(msg) = data.get("message") {
@@ -364,8 +414,10 @@ fn parse_anthropic_event(event_type: Option<&str>, data: &Value, deltas: &mut Ve
                     .to_string();
                 // Usage BEFORE MessageStart so the formatter has the correct
                 // input_tokens available when it emits the message_start SSE event.
-                let u = extract_anthropic_usage(msg);
-                if u.prompt_tokens > 0
+                *usage = AnthropicStreamUsage::default();
+                let u = usage.update(msg);
+                if u.required_components_known
+                    || u.prompt_tokens > 0
                     || u.cache_read_tokens.is_some()
                     || u.cache_creation_tokens.is_some()
                     || u.server_tool_use.is_some()
@@ -465,8 +517,9 @@ fn parse_anthropic_event(event_type: Option<&str>, data: &Value, deltas: &mut Ve
             // so self.usage must already reflect the final counts.
             // Also read input_tokens here — ZhipuAI and others publish the real
             // value in message_delta.usage rather than message_start.usage.
-            let u = extract_anthropic_usage(data);
-            if u.prompt_tokens > 0
+            let u = usage.update(data);
+            if u.required_components_known
+                || u.prompt_tokens > 0
                 || u.completion_tokens > 0
                 || u.cache_read_tokens.is_some()
                 || u.cache_creation_tokens.is_some()

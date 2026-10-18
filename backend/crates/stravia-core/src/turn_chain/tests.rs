@@ -1731,7 +1731,7 @@ async fn assert_request_context_contract(store: &SqlTurnChainStore) {
     );
     assert!(context.get(&corrupt).is_none());
 
-    let encoded = crate::storage_codec::encode(&serde_json::to_vec(&item).unwrap()).unwrap();
+    let encoded = crate::storage_codec::encode(serde_json::to_vec(&item).unwrap().into()).unwrap();
     overwrite_context_content(store, &owner, encoded).await;
     // Abandoning a materialization models a failed domain fold: the next read
     // clears its pending content, so admitting only the root cannot leak it.

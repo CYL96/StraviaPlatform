@@ -973,8 +973,10 @@ mod tests {
                 .await
                 .is_err()
         );
-        let valid_payload =
-            crate::storage_codec::encode(br#"{"data":{},"slots":[],"contents":[]}"#).unwrap();
+        let valid_payload = crate::storage_codec::encode(
+            br#"{"data":{},"slots":[],"contents":[]}"#.as_slice().into(),
+        )
+        .unwrap();
         for (id, kind, principal) in [
             ("foreign", "response", "api-key:bob"),
             ("wrong-kind", "agent", "api-key:alice"),

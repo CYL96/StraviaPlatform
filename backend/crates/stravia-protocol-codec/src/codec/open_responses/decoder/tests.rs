@@ -1,6 +1,49 @@
 use super::*;
 
 #[test]
+fn message_text_fidelity_survives_plain_and_media_content() {
+    let text = ["first\n", "", "🙂\tlast"];
+    for with_image in [false, true] {
+        let mut content: Vec<Value> = text
+            .iter()
+            .map(|text| serde_json::json!({"type": "input_text", "text": text}))
+            .collect();
+        if with_image {
+            content.insert(
+                1,
+                serde_json::json!({
+                    "type": "input_image",
+                    "image_url": "data:image/png;base64,YQ=="
+                }),
+            );
+        }
+        let item = decode_input_item(&serde_json::json!({
+            "type": "message", "role": "user", "content": content
+        }))
+        .unwrap()
+        .unwrap();
+        match item.content {
+            MessageContent::Text(actual) => {
+                assert!(!with_image);
+                assert_eq!(actual.as_str(), text.concat());
+            }
+            MessageContent::Blocks(blocks) => {
+                assert!(with_image);
+                assert!(matches!(&blocks[1], ContentBlock::Image { .. }));
+                let actual: Vec<&str> = blocks
+                    .iter()
+                    .filter_map(|block| match block {
+                        ContentBlock::Text { text, .. } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(actual, text);
+            }
+        }
+    }
+}
+
+#[test]
 fn accepts_codex_rolling_request_extensions() {
     let request = ResponsesDecoder
         .decode_request(serde_json::json!({

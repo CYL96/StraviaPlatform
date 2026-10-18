@@ -847,7 +847,7 @@ async fn discovery_projection_skips_only_proven_incompatible_corrupt_candidates(
             .unwrap();
         let mut replay = root.clone();
         replay.items.push(AiItem::output_text("answer"));
-        let history = ClientHistoryState::from_request(&root, &replay.items);
+        let history = ClientHistoryState::from_request_with_count(&root, &replay.items).0;
         let item_count = u32::try_from(
             stravia_runtime_contract::protocol::ir::canonical::history_unit_count(&replay.items),
         )
@@ -861,7 +861,8 @@ async fn discovery_projection_skips_only_proven_incompatible_corrupt_candidates(
                         let mut different = root.clone();
                         different.instructions = Some("incompatible controls".into());
                         projection.controls_fingerprint =
-                            ClientHistoryState::from_request(&different, &replay.items)
+                            ClientHistoryState::from_request_with_count(&different, &replay.items)
+                                .0
                                 .controls_fingerprint;
                     }
                     "different-context" => {
@@ -1080,7 +1081,8 @@ async fn shared_discovery_replay_preserves_mutations_reasoning_and_media_boundar
         child["trusted_media_turn_ids"] = serde_json::json!(["child-media"]);
         let request = responses_request(input.clone());
         child["client_history"] =
-            serde_json::to_value(ClientHistoryState::from_request(&request, &input)).unwrap();
+            serde_json::to_value(ClientHistoryState::from_request_with_count(&request, &input).0)
+                .unwrap();
         child["effective_state"]["selected_target_key"] = serde_json::json!("selected-target");
         child["upstream_response_id"] = serde_json::json!("upstream-child");
         child["effective_system"] = serde_json::json!("effective child system");
@@ -1969,10 +1971,11 @@ async fn reasoning_tracking_metadata_does_not_fork_generation_history() {
     .fetch_one(pool)
     .await
     .unwrap();
-    let expected_history = ClientHistoryState::from_request(
+    let expected_history = ClientHistoryState::from_request_with_count(
         &responses_request(replay.clone()),
         &replay[..replay.len() - 1],
-    );
+    )
+    .0;
     assert_eq!(
         projection,
         (

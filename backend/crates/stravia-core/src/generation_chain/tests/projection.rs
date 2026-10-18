@@ -30,6 +30,16 @@ async fn candidate_projection_uses_client_controls_and_retained_items() {
         });
         expected.extend(projected.client_output.clone());
         assert_eq!(
+            projected.client_item_units,
+            expected
+                .iter()
+                .map(|item| {
+                    stravia_runtime_contract::protocol::ir::canonical::history_item_values(item)
+                        .len()
+                })
+                .sum::<usize>(),
+        );
+        assert_eq!(
             projection.version,
             stravia_runtime_contract::turn_chain::REUSABLE_PREFIX_PROJECTION_VERSION,
         );
@@ -43,11 +53,15 @@ async fn candidate_projection_uses_client_controls_and_retained_items() {
         );
         assert_eq!(
             projection.controls_fingerprint,
-            ClientHistoryState::from_request(&request, &expected).controls_fingerprint,
+            ClientHistoryState::from_request_with_count(&request, &expected)
+                .0
+                .controls_fingerprint,
         );
         assert_ne!(
             projection.controls_fingerprint,
-            ClientHistoryState::from_request(write.request(), &expected).controls_fingerprint,
+            ClientHistoryState::from_request_with_count(write.request(), &expected)
+                .0
+                .controls_fingerprint,
         );
         assert_ne!(
             projection.context_fingerprint,

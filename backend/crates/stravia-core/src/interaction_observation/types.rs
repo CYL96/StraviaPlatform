@@ -9,6 +9,55 @@ use stravia_protocol_codec::accumulator::CanonicalPartIndex;
 pub type BundleStream = Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>;
 pub type ObservationStream = Pin<Box<dyn Stream<Item = ObservationUpdate> + Send>>;
 
+/// Transport bytes keep their shared backing until the trace record is serialized.
+/// Deserialization accepts the persisted JSON representation without reinterpreting it.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub(crate) enum WirePayload {
+    Json(Value),
+    #[serde(skip)]
+    Bytes(Bytes),
+    #[serde(skip)]
+    Base64(Bytes),
+}
+
+impl From<Value> for WirePayload {
+    fn from(value: Value) -> Self {
+        Self::Json(value)
+    }
+}
+
+struct EncodedBase64<'a>(&'a [u8]);
+
+impl Serialize for EncodedBase64<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(&base64::display::Base64Display::new(
+            self.0,
+            &base64::engine::general_purpose::STANDARD,
+        ))
+    }
+}
+
+impl Serialize for WirePayload {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Json(value) => value.serialize(serializer),
+            Self::Bytes(bytes) => match std::str::from_utf8(bytes) {
+                Ok(text) => serializer.serialize_str(text),
+                Err(_) => {
+                    use serde::ser::SerializeMap;
+                    let mut map = serializer.serialize_map(Some(2))?;
+                    // Value::Object uses sorted keys; preserve its exact encoded ordering.
+                    map.serialize_entry("data", &EncodedBase64(bytes))?;
+                    map.serialize_entry("encoding", "base64")?;
+                    map.end()
+                }
+            },
+            Self::Base64(bytes) => EncodedBase64(bytes).serialize(serializer),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ConfirmedUsage {
     /// 原始事件为上游总输入；管理读取边界投影为逐 attempt 的净输入，不能再次扣缓存。
@@ -428,7 +477,7 @@ pub(crate) enum RunEvent {
         status_code: Option<u16>,
         url: Option<String>,
         headers: Value,
-        payload: Value,
+        payload: WirePayload,
     },
     ObservationGap {
         reason: String,

@@ -6,9 +6,12 @@ dependencies = []
 
 [dependency-groups]
 test = [
+  "psycopg[binary]>=3.3.6",
   "pytest==8.4.1",
   "pytest-xdist>=3.8.0",
   "pywinpty>=3.0.5 ; sys_platform == 'win32'",
+  "tiktoken==0.14.0",
+  "zstandard==0.25.0",
 ]
 
 [tool.uv]

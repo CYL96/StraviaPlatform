@@ -1,5 +1,5 @@
 //! The readable canonical surface. Protocol identities and opaque payloads never enter it.
-use std::collections::BTreeSet;
+use std::{borrow::Cow, collections::BTreeSet};
 
 use serde_json::Value;
 
@@ -16,12 +16,15 @@ pub(super) fn active(mapping: &Mapping) -> bool {
 }
 
 /// Single pass over original bytes: inserted secrets/references are never scanned again.
-pub(super) fn replace(
-    text: &str,
+pub(super) fn replace<'a>(
+    text: &'a str,
     mappings: &[Mapping],
     restore: bool,
     used: &mut BTreeSet<String>,
-) -> String {
+) -> Cow<'a, str> {
+    if text.is_empty() || mappings.is_empty() {
+        return Cow::Borrowed(text);
+    }
     let mut candidates: Vec<_> = mappings
         .iter()
         // Outbound protection uses the loaded snapshot even if it expires during
@@ -37,13 +40,16 @@ pub(super) fn replace(
             .then_with(|| a_key.cmp(b_key))
             .then_with(|| a.reference.cmp(&b.reference))
     });
-    let mut result = String::with_capacity(text.len());
+    if candidates.is_empty() {
+        return Cow::Borrowed(text);
+    }
+    let mut result = String::new();
+    let mut copied = 0;
     let mut position = 0;
     while position < text.len() {
         // References are protocol atoms. Neither a broad detector nor a known
         // secret matching their identifier may nest another reference inside one.
         if !restore && let Some(reference) = marker::reference_prefix(&text[position..]) {
-            result.push_str(reference);
             position += reference.len();
             continue;
         }
@@ -56,19 +62,47 @@ pub(super) fn replace(
             } else {
                 (&mapping.secret, &mapping.reference)
             };
+            result.push_str(&text[copied..position]);
             result.push_str(to);
             position += from.len();
+            copied = position;
             used.insert(mapping.reference.clone());
         } else {
             let ch = text[position..].chars().next().expect("character boundary");
-            result.push(ch);
             position += ch.len_utf8();
         }
     }
-    result
+    if copied == 0 {
+        Cow::Borrowed(text)
+    } else {
+        result.push_str(&text[copied..]);
+        Cow::Owned(result)
+    }
 }
 
-type Visitor<'a> = dyn FnMut(&mut String, Option<&str>) -> Result<(), RedactionError> + 'a;
+type Visitor<'a> =
+    dyn for<'text> FnMut(&'text str, Option<&str>) -> Result<Cow<'text, str>, RedactionError> + 'a;
+
+#[derive(serde::Deserialize)]
+struct DecodedString<'a>(#[serde(borrow)] Cow<'a, str>);
+
+fn decode_string(raw: &str) -> Result<Cow<'_, str>, RedactionError> {
+    serde_json::from_str::<DecodedString<'_>>(raw)
+        .map(|decoded| decoded.0)
+        .map_err(|_| RedactionError::InvalidText)
+}
+
+fn decode_unterminated(content: &str) -> Result<Cow<'_, str>, RedactionError> {
+    if !content.contains('\\') {
+        if content.bytes().any(|byte| byte < 0x20) {
+            return Err(RedactionError::InvalidText);
+        }
+        return Ok(Cow::Borrowed(content));
+    }
+    serde_json::from_str::<String>(&format!("\"{content}\""))
+        .map(Cow::Owned)
+        .map_err(|_| RedactionError::InvalidText)
+}
 
 fn json_values(
     value: &mut Value,
@@ -76,7 +110,11 @@ fn json_values(
     visit: &mut Visitor<'_>,
 ) -> Result<(), RedactionError> {
     match value {
-        Value::String(text) => visit(text, context)?,
+        Value::String(text) => {
+            if let Cow::Owned(replaced) = visit(text, context)? {
+                *text = replaced;
+            }
+        }
         Value::Array(values) => {
             for value in values {
                 json_values(value, context, visit)?;
@@ -96,17 +134,17 @@ fn arguments_text(arguments: &mut String, visit: &mut Visitor<'_>) -> Result<(),
     if arguments.is_empty() {
         return Ok(());
     }
-    if serde_json::from_str::<Value>(arguments).is_err() {
+    if serde_json::from_str::<serde::de::IgnoredAny>(arguments).is_err() {
         // 结构未闭合的入参：闭合且可解码的字符串 token 仍走解码-替换-重编码
         // 语义，字符串之外的字节只做字面扫描；转义损坏的 token 与无法解码
         // 的尾部可能藏有转义形式凭据或引用，任何方向都 fail-closed。
         return malformed_arguments_text(arguments, visit);
     }
     let bytes = arguments.as_bytes();
-    let mut out = String::with_capacity(arguments.len());
+    let mut out = String::new();
     let mut cursor = 0;
     let mut copied = 0;
-    let mut context: Option<String> = None;
+    let mut context: Option<Cow<'_, str>> = None;
     while cursor < bytes.len() {
         if bytes[cursor] != b'"' {
             cursor += 1;
@@ -125,19 +163,16 @@ fn arguments_text(arguments: &mut String, visit: &mut Visitor<'_>) -> Result<(),
             }
         }
         let raw = &arguments[start..cursor];
-        let mut decoded: String =
-            serde_json::from_str(raw).map_err(|_| RedactionError::InvalidText)?;
+        let decoded = decode_string(raw)?;
         let after = arguments[cursor..].trim_start();
         if after.starts_with(':') {
             context = Some(decoded);
             continue;
         }
-        let original = decoded.clone();
-        visit(&mut decoded, context.as_deref())?;
-        if decoded != original {
+        if let Cow::Owned(replaced) = visit(&decoded, context.as_deref())? {
             out.push_str(&arguments[copied..start]);
             out.push_str(
-                &serde_json::to_string(&decoded).map_err(|_| RedactionError::InvalidText)?,
+                &serde_json::to_string(&replaced).map_err(|_| RedactionError::InvalidText)?,
             );
             copied = cursor;
         }
@@ -149,12 +184,12 @@ fn arguments_text(arguments: &mut String, visit: &mut Visitor<'_>) -> Result<(),
     Ok(())
 }
 
-type ClosedStringToken = (usize, usize, Option<String>);
+type ClosedStringToken<'a> = (usize, usize, Option<Cow<'a, str>>);
 
 // 完整闭合的字符串 token：返回（含引号的字节区间, 解码值——转义损坏时为
 // None，不凭空解码），以及第一个未闭合字符串的开引号位置；其后的字节
 // 一律按字符串残段处理。
-fn closed_string_tokens(raw: &str) -> (Vec<ClosedStringToken>, Option<usize>) {
+fn closed_string_tokens(raw: &str) -> (Vec<ClosedStringToken<'_>>, Option<usize>) {
     let bytes = raw.as_bytes();
     let mut tokens = Vec::new();
     let mut unterminated = None;
@@ -182,7 +217,7 @@ fn closed_string_tokens(raw: &str) -> (Vec<ClosedStringToken>, Option<usize>) {
             unterminated = Some(start);
             break;
         }
-        tokens.push((start, end, serde_json::from_str::<String>(token).ok()));
+        tokens.push((start, end, decode_string(token).ok()));
     }
     (tokens, unterminated)
 }
@@ -194,7 +229,7 @@ fn malformed_arguments_text(
     let (tokens, unterminated_from) = closed_string_tokens(arguments);
     let mut edits: Vec<(usize, usize, String)> = Vec::new();
     let mut residuals: Vec<(usize, usize)> = Vec::new();
-    let mut context: Option<String> = None;
+    let mut context: Option<Cow<'_, str>> = None;
     let mut last = 0;
     for (start, end, decoded) in tokens {
         if last < start {
@@ -209,14 +244,11 @@ fn malformed_arguments_text(
             context = Some(decoded);
             continue;
         }
-        let original = decoded.clone();
-        let mut decoded = decoded;
-        visit(&mut decoded, context.as_deref())?;
-        if decoded != original {
+        if let Cow::Owned(replaced) = visit(&decoded, context.as_deref())? {
             edits.push((
                 start,
                 end,
-                serde_json::to_string(&decoded).map_err(|_| RedactionError::InvalidText)?,
+                serde_json::to_string(&replaced).map_err(|_| RedactionError::InvalidText)?,
             ));
         }
     }
@@ -225,14 +257,10 @@ fn malformed_arguments_text(
         residuals.push((last, open + 1));
         let content = &arguments[open + 1..];
         // 转义序列完整则内容可判定解码；否则该段语义不可保证，fail-closed。
-        let decoded = serde_json::from_str::<String>(&format!("\"{content}\""))
-            .map_err(|_| RedactionError::InvalidText)?;
-        let original = decoded.clone();
-        let mut decoded = decoded;
-        visit(&mut decoded, context.as_deref())?;
-        if decoded != original {
+        let decoded = decode_unterminated(content)?;
+        if let Cow::Owned(replaced) = visit(&decoded, context.as_deref())? {
             let encoded =
-                serde_json::to_string(&decoded).map_err(|_| RedactionError::InvalidText)?;
+                serde_json::to_string(&replaced).map_err(|_| RedactionError::InvalidText)?;
             edits.push((
                 open + 1,
                 arguments.len(),
@@ -247,9 +275,7 @@ fn malformed_arguments_text(
             continue;
         }
         // 字符串之外的残段没有转义语义，字面扫描与拼接即为原始字节。
-        let mut after = arguments[start..end].to_string();
-        visit(&mut after, None)?;
-        if after != arguments[start..end] {
+        if let Cow::Owned(after) = visit(&arguments[start..end], None)? {
             edits.push((start, end, after));
         }
     }
@@ -350,41 +376,54 @@ fn encoded_tool_result(
     kind: ToolResultContentKind,
     visit: &mut Visitor<'_>,
 ) -> Result<(), RedactionError> {
+    if let Some(replaced) = encoded_tool_result_replacement(text, kind, visit)? {
+        *text = replaced;
+    }
+    Ok(())
+}
+
+fn encoded_tool_result_replacement(
+    text: &str,
+    kind: ToolResultContentKind,
+    visit: &mut Visitor<'_>,
+) -> Result<Option<String>, RedactionError> {
     let mut value: Value = serde_json::from_str(text).map_err(|_| RedactionError::InvalidText)?;
     let mut changed = false;
     tool_result(&mut value, Some(kind), true, &mut |text, context| {
-        let original = text.clone();
-        visit(text, context)?;
-        changed |= original != *text;
-        Ok(())
+        let replaced = visit(text, context)?;
+        changed |= matches!(replaced, Cow::Owned(_));
+        Ok(replaced)
     })?;
     if changed {
-        *text = serde_json::to_string(&value).map_err(|_| RedactionError::InvalidText)?;
+        return serde_json::to_string(&value)
+            .map(Some)
+            .map_err(|_| RedactionError::InvalidText);
     }
-    Ok(())
+    Ok(None)
 }
 
 // Both borrows expand from one field-selection definition. Collection never clones
 // media, vendor metadata, opaque reasoning, or the request itself.
 macro_rules! readable_surface {
-    ($module:ident, $json:ident, $arguments:ident, $result:ident, $encoded:ident, $iter:ident, $get:ident, $values:ident, $slice:ident, $shared_text:path, $($qualifier:tt)*) => {
+    ($module:ident, $json:ident, $arguments:ident, $result:ident, $encoded:ident, $iter:ident, $get:ident, $values:ident, $slice:ident, $shared_text:path, $shared_encoded:path, $apply:path, $text_type:ty, $($qualifier:tt)*) => {
         mod $module {
             use super::*;
             fn json_values(value: & $($qualifier)* Value, context: Option<&str>, location: &'static str, visit: &mut Visitor<'_>) -> Result<(), RedactionError> {
     super::$json(value, context, &mut |text, context| visit(text, context, location))
 }
-#[allow(clippy::ptr_arg)]
-fn arguments_text(value: & $($qualifier)* String, _source: &'static str, visit: &mut Visitor<'_>) -> Result<(), RedactionError> {
+fn arguments_text(value: $text_type, _source: &'static str, visit: &mut Visitor<'_>) -> Result<(), RedactionError> {
     super::$arguments(value, &mut |text, context| visit(text, context, "tool_arguments"))
 }
 fn tool_result(value: & $($qualifier)* Value, kind: Option<ToolResultContentKind>, reject: bool, _source: &'static str, visit: &mut Visitor<'_>) -> Result<(), RedactionError> {
     super::$result(value, kind, reject, &mut |text, context| visit(text, context, "tool_result"))
 }
-#[allow(clippy::ptr_arg)]
-fn encoded_tool_result(value: & $($qualifier)* String, kind: ToolResultContentKind, _source: &'static str, visit: &mut Visitor<'_>) -> Result<(), RedactionError> {
+fn encoded_tool_result(value: $text_type, kind: ToolResultContentKind, _source: &'static str, visit: &mut Visitor<'_>) -> Result<(), RedactionError> {
     super::$encoded(value, kind, &mut |text, context| visit(text, context, "tool_result"))
 }
-            type Visitor<'a> = dyn FnMut(& $($qualifier)* String, Option<&str>, &'static str) -> Result<(), RedactionError> + 'a;
+            pub(super) type Visitor<'a> = dyn for<'text> FnMut(&'text str, Option<&str>, &'static str) -> Result<Cow<'text, str>, RedactionError> + 'a;
+fn apply(text: $text_type, context: Option<&str>, location: &'static str, visit: &mut Visitor<'_>) -> Result<(), RedactionError> {
+    $apply(text, context, location, visit)
+}
 pub(super) fn schema(value: & $($qualifier)* Value, location: &'static str, visit: &mut Visitor<'_>) -> Result<(), RedactionError> {
     match value {
         Value::Object(values) => for (key, value) in values {
@@ -412,10 +451,10 @@ pub(super) fn wire_text(value: & $($qualifier)* Value, location: &'static str, v
             let embedded_resource = kind == "resource";
             let tool_input = matches!(kind, "tool_use" | "server_tool_use");
             let location = if tool_input { "tool_arguments" } else if matches!(kind, "tool_result" | "server_tool_result" | "codeExecutionResult") { "tool_result" } else { match values.get("role").and_then(Value::as_str) { Some("user") => "user_message", Some("tool") => "tool_result", Some("assistant" | "system" | "developer") => "system_or_history", _ => location } };
-            if search && let Some(Value::String(source)) = values.$get("source") { visit(source, None, location)?; }
+            if search && let Some(Value::String(source)) = values.$get("source") { apply(source, None, location, visit)?; }
             if document && let Some(source) = values.$get("source") {
                 match source.get("type").and_then(Value::as_str) {
-                    Some("text" | "plain_text") => if let Some(Value::String(data)) = source.$get("data") { visit(data, None, location)?; },
+                    Some("text" | "plain_text") => if let Some(Value::String(data)) = source.$get("data") { apply(data, None, location, visit)?; },
                     Some("content" | "blocks") => if let Some(content) = source.$get("content") { wire_text(content, location, visit)?; },
                     _ => {}
                 }
@@ -428,16 +467,16 @@ pub(super) fn wire_text(value: & $($qualifier)* Value, location: &'static str, v
                     "input" | "output" | "variables" | "json" => json_values(value, None, location, visit)?,
                     "functionCall" => if let Some(arguments) = value.$get("args") { json_values(arguments, None, "tool_arguments", visit)?; },
                     "functionResponse" => if let Some(result) = value.$get("response") { json_values(result, None, "tool_result", visit)?; },
-                    "resource" if embedded_resource => if let Some(Value::String(text)) = value.$get("text") { visit(text, None, location)?; },
+                    "resource" if embedded_resource => if let Some(Value::String(text)) = value.$get("text") { apply(text, None, location, visit)?; },
                     "format" | "json_schema" | "parts" | "functionDeclarations" | "executableCode" | "codeExecutionResult" | "citations" => wire_text(value, location, visit)?,
-                    "content" | "summary" | "results" | "context" => if let Value::String(text) = value { visit(text, Some(key), location)?; } else { wire_text(value, location, visit)?; },
+                    "content" | "summary" | "results" | "context" => if let Value::String(text) = value { apply(text, Some(key), location, visit)?; } else { wire_text(value, location, visit)?; },
                     "schema" | "parameters" | "input_schema" | "responseSchema" | "responseJsonSchema" => schema(value, location, visit)?,
                     "input_examples" => json_values(value, None, location, visit)?,
                     _ => {}
                 }
             }
         },
-        Value::String(text) => visit(text, None, location)?,
+        Value::String(text) => apply(text, None, location, visit)?,
         _ => {}
     }
     Ok(())
@@ -452,20 +491,20 @@ pub(super) fn blocks(blocks: & $($qualifier)* [ContentBlock], reject_ambiguous: 
             _ => location,
         };
         match block {
-            ContentBlock::Text { text, .. } => visit($shared_text(text), None, location)?,
-            ContentBlock::Thinking { thinking, .. } => visit(thinking, None, location)?,
-            ContentBlock::Reasoning { summary, content, .. } => for text in summary.$iter().chain(content) { visit(text, None, location)?; },
+            ContentBlock::Text { text, .. } => $shared_text(text, None, location, visit)?,
+            ContentBlock::Thinking { thinking, .. } => apply(thinking, None, location, visit)?,
+            ContentBlock::Reasoning { summary, content, .. } => for text in summary.$iter().chain(content) { apply(text, None, location, visit)?; },
             ContentBlock::ToolUse { input, .. } | ContentBlock::ServerToolUse { input, .. } => json_values(input, None, location, visit)?,
             ContentBlock::ToolResult { content, content_kind, .. } | ContentBlock::ServerToolResult { content, content_kind, .. } => tool_result(content, *content_kind, reject_ambiguous, location, visit)?,
             ContentBlock::Document { source, title, context, .. } => {
-                for text in title.$iter().chain(context) { visit(text, None, location)?; }
-                match source { DocumentSource::PlainText { data } => visit(data, None, location)?, DocumentSource::Blocks { content } => self::blocks(content, reject_ambiguous, location, visit)?, _ => {} }
+                for text in title.$iter().chain(context) { apply(text, None, location, visit)?; }
+                match source { DocumentSource::PlainText { data } => apply(data, None, location, visit)?, DocumentSource::Blocks { content } => self::blocks(content, reject_ambiguous, location, visit)?, _ => {} }
             }
-            ContentBlock::SearchResult { content, title, source, .. } => { visit(title, None, location)?; visit(source, None, location)?; self::blocks(content, reject_ambiguous, location, visit)?; }
-            ContentBlock::Citation { cited_text, .. } => visit(cited_text, None, location)?,
-            ContentBlock::ExecutableCode { code, .. } => visit(code, None, location)?,
-            ContentBlock::CodeExecutionResult { stdout, stderr, .. } => { visit(stdout, None, location)?; visit(stderr, None, location)?; }
-            ContentBlock::Refusal { refusal } => visit(refusal, None, location)?,
+            ContentBlock::SearchResult { content, title, source, .. } => { apply(title, None, location, visit)?; apply(source, None, location, visit)?; self::blocks(content, reject_ambiguous, location, visit)?; }
+            ContentBlock::Citation { cited_text, .. } => apply(cited_text, None, location, visit)?,
+            ContentBlock::ExecutableCode { code, .. } => apply(code, None, location, visit)?,
+            ContentBlock::CodeExecutionResult { stdout, stderr, .. } => { apply(stdout, None, location, visit)?; apply(stderr, None, location, visit)?; }
+            ContentBlock::Refusal { refusal } => apply(refusal, None, location, visit)?,
             ContentBlock::Unknown { raw } => wire_text(raw, location, visit)?,
             ContentBlock::Image { .. } | ContentBlock::Audio { .. } | ContentBlock::File { .. } | ContentBlock::Video { .. } | ContentBlock::RedactedThinking { .. } | ContentBlock::Compaction { .. } | ContentBlock::CompactionTrigger {} | ContentBlock::ContainerUpload { .. } => {}
         }
@@ -487,18 +526,18 @@ pub(super) fn item_text(item: & $($qualifier)* AiItem, reject_ambiguous: bool, _
     } else { None };
     match & $($qualifier)* item.content {
         MessageContent::Text(text) if item.role == stravia_runtime_contract::protocol::ir::Role::Tool => match encoded_kind {
-            Some(ToolResultContentKind::ContentBlocks) => encoded_tool_result($shared_text(text), ToolResultContentKind::ContentBlocks, location, visit)?,
-            Some(ToolResultContentKind::Json) => visit($shared_text(text), None, location)?,
+            Some(ToolResultContentKind::ContentBlocks) => $shared_encoded(text, ToolResultContentKind::ContentBlocks, location, visit)?,
+            Some(ToolResultContentKind::Json) => $shared_text(text, None, location, visit)?,
             None if encoded_compound_array(text) => if reject_ambiguous { return Err(RedactionError::AmbiguousToolResult); },
-            None => visit($shared_text(text), None, location)?,
+            None => $shared_text(text, None, location, visit)?,
         },
-        MessageContent::Text(text) => visit($shared_text(text), None, location)?,
+        MessageContent::Text(text) => $shared_text(text, None, location, visit)?,
         MessageContent::Blocks(content) if item.role == stravia_runtime_contract::protocol::ir::Role::Tool => for block in content {
             if let (Some(kind), ContentBlock::ToolResult { content: Value::String(text), .. }
                 | ContentBlock::ServerToolResult { content: Value::String(text), .. }) = (encoded_kind, & $($qualifier)* *block) {
                 match kind {
                     ToolResultContentKind::ContentBlocks => encoded_tool_result(text, kind, location, visit)?,
-                    ToolResultContentKind::Json => visit(text, None, location)?,
+                    ToolResultContentKind::Json => apply(text, None, location, visit)?,
                 }
             } else if let ContentBlock::Unknown { raw } = block {
                 if content_result_type(raw.get("type").and_then(Value::as_str)) {
@@ -517,13 +556,13 @@ pub(super) fn item_text(item: & $($qualifier)* AiItem, reject_ambiguous: bool, _
 
 
 pub(super) fn request(request: & $($qualifier)* AiRequest, reject_ambiguous: bool, location: &'static str, visit: &mut Visitor<'_>) -> Result<(), RedactionError> {
-    if let Some(text) = & $($qualifier)* request.instructions { visit(text, None, "system_or_history")?; }
+    if let Some(text) = & $($qualifier)* request.instructions { apply(text, None, "system_or_history", visit)?; }
     for item in & $($qualifier)* request.items { item_text(item, reject_ambiguous, location, visit)?; }
-    if let Some(embedding) = & $($qualifier)* request.embedding { match & $($qualifier)* embedding.input { EmbeddingInput::Text(text) => visit(text, None, location)?, EmbeddingInput::Texts(texts) => for text in texts { visit(text, None, location)?; }, _ => {} } }
+    if let Some(embedding) = & $($qualifier)* request.embedding { match & $($qualifier)* embedding.input { EmbeddingInput::Text(text) => apply(text, None, location, visit)?, EmbeddingInput::Texts(texts) => for text in texts { apply(text, None, location, visit)?; }, _ => {} } }
     if let Some(tools) = & $($qualifier)* request.tools { for tool in tools { function_tool(tool, location, visit)?; } }
     if let Some(ResponseFormat::JsonSchema { schema: value, description, .. }) = & $($qualifier)* request.response_format {
         schema(value, location, visit)?;
-        if let Some(description) = description { visit(description, None, location)?; }
+        if let Some(description) = description { apply(description, None, location, visit)?; }
     }
     // Encoders prefer these fidelity-preserving copies over canonical fields.
     // Select only model-readable carriers, never the arbitrary vendor bag:
@@ -538,17 +577,17 @@ pub(super) fn request(request: & $($qualifier)* AiRequest, reject_ambiguous: boo
         }
     }
     if let Some(metadata) = & $($qualifier)* request.parameters.metadata {
-        for (key, text) in metadata { visit(text, Some(key), location)?; }
+        for (key, text) in metadata { apply(text, Some(key), location, visit)?; }
     }
     for tool in & $($qualifier)* request.parameters.native_tools {
         match tool {
             NativeTool::ToolSearch(tool) => {
-                if let Some(text) = & $($qualifier)* tool.description { visit(text, None, location)?; }
+                if let Some(text) = & $($qualifier)* tool.description { apply(text, None, location, visit)?; }
                 if let Some(parameters) = & $($qualifier)* tool.parameters { schema(parameters, location, visit)?; }
             }
             NativeTool::Custom(tool) => custom_tool(tool, location, visit)?,
             NativeTool::Namespace(namespace) => {
-                if let Some(text) = & $($qualifier)* namespace.description { visit(text, None, location)?; }
+                if let Some(text) = & $($qualifier)* namespace.description { apply(text, None, location, visit)?; }
                 for member in & $($qualifier)* namespace.tools {
                     match member {
                         NamespaceMember::Function(tool) => function_tool(tool, location, visit)?,
@@ -563,13 +602,13 @@ pub(super) fn request(request: & $($qualifier)* AiRequest, reject_ambiguous: boo
 }
 
 fn function_tool(tool: & $($qualifier)* ToolSpec, location: &'static str, visit: &mut Visitor<'_>) -> Result<(), RedactionError> {
-    if let Some(text) = & $($qualifier)* tool.description { visit(text, None, location)?; }
+    if let Some(text) = & $($qualifier)* tool.description { apply(text, None, location, visit)?; }
     schema(& $($qualifier)* tool.parameters, location, visit)
 }
 
 fn custom_tool(tool: & $($qualifier)* CustomTool, location: &'static str, visit: &mut Visitor<'_>) -> Result<(), RedactionError> {
-    if let Some(text) = & $($qualifier)* tool.description { visit(text, None, location)?; }
-    if let Some(grammar) = & $($qualifier)* tool.grammar { visit(& $($qualifier)* grammar.definition, None, location)?; }
+    if let Some(text) = & $($qualifier)* tool.description { apply(text, None, location, visit)?; }
+    if let Some(grammar) = & $($qualifier)* tool.grammar { apply(& $($qualifier)* grammar.definition, None, location, visit)?; }
     Ok(())
 }
 
@@ -587,7 +626,10 @@ readable_surface!(
     get,
     values,
     from_ref,
-    std::sync::Arc::as_ref,
+    read_shared,
+    read_shared_encoded,
+    apply_read,
+    &str,
 );
 readable_surface!(
     write_surface,
@@ -599,11 +641,91 @@ readable_surface!(
     get_mut,
     values_mut,
     from_mut,
-    std::sync::Arc::make_mut,
+    write_shared,
+    write_shared_encoded,
+    apply_write,
+    &mut String,
     mut
 );
 
-type ReadVisitor<'a> = dyn FnMut(&String, Option<&str>) -> Result<(), RedactionError> + 'a;
+fn apply_read(
+    text: &str,
+    context: Option<&str>,
+    location: &'static str,
+    visit: &mut read_surface::Visitor<'_>,
+) -> Result<(), RedactionError> {
+    visit(text, context, location)?;
+    Ok(())
+}
+
+fn apply_write(
+    text: &mut String,
+    context: Option<&str>,
+    location: &'static str,
+    visit: &mut write_surface::Visitor<'_>,
+) -> Result<(), RedactionError> {
+    if let Cow::Owned(replaced) = visit(text, context, location)? {
+        *text = replaced;
+    }
+    Ok(())
+}
+
+fn read_shared(
+    text: &std::sync::Arc<String>,
+    context: Option<&str>,
+    location: &'static str,
+    visit: &mut read_surface::Visitor<'_>,
+) -> Result<(), RedactionError> {
+    apply_read(text, context, location, visit)
+}
+
+fn write_shared(
+    text: &mut std::sync::Arc<String>,
+    context: Option<&str>,
+    location: &'static str,
+    visit: &mut write_surface::Visitor<'_>,
+) -> Result<(), RedactionError> {
+    if let Cow::Owned(replaced) = visit(text, context, location)? {
+        set_shared(text, replaced);
+    }
+    Ok(())
+}
+
+fn set_shared(text: &mut std::sync::Arc<String>, replaced: String) {
+    if let Some(text) = std::sync::Arc::get_mut(text) {
+        *text = replaced;
+    } else {
+        *text = std::sync::Arc::new(replaced);
+    }
+}
+
+fn read_shared_encoded(
+    text: &std::sync::Arc<String>,
+    kind: ToolResultContentKind,
+    _location: &'static str,
+    visit: &mut read_surface::Visitor<'_>,
+) -> Result<(), RedactionError> {
+    read_encoded_tool_result(text, kind, &mut |text, context| {
+        visit(text, context, "tool_result")
+    })
+}
+
+fn write_shared_encoded(
+    text: &mut std::sync::Arc<String>,
+    kind: ToolResultContentKind,
+    _location: &'static str,
+    visit: &mut write_surface::Visitor<'_>,
+) -> Result<(), RedactionError> {
+    if let Some(replaced) = encoded_tool_result_replacement(text, kind, &mut |text, context| {
+        visit(text, context, "tool_result")
+    })? {
+        set_shared(text, replaced);
+    }
+    Ok(())
+}
+
+type ReadVisitor<'a> =
+    dyn for<'text> FnMut(&'text str, Option<&str>) -> Result<Cow<'text, str>, RedactionError> + 'a;
 
 fn append_context(
     output: &mut String,
@@ -649,7 +771,7 @@ fn read_json_values(
     visit: &mut ReadVisitor<'_>,
 ) -> Result<(), RedactionError> {
     if let Value::String(text) = value {
-        return visit(text, context);
+        return visit(text, context).map(|_| ());
     }
     let mut readable = String::new();
     decoded_json(value, context, &mut readable)?;
@@ -680,13 +802,12 @@ fn read_arguments(arguments: &str, visit: &mut ReadVisitor<'_>) -> Result<(), Re
         if let Some(open) = unterminated_from {
             readable.push_str(&arguments[last..open]);
             let content = &arguments[open + 1..];
-            let decoded = serde_json::from_str::<String>(&format!("\"{content}\""))
-                .map_err(|_| RedactionError::InvalidText)?;
+            let decoded = decode_unterminated(content)?;
             readable.push_str(&decoded);
         } else {
             readable.push_str(&arguments[last..]);
         }
-        return visit(&readable, None);
+        return visit(&readable, None).map(|_| ());
     };
     read_json_values(&value, None, visit)
 }
@@ -698,13 +819,17 @@ fn read_tool_result(
     visit: &mut ReadVisitor<'_>,
 ) -> Result<(), RedactionError> {
     let mut readable = String::new();
-    let mut collect =
-        |text: &String, context: Option<&str>| append_context(&mut readable, text, context);
     match result_kind(value, kind, reject_ambiguous)? {
-        Some(ToolResultContentKind::Json) => read_json_values(value, None, &mut collect)?,
+        Some(ToolResultContentKind::Json) => {
+            read_json_values(value, None, &mut |text, context| {
+                append_context(&mut readable, text, context)?;
+                Ok(Cow::Borrowed(text))
+            })?
+        }
         Some(ToolResultContentKind::ContentBlocks) => {
             read_surface::wire_text(value, "tool_result", &mut |text, context, _| {
-                collect(text, context)
+                append_context(&mut readable, text, context)?;
+                Ok(Cow::Borrowed(text))
             })?
         }
         None => {}
@@ -741,9 +866,9 @@ pub fn request_texts(
                 append_context(&mut readable, text, Some(key))?;
                 texts.push(readable);
             } else {
-                texts.push(text.clone());
+                texts.push(text.to_owned());
             }
-            Ok(())
+            Ok(Cow::Borrowed(text))
         },
     )?;
     Ok((texts, sources))
@@ -755,8 +880,7 @@ pub fn redact_request(
 ) -> Result<Vec<String>, RedactionError> {
     let mut used = BTreeSet::new();
     write_surface::request(value, true, "other_text", &mut |text, _, _| {
-        *text = replace(text, mappings, false, &mut used);
-        Ok(())
+        Ok(replace(text, mappings, false, &mut used))
     })?;
     if mappings
         .iter()
@@ -775,8 +899,7 @@ pub(super) fn restore_item(
     used: &mut BTreeSet<String>,
 ) -> Result<(), RedactionError> {
     write_surface::item_text(item, false, "other_text", &mut |text, _, _| {
-        *text = replace(text, mappings, true, used);
-        Ok(())
+        Ok(replace(text, mappings, true, used))
     })
 }
 
@@ -786,8 +909,7 @@ pub(super) fn restore_arguments(
     used: &mut BTreeSet<String>,
 ) -> Result<(), RedactionError> {
     arguments_text(arguments, &mut |text, _| {
-        *text = replace(text, mappings, true, used);
-        Ok(())
+        Ok(replace(text, mappings, true, used))
     })
 }
 
@@ -803,17 +925,22 @@ pub(super) fn restore_unknown(
     if value.get("__open_responses_event").is_some() {
         return Ok(false);
     }
+    // Gemini emits response metadata between text deltas. Like the stream
+    // accumulator, keep it outside canonical item boundaries: flushing here
+    // would expose an unfinished reference instead of restoring its next delta.
+    let response_metadata = value
+        .get("__google_response_metadata")
+        .is_some_and(Value::is_object);
     let mut changed = false;
     write_surface::wire_text(&mut value, "other_text", &mut |text, _, _| {
-        let restored = replace(text, mappings, true, used);
-        changed |= restored != *text;
-        *text = restored;
-        Ok(())
+        let replaced = replace(text, mappings, true, used);
+        changed |= matches!(replaced, Cow::Owned(_));
+        Ok(replaced)
     })?;
     if changed {
         *raw = serde_json::to_string(&value).map_err(|_| RedactionError::InvalidText)?;
     }
-    Ok(true)
+    Ok(!response_metadata)
 }
 
 pub(super) fn restore_compaction(
@@ -827,8 +954,7 @@ pub(super) fn restore_compaction(
     if let Some(output) = value.wire.get_mut("output").and_then(Value::as_array_mut) {
         for item in output {
             write_surface::wire_text(item, "other_text", &mut |text, _, _| {
-                *text = replace(text, mappings, true, &mut used);
-                Ok(())
+                Ok(replace(text, mappings, true, &mut used))
             })?;
         }
     }
@@ -853,6 +979,62 @@ mod tests {
     use stravia_runtime_contract::hook::{ContextCompleteness, ContextSnapshot};
 
     #[test]
+    fn replacements_keep_longest_matches_unicode_and_inserted_values_literal() {
+        let first = Mapping {
+            reference: format!("{PREFIX}{}{SUFFIX}", "a".repeat(IDENTIFIER_LEN)),
+            secret: "密钥-long".into(),
+            expires_at: i64::MAX,
+        };
+        let second = Mapping {
+            reference: format!("{PREFIX}{}{SUFFIX}", "b".repeat(IDENTIFIER_LEN)),
+            secret: "密钥".into(),
+            expires_at: i64::MAX,
+        };
+        let mappings = [second, first];
+        let mut used = BTreeSet::new();
+        let input = "开始 密钥-long / 密钥 结束";
+        assert_eq!(
+            replace(input, &mappings, false, &mut used),
+            format!(
+                "开始 {} / {} 结束",
+                mappings[1].reference, mappings[0].reference
+            ),
+        );
+        assert_eq!(used.len(), 2);
+        let nested = [
+            Mapping {
+                secret: mappings[1].reference.clone(),
+                ..mappings[0].clone()
+            },
+            mappings[1].clone(),
+        ];
+        assert_eq!(
+            replace(&nested[0].reference, &nested, true, &mut BTreeSet::new()),
+            nested[1].reference,
+        );
+    }
+
+    #[test]
+    fn untouched_argument_spelling_survives_valid_and_malformed_json() {
+        let mappings = [Mapping {
+            reference: format!("{PREFIX}{}{SUFFIX}", "a".repeat(IDENTIFIER_LEN)),
+            secret: "not-present".into(),
+            expires_at: i64::MAX,
+        }];
+        for original in [
+            " { \"key\" : \"前缀\\u003c-no-reference\", \"number\": 1.00e+02 } ",
+            " { \"key\" : \"前缀\\u003c-no-reference\", bare-tail",
+            " { \"key\" : \"前缀\\u003c-no-reference",
+        ] {
+            let mut arguments = original.to_owned();
+            let mut used = BTreeSet::new();
+            restore_arguments(&mut arguments, &mappings, &mut used).unwrap();
+            assert_eq!(arguments, original);
+            assert!(used.is_empty());
+        }
+    }
+
+    #[test]
     fn outbound_replacement_preserves_reference_atoms_when_identifiers_are_known_secrets() {
         let identifier = "abcdefghijklmnopqrstuvwxyzab";
         let reference = format!("{PREFIX}{identifier}{SUFFIX}");
@@ -862,12 +1044,8 @@ mod tests {
             expires_at: i64::MAX,
         };
         let mut used = BTreeSet::new();
-        let replaced = replace(
-            &format!("{reference} {identifier}"),
-            std::slice::from_ref(&mapping),
-            false,
-            &mut used,
-        );
+        let input = format!("{reference} {identifier}");
+        let replaced = replace(&input, std::slice::from_ref(&mapping), false, &mut used);
         assert_eq!(replaced, format!("{reference} {}", mapping.reference));
         assert_eq!(used, BTreeSet::from([mapping.reference.clone()]));
         assert_eq!(
@@ -1187,7 +1365,7 @@ mod tests {
         );
         read_surface::request(&request, true, "request", &mut |text, _, _| {
             assert!(!text.contains(&mapping.secret));
-            Ok(())
+            Ok(Cow::Borrowed(text))
         })
         .unwrap();
     }

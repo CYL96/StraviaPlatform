@@ -7,7 +7,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from tests.common.measure_protocol_http import MARKER, prompt_from, run_load
+from tests.common.measure_protocol_http import MARKER, run_load
+from tests.common.protocol_workload import Workload, canonical_input
 
 
 @pytest.mark.e2e
@@ -21,7 +22,7 @@ def test_benchmark_rejects_failed_or_missing_terminal_after_visible_text(protoco
 
         def do_POST(self) -> None:  # noqa: N802
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-            nonce = MARKER.search(prompt_from(body, protocol)).group()
+            nonce = MARKER.search(canonical_input(protocol, body)[-1].text).group()
             with server.lock:
                 server.arrivals.append({"nonce": nonce, "valid": True})
             text = {
@@ -50,11 +51,18 @@ def test_benchmark_rejects_failed_or_missing_terminal_after_visible_text(protoco
     server.arrivals = []
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    args = SimpleNamespace(payload_bytes=1024, padding="a" * 1024, concurrency=1,
-                           qps=1, request_timeout=5, min_qps_ratio=.95)
+    args = SimpleNamespace(concurrency=1, qps=1, request_timeout=5, requests_per_case=1,
+                           chain_turns=1, max_tokens_per_second=30, max_duration=1,
+                           max_start_lag_ms=1000, max_pacing_lag_ms=250,
+                           workload_generator=Workload(min_input_tokens=256, max_input_tokens=512,
+                                                       min_images=0, max_images=0, image_size=2,
+                                                       min_tokens_per_second=30, max_tokens_per_second=30,
+                                                       min_duration=1, max_duration=1))
     try:
         measured = run_load(args, f"http://127.0.0.1:{server.server_port}", "benchmark-only",
-                            protocol, server, True, "open-loop", 1, "measure")
+                            protocol, server, True, "open-loop", 1, "measure",
+                            {"route_id": "fixture-route", "expected_provider_id": "fixture-provider",
+                             "expected_target_id": "fixture-target", "expected_model": "fixture-model"})
         assert measured["completed_requests"] == 1
         assert measured["requests"][0]["status"] == 200
         assert measured["requests"][0]["ttft_ms"] is not None

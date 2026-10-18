@@ -99,7 +99,7 @@ Interaction 卡片、详情与用量分析共享 `Confirmed Upstream Usage`：
 - output 已包含 reasoning，不再累加或单列思考指标；cache read 与 cache write 保留独立展示。管理面按输入、输出分别呈现，不以缺少缓存分项的相加结果冒充总 Token；
 - 原始 IR、attempt 用量、持久化事件与 wire debug trace 保留上游总输入及 reasoning 子项；管理统计、列表、详情、分页事件查询与 Bundle 汇总在读取边界使用净输入投影，前端不再次扣减。Bundle 导出的原始 events 保持上游值，汇总先按 attempt 合并修订再计算净输入。历史查询立即使用新口径，无需改写数据库、事件或新增接口字段；轻量全局 SSE 通知仍不携带事件正文；
 - 每个实际上游 attempt 的 usage 最多记一次；
-- 流式 usage 在接收时观察，不以客户端输出已经提交为前提。正常完成以 Vendor 的完整返回值确认；失败或取消没有完整返回值时，以已收到的最后已知快照确认。多帧报告是同一 attempt 的修订，不重复累加；未知字段不抹掉已知值，明确报告的零可覆盖先前数值，完全未报告的字段保持 `null`。OpenAI-compatible 流式解析按字段合并累计报告（包括只报告一个必需字段的零值修订），再交给通用累积器；该协议内归一化不改变其他 Vendor 的增量或累计契约；
+- 流式 usage 在接收时观察，不以客户端输出已经提交为前提。正常完成以 Vendor 的完整返回值确认；失败或取消没有完整返回值时，以已收到的最后已知快照确认。多帧报告是同一 attempt 的修订，不重复累加；未知字段不抹掉已知值，明确报告的零可覆盖先前数值，完全未报告的字段保持 `null`。OpenAI-compatible 流式解析按字段合并累计报告（包括只报告一个必需字段的零值修订），再交给通用累积器。Anthropic 同样合并 `message_start` / `message_delta` 中已报告的累计 token 与 cache 字段，防止仅含最终 output 的修订被初始已知零值遮蔽；这些协议内归一化不改变其他 Vendor 的增量或累计契约；
 - Target attempt 成功与明确报告的 usage 不因随后还原或映射发布失败而改写；Model Turn 的唯一终态由内部完成 gate 记录，只有发布完成且未被取消或超时抢占才记成功；
 - 上游尚未报告或永不报告时保持 `unknown`，不显示为零，不用本地 tokenizer 估算；
 - Interaction、Run 与 Bundle 聚合按字段累计已报告部分；某次 attempt 的未知值不抹掉其他 attempt 的已确认值。全部未报告时该字段保持 `null`，明确报告的零保留为零。失败但已报告的用量同样累计，重复报告不重复计数；用量分析的 overview、series、model、API Key 汇总只统计成功的 Target attempt，按字段累计已报告部分：某次成功 attempt 的字段未知只不计入该值，不抹掉组内其他已确认用量，全部未知时该字段保持 `null`。失败或未完成 attempt 不参与这些成功尝试统计，但不否认其在 Run、Interaction 与 Bundle 中已报告的用量；
@@ -297,6 +297,12 @@ Wire 记录直接写入 Debug Trace 队列，不逐条写入普通 `observation_
 Trace 继续使用既有有界队列与写入批次；队列、捕获缓冲或存储失败不等待、不反压推理，Trace 标记 `partial` 或 gap。manifest 的字节及事件水位只公布已确认可读取的数据；分段切换、snapshot、finish 与关闭保持显式 flush，不能因后续 finish 成功而把缺失捕获伪装成完整。
 
 ### 5.3 顺序与 SSE cursor
+
+准入先取得 Admit、交付收据、执行 Finish 与最终清理的队列容量，再从请求准备有界证据；总队列容量不变。收据与 Finish 各有独立保留槽，正常执行终态及已提交历史关联不等待最后一个后台发布句柄释放。未能排队准入的 Run 不继续投递普通事件、收据或 Finish，只保留既有易失缺口，并清理已捕获的 Trace。Admit 已入队仅证明 FIFO 接纳，不证明 SQL 已提交；SQL 准入失败时撤销内存归属，不接纳其输入窗口或工具结果回放证据。
+
+Client Output Commit 的已确认事实在进入普通事件队列前保留，随 Finish 合并落盘；未正常 finish 的异常析构也保留此前确实发生的提交。不能从 HTTP 200、Delivery 成功或存在 Generation ID 反推该事实。请求完整交付、历史节点已提交与 Observation 不完整可以同时成立，缺口不改写请求或历史结果。
+
+有界队列可能丢失 `model_turn_started`。SQLite/PostgreSQL 在同一事件事务内确认 Target attempt 的父 Model Turn 属于当前 Run；父事实不可用时，以 `observation_gap`（`reason=model_turn_start_unavailable`）代替孤儿开始事件，不能捏造父 Turn/Attempt，也不能让该外键失败回滚整批事件。实际收到的 `target_attempt_finished` 及其 usage 仍保留；缺失的尝试投影不能补造为零用量。
 
 Observation writer 为持久化事件分配递增 `event_sequence`；持久事件 allocator 不因清历史或到期回收而倒退，已提交事件 ID 不重用。事件及受影响摘要在同一数据库事务内提交后才广播；SSE event ID 等于 sequence。此单调分配契约不同于查询的 `snapshot_sequence`：后者只描述同一读取事务内仍保留的已提交事实，跨清理或 reset 重建不保证单调。
 

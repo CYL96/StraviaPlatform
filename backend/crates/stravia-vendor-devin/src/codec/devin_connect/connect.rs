@@ -4,6 +4,7 @@
 //! Flags: `0x01` gzip payload, `0x02` end-of-stream trailer (JSON),
 //! `0x03` = both. Matches `dwgx/WindsurfAPI` `src/connect.js`.
 
+use std::borrow::Cow;
 use std::io::Read;
 
 use anyhow::{Context, bail};
@@ -50,12 +51,12 @@ pub fn wrap_request(proto: &[u8]) -> anyhow::Result<Vec<u8>> {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum ConnectFrame {
+pub(crate) enum ConnectFrame<'a> {
     /// A protobuf `GetChatMessageResponse` payload.
-    Data(Vec<u8>),
+    Data(Cow<'a, [u8]>),
     /// Terminal trailer; payload is JSON (`{}` on success, an error object
     /// otherwise).
-    EndStream(Vec<u8>),
+    EndStream(Cow<'a, [u8]>),
 }
 
 /// Incremental splitter for the Connect byte stream. Handles headers and
@@ -63,67 +64,58 @@ pub(crate) enum ConnectFrame {
 /// once a complete frame is present.
 pub(crate) struct ConnectFrameReader {
     buffer: Vec<u8>,
+    consumed: usize,
 }
 
 impl ConnectFrameReader {
     pub(crate) fn new() -> Self {
-        Self { buffer: Vec::new() }
+        Self {
+            buffer: Vec::new(),
+            consumed: 0,
+        }
     }
 
     /// Append bytes and yield every complete frame now available.
-    pub(crate) fn push(&mut self, raw: &[u8]) -> anyhow::Result<Vec<ConnectFrame>> {
-        let mut frames = Vec::new();
-        self.push_with(raw, |frame| {
-            frames.push(frame);
-            Ok(())
-        })?;
-        Ok(frames)
-    }
-
-    /// 诊断调用方可保留错误发生前的完整帧；执行解析仍使用原有原子返回接口。
-    pub(crate) fn push_with(
-        &mut self,
-        raw: &[u8],
-        mut visit: impl FnMut(ConnectFrame) -> anyhow::Result<()>,
-    ) -> anyhow::Result<()> {
+    pub(crate) fn push(&mut self, raw: &[u8]) -> anyhow::Result<Vec<ConnectFrame<'_>>> {
+        self.buffer.drain(..self.consumed);
+        self.consumed = 0;
         self.buffer.extend_from_slice(raw);
+        let mut frames = Vec::new();
         loop {
-            if self.buffer.len() < HEADER_SIZE {
+            let pending = &self.buffer[self.consumed..];
+            if pending.len() < HEADER_SIZE {
                 break;
             }
             let len = u32::from_be_bytes(
-                self.buffer[1..HEADER_SIZE]
+                pending[1..HEADER_SIZE]
                     .try_into()
                     .expect("four-byte frame length"),
             ) as usize;
             if len > MAX_FRAME_SIZE {
                 bail!("Connect frame size {len} exceeds {MAX_FRAME_SIZE}");
             }
-            if self.buffer.len() < HEADER_SIZE + len {
+            if pending.len() < HEADER_SIZE + len {
                 break;
             }
-            let flags = self.buffer[0];
-            let payload: Vec<u8> = self
-                .buffer
-                .drain(..HEADER_SIZE + len)
-                .skip(HEADER_SIZE)
-                .collect();
+            let flags = pending[0];
+            let payload = &pending[HEADER_SIZE..HEADER_SIZE + len];
+            self.consumed += HEADER_SIZE + len;
             let payload = if flags & FLAG_COMPRESSED != 0 {
-                gunzip(&payload)?
+                Cow::Owned(gunzip(payload)?)
             } else {
-                payload
+                Cow::Borrowed(payload)
             };
-            visit(if flags & FLAG_END_STREAM != 0 {
+            frames.push(if flags & FLAG_END_STREAM != 0 {
                 ConnectFrame::EndStream(payload)
             } else {
                 ConnectFrame::Data(payload)
-            })?;
+            });
         }
-        Ok(())
+        Ok(frames)
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.buffer.is_empty()
+        self.buffer.len() == self.consumed
     }
 }
 
@@ -157,8 +149,8 @@ mod tests {
         assert_eq!(
             reader.push(&wire[7..]).unwrap(),
             vec![
-                ConnectFrame::Data(b"abc".to_vec()),
-                ConnectFrame::EndStream(b"{}".to_vec()),
+                ConnectFrame::Data(b"abc".as_slice().into()),
+                ConnectFrame::EndStream(b"{}".as_slice().into()),
             ]
         );
         assert!(reader.is_empty());
@@ -171,7 +163,7 @@ mod tests {
         let mut reader = ConnectFrameReader::new();
         assert_eq!(
             reader.push(&wire).unwrap(),
-            vec![ConnectFrame::Data(b"deflated".to_vec())]
+            vec![ConnectFrame::Data(b"deflated".as_slice().into())]
         );
     }
 
@@ -191,7 +183,7 @@ mod tests {
         assert!(!reader.is_empty());
         assert_eq!(
             reader.push(&wire[6..]).unwrap(),
-            vec![ConnectFrame::Data(b"payload".to_vec())]
+            vec![ConnectFrame::Data(b"payload".as_slice().into())]
         );
     }
 }

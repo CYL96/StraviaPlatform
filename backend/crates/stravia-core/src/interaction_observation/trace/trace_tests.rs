@@ -2,7 +2,7 @@ use super::*;
 
 use serde_json::Value;
 
-fn wire_record(sequence: i64, message_type: &str, payload: Value) -> TraceRecord {
+fn wire_record(sequence: i64, message_type: &str, payload: impl Into<WirePayload>) -> TraceRecord {
     TraceRecord {
         schema_version: 0,
         sequence,
@@ -24,7 +24,7 @@ fn wire_record(sequence: i64, message_type: &str, payload: Value) -> TraceRecord
         url: None,
         headers: Value::Null,
         payload_encoding: "json".to_owned(),
-        payload,
+        payload: payload.into(),
         error: None,
         redactions: Vec::new(),
     }
@@ -49,9 +49,9 @@ async fn actual_wire_capture_limit_is_partial() {
     let manager = TraceManager::new(directory.path().to_owned()).expect("trace manager");
     // Exercise the production cap without changing process-wide environment.
     let handle = manager.create();
-    let oversized = "x".repeat(WIRE_CAPTURE_LIMIT_BYTES + 1);
+    let oversized = bytes::Bytes::from(vec![b'x'; WIRE_CAPTURE_LIMIT_BYTES + 1]);
     assert_eq!(
-        handle.record(wire_record(1, "body", Value::String(oversized))),
+        handle.record(wire_record(1, "body", WirePayload::Bytes(oversized))),
         TraceWriteOutcome::Partial(WIRE_CAPTURE_LIMIT)
     );
     assert_eq!(
@@ -62,6 +62,85 @@ async fn actual_wire_capture_limit_is_partial() {
     assert_eq!(manifest.status, "partial");
     assert_eq!(manifest.reasons, [WIRE_CAPTURE_LIMIT]);
     assert_eq!(persisted_records(&handle).await.len(), 1);
+    manager.shutdown().await;
+}
+
+#[test]
+fn shared_wire_payload_matches_legacy_encoding_and_capture_budget() {
+    for bytes in [
+        &b""[..],
+        &b"{\"not\":\"parsed\"}\n\0\\\""[..],
+        "雪😀".as_bytes(),
+        &b"\xff"[..],
+        &b"\xff\0"[..],
+        &b"\xff\0\x80"[..],
+        &b"\xff\0\x80\x81"[..],
+    ] {
+        let legacy = match std::str::from_utf8(bytes) {
+            Ok(text) => Value::String(text.to_owned()),
+            Err(_) => serde_json::json!({
+                "encoding": "base64",
+                "data": base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD, bytes,
+                ),
+            }),
+        };
+        let shared = WirePayload::Bytes(bytes::Bytes::copy_from_slice(bytes));
+        let encoded = serde_json::to_vec(&shared).unwrap();
+        assert_eq!(encoded, serde_json::to_vec(&legacy).unwrap());
+        assert_eq!(wire_payload_size(&shared), wire_value_size(&legacy));
+        let restored: WirePayload = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(serde_json::to_value(restored).unwrap(), legacy);
+        if let Value::Object(object) = legacy {
+            let normalized = WirePayload::Base64(bytes::Bytes::copy_from_slice(bytes));
+            assert_eq!(
+                serde_json::to_vec(&normalized).unwrap(),
+                serde_json::to_vec(&object["data"]).unwrap(),
+            );
+            assert_eq!(
+                wire_payload_size(&normalized),
+                wire_value_size(&object["data"])
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn shared_wire_bytes_preserve_chunks_order_and_snapshot_frontier() {
+    let directory = tempfile::tempdir().expect("trace directory");
+    let manager = TraceManager::new(directory.path().to_owned()).expect("trace manager");
+    let handle = manager.create();
+    let chunk = bytes::Bytes::from_static(b"first\xff\0last");
+    for (sequence, range) in [(1, 0..5), (2, 5..7), (3, 7..11)] {
+        assert_eq!(
+            handle.record(wire_record(
+                sequence,
+                "body_chunk",
+                WirePayload::Bytes(chunk.slice(range))
+            )),
+            TraceWriteOutcome::Queued,
+        );
+    }
+    drop(chunk);
+    let snapshot = handle.snapshot(2).await.expect("snapshot");
+    let mut visible = Vec::new();
+    for segment in snapshot.segments {
+        super::super::trace_storage::visit(&segment.path, segment.bytes, |record| {
+            visible.push(record);
+            Ok(())
+        })
+        .expect("snapshot records");
+    }
+    assert_eq!(visible.len(), 2);
+    assert_eq!(visible[0]["payload"], "first");
+    assert_eq!(
+        visible[1]["payload"],
+        serde_json::json!({"data": "/wA=", "encoding": "base64"})
+    );
+    handle.finish().await;
+    let records = persisted_records(&handle).await;
+    assert_eq!(records.len(), 3);
+    assert_eq!(serde_json::to_value(&records[2].payload).unwrap(), "last");
     manager.shutdown().await;
 }
 
@@ -90,7 +169,10 @@ async fn manifest_directory_created_before_trace_writer_preserves_wire_capture()
     assert_eq!(manifest.status, "complete");
     let records = persisted_records(&handle).await;
     assert_eq!(records[0].sequence, 1);
-    assert_eq!(records[0].payload, "data: captured\n\n");
+    assert_eq!(
+        serde_json::to_value(&records[0].payload).unwrap(),
+        "data: captured\n\n"
+    );
     manager.shutdown().await;
 }
 
@@ -128,8 +210,14 @@ async fn wire_chunks_are_exported_immediately_without_protocol_reassembly() {
     assert_eq!(manifest.status, "complete");
     let records = persisted_records(&handle).await;
     assert_eq!(records.len(), 2);
-    assert_eq!(records[0].payload, "data: {");
-    assert_eq!(records[1].payload, "not-json\n\n");
+    assert_eq!(
+        serde_json::to_value(&records[0].payload).unwrap(),
+        "data: {"
+    );
+    assert_eq!(
+        serde_json::to_value(&records[1].payload).unwrap(),
+        "not-json\n\n"
+    );
     manager.shutdown().await;
 }
 
@@ -162,7 +250,7 @@ async fn debug_redacts_only_authorization_header_values() {
         record.url.as_deref(),
         Some(format!("https://example.test/v1?token={sentinel}").as_str())
     );
-    assert_eq!(record.payload, sentinel);
+    assert_eq!(serde_json::to_value(&record.payload).unwrap(), sentinel);
     assert_eq!(record.redactions, [RedactionKind::CredentialHeader]);
     manager.shutdown().await;
 }
@@ -194,14 +282,14 @@ async fn raw_media_non_utf8_and_websocket_messages_preserve_observed_bytes() {
     assert_eq!(handle.finish().await.status, "complete");
     let records = persisted_records(&handle).await;
     assert_eq!(records.len(), 4);
-    assert_eq!(records[0].payload, media);
+    assert_eq!(serde_json::to_value(&records[0].payload).unwrap(), media);
     assert_eq!(records[1].payload_encoding, "base64");
-    assert_eq!(records[1].payload, "/wAB");
+    assert_eq!(serde_json::to_value(&records[1].payload).unwrap(), "/wAB");
     assert_eq!(records[2].transport.as_deref(), Some("websocket"));
-    assert_eq!(records[2].payload, "ws-雪");
+    assert_eq!(serde_json::to_value(&records[2].payload).unwrap(), "ws-雪");
     assert_eq!(records[3].message_type.as_deref(), Some("binary"));
     assert_eq!(records[3].payload_encoding, "base64");
-    assert_eq!(records[3].payload, "AP+A");
+    assert_eq!(serde_json::to_value(&records[3].payload).unwrap(), "AP+A");
     manager.shutdown().await;
 }
 
@@ -217,7 +305,10 @@ async fn malformed_complete_wire_is_complete_capture() {
     assert_eq!(manifest.status, "complete");
     assert!(manifest.reasons.is_empty());
     let records = persisted_records(&handle).await;
-    assert_eq!(records[0].payload, malformed);
+    assert_eq!(
+        serde_json::to_value(&records[0].payload).unwrap(),
+        malformed
+    );
     manager.shutdown().await;
 }
 
@@ -236,8 +327,9 @@ async fn websocket_ping_pong_are_metadata_only() {
     let records = persisted_records(&handle).await;
     assert_eq!(records.len(), 2);
     for record in records {
-        assert_eq!(record.payload["content_capture"], "omitted");
-        assert_eq!(record.payload["reason"], "control_frame_payload_omitted");
+        let payload = serde_json::to_value(record.payload).unwrap();
+        assert_eq!(payload["content_capture"], "omitted");
+        assert_eq!(payload["reason"], "control_frame_payload_omitted");
     }
     manager.shutdown().await;
 }
@@ -295,7 +387,7 @@ async fn snapshot_barrier_seals_the_batch_before_later_records() {
         .expect("read fixed-cut snapshot");
     }
     assert_eq!(records.len(), 1);
-    assert_eq!(records[0].payload, "before");
+    assert_eq!(serde_json::to_value(&records[0].payload).unwrap(), "before");
     assert_eq!(handle.finish().await.status, "complete");
     assert_eq!(persisted_records(&handle).await.len(), 2);
     manager.shutdown().await;
@@ -379,6 +471,9 @@ async fn stopped_capture_preserves_previously_queued_records() {
     assert_eq!(manifest.status, "partial");
     let records = persisted_records(&handle).await;
     assert_eq!(records.len(), 1);
-    assert_eq!(records[0].payload, "data: start\n");
+    assert_eq!(
+        serde_json::to_value(&records[0].payload).unwrap(),
+        "data: start\n"
+    );
     manager.shutdown().await;
 }

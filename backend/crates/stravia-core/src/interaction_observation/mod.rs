@@ -765,27 +765,19 @@ pub(crate) struct IngressCapture {
     trace: TraceHandle,
 }
 
-pub(crate) fn wire_bytes_value(bytes: &[u8]) -> serde_json::Value {
-    std::str::from_utf8(bytes)
-        .map(|text| serde_json::Value::String(text.to_owned()))
-        .unwrap_or_else(|_| {
-            serde_json::json!({
-                "encoding": "base64",
-                "data": base64::Engine::encode(
-                    &base64::engine::general_purpose::STANDARD,
-                    bytes,
-                ),
-            })
-        })
-}
-
 pub(crate) fn wire_headers_value(headers: &axum::http::HeaderMap) -> serde_json::Value {
     let mut encoded = serde_json::Map::new();
     for (name, value) in headers {
-        let value = value
-            .to_str()
+        let value = std::str::from_utf8(value.as_bytes())
             .map(|value| serde_json::Value::String(value.to_owned()))
-            .unwrap_or_else(|_| wire_bytes_value(value.as_bytes()));
+            .unwrap_or_else(|_| {
+                serde_json::json!({
+                    "encoding": "base64",
+                    "data": base64::Engine::encode(
+                        &base64::engine::general_purpose::STANDARD, value.as_bytes(),
+                    ),
+                })
+            });
         match encoded.entry(name.as_str().to_owned()) {
             serde_json::map::Entry::Vacant(entry) => {
                 entry.insert(value);
@@ -890,13 +882,15 @@ impl IngressObserver {
             redaction::ProtectedSecrets::default,
             TraceHandle::protected_secrets,
         );
-        let inner = Arc::new(RunObserverInner {
+        let mut inner = RunObserverInner {
             observation: self.observation.clone(),
             run_id: start.id.clone(),
             principal: start.principal.clone(),
             debug_enabled,
             trace: self.trace.take(),
             terminal: AtomicBool::new(false),
+            client_output_committed: AtomicBool::new(false),
+            admission_queued: false,
             event_boundary: Mutex::new(()),
             gap: AtomicBool::new(false),
             gap_reported: AtomicBool::new(false),
@@ -909,7 +903,14 @@ impl IngressObserver {
                     .try_reserve_owned()
                     .ok(),
             ),
-            pending_finish: Mutex::new(None),
+            finish: Mutex::new(
+                self.observation
+                    .inner
+                    .writer
+                    .clone()
+                    .try_reserve_owned()
+                    .ok(),
+            ),
             queued_text: Mutex::new(None),
             failure: Mutex::new(None),
             generation_commit_fences: Mutex::new(Vec::new()),
@@ -918,15 +919,25 @@ impl IngressObserver {
             thinking_redaction: Mutex::new(std::collections::BTreeMap::new()),
             visible_redaction: Mutex::new(std::collections::BTreeMap::new()),
             protected,
-        });
-        // 没有成功收据与最终清理的保留槽，就不创建可被后续 User 误判的运行投影。
-        let can_admit = inner.completion.lock().is_some() && inner.finalization.lock().is_some();
-        let admitted = if can_admit {
-            let facts = facts.prepare(&start.id);
+        };
+        // 先保留准入、收据、终态与最终清理的容量，再遍历正文准备准入证据。
+        let can_admit = inner.completion.lock().is_some()
+            && inner.finalization.lock().is_some()
+            && inner.finish.lock().is_some();
+        let admission = if can_admit {
             self.observation
                 .inner
                 .writer
-                .try_send(WriterCommand::Admit(Box::new(writer::AdmitPayload {
+                .clone()
+                .try_reserve_owned()
+                .ok()
+        } else {
+            None
+        };
+        let admitted = if let Some(admission) = admission {
+            let facts = facts.prepare(&start.id);
+            !admission
+                .send(WriterCommand::Admit(Box::new(writer::AdmitPayload {
                     start,
                     facts,
                     received_at: self.received_at,
@@ -935,11 +946,17 @@ impl IngressObserver {
                     trace: inner.trace.clone(),
                     discarded_trace,
                 })))
-                .is_ok()
+                .is_closed()
         } else {
             false
         };
+        inner.admission_queued = admitted;
         if !admitted {
+            inner.completion.lock().take();
+            inner.finish.lock().take();
+            if inner.trace.is_none() {
+                inner.finalization.lock().take();
+            }
             inner.gap.store(true, Ordering::Release);
             self.observation
                 .inner
@@ -948,7 +965,9 @@ impl IngressObserver {
                 .record(&inner.run_id, writer::now());
         }
         drop(ingress);
-        RunObserver { inner }
+        RunObserver {
+            inner: Arc::new(inner),
+        }
     }
     pub(crate) fn reject(mut self, outcome: RejectedOutcome) {
         self.reject_inner(outcome);
@@ -1016,12 +1035,14 @@ struct RunObserverInner {
     debug_enabled: bool,
     trace: Option<TraceHandle>,
     terminal: AtomicBool,
+    client_output_committed: AtomicBool,
+    admission_queued: bool,
     event_boundary: Mutex<()>,
     gap: AtomicBool,
     gap_reported: AtomicBool,
     finalization: Mutex<Option<writer::WriterPermit>>,
     completion: Mutex<Option<writer::WriterPermit>>,
-    pending_finish: Mutex<Option<(RunOutcome, i64)>>,
+    finish: Mutex<Option<writer::WriterPermit>>,
     queued_text: Mutex<Option<Arc<Mutex<writer::QueuedText>>>>,
     failure: Mutex<Option<FailureDiagnostic>>,
     generation_commit_fences: Mutex<Vec<crate::generation_chain::GenerationCommitFence>>,
@@ -1101,6 +1122,9 @@ impl RunObserver {
 
     /// Publish once, only after all active and newly discovered mappings are registered.
     pub(crate) fn publish_input_preview(&self) {
+        if !self.inner.admission_queued {
+            return;
+        }
         let tool_results = std::mem::take(&mut *self.inner.pending_tool_results.lock());
         self.send_tool_results(tool_results);
         let Some(input) = self.inner.pending_input.lock().take() else {
@@ -1202,6 +1226,9 @@ impl RunObserver {
         &self.inner.run_id
     }
     pub(crate) fn record(&self, event: RunEvent) {
+        if !self.inner.admission_queued {
+            return;
+        }
         if !self.inner.debug_enabled && matches!(event, RunEvent::Wire { .. }) {
             return;
         }
@@ -1263,22 +1290,7 @@ impl RunObserver {
             part_index,
         } = event
         {
-            let ready = self
-                .inner
-                .visible_redaction
-                .lock()
-                .entry((item_ordinal, part_index))
-                .or_insert_with(|| {
-                    redaction::VisibleTextRedactor::with_protected(self.inner.protected.clone())
-                })
-                .push(text);
-            if let Some(text) = ready {
-                self.send_event(RunEvent::ClientVisibleContentDelta {
-                    text,
-                    item_ordinal,
-                    part_index,
-                });
-            }
+            self.record_visible_delta(item_ordinal, part_index, &text);
             return;
         }
         if let RunEvent::ModelThinking {
@@ -1299,6 +1311,33 @@ impl RunObserver {
             self.flush_visible();
         }
         self.send_event(event);
+    }
+
+    pub(crate) fn record_visible_delta(
+        &self,
+        item_ordinal: usize,
+        part_index: CanonicalPartIndex,
+        text: &str,
+    ) {
+        if !self.inner.admission_queued {
+            return;
+        }
+        let ready = self
+            .inner
+            .visible_redaction
+            .lock()
+            .entry((item_ordinal, part_index))
+            .or_insert_with(|| {
+                redaction::VisibleTextRedactor::with_protected(self.inner.protected.clone())
+            })
+            .push(text);
+        if let Some(text) = ready {
+            self.send_event(RunEvent::ClientVisibleContentDelta {
+                text,
+                item_ordinal,
+                part_index,
+            });
+        }
     }
     fn flush_thinking(&self, model_turn_id: &str, attempt_id: &str) -> bool {
         let mut states = self.inner.thinking_redaction.lock();
@@ -1360,6 +1399,9 @@ impl RunObserver {
         }
     }
     fn send_tool_results(&self, mut events: Vec<RunEvent>) {
+        if !self.inner.admission_queued {
+            return;
+        }
         if events.is_empty() {
             return;
         }
@@ -1389,9 +1431,18 @@ impl RunObserver {
         }
     }
     fn send_event(&self, mut event: RunEvent) {
+        if !self.inner.admission_queued {
+            return;
+        }
         // Keep concurrently produced activity ordered with Finish without rejecting
         // meaningful background events that arrive after client delivery.
         let _boundary = self.inner.event_boundary.lock();
+        if matches!(event, RunEvent::ClientOutputCommitted) {
+            // 已确认的提交不能随普通事件队列溢出丢失；最终由保留的 Finish 槽合并落盘。
+            self.inner
+                .client_output_committed
+                .store(true, Ordering::Release);
+        }
         if matches!(event, RunEvent::ClientToolResult { .. }) {
             self.send_tool_results(vec![event]);
             return;
@@ -1539,33 +1590,32 @@ impl RunObserver {
         let _boundary = self.inner.event_boundary.lock();
         let mut generation_commit_fences = self.inner.generation_commit_fences.lock();
         if !self.inner.terminal.swap(true, Ordering::AcqRel) {
+            outcome.client_output_committed |=
+                self.inner.client_output_committed.load(Ordering::Acquire);
             let command = WriterCommand::Finish {
                 run_id: self.inner.run_id.clone(),
                 outcome,
                 finished_at,
             };
-            let result = if let Some(permit) = self.inner.completion.lock().take() {
-                permit.send(command);
-                Ok(())
-            } else {
-                self.inner.observation.inner.writer.try_send(command)
-            };
-            if let Err(error) = result {
-                if let WriterCommand::Finish {
-                    outcome,
-                    finished_at,
-                    ..
-                } = *error.into_inner()
-                {
-                    *self.inner.pending_finish.lock() = Some((outcome, finished_at));
-                }
-                self.inner.gap.store(true, Ordering::Release);
-                self.inner
-                    .observation
+            // 收据与 Finish 分别保留槽位；不能等待最后一个后台发布句柄 Drop 才落终态。
+            if self.inner.admission_queued {
+                let sender = self
                     .inner
-                    .unpersisted_gaps
+                    .finish
                     .lock()
-                    .record(&self.inner.run_id, writer::now());
+                    .take()
+                    .expect("admitted run reserves Finish")
+                    .send(command);
+                // 保留槽只保证容量；接收端退出时 send 不返回错误，仍须留下缺口。
+                if sender.is_closed() {
+                    self.inner.gap.store(true, Ordering::Release);
+                    self.inner
+                        .observation
+                        .inner
+                        .unpersisted_gaps
+                        .lock()
+                        .record(&self.inner.run_id, finished_at);
+                }
             }
             // Preserve Finish/Admit FIFO ordering without waiting for observation
             // persistence. A full or closed writer only records a diagnostic gap.
@@ -1582,6 +1632,9 @@ impl RunPublicationGuard {
     }
 
     pub(crate) fn credential_mappings_created(&self, discoveries: Vec<CredentialDiscovery>) {
+        if !self.inner.admission_queued {
+            return;
+        }
         let _boundary = self.inner.event_boundary.lock();
         let mut event = RunEvent::CredentialMappingsCreated { discoveries };
         self.inner.protected.event(&mut event);
@@ -1610,6 +1663,24 @@ impl RunPublicationGuard {
 
 impl Drop for RunObserverInner {
     fn drop(&mut self) {
+        if !self.admission_queued {
+            // 拒绝观测准入不是一个可持久化 Run；只清理已捕获的 Trace，绝不发送孤儿事件。
+            self.observation
+                .inner
+                .active_traces
+                .lock()
+                .remove(&self.run_id);
+            if let Some(permit) = self.finalization.get_mut().take() {
+                permit.send(WriterCommand::Finalize {
+                    run_id: None,
+                    rejection_id: None,
+                    trace: self.trace.take(),
+                    pending_finish: None,
+                    gap: true,
+                });
+            }
+            return;
+        }
         for ((model_turn_id, attempt_id, item_ordinal, part_index), mut state) in
             std::mem::take(self.thinking_redaction.get_mut())
         {
@@ -1665,11 +1736,11 @@ impl Drop for RunObserverInner {
                 *self.gap.get_mut() = true;
             }
         }
-        let mut pending_finish = self.pending_finish.get_mut().take();
+        let mut pending_finish = None;
         if !*self.terminal.get_mut() {
             pending_finish = Some((
                 RunOutcome {
-                    client_output_committed: false,
+                    client_output_committed: *self.client_output_committed.get_mut(),
                     delivery: None,
                     delivery_completed_at: None,
                     status: "interrupted".into(),
@@ -1739,14 +1810,21 @@ fn record_trace_observed_at(
         return;
     };
     let (payload_encoding, payload) = match payload {
-        serde_json::Value::Object(mut object)
+        WirePayload::Json(serde_json::Value::Object(mut object))
             if object.get("encoding").and_then(serde_json::Value::as_str) == Some("base64") =>
         {
             (
                 "base64".to_owned(),
-                object.remove("data").unwrap_or(serde_json::Value::Null),
+                object
+                    .remove("data")
+                    .unwrap_or(serde_json::Value::Null)
+                    .into(),
             )
         }
+        WirePayload::Bytes(bytes) if std::str::from_utf8(&bytes).is_err() => {
+            ("base64".to_owned(), WirePayload::Base64(bytes))
+        }
+        WirePayload::Base64(bytes) => ("base64".to_owned(), WirePayload::Base64(bytes)),
         other => ("json".to_owned(), other),
     };
     let _ = trace.record(TraceRecord {
@@ -1835,7 +1913,7 @@ mod snapshot_tests {
     #[test]
     fn wire_headers_preserve_duplicate_and_non_utf8_values() {
         assert_eq!(
-            wire_bytes_value(b"\xff\0"),
+            serde_json::to_value(WirePayload::Bytes(bytes::Bytes::from_static(b"\xff\0"))).unwrap(),
             serde_json::json!({"encoding": "base64", "data": "/wA="}),
         );
         let mut headers = axum::http::HeaderMap::new();
@@ -1844,14 +1922,58 @@ mod snapshot_tests {
             axum::http::HeaderValue::from_bytes(b"\xff").expect("opaque header"),
         );
         headers.append("x-opaque", axum::http::HeaderValue::from_static("plain"));
+        headers.append(
+            "x-opaque",
+            axum::http::HeaderValue::from_bytes("雪".as_bytes()).expect("UTF-8 header"),
+        );
 
         assert_eq!(
             wire_headers_value(&headers)["x-opaque"],
             serde_json::json!([
                 {"encoding": "base64", "data": "/w=="},
                 "plain",
+                "雪",
             ])
         );
+    }
+
+    #[tokio::test]
+    async fn shared_wire_capture_preserves_binary_payload_encoding() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let manager = trace::TraceManager::new(directory.path().to_owned())?;
+        let handle = manager.create();
+        for (index, body) in [b"\xff\0".as_slice(), "雪".as_bytes()]
+            .into_iter()
+            .enumerate()
+        {
+            record_trace_observed_at(
+                &handle,
+                Some("run"),
+                None,
+                RunEvent::Wire {
+                    direction: "upstream_response".into(),
+                    transport: "http".into(),
+                    protocol: "responses".into(),
+                    message_type: "body_chunk".into(),
+                    model_turn_id: None,
+                    attempt_id: None,
+                    status_code: Some(200),
+                    url: None,
+                    headers: Value::Null,
+                    payload: WirePayload::Bytes(bytes::Bytes::copy_from_slice(body)),
+                },
+                index as i64 + 1,
+                123,
+            );
+        }
+        let records = load_trace_values(handle.snapshot(i64::MAX).await?).await?;
+        assert_eq!(records[0]["payload_encoding"], "base64");
+        assert_eq!(records[0]["payload"], "/wA=");
+        assert_eq!(records[1]["payload_encoding"], "json");
+        assert_eq!(records[1]["payload"], "雪");
+        handle.finish().await;
+        manager.shutdown().await;
+        Ok(())
     }
 
     /// Every test admission crosses the same one-call boundary as production.
@@ -2226,7 +2348,167 @@ mod snapshot_tests {
     }
 
     #[tokio::test]
-    async fn reserved_receipt_survives_full_queue_and_finish_uses_finalization()
+    async fn rejected_admission_stays_inert_after_queue_recovers() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let pool = crate::test_support::migrated_sqlite_pool().await?;
+        let observation = test_observation(&pool, directory.path(), true).await;
+        // 不让写者运行，真实占满有界队列；随后释放压力也不能复活失败的准入。
+        while observation.inner.writer.capacity() > 0 {
+            let (done, _) = oneshot::channel();
+            assert!(
+                observation
+                    .inner
+                    .writer
+                    .try_send(WriterCommand::Barrier(done))
+                    .is_ok()
+            );
+        }
+        let rejected: Vec<_> = (0..writer::QUEUE_CAPACITY)
+            .map(|index| {
+                test_run(
+                    &observation,
+                    &format!("rejected-inert-{index}"),
+                    facts(Vec::new()),
+                )
+            })
+            .collect();
+        observation.flush().await?;
+        for run in rejected {
+            run.record(RunEvent::ModelTurnStarted {
+                model_turn_id: "orphan-turn".into(),
+                route_id: "route".into(),
+                model_display_name: None,
+                estimated_input_tokens: None,
+            });
+            run.observe_client_completion(&[], &[], writer::now(), false);
+            run.finish(RunOutcome {
+                client_output_committed: true,
+                delivery: None,
+                delivery_completed_at: None,
+                status: "completed".into(),
+                terminal_reason: None,
+                generation_node_id: None,
+                generation_root_id: None,
+            });
+        }
+        // 已拒绝的 Run 不能在恢复后占掉下一条正常观测的准入容量。
+        let next = test_run(&observation, "after-rejected", facts(Vec::new()));
+        next.observe_client_completion(&[], &[], writer::now(), false);
+        next.finish(RunOutcome {
+            client_output_committed: true,
+            delivery: None,
+            delivery_completed_at: None,
+            status: "completed".into(),
+            terminal_reason: None,
+            generation_node_id: None,
+            generation_root_id: None,
+        });
+        drop(next);
+        observation.flush().await?;
+        let status: Option<String> = sqlx::query_scalar(
+            "SELECT status FROM inference_run_observations WHERE id='after-rejected'",
+        )
+        .fetch_optional(&pool)
+        .await?;
+        assert_eq!(status.as_deref(), Some("completed"));
+        let events: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM observation_events WHERE run_id LIKE 'rejected-inert-%'",
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(events, 0);
+        assert!(observation.inner.active_traces.lock().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn lost_model_turn_start_becomes_gap_without_orphan_attempt() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let pool = crate::test_support::migrated_sqlite_pool().await?;
+        let observation = test_observation(&pool, directory.path(), false).await;
+        let run = test_run(&observation, "missing-turn", facts(Vec::new()));
+        while observation.inner.writer.capacity() > 0 {
+            let (done, _) = oneshot::channel();
+            assert!(
+                observation
+                    .inner
+                    .writer
+                    .try_send(WriterCommand::Barrier(done))
+                    .is_ok()
+            );
+        }
+        run.record(RunEvent::ModelTurnStarted {
+            model_turn_id: "lost-turn".into(),
+            route_id: "route".into(),
+            model_display_name: None,
+            estimated_input_tokens: None,
+        });
+        observation.flush().await?;
+        run.record(RunEvent::TargetAttemptStarted {
+            model_turn_id: "lost-turn".into(),
+            attempt_id: "orphan-attempt".into(),
+            target_id: "target".into(),
+            provider_id: "provider".into(),
+            provider_name: "provider".into(),
+            upstream_model: "model".into(),
+            protocol: "responses".into(),
+            upstream_url: "http://upstream.invalid".into(),
+        });
+        run.record(RunEvent::TargetAttemptFinished {
+            model_turn_id: "lost-turn".into(),
+            attempt_id: "orphan-attempt".into(),
+            status: "completed".into(),
+            status_code: Some(200),
+            error_code: None,
+            error: None,
+            duration_ms: 1,
+            first_token_ms: None,
+            usage: Some(ConfirmedUsage {
+                input_tokens: Some(17),
+                output_tokens: Some(3),
+                ..Default::default()
+            }),
+        });
+        let guard = run.publication_guard().expect("live publication");
+        run.observe_client_completion(&[], &[], writer::now(), false);
+        run.finish(RunOutcome {
+            client_output_committed: true,
+            delivery: None,
+            delivery_completed_at: None,
+            status: "completed".into(),
+            terminal_reason: None,
+            generation_node_id: Some("history-node".into()),
+            generation_root_id: Some("history-root".into()),
+        });
+        observation.flush().await?;
+        let state: (String, Option<String>) = sqlx::query_as(
+            "SELECT status,generation_node_id FROM inference_run_observations WHERE id='missing-turn'",
+        ).fetch_one(&pool).await?;
+        assert_eq!(state, ("completed".into(), Some("history-node".into())));
+        let attempts: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM target_attempt_observations WHERE run_id='missing-turn'",
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(attempts, 0);
+        let gaps = observation.inner.store.replay(0).await?;
+        assert!(gaps.iter().any(|event| {
+            event.kind == "observation_gap"
+                && event.payload["reason"] == "model_turn_start_unavailable"
+        }));
+        assert!(gaps.iter().any(|event| {
+            event.kind == "target_attempt_finished"
+                && event.payload["usage"]["input_tokens"] == 17
+                && event.payload["usage"]["output_tokens"] == 3
+        }));
+        drop(run);
+        drop(guard);
+        observation.flush().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn receipt_and_finish_survive_full_queue_before_publication_guard_drops()
     -> anyhow::Result<()> {
         let directory = tempfile::tempdir()?;
         let pool = crate::test_support::migrated_sqlite_pool().await?;
@@ -2245,31 +2527,37 @@ mod snapshot_tests {
             }
         }
         assert_eq!(observation.inner.writer.capacity(), 0);
+        let guard = run
+            .publication_guard()
+            .expect("publication keeps observer alive");
+        run.record(RunEvent::ClientOutputCommitted);
         run.observe_client_completion(&[], &[], writer::now(), false);
         run.finish(RunOutcome {
-            client_output_committed: true,
+            client_output_committed: false,
             delivery: None,
             delivery_completed_at: None,
             status: "completed".into(),
             terminal_reason: None,
-            generation_node_id: None,
-            generation_root_id: None,
+            generation_node_id: Some("queue-history-node".into()),
+            generation_root_id: Some("queue-history-root".into()),
         });
-        assert!(run.inner.pending_finish.lock().is_some());
         let rejected_projection = test_run(&observation, "no-receipt-slot", facts(Vec::new()));
-        assert!(rejected_projection.inner.gap.load(Ordering::Acquire));
         drop(rejected_projection);
         drop(run);
         observation.flush().await?;
-        let row: (String, Option<i64>) = sqlx::query_as(
-            "SELECT status,finished_at FROM inference_run_observations WHERE id='full-queue-receipt'",
+        let row: (String, Option<i64>, Option<String>, bool) = sqlx::query_as(
+            "SELECT status,finished_at,generation_node_id,client_output_committed FROM inference_run_observations WHERE id='full-queue-receipt'",
         ).fetch_one(&pool).await?;
         assert_eq!(row.0, "completed");
         assert!(row.1.is_some());
-        let count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM observation_events WHERE run_id='full-queue-receipt' AND kind='run_finished'",
+        assert_eq!(row.2.as_deref(), Some("queue-history-node"));
+        assert!(row.3);
+        drop(guard);
+        observation.flush().await?;
+        let finalized: (String, Option<i64>, Option<String>, bool) = sqlx::query_as(
+            "SELECT status,finished_at,generation_node_id,client_output_committed FROM inference_run_observations WHERE id='full-queue-receipt'",
         ).fetch_one(&pool).await?;
-        assert_eq!(count, 1);
+        assert_eq!(finalized, row);
         let missing: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM inference_run_observations WHERE id='no-receipt-slot'",
         )
@@ -3263,7 +3551,7 @@ mod snapshot_tests {
             status_code: Some(200),
             url: None,
             headers: Value::Null,
-            payload: serde_json::json!({"marker": "incomplete-prefix"}),
+            payload: serde_json::json!({"marker": "incomplete-prefix"}).into(),
         });
         observation.flush().await?;
         let at_frontier = load_trace_values(trace.snapshot(frontier).await?).await?;
@@ -3360,7 +3648,7 @@ mod snapshot_tests {
                     status_code: Some(200),
                     url: None,
                     headers: Value::Null,
-                    payload: serde_json::json!({"marker":marker}),
+                    payload: serde_json::json!({"marker":marker}).into(),
                 });
                 observation.flush().await?;
             }
@@ -3812,7 +4100,7 @@ mod snapshot_tests {
             ),
         ] {
             sqlx::query("INSERT INTO observation_events(sequence,occurred_at,interaction_id,kind,payload,expires_at) VALUES (?,?,?,'credential_mappings_created',?,?)")
-                .bind(sequence).bind(time).bind(interaction).bind(crate::storage_codec::encode(payload.as_bytes())?)
+                .bind(sequence).bind(time).bind(interaction).bind(crate::storage_codec::encode(payload.as_bytes().into())?)
                 .bind(now + 86_400_000).execute(&pool).await?;
         }
         pool.close().await;

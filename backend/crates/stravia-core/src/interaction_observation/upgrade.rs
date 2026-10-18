@@ -57,7 +57,7 @@ fn decode_legacy(current: String) -> anyhow::Result<(String, Value)> {
 
 async fn encode_event(value: Value) -> anyhow::Result<(Value, Vec<u8>)> {
     tokio::task::spawn_blocking(move || {
-        let bytes = crate::storage_codec::encode(&serde_json::to_vec(&value)?)?;
+        let bytes = crate::storage_codec::encode(serde_json::to_vec(&value)?.into())?;
         Ok((value, bytes))
     })
     .await?

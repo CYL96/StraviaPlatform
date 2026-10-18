@@ -708,31 +708,6 @@ impl ResponsesStreamParser {
     }
 }
 
-fn sse_frame_boundary(buffer: &str) -> Option<(usize, usize)> {
-    let bytes = buffer.as_bytes();
-    let mut previous_eol = None;
-    let mut index = 0;
-    while index < bytes.len() {
-        let eol_len = match bytes[index] {
-            b'\n' => 1,
-            b'\r' if bytes.get(index + 1) == Some(&b'\n') => 2,
-            b'\r' => 1,
-            _ => {
-                index += 1;
-                continue;
-            }
-        };
-        if let Some((previous_start, previous_end)) = previous_eol
-            && previous_end == index
-        {
-            return Some((previous_start, index + eol_len - previous_start));
-        }
-        previous_eol = Some((index, index + eol_len));
-        index += eol_len;
-    }
-    None
-}
-
 impl ResponsesStreamParser {
     /// Decode one complete Open Responses WebSocket event using the same
     /// validation and canonical conversion as the SSE transport.
@@ -747,17 +722,14 @@ impl ResponsesStreamParser {
     }
 
     pub(crate) fn parse_chunk(&mut self, raw: &str) -> Result<Vec<AiStreamDelta>> {
-        self.buffer.push_str(raw);
         let mut deltas = Vec::new();
 
-        while let Some((pos, delimiter_len)) = sse_frame_boundary(&self.buffer) {
-            let block = self.buffer[..pos].to_string();
-            self.buffer = self.buffer[pos + delimiter_len..].to_string();
-
-            let mut event_name: Option<String> = None;
+        let mut buffer = std::mem::take(&mut self.buffer);
+        let result = crate::consume_sse_frames(&mut buffer, raw, |block| {
+            let mut event_name = None;
             for line in block.lines() {
                 if let Some(event) = line.strip_prefix("event: ") {
-                    event_name = Some(event.trim().to_string());
+                    event_name = Some(event.trim());
                     continue;
                 }
                 let Some(data) = line.strip_prefix("data: ") else {
@@ -773,10 +745,12 @@ impl ResponsesStreamParser {
                 }
                 let payload = serde_json::from_str::<Value>(data)
                     .map_err(|error| anyhow::anyhow!("invalid Open Responses SSE JSON: {error}"))?;
-                self.parse_event(event_name.as_deref(), &payload, &mut deltas)?;
+                self.parse_event(event_name, &payload, &mut deltas)?;
             }
-        }
-
+            Ok(())
+        });
+        self.buffer = buffer;
+        result?;
         Ok(deltas)
     }
 
@@ -784,8 +758,8 @@ impl ResponsesStreamParser {
         let deltas = if self.buffer.trim().is_empty() {
             Vec::new()
         } else {
-            let remaining = std::mem::take(&mut self.buffer);
-            self.parse_chunk(&format!("{remaining}\n\n"))?
+            self.buffer.push_str("\n\n");
+            self.parse_chunk("")?
         };
         // OpenAI's rolling Responses SSE ends after the terminal event and
         // omits the legacy [DONE] sentinel.

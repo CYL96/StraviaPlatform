@@ -430,13 +430,10 @@ impl OpenAIStreamParser {
 
 impl OpenAIStreamParser {
     pub(crate) fn parse_chunk(&mut self, raw: &str) -> Result<Vec<AiStreamDelta>> {
-        self.buffer.push_str(raw);
         let mut deltas = Vec::new();
 
-        while let Some(pos) = self.buffer.find("\n\n") {
-            let block = self.buffer[..pos].to_string();
-            self.buffer = self.buffer[pos + 2..].to_string();
-
+        let mut buffer = std::mem::take(&mut self.buffer);
+        let result = crate::consume_sse_frames(&mut buffer, raw, |block| {
             for line in block.lines() {
                 if let Some(data) = line.strip_prefix("data: ") {
                     let data = data.trim();
@@ -460,16 +457,18 @@ impl OpenAIStreamParser {
                     self.parse_openai_chunk(&chunk, &mut deltas)?;
                 }
             }
-        }
-
+            Ok(())
+        });
+        self.buffer = buffer;
+        result?;
         Ok(deltas)
     }
 
     pub(crate) fn finish(&mut self) -> Result<Vec<AiStreamDelta>> {
         let mut ai_deltas: Vec<AiStreamDelta> = Vec::new();
         if !self.buffer.trim().is_empty() {
-            let remaining = std::mem::take(&mut self.buffer);
-            ai_deltas.extend(self.parse_chunk(&format!("{remaining}\n\n"))?);
+            self.buffer.push_str("\n\n");
+            ai_deltas.extend(self.parse_chunk("")?);
         }
         ai_deltas.extend(self.flush_pending_text());
         self.emit_pending_terminal_error(&mut ai_deltas);
@@ -700,41 +699,43 @@ impl OpenAIStreamParser {
             return;
         }
         self.think_buffer.push_str(text);
-
+        let mut consumed = 0;
         loop {
+            let pending = &self.think_buffer[consumed..];
             if self.in_think_block {
-                if let Some(end_idx) = self.think_buffer.find("</think>") {
-                    let thought = self.think_buffer[..end_idx].trim().to_string();
+                if let Some(end_idx) = pending.find("</think>") {
+                    let thought = pending[..end_idx].trim().to_string();
                     if !thought.is_empty() {
                         deltas.push(AiStreamDelta::ThinkingDelta(thought));
                     }
-                    self.think_buffer = self.think_buffer[end_idx + "</think>".len()..].to_string();
+                    consumed += end_idx + "</think>".len();
                     self.in_think_block = false;
                     continue;
                 }
                 break;
             }
 
-            if let Some(start_idx) = self.think_buffer.find("<think>") {
-                let before = self.think_buffer[..start_idx].to_string();
+            if let Some(start_idx) = pending.find("<think>") {
+                let before = pending[..start_idx].to_string();
                 if !before.is_empty() {
                     deltas.push(AiStreamDelta::TextDelta(before));
                 }
-                self.think_buffer = self.think_buffer[start_idx + "<think>".len()..].to_string();
+                consumed += start_idx + "<think>".len();
                 self.in_think_block = true;
                 continue;
             }
 
-            let keep = longest_suffix_that_can_start_tag(&self.think_buffer, "<think>");
-            if self.think_buffer.len() > keep {
-                let emit = self.think_buffer[..self.think_buffer.len() - keep].to_string();
+            let keep = longest_suffix_that_can_start_tag(pending, "<think>");
+            if pending.len() > keep {
+                let emit = pending[..pending.len() - keep].to_string();
                 if !emit.is_empty() {
                     deltas.push(AiStreamDelta::TextDelta(emit));
                 }
-                self.think_buffer = self.think_buffer[self.think_buffer.len() - keep..].to_string();
+                consumed += pending.len() - keep;
             }
             break;
         }
+        self.think_buffer.drain(..consumed);
     }
 
     fn flush_pending_text(&mut self) -> Vec<AiStreamDelta> {

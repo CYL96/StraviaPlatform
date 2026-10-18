@@ -6,10 +6,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use axum::Json;
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade};
 use axum::extract::{Extension, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
+use bytes::{Bytes, BytesMut};
 use futures::{SinkExt, StreamExt};
 use parking_lot::Mutex;
 use serde_json::Value;
@@ -53,7 +54,7 @@ impl AllowedWebSocketOrigins {
 fn ws_wire(
     direction: &str,
     message_type: &str,
-    payload: Value,
+    payload: impl Into<crate::interaction_observation::WirePayload>,
 ) -> crate::interaction_observation::RunEvent {
     crate::interaction_observation::RunEvent::Wire {
         direction: direction.into(),
@@ -65,7 +66,7 @@ fn ws_wire(
         status_code: None,
         url: Some("/v1/responses".into()),
         headers: Value::Null,
-        payload,
+        payload: payload.into(),
     }
 }
 
@@ -92,7 +93,7 @@ fn handshake_ingress(
         status_code: None,
         url: Some("/v1/responses".into()),
         headers: crate::interaction_observation::wire_headers_value(headers),
-        payload: Value::Null,
+        payload: Value::Null.into(),
     });
     observer
 }
@@ -134,7 +135,7 @@ fn websocket_ingress(
                 status_code: None,
                 url: Some("/v1/responses".into()),
                 headers: handshake.request.headers,
-                payload: Value::Null,
+                payload: Value::Null.into(),
             }
         });
         observer.record_debug_at(handshake.response_recorded_at, || {
@@ -148,7 +149,7 @@ fn websocket_ingress(
                 status_code: Some(handshake.response_status),
                 url: Some("/v1/responses".into()),
                 headers: handshake.response_headers,
-                payload: Value::Null,
+                payload: Value::Null.into(),
             }
         });
     }
@@ -329,7 +330,7 @@ async fn serve(
                         ws_wire(
                             "client_to_platform",
                             "text",
-                            Value::String(text.to_string()),
+                            crate::interaction_observation::WirePayload::Bytes(text.clone().into()),
                         )
                     });
                     let Ok(mut event) = serde_json::from_str::<Value>(&text) else {
@@ -733,7 +734,7 @@ async fn forward_response(
         .get::<crate::model_turn::UpstreamErrorResponse>()
         .is_some();
     let mut stream = response.into_body().into_data_stream();
-    let mut buffer = String::new();
+    let mut buffer = Bytes::new();
     while let Some(chunk) = stream.next().await {
         let Ok(chunk) = chunk else {
             if send_error(outgoing, 500, "server_error", "Response stream failed.").await
@@ -750,7 +751,7 @@ async fn forward_response(
             }
             return;
         };
-        let Ok(text) = std::str::from_utf8(&chunk) else {
+        let Ok(_) = std::str::from_utf8(&chunk) else {
             if send_error(
                 outgoing,
                 500,
@@ -771,7 +772,15 @@ async fn forward_response(
             }
             return;
         };
-        buffer.push_str(text);
+        if buffer.is_empty() {
+            buffer = chunk;
+        } else {
+            let mut joined = std::mem::take(&mut buffer)
+                .try_into_mut()
+                .unwrap_or_else(|bytes| BytesMut::from(bytes.as_ref()));
+            joined.extend_from_slice(&chunk);
+            buffer = joined.freeze();
+        }
         if status.is_success()
             && !forward_sse_frames(&mut buffer, outgoing, progress, delivery.as_ref()).await
         {
@@ -788,7 +797,7 @@ async fn forward_response(
             }
         }
     } else {
-        let decoded = serde_json::from_str::<Value>(&buffer).ok();
+        let decoded = serde_json::from_slice::<Value>(&buffer).ok();
         let message = decoded
             .as_ref()
             .and_then(|body| {
@@ -812,14 +821,16 @@ async fn forward_response(
         } else {
             error_body(status.as_u16(), &code, &message)
         };
-        let error_text = event.to_string();
+        let error_text: Utf8Bytes = event.to_string().into();
         if send_error_text(outgoing, error_text.clone()).await {
             if let Some(observer) = rejection_observer.as_ref() {
                 observer.record_debug(|| {
                     ws_wire(
                         "platform_to_client",
                         "text",
-                        Value::String(error_text.clone()),
+                        crate::interaction_observation::WirePayload::Bytes(
+                            error_text.clone().into(),
+                        ),
                     )
                 });
             }
@@ -834,15 +845,19 @@ async fn forward_response(
 }
 
 async fn forward_sse_frames(
-    buffer: &mut String,
+    buffer: &mut Bytes,
     outgoing: &mpsc::Sender<OutgoingMessage>,
     progress: &Arc<Mutex<StreamForwardProgress>>,
     delivery: Option<&Arc<Mutex<crate::proxy::dispatcher::WebSocketRunDelivery>>>,
 ) -> bool {
-    while let Some(end) = buffer.find("\n\n") {
-        let frame = buffer[..end].to_owned();
-        buffer.drain(..end + 2);
-        for line in frame.lines() {
+    while let Some((end, delimiter_len)) = sse_frame_boundary(buffer) {
+        let frame = buffer.split_to(end + delimiter_len);
+        let text = std::str::from_utf8(&frame[..end]).expect("validated response UTF-8");
+        let mut offset = 0;
+        for line in text.split_inclusive('\n') {
+            let start = offset;
+            offset += line.len();
+            let line = line.trim_end_matches(['\r', '\n']);
             let Some(data) = line.strip_prefix("data: ") else {
                 continue;
             };
@@ -852,7 +867,12 @@ async fn forward_sse_frames(
             let (delivered, delivered_rx) = tokio::sync::oneshot::channel();
             if outgoing
                 .send(OutgoingMessage {
-                    message: Message::Text(data.to_owned().into()),
+                    message: Message::Text(
+                        Utf8Bytes::try_from(
+                            frame.slice(start + "data: ".len()..start + line.len()),
+                        )
+                        .expect("validated response UTF-8"),
+                    ),
                     delivered: Some(delivered),
                     run_delivery: delivery.cloned(),
                 })
@@ -871,6 +891,31 @@ async fn forward_sse_frames(
         }
     }
     true
+}
+
+fn sse_frame_boundary(buffer: &[u8]) -> Option<(usize, usize)> {
+    let mut previous_eol = None;
+    let mut index = 0;
+    while index < buffer.len() {
+        let eol_len = match buffer[index] {
+            b'\n' => 1,
+            b'\r' if buffer.get(index + 1) == Some(&b'\n') => 2,
+            b'\r' if index + 1 == buffer.len() => break,
+            b'\r' => 1,
+            _ => {
+                index += 1;
+                continue;
+            }
+        };
+        if let Some((start, end)) = previous_eol
+            && end == index
+        {
+            return Some((start, index + eol_len - start));
+        }
+        previous_eol = Some((index, index + eol_len));
+        index += eol_len;
+    }
+    None
 }
 
 async fn send_run_timeout(
@@ -938,10 +983,10 @@ async fn send_run_timeout(
         }),
     ] {
         let (delivered, delivered_rx) = tokio::sync::oneshot::channel();
-        let text = body.to_string();
+        let text: Utf8Bytes = body.to_string().into();
         if outgoing
             .send(OutgoingMessage {
-                message: Message::Text(text.clone().into()),
+                message: Message::Text(text.clone()),
                 delivered: Some(delivered),
                 run_delivery: None,
             })
@@ -959,7 +1004,13 @@ async fn send_run_timeout(
         if let Some(delivery) = delivery.as_ref() {
             delivery.lock().sent_error_text(&text);
         } else if let Some(observer) = active_observer.lock().clone() {
-            observer.record_debug(|| ws_wire("platform_to_client", "text", Value::String(text)));
+            observer.record_debug(|| {
+                ws_wire(
+                    "platform_to_client",
+                    "text",
+                    crate::interaction_observation::WirePayload::Bytes(text.into()),
+                )
+            });
         }
     }
     if let Some(delivery) = delivery {
@@ -1035,14 +1086,14 @@ async fn send_error(
     message: &str,
 ) -> bool {
     let body = error_body(status, code, message);
-    send_error_text(outgoing, body.to_string()).await
+    send_error_text(outgoing, body.to_string().into()).await
 }
 
-async fn send_error_text(outgoing: &mpsc::Sender<OutgoingMessage>, text: String) -> bool {
+async fn send_error_text(outgoing: &mpsc::Sender<OutgoingMessage>, text: Utf8Bytes) -> bool {
     let (delivered, delivered_rx) = tokio::sync::oneshot::channel();
     outgoing
         .send(OutgoingMessage {
-            message: Message::Text(text.into()),
+            message: Message::Text(text),
             delivered: Some(delivered),
             run_delivery: None,
         })
@@ -1069,12 +1120,13 @@ mod tests {
     #[tokio::test]
     async fn sse_bridge_forwards_json_events_without_done_sentinel() {
         let (tx, mut rx) = mpsc::channel(4);
-        let mut buffer = concat!(
+        let buffer = concat!(
             "event: response.created\n",
             "data: {\"type\":\"response.created\",\"sequence_number\":0}\n\n",
             "data: [DONE]\n\n"
         )
-        .to_string();
+        .as_bytes();
+        let mut buffer = Bytes::from_static(buffer);
         let progress = Arc::new(Mutex::new(StreamForwardProgress::default()));
         let forwarding = async { forward_sse_frames(&mut buffer, &tx, &progress, None).await };
         let receiving = async {
@@ -1094,6 +1146,39 @@ mod tests {
         assert_eq!(event, r#"{"type":"response.created","sequence_number":0}"#);
         drop(tx);
         assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn sse_bridge_preserves_crlf_unicode_order_and_partial_frame() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut buffer = Bytes::from_static(
+            "event: response.output_text.delta\r\ndata: {\"delta\":\"世界\"}\r\n\r\ndata: {\"delta\":\"next\"}\n\ndata: partial"
+                .as_bytes(),
+        );
+        let progress = Arc::new(Mutex::new(StreamForwardProgress::default()));
+        let forwarding = forward_sse_frames(&mut buffer, &tx, &progress, None);
+        let receiving = async {
+            let mut messages = Vec::new();
+            for _ in 0..2 {
+                let OutgoingMessage {
+                    message: Message::Text(event),
+                    delivered: Some(delivered),
+                    ..
+                } = rx.recv().await.expect("forwarded event")
+                else {
+                    panic!("text event with delivery acknowledgment");
+                };
+                messages.push(event);
+                delivered.send(()).expect("delivery ack receiver");
+            }
+            messages
+        };
+        let (forwarded, messages) = tokio::join!(forwarding, receiving);
+        assert!(forwarded);
+        assert_eq!(&buffer[..], b"data: partial");
+        drop(buffer);
+        assert_eq!(messages[0], r#"{"delta":"世界"}"#);
+        assert_eq!(messages[1], r#"{"delta":"next"}"#);
     }
 
     #[tokio::test]

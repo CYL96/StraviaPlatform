@@ -608,6 +608,8 @@ SQLite 与 PostgreSQL 的候选查询仍将 `(prefix_fingerprint, prefix_item_co
 
 历史指纹与精确前缀核验复用完整消息语义投影：忽略应用 `metadata`、`internal_chat_message_metadata_passthrough` 和交付身份字段，不忽略角色顺序、内容块、工具关联、推理密文、原生压缩状态或未分类协议扩展。原始 wire 字段继续保留。Gateway 初始化时按版本重建旧 Generation 前缀索引，只更新派生列；缺失祖先或过期历史撤销不可用索引，不重写原始节点或父边。
 
+同一不可变客户端投影的 context fingerprint 与 canonical 单元数一起计算，提交索引复用该计数，不再为计数重新投影正文。计算边界在输出改写、inline compaction 与 Replace 之后；不能缓存可变请求，也不能把 Provider/脱敏投影的摘要当作客户端历史摘要。发现、重放与前缀重建借用同一套语义单元，普通文本不先复制成 owned JSON。既有 JSON 键序、单元顺序、哈希域及长度前缀保持不变；长度前缀仍要求先计 JSON 字节数，再对相同字节散列，不通过保留完整序列化正文来省掉这一契约。
+
 SQLite 与 PostgreSQL 的启动重建在同一事务内先去重旧索引 head 的祖先元数据，校验完整、同 Principal、未过期的 Response 祖先链，再按父节点优先顺序逐节点读取、恢复和解码一次。`TurnChainStore::rebuild_prefixes` 的可变回调接收单个 `TurnNode` 与可选的原完成时间；无索引祖先仍参与折叠，但不新增索引，已有当前版本的祖先索引保持不变。Generation 折叠只保留每节点的客户端 context 哈希与 canonical 单元数，Append 延续父摘要，Replace 从空摘要重新计算，分支互不污染；不为每个 head 重新物化完整祖先历史，也不保留完整正文缓存。只有旧索引更新派生列，成功重建保留原完成时间；解码或存储失败回滚整个索引事务。
 
 Hook、Vendor Plugin 协议选择与 representability gate 完成后，dispatcher 才对完整 Effective Model Request 查找 Reusable Response Prefix。索引只保存已完整交付、upstream terminal 为 `completed` 且 UpstreamResponse/ClientOutput Hook 未改变输出的节点；匹配以完整 `AiItem` 边界进行，并要求 Principal、精确 Target、Provider 账号/配置、resolved model、egress protocol、instructions、tools、reasoning、response format 和其它请求控制严格一致。最长前缀优先；同长度按完成时间与节点 ID 确定性排序。无安全候选、当前 Target 不可续接或全请求相同时发送完整历史，不构造空自动 delta。
@@ -627,7 +629,7 @@ Codex HTTP 推理实际发送 `stream=true` 时，Vendor 显式选择既有 SSE 
 
 ### 4.10 Interaction Observation
 
-成功的 Generation commit 在结算时将屏障交给 RunObserver；其 `Finish` 命令同步进入 writer FIFO 后释放，使下一次 `Admit` 不越过父 Run 的完成记录。这里只约束入队顺序，不等待 Observation 持久化、flush 或最后一个 observer clone 析构。writer 满或关闭时记录 gap 并立即释放，不能让诊断失败阻塞生成进度。
+成功的 Generation commit 在结算时将屏障交给 RunObserver；其 `Finish` 命令同步进入 writer FIFO 后释放，使下一次 `Admit` 不越过父 Run 的完成记录。准入先取得 Admit、交付收据、Finish 与最终清理的容量，收据不能消耗 Finish 的保留槽；无法准入时记录 gap，不创建可能继续发送孤儿命令的 Run 投影。这里只约束入队顺序，不等待 Observation 持久化、flush 或最后一个 observer clone 析构。已确认的 Client Output Commit 随 Finish 保留，不从 HTTP 成功推断；writer 关闭或持久化失败仍只记录诊断缺口并释放屏障，不能阻塞生成进度。排队成功不等于 SQL 准入已提交，后者失败时必须撤销内存归属与未提交的输入证据。
 
 `interaction_observation` 是 Generation Chain 外部的 crate-private deep module。一个 Connect Client Interaction 通常从新的 canonical User item 开始，并容纳其客户端工具续接的 Inference Run tree。同一 Principal 下精确续接 Generation Chain parent 时，无新增 User、提交父历史中待完成工具调用的结果，或 ingress 接收时间位于父响应完整交付后 `[0, 2000]` 毫秒内，均继续原 Interaction；后两项允许夹带新增 User，工具续接不限时间，快速续接允许重新激活已完成 Interaction，但父 node 已被其他 Run 续接时不适用。其余新增 User 创建 child Interaction。归并理由只用于诊断，不证明输入来自 harness，不改变模型输入、权限或执行父边。无 parent 的失败 root 仅在同 Principal、exact canonical fingerprint、未 Client Output Commit、无并发相同 Run、两分钟内等全部条件满足时在进程内推断重试归组。推断边绝不写回 Generation Chain。
 
@@ -681,6 +683,8 @@ Trace segment 位于 data directory 下的托管 `diagnostics/observation-debug`
 检测器内置 Betterleaks 提交 `95237cf8eb4d8e9f67409595b245e674832992cf` 的 462 条规则、上游词表及许可证。Rust 编译器启动检测时核对完整快照并编译本地正则、过滤表达式、熵与组合条件；token efficiency 使用内置 `cl100k_base`。模型文本没有受信文件路径，因此文件专属条件以空路径求值。`validate` 仅保留在原始快照中，不编译、不执行；运行时不下载规则或词表。先扫描全部可读文本、补齐新秘密映射，再统一执行最长优先的单次精确替换；工具 JSON 以解码后的字符串参加检测与替换，不改写协议标识、媒体或不透明载荷。
 
 补充的 Kingfisher v1.109.0 快照固定于提交 `9ffb8969c4ad5a5c6c24e686cb252c434bc8adce`，包含全部 1,013 条规则，其中 861 条可报告、152 条隐藏辅助规则。其正则使用上游 Rust 字节模式及注释清理，秘密选择优先级为命中的 `TOKEN` 命名组、首个命名组、组 1、完整匹配。字节 Shannon 熵必须严格大于规则阈值；字符数量、排除子串、18 条内置安全列表及 14 条规则的校验和均在本地执行。校验和模板被编译为封闭的类型化运算，不引入 Liquid 或网络执行器。隐藏规则只列入目录，不产生映射；置信度不阻断保护。Betterleaks 的全局过滤仅作用于自身规则，两组规则共享最终位置报告与秘密去重，但不相互抑制命中。
+
+上面的条数是完整来源快照，不是有效执行目录。编译规则正则前仅折叠经过审阅且解析后策略完全相同的身份：`bittrex-secret-key` → `bittrex-access-key`、`kingfisher.jfrog.1` → `kingfisher.artifactory.2`、`kingfisher.plaid.3` → `kingfisher.plaid.2`。规范身份保留上游首次出现的位置与扫描优先级；当前有效目录为 Betterleaks 461 条、Kingfisher 1,011 条（860 条可报告、151 条隐藏），合计 1,472 条。原始资产、导入器及散列仍完整保留来源证据。比较包括缺省值、捕获模式、过滤、熵、requirements/checksum、可见性、specificity 与 confidence；Kingfisher 比较前采用同一注释清理。组件引用随被移除身份迁移，但同时依赖一对身份的父规则不自动折叠；任何策略差异都保留两条规则。不提供运行时别名、不重写历史事件。`kingfisher.brevo.1` 与 `kingfisher.sendinblue.1` 虽模式相同但 confidence 不同，继续保留；跨来源规则的 Unicode、全局过滤和安全列表策略不同，不作正则等价推断或跨源合并。
 
 Kingfisher 移植范围是模型文本的离线规则检测，不包含其文件发现、可选解码、Tree-sitter、数据库 URI 解析、用户安全列表、内联忽略指令或联网验证。字节正则产生的非 UTF-8 字符边界片段不作文本替换。离线快照不保留 `validation`、`revocation` 或用于联网验证的依赖绑定。开发期导入方式、来源逐文件散列和许可记录见 `backend/crates/stravia-credential-protection/tools/import_kingfisher.py` 与 `src/detection/UPSTREAM.kingfisher.json`；管理规则目录、匹配测试与正式保护使用同一个合并检测器。
 

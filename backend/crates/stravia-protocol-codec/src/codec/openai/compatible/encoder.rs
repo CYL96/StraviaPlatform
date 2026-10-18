@@ -1138,9 +1138,7 @@ fn encode_content_block_for_openai(b: ContentBlock) -> Value {
 
 fn media_source_to_url(source: MediaSource) -> String {
     match source {
-        MediaSource::Base64 { media_type, data } => {
-            format!("data:{media_type};base64,{data}")
-        }
+        MediaSource::Base64 { media_type, data } => crate::codec::media_data_url(&media_type, data),
         MediaSource::Url(url) => url,
         MediaSource::FileId { file_id, .. } => file_id,
     }

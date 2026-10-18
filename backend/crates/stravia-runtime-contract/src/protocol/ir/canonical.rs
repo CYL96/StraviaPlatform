@@ -293,8 +293,8 @@ fn history_units(item: &AiItem) -> Vec<HistoryUnit<'_>> {
 }
 
 /// Canonical semantic units of one history item, in emission order. Callers
-/// that also need the unit count should project once through this function and
-/// take `len()`, not re-project via [`history_unit_count`].
+/// that only need a digest and count should use
+/// [`append_history_context_hash_with_count`] to avoid owned text copies.
 pub fn history_item_values(item: &AiItem) -> Vec<serde_json::Value> {
     let values = if let Some(mut native) = native_compaction_item(item) {
         if let Some(fields) = native.as_object_mut() {
@@ -598,24 +598,40 @@ pub fn history_items_equal(left: &[AiItem], right: &[AiItem]) -> bool {
 }
 
 pub fn append_history_context_hash(previous: &[u8; 32], item: &AiItem) -> [u8; 32] {
-    history_units(item)
-        .into_iter()
-        .fold(*previous, |previous, value| {
-            append_history_serialized_hash(previous, &value)
-        })
+    append_history_context_hash_with_count(previous, item).0
+}
+
+/// Internal workspace projection: count and digest share the same borrowed units.
+pub fn append_history_context_hash_with_count(
+    previous: &[u8; 32],
+    item: &AiItem,
+) -> ([u8; 32], usize) {
+    let units = history_units(item);
+    let count = units.len();
+    let hash = units.into_iter().fold(*previous, |previous, value| {
+        append_history_serialized_hash(previous, &value)
+    });
+    (hash, count)
 }
 
 pub fn history_context_hash(items: &[AiItem]) -> [u8; 32] {
-    let mut digest = hash_bytes(b"stravia-generation-chain-history-v1");
-    for item in items {
-        digest = append_history_context_hash(&digest, item);
-    }
-    digest
+    history_context_hash_with_count(items).0
 }
 
-/// Folds one canonical unit value into a running context hash. Pair with
-/// [`history_item_values`] to project each item once when both the hash chain
-/// and the unit count are needed.
+/// Internal workspace projection for immutable history snapshots.
+pub fn history_context_hash_with_count(items: &[AiItem]) -> ([u8; 32], usize) {
+    let mut digest = hash_bytes(b"stravia-generation-chain-history-v1");
+    let mut count = 0;
+    for item in items {
+        let (next, units) = append_history_context_hash_with_count(&digest, item);
+        digest = next;
+        count += units;
+    }
+    (digest, count)
+}
+
+/// Folds one already-owned canonical unit value into a running context hash.
+/// For typed items, prefer [`append_history_context_hash_with_count`].
 pub fn append_history_value_hash(previous: [u8; 32], value: serde_json::Value) -> [u8; 32] {
     append_history_serialized_hash(previous, &value)
 }
@@ -1032,8 +1048,35 @@ mod tests {
             }
         }
         assert_eq!(history_context_hash(items), expected);
+        assert_eq!(history_context_hash_with_count(items), (expected, count));
+        let mut incremental = hash_bytes(b"stravia-generation-chain-history-v1");
+        let mut incremental_count = 0;
+        for item in items {
+            let (next, units) = append_history_context_hash_with_count(&incremental, item);
+            incremental = next;
+            incremental_count += units;
+        }
+        assert_eq!((incremental, incremental_count), (expected, count));
         assert_eq!(history_unit_count(items), count);
         assert_eq!(item_hashes(items), hashes);
+    }
+
+    #[test]
+    fn counted_history_matches_owned_bytes_for_empty_and_large_snapshots() {
+        assert_borrowed_history_matches_owned(&[]);
+        for length in [0, 255, 256, 65_536] {
+            let item = AiItem::output_text("\"\\\n中文🙂".repeat(length));
+            assert_borrowed_history_matches_owned(std::slice::from_ref(&item));
+            let mut changed = item.clone();
+            changed.content = MessageContent::Text("rewritten".to_owned().into());
+            assert_borrowed_history_matches_owned(std::slice::from_ref(&changed));
+            if length != 0 {
+                assert_ne!(
+                    history_context_hash_with_count(std::slice::from_ref(&item)).0,
+                    history_context_hash_with_count(std::slice::from_ref(&changed)).0,
+                );
+            }
+        }
     }
 
     #[test]

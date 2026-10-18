@@ -840,6 +840,73 @@ fn test_usage_delta_before_done() {
 }
 
 #[test]
+fn test_partial_final_usage_updates_known_initial_zero_through_accumulator() {
+    use crate::accumulator::StreamResponseAccumulator;
+
+    for (input, cache_read, cache_creation, output) in
+        [(100, 50, 200, 301), (100, 0, 0, 301), (0, 0, 0, 0)]
+    {
+        let mut parser = AnthropicStreamParser::new();
+        let mut accumulator = StreamResponseAccumulator::default();
+        let start = make_sse_block(
+            "message_start",
+            &serde_json::json!({
+                "type": "message_start",
+                "message": {
+                    "id": "usage-regression",
+                    "model": "claude",
+                    "usage": {
+                        "input_tokens": input,
+                        "output_tokens": 0,
+                        "cache_read_input_tokens": cache_read,
+                        "cache_creation_input_tokens": cache_creation
+                    }
+                }
+            })
+            .to_string(),
+        );
+        accumulator.apply_all(&parser.parse_chunk(&start).unwrap());
+        assert!(accumulator.usage.required_components_known);
+        assert_eq!(accumulator.usage.completion_tokens, 0);
+
+        let final_event = make_sse_block(
+            "message_delta",
+            &serde_json::json!({
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn"},
+                "usage": {"output_tokens": output}
+            })
+            .to_string(),
+        );
+        let final_deltas = parser.parse_chunk(&final_event).unwrap();
+        let AiStreamDelta::Usage(final_usage) = &final_deltas[0] else {
+            panic!("final usage must precede Done");
+        };
+        assert!(final_usage.required_components_known);
+        assert_eq!(final_usage.completion_tokens, output);
+        assert_eq!(
+            final_usage.prompt_tokens,
+            input + cache_read + cache_creation
+        );
+        accumulator.apply_all(&final_deltas);
+        accumulator.apply_all(&parser.finish().unwrap());
+        let response = accumulator.into_ai_response();
+        assert_eq!(response.usage.completion_tokens, output);
+        assert_eq!(
+            response.usage.prompt_tokens,
+            input + cache_read + cache_creation
+        );
+        assert_eq!(
+            response.usage.total_tokens,
+            input + cache_read + cache_creation + output
+        );
+        assert_eq!(response.usage.cache_read_tokens, Some(cache_read));
+        assert_eq!(response.usage.cache_creation_tokens, Some(cache_creation));
+        assert!(response.usage.required_components_known);
+    }
+}
+
+#[test]
 fn test_message_delta_input_tokens_read() {
     // Bug 0c: input_tokens from message_delta.usage must be captured.
     // ZhipuAI / MiniMax publish the real input count here instead of message_start.

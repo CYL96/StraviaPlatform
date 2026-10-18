@@ -1189,7 +1189,28 @@ impl ObservationStore {
                 };
                 let mut status_changed = false;
                 let mut visible = String::new();
-                for (run_event, at, kind, payload) in prepared {
+                for (run_event, at, mut kind, mut payload) in prepared {
+                    // 有界队列可能丢失父 Turn 开始；不能捏造父事实，也不能让子事件外键回滚整批。
+                    let gap;
+                    let run_event = if let RunEvent::TargetAttemptStarted {
+                        model_turn_id, ..
+                    } = run_event
+                    {
+                        let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM model_turn_observations WHERE id=? AND run_id=?)")
+                            .bind(model_turn_id).bind(run_id).fetch_one(&mut *tx).await?;
+                        if exists {
+                            run_event
+                        } else {
+                            gap = RunEvent::ObservationGap {
+                                reason: "model_turn_start_unavailable".into(),
+                            };
+                            kind = "observation_gap".into();
+                            payload = serde_json::to_value(&gap)?;
+                            &gap
+                        }
+                    } else {
+                        run_event
+                    };
                     if kind == "usage_confirmed" {
                         apply_sqlite(
                             &mut tx,
@@ -1279,7 +1300,28 @@ impl ObservationStore {
                 let mut sequences = sequences.into_iter();
                 let mut status_changed = false;
                 let mut visible = String::new();
-                for (run_event, at, kind, payload) in prepared {
+                for (run_event, at, mut kind, mut payload) in prepared {
+                    // 与 SQLite 使用同一缺口语义，检查位于事务内以观察本批已写入的父 Turn。
+                    let gap;
+                    let run_event = if let RunEvent::TargetAttemptStarted {
+                        model_turn_id, ..
+                    } = run_event
+                    {
+                        let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM model_turn_observations WHERE id=$1 AND run_id=$2)")
+                            .bind(model_turn_id).bind(run_id).fetch_one(&mut *tx).await?;
+                        if exists {
+                            run_event
+                        } else {
+                            gap = RunEvent::ObservationGap {
+                                reason: "model_turn_start_unavailable".into(),
+                            };
+                            kind = "observation_gap".into();
+                            payload = serde_json::to_value(&gap)?;
+                            &gap
+                        }
+                    } else {
+                        run_event
+                    };
                     if kind == "usage_confirmed" {
                         apply_postgres(
                             &mut tx,
@@ -2440,14 +2482,14 @@ async fn insert_event_sqlite(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     event: EventInsert<'_>,
 ) -> anyhow::Result<()> {
-    sqlx::query("INSERT INTO observation_events (sequence,occurred_at,interaction_id,run_id,rejection_id,kind,payload,expires_at,tool_id,operation_id) VALUES (?,?,?,?,?,?,?,?,?,?)").bind(event.sequence).bind(event.occurred_at).bind(event.interaction_id).bind(event.run_id).bind(event.rejection_id).bind(event.kind).bind(crate::storage_codec::encode(&serde_json::to_vec(event.payload)?)?).bind(event.expires_at).bind(event.payload.get("tool_id").and_then(Value::as_str)).bind(event.payload.get("operation_id").and_then(Value::as_str)).execute(&mut **tx).await?;
+    sqlx::query("INSERT INTO observation_events (sequence,occurred_at,interaction_id,run_id,rejection_id,kind,payload,expires_at,tool_id,operation_id) VALUES (?,?,?,?,?,?,?,?,?,?)").bind(event.sequence).bind(event.occurred_at).bind(event.interaction_id).bind(event.run_id).bind(event.rejection_id).bind(event.kind).bind(crate::storage_codec::encode(serde_json::to_vec(event.payload)?.into())?).bind(event.expires_at).bind(event.payload.get("tool_id").and_then(Value::as_str)).bind(event.payload.get("operation_id").and_then(Value::as_str)).execute(&mut **tx).await?;
     Ok(())
 }
 async fn insert_event_postgres(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     event: EventInsert<'_>,
 ) -> anyhow::Result<()> {
-    sqlx::query("INSERT INTO observation_events (sequence,occurred_at,interaction_id,run_id,rejection_id,kind,payload,expires_at,tool_id,operation_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)").bind(event.sequence).bind(event.occurred_at).bind(event.interaction_id).bind(event.run_id).bind(event.rejection_id).bind(event.kind).bind(crate::storage_codec::encode(&serde_json::to_vec(event.payload)?)?).bind(event.expires_at).bind(event.payload.get("tool_id").and_then(Value::as_str)).bind(event.payload.get("operation_id").and_then(Value::as_str)).execute(&mut **tx).await?;
+    sqlx::query("INSERT INTO observation_events (sequence,occurred_at,interaction_id,run_id,rejection_id,kind,payload,expires_at,tool_id,operation_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)").bind(event.sequence).bind(event.occurred_at).bind(event.interaction_id).bind(event.run_id).bind(event.rejection_id).bind(event.kind).bind(crate::storage_codec::encode(serde_json::to_vec(event.payload)?.into())?).bind(event.expires_at).bind(event.payload.get("tool_id").and_then(Value::as_str)).bind(event.payload.get("operation_id").and_then(Value::as_str)).execute(&mut **tx).await?;
     Ok(())
 }
 
@@ -4614,7 +4656,7 @@ mod tests {
             status_code: None,
             url: None,
             headers: Value::Null,
-            payload: Value::Null,
+            payload: Value::Null.into(),
         };
         let empty_credentials = || RunEvent::CredentialMappingsCreated {
             discoveries: Vec::new(),

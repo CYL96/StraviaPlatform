@@ -1,4 +1,5 @@
 use super::*;
+use std::borrow::Cow;
 use stravia_protocol_codec::{
     accumulator::StreamResponseAccumulator, transform::ProtocolTransform,
 };
@@ -77,9 +78,12 @@ fn invalid(e: impl std::fmt::Display) -> PluginError {
 #[derive(Default)]
 pub(super) struct Frames {
     pending: Vec<u8>,
+    consumed: usize,
 }
 impl Frames {
-    pub(super) fn push(&mut self, chunk: &[u8]) -> Result<Vec<Vec<u8>>, PluginError> {
+    pub(super) fn push(&mut self, chunk: &[u8]) -> Result<Vec<&[u8]>, PluginError> {
+        self.pending.drain(..self.consumed);
+        self.consumed = 0;
         if self.pending.len().saturating_add(chunk.len()) > MAX_BODY {
             return Err(invalid("SSE event exceeds size limit"));
         }
@@ -104,33 +108,35 @@ impl Frames {
                     1
                 };
             if pos == line_start {
-                events.push(self.pending[start..end].to_vec());
+                events.push(&self.pending[start..end]);
                 start = end;
             }
             line_start = end;
             pos = end;
         }
-        if start > 0 {
-            self.pending.drain(..start);
-        }
+        self.consumed = start;
         Ok(events)
     }
     pub(super) fn finish(&mut self) -> Vec<u8> {
+        self.pending.drain(..self.consumed);
+        self.consumed = 0;
         std::mem::take(&mut self.pending)
     }
 }
-pub(super) fn event(event: &[u8]) -> Result<(Vec<u8>, Option<AiError>), PluginError> {
+pub(super) fn event(event: &[u8]) -> Result<(Cow<'_, [u8]>, Option<AiError>), PluginError> {
     let text = std::str::from_utf8(event).map_err(invalid)?;
-    let payload = text
-        .split(['\r', '\n'])
-        .filter_map(|line| {
-            line.strip_prefix("data:")
-                .map(|v| v.strip_prefix(' ').unwrap_or(v))
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let mut lines = text.split(['\r', '\n']).filter_map(|line| {
+        line.strip_prefix("data:")
+            .map(|v| v.strip_prefix(' ').unwrap_or(v))
+    });
+    let mut payload = Cow::Borrowed(lines.next().unwrap_or_default());
+    for line in lines {
+        let payload = payload.to_mut();
+        payload.push('\n');
+        payload.push_str(line);
+    }
     if payload.is_empty() || payload == "[DONE]" {
-        return Ok((event.to_vec(), None));
+        return Ok((Cow::Borrowed(event), None));
     }
     let mut value: Value = serde_json::from_str(&payload).map_err(invalid)?;
     let failure = failure(&value);
@@ -147,7 +153,7 @@ pub(super) fn event(event: &[u8]) -> Result<(Vec<u8>, Option<AiError>), PluginEr
     } else {
         format!("data: {value}\n\n")
     };
-    Ok((wire.into_bytes(), failure))
+    Ok((Cow::Owned(wire.into_bytes()), failure))
 }
 pub(super) fn decode(
     host: &GuestHost,
@@ -191,7 +197,7 @@ pub(super) fn decode(
     let mut frames = Frames::default();
     while let Some(chunk) = response.read_body()? {
         for frame in frames.push(&chunk)? {
-            let (wire, error) = event(&frame)?;
+            let (wire, error) = event(frame)?;
             if let Some(error) = error {
                 common::emit_deltas(
                     host,

@@ -94,16 +94,16 @@ impl RunLedger {
                         return Vec::new();
                     }
                     match &item.content {
-                        MessageContent::Text(text) => vec![(ordinal, 0, text.as_ref().clone())],
+                        MessageContent::Text(text) => vec![(ordinal, 0, Arc::clone(text))],
                         MessageContent::Blocks(parts) => parts
                             .iter()
                             .enumerate()
                             .filter_map(|(part_index, part)| match part {
                                 ContentBlock::Text { text, .. } => {
-                                    Some((ordinal, part_index, text.as_ref().clone()))
+                                    Some((ordinal, part_index, Arc::clone(text)))
                                 }
                                 ContentBlock::Refusal { refusal } => {
-                                    Some((ordinal, part_index, refusal.clone()))
+                                    Some((ordinal, part_index, Arc::new(refusal.clone())))
                                 }
                                 _ => None,
                             })
