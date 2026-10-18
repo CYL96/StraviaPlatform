@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## [0.5.2] - 2026-10-18
+
 ### Added
 
 - Public `generate` and `StraviaRead` calls now return a durable `stravia://tool-executions/<id>` reference after their bounded synchronous wait (60 seconds by default), while fast calls retain their original results and errors. Query through `StraviaRead` with optional URI `wait` seconds; completed results survive restart, unfinished work is interrupted without replay, and query cancellation never cancels the original execution. MCP, explicit calls, and transparent injection share Core behavior; internal Agent reads remain synchronous. Source-request cleanup cancels and invalidates non-MCP executions without deleting independent Artifacts; MCP retains existing history policy. SQLite/PostgreSQL migration `0023` adds the durable associations and publication fences. Stop and back up the complete data directory and external database before upgrading; rollback requires restoring that backup. See [Media Generation](docs/design/media-generation.md#公开工具的等待与执行引用).
@@ -43,6 +45,7 @@
 
 ### Fixed
 
+- Updated the Chat and Codex connection-reuse acceptance fixtures to declare text output and hosted image capability explicitly, matching the current Route and Provider Model contracts without weakening eligibility checks.
 - CI formatting checks now exclude Inlang's generated `.lix` directory and accept the development launcher formatting. Model-history browser acceptance follows the populated-list toolbar while still verifying retained deleted-service history, and lets Playwright own browser-context cleanup. The real development setup acceptance has a dedicated cold-compilation budget for all workspace Vendor components; production timeouts and management-entry/CSRF checks are unchanged.
 - Gemini streaming credential restoration no longer treats response-level metadata between text fragments as a new content item. Reversible references split across chunks are restored in both delivered text and committed client history; metadata and real item boundaries remain intact.
 - Anthropic streaming usage now merges explicitly reported `message_start` and `message_delta` fields before publishing cumulative snapshots, so a final output count replaces the initial known zero without losing input or cache usage. Explicit zero revisions remain valid; missing fields do not erase known values. Rebuild Vendor components to update upstream parsing. Existing stored observations are not rewritten.

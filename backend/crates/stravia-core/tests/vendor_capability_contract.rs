@@ -3038,6 +3038,28 @@ async fn manually_installed_codex_component_reuses_one_connection_for_search_and
         .admin()
         .sync_provider_models(&provider.id)
         .await?;
+    // Static IDs do not prove hosted image support; declare the fixture's
+    // capabilities explicitly instead of relying on model-name inference.
+    let detail = harness
+        .gateway
+        .admin()
+        .get_provider_model(&provider.id, "gpt-5.4")
+        .await?;
+    let mut metadata = serde_json::to_value(&detail.metadata)?;
+    metadata["capabilities"] = json!(["infer", "search", "media_image"]);
+    metadata["modalities"] = json!({"input": ["text"], "output": ["text", "image"]});
+    harness
+        .gateway
+        .admin()
+        .update_provider_model(
+            &provider.id,
+            "gpt-5.4",
+            stravia_core::provider_models::UpdateProviderModel {
+                metadata,
+                revision: detail.revision,
+            },
+        )
+        .await?;
     let route = create_route(
         &harness.gateway,
         "codex-multi-capability",
