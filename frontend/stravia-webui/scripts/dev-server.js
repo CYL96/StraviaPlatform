@@ -29,9 +29,13 @@ try {
   const backend = spawn(
     'cargo',
     [
-      'run', '-p', 'stravia-server', '--',
+      'run',
+      '-p',
+      'stravia-server',
+      '--',
       ...[...origins].flatMap((origin) => ['--admin-origin', origin]),
-      '--trusted-proxy', '127.0.0.1',
+      '--trusted-proxy',
+      '127.0.0.1',
     ],
     { cwd: repositoryRoot, stdio: 'inherit' },
   )

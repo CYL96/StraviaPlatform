@@ -9,7 +9,8 @@ import { once } from 'node:events'
 import type { ModelChangePage, Provider, ProviderModelSyncState } from '../src/lib/types'
 
 test('real backend records discovery, manual policy, failure and retained deleted-service history', async ({
-  browser,
+  context,
+  page,
 }) => {
   test.setTimeout(120_000)
   const directory = await mkdtemp(join(tmpdir(), 'stravia-model-history-browser-'))
@@ -83,7 +84,6 @@ test('real backend records discovery, manual policy, failure and retained delete
       reject(new Error(`Server exited before readiness: ${code}`))
     })
   })
-  const context = await browser.newContext()
   try {
     const { origin, token } = await ready
     const api = async <T>(path: string, method = 'GET', body?: unknown): Promise<T> => {
@@ -102,8 +102,10 @@ test('real backend records discovery, manual policy, failure and retained delete
       password: 'isolated model history password',
       client_base_url: origin,
     })
-    await context.addInitScript(() => localStorage.setItem('stravia-locale', 'en-US'))
-    const page = await context.newPage()
+    await context.addInitScript(() => {
+      if (location.protocol === 'http:' || location.protocol === 'https:')
+        localStorage.setItem('stravia-locale', 'en-US')
+    })
     await page.goto(`${origin}/login`)
     await page.locator('#admin-username').fill('admin')
     await page.locator('input[autocomplete="current-password"]').fill('isolated model history password')
@@ -159,26 +161,39 @@ test('real backend records discovery, manual policy, failure and retained delete
     const models = await api<{ models: Array<{ id: string }> }>(`/providers/${provider.id}/models`)
     expect(models.models.map((model) => model.id)).toContain('second-synthetic')
     await api(`/providers/${provider.id}`, 'DELETE')
+    const retained = await api<ModelChangePage>(`/model-changes?provider_id=${provider.id}`)
+    expect(retained.records).toEqual(
+      expect.arrayContaining([expect.objectContaining({ id: initial.records[0].id, provider_deleted: true })]),
+    )
+    // Browse deleted-service history from the normal, nonempty list toolbar.
+    await api('/providers', 'POST', {
+      name: 'Remaining browser service',
+      source: {
+        type: 'custom',
+        vendor: 'custom',
+        channel: 'default',
+        protocol: 'openai-compatible',
+        base_url: upstreamOrigin,
+      },
+      credential: { type: 'none' },
+    })
     await page.goto(`${origin}/providers`)
-    // Empty configured lists still offer retained global history.
     await page.getByRole('button', { name: 'Change history', exact: true }).click()
     await expect(page.getByRole('dialog')).toContainText('Browser history service')
     await expect(page.getByRole('dialog')).toContainText('Provider deleted')
   } finally {
+    // Playwright owns the context and closes it in fixture teardown, outside the
+    // test's expired timeout budget. Closing it here can replace the real error.
     try {
-      if (browser.isConnected()) await context.close()
+      upstream.closeAllConnections()
+      if (upstream.listening)
+        await new Promise<void>((done, reject) => upstream.close((error) => (error ? reject(error) : done())))
     } finally {
+      if (server.exitCode === null) server.kill()
       try {
-        upstream.closeAllConnections()
-        if (upstream.listening)
-          await new Promise<void>((done, reject) => upstream.close((error) => (error ? reject(error) : done())))
+        await closed
       } finally {
-        if (server.exitCode === null) server.kill()
-        try {
-          await closed
-        } finally {
-          await rm(directory, { recursive: true, force: true })
-        }
+        await rm(directory, { recursive: true, force: true })
       }
     }
   }

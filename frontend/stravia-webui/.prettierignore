@@ -4,5 +4,6 @@ dist-desktop-e2e/
 node_modules/
 src/lib/paraglide/
 test-results/
+project.inlang/.lix/
 project.inlang/.meta.json
 project.inlang/README.md

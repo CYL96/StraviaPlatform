@@ -146,6 +146,9 @@ def test_development_task_accepts_vite_origin_without_bypassing_csrf(
             "POST", "/api/v1/setup/claim", {"token": token}, headers={"origin": origin},
         )
         assert status == 204, body
+        # 真正的开发任务冷编译完整 manifest（base 和全部专属插件），不同于生产/
+        # 常规 E2E 的内嵌组件集合；双 CPU 实测约 270 秒，留出 CI 调度余量。
+        development_setup_timeout = 600.0
         status, body = operator.request(
             "POST", "/api/v1/setup/complete",
             {
@@ -153,7 +156,7 @@ def test_development_task_accepts_vite_origin_without_bypassing_csrf(
                 "database": {"backend": "sqlite"},
                 "username": "owner", "password": "correct horse battery staple",
             },
-            headers={"origin": origin}, timeout=SERVER_STARTUP_TIMEOUT,
+            headers={"origin": origin}, timeout=development_setup_timeout,
         )
         assert status == 200, body
         for candidate in accessible_origins:
