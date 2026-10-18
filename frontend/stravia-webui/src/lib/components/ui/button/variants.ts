@@ -1,7 +1,7 @@
 import { type VariantProps, tv } from 'tailwind-variants'
 import type { HTMLAnchorAttributes, HTMLButtonAttributes } from 'svelte/elements'
 
-import type { WithElementRef } from '$lib/utils.js'
+import type { WithElementRef } from '#lib/utils.js'
 
 export const buttonVariants = tv({
   base: "rounded-lg border border-transparent bg-clip-padding text-sm font-medium focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 active:not-aria-[haspopup]:scale-[0.96] aria-invalid:border-destructive aria-invalid:ring-3 aria-invalid:ring-destructive/20 dark:aria-invalid:border-destructive/50 dark:aria-invalid:ring-destructive/40 [&_svg:not([class*='size-'])]:size-4 group/button inline-flex shrink-0 items-center justify-center whitespace-nowrap transition-[background-color,border-color,color,box-shadow,transform,opacity] duration-[140ms] ease-[cubic-bezier(0.2,0,0,1)] outline-none select-none disabled:pointer-events-none disabled:opacity-50 [&_svg]:pointer-events-none [&_svg]:shrink-0",

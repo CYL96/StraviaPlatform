@@ -1,25 +1,31 @@
 <script lang="ts">
 import type { Snippet } from 'svelte'
-import * as m from '$lib/paraglide/messages.js'
+import * as m from '#lib/paraglide/messages.js'
 import DownloadIcon from '@lucide/svelte/icons/download'
 import XIcon from '@lucide/svelte/icons/x'
 import ChevronRightIcon from '@lucide/svelte/icons/chevron-right'
 
-import { formatDuration, formatLogTime, formatNumber, formatTps } from '$lib/format'
-import ObservationConversation from '$lib/components/observation-conversation.svelte'
-import ObservationLogViewport from '$lib/components/observation-log-viewport.svelte'
-import RequestFailure from '$lib/components/request-failure.svelte'
-import TechnicalValue from '$lib/components/technical-value.svelte'
-import { failureOriginLabel, observationDebugStatusLabel, observationStatusLabel } from '$lib/observation-labels'
-import { interactionDisplayStatus } from '$lib/observation-chain-visibility'
-import { observationEventSummary, observationStatusTone } from '$lib/observation-event-summary'
-import { deriveTimeline, itemEvents, itemKey, processGroup, type StreamItem } from '$lib/observation-timeline'
-import type { InteractionDetail, LiveContentBlock, ObservationEvent, RunDetail, FailedRequestDetail } from '$lib/types'
-import { Button } from '$lib/components/ui/button'
-import * as Empty from '$lib/components/ui/empty'
-import * as Tabs from '$lib/components/ui/tabs'
-import * as Alert from '$lib/components/ui/alert'
-import * as Collapsible from '$lib/components/ui/collapsible'
+import { formatDuration, formatLogTime, formatNumber, formatTps } from '#lib/format.js'
+import ObservationConversation from '#lib/components/observation-conversation.svelte'
+import ObservationLogViewport from '#lib/components/observation-log-viewport.svelte'
+import RequestFailure from '#lib/components/request-failure.svelte'
+import TechnicalValue from '#lib/components/technical-value.svelte'
+import { failureOriginLabel, observationDebugStatusLabel, observationStatusLabel } from '#lib/observation-labels.js'
+import { interactionDisplayStatus } from '#lib/observation-chain-visibility.js'
+import { observationEventSummary, observationStatusTone } from '#lib/observation-event-summary.js'
+import { deriveTimeline, itemEvents, itemKey, processGroup, type StreamItem } from '#lib/observation-timeline.js'
+import type {
+  InteractionDetail,
+  LiveContentBlock,
+  ObservationEvent,
+  RunDetail,
+  FailedRequestDetail,
+} from '#lib/types.js'
+import { Button } from '#lib/components/ui/button/index.js'
+import * as Empty from '#lib/components/ui/empty/index.js'
+import * as Tabs from '#lib/components/ui/tabs/index.js'
+import * as Alert from '#lib/components/ui/alert/index.js'
+import * as Collapsible from '#lib/components/ui/collapsible/index.js'
 
 interface Props {
   interaction?: InteractionDetail

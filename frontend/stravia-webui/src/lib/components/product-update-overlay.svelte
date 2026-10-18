@@ -1,24 +1,21 @@
 <script lang="ts">
-import { browser } from '$app/environment'
-import * as m from '$lib/paraglide/messages.js'
+import { browser } from '$app/env'
+import * as m from '#lib/paraglide/messages.js'
 import { onDestroy, untrack } from 'svelte'
 import { toast } from 'svelte-sonner'
-
-import UpdateNotification from '$lib/components/update-notification.svelte'
-import * as Alert from '$lib/components/ui/alert'
-
-import { Button } from '$lib/components/ui/button'
-import * as Dialog from '$lib/components/ui/dialog'
-import { Spinner } from '$lib/components/ui/spinner'
-import { openExternalUrl } from '$lib/open-external'
-import { supportsInAppInstallProgress } from '$lib/product-update'
-import { getProductUpdateCoordinator } from '$lib/product-update.svelte'
+import UpdateNotification from '#lib/components/update-notification.svelte'
+import * as Alert from '#lib/components/ui/alert/index.js'
+import { Button } from '#lib/components/ui/button/index.js'
+import * as Dialog from '#lib/components/ui/dialog/index.js'
+import { Spinner } from '#lib/components/ui/spinner/index.js'
+import { openExternalUrl } from '#lib/open-external.js'
+import { supportsInAppInstallProgress } from '#lib/product-update.js'
+import { getProductUpdateCoordinator } from '#lib/product-update.svelte.js'
 
 const updates = getProductUpdateCoordinator()
 const showInstallingOverlay = $derived(
   updates.state.phase === 'installing' && supportsInAppInstallProgress(browser ? navigator.userAgent : ''),
 )
-
 const notificationId = 'product-update-available'
 
 // Sonner 只承接展示，关闭通知与跳过版本的规则仍由更新协调器持有。

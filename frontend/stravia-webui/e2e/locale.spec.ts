@@ -1,5 +1,7 @@
 import { expect, test, type Page } from '@playwright/test'
 
+import { prepareApp } from './prepare-app'
+
 test.use({ timezoneId: 'Asia/Shanghai' })
 
 async function prepareLocalePage(page: Page, languages: string[], savedLocale?: string): Promise<void> {
@@ -95,6 +97,7 @@ test('Login switches language without navigation or losing form state', async ({
 
 test('Settings uses the shared language selector and updates immediately', async ({ page }) => {
   await prepareLocalePage(page, ['en-US'], 'en-US')
+  await prepareApp(page)
   await page.goto('/settings')
 
   await expect(page.getByRole('heading', { name: 'Settings', exact: true })).toBeVisible()

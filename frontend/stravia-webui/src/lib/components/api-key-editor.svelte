@@ -1,26 +1,27 @@
 <script lang="ts">
-import * as m from '$lib/paraglide/messages.js'
+import * as m from '#lib/paraglide/messages.js'
 import { resolve } from '$app/paths'
 import { useQueryClient } from '@tanstack/svelte-query'
 import ChevronsUpDownIcon from '@lucide/svelte/icons/chevrons-up-down'
 import CopyIcon from '@lucide/svelte/icons/copy'
 import { toast } from 'svelte-sonner'
+import { admin } from '#lib/admin-client.js'
+import { localizeBackendErrorMessage } from '#lib/backend-error.js'
 
-import { admin } from '$lib/admin-client'
-import { localizeBackendErrorMessage } from '$lib/backend-error'
-import { effectiveModelDisplayName, logicalModelSecondaryId, sortLogicalModels } from '$lib/logical-model'
-import type { ApiKey, Route } from '$lib/types'
-import PageHeader from '$lib/components/page-header.svelte'
-import * as Field from '$lib/components/ui/field'
-import { Button, buttonVariants } from '$lib/components/ui/button'
-import * as Command from '$lib/components/ui/command'
-import SecretInput from '$lib/components/secret-input.svelte'
-import * as InputGroup from '$lib/components/ui/input-group'
-import { Input } from '$lib/components/ui/input'
-import * as Popover from '$lib/components/ui/popover'
-import * as Sheet from '$lib/components/ui/sheet'
-import { Spinner } from '$lib/components/ui/spinner'
-import { Switch } from '$lib/components/ui/switch'
+import { effectiveModelDisplayName, logicalModelSecondaryId, sortLogicalModels } from '#lib/logical-model.js'
+
+import type { ApiKey, Route } from '#lib/types.js'
+import PageHeader from '#lib/components/page-header.svelte'
+import * as Field from '#lib/components/ui/field/index.js'
+import { Button, buttonVariants } from '#lib/components/ui/button/index.js'
+import * as Command from '#lib/components/ui/command/index.js'
+import SecretInput from '#lib/components/secret-input.svelte'
+import * as InputGroup from '#lib/components/ui/input-group/index.js'
+import { Input } from '#lib/components/ui/input/index.js'
+import * as Popover from '#lib/components/ui/popover/index.js'
+import * as Sheet from '#lib/components/ui/sheet/index.js'
+import { Spinner } from '#lib/components/ui/spinner/index.js'
+import { Switch } from '#lib/components/ui/switch/index.js'
 
 interface KeyForm {
   key: string
@@ -58,6 +59,7 @@ let {
   presentation = 'sheet',
   onSaved,
 }: Props = $props()
+
 const queryClient = useQueryClient()
 let form = $state(keyForm())
 let saving = $state(false)
@@ -342,10 +344,9 @@ async function saveKey(): Promise<void> {
               </Field.Label>
               {#if !mediaUnderstandingEnabled}
                 <a
-                  href={resolve('/media-understanding')}
-                  class="text-sm text-muted-foreground underline underline-offset-2 hover:text-foreground">
-                  {m.api_key_editor_platform_capability_disabled()}
-                </a>
+                  href={resolve('media-understanding')}
+                  class="text-sm text-muted-foreground underline underline-offset-2 hover:text-foreground"
+                  >{m.api_key_editor_platform_capability_disabled()}</a>
               {/if}
             </Field.Content>
           </Field.Field>
@@ -362,10 +363,9 @@ async function saveKey(): Promise<void> {
               </Field.Label>
               {#if mediaGenerationStatus === 'disabled'}
                 <a
-                  href={resolve('/media-generation')}
-                  class="text-sm text-muted-foreground underline underline-offset-2 hover:text-foreground">
-                  {m.api_key_editor_platform_capability_disabled()}
-                </a>
+                  href={resolve('media-generation')}
+                  class="text-sm text-muted-foreground underline underline-offset-2 hover:text-foreground"
+                  >{m.api_key_editor_platform_capability_disabled()}</a>
               {:else if mediaGenerationStatus === 'loading'}
                 <span class="text-sm text-muted-foreground" role="status">{m.common_settings_loading()}</span>
               {:else if mediaGenerationStatus === 'unavailable'}
@@ -387,10 +387,9 @@ async function saveKey(): Promise<void> {
               </Field.Label>
               {#if !webSearchEnabled}
                 <a
-                  href={resolve('/web-search')}
-                  class="text-sm text-muted-foreground underline underline-offset-2 hover:text-foreground">
-                  {m.api_key_editor_platform_capability_disabled()}
-                </a>
+                  href={resolve('web-search')}
+                  class="text-sm text-muted-foreground underline underline-offset-2 hover:text-foreground"
+                  >{m.api_key_editor_platform_capability_disabled()}</a>
               {/if}
             </Field.Content>
           </Field.Field>
@@ -419,7 +418,8 @@ async function saveKey(): Promise<void> {
       </section>
       <div
         class="sticky bottom-0 z-20 mt-auto flex translate-y-2 justify-end gap-2 border-t bg-background py-2 after:absolute after:inset-x-0 after:top-full after:h-2 after:bg-background after:content-['']">
-        <Button href={resolve('/api-keys')} variant="outline">{m.common_cancel()}</Button>
+        <Button href={resolve('api-keys')} variant="outline">{m.common_cancel()}</Button>
+
         <Button type="submit" disabled={saving}>
           {#if saving}<Spinner data-icon="inline-start" />{/if}{m.api_key_editor_save_api_key()}
         </Button>

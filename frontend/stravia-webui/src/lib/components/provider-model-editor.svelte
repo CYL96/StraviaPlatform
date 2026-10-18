@@ -1,16 +1,16 @@
 <script lang="ts">
-import * as m from '$lib/paraglide/messages.js'
+import * as m from '#lib/paraglide/messages.js'
 import ChevronRightIcon from '@lucide/svelte/icons/chevron-right'
 import PlusIcon from '@lucide/svelte/icons/plus'
 import Trash2Icon from '@lucide/svelte/icons/trash-2'
 import { tick, untrack } from 'svelte'
 
-import { specificationReasoningEfforts } from '$lib/model-specification'
-import FormSection from '$lib/components/form-section.svelte'
-import ModalitySelect from '$lib/components/modality-select.svelte'
-import { localeState } from '$lib/localization.svelte'
-import { providerModelSelectionPolicyLabel } from '$lib/provider-model-labels'
-import type { ProviderModelDetail, ProviderModelMetadata, ProviderModelSelectionPolicy } from '$lib/types'
+import { specificationReasoningEfforts } from '#lib/model-specification.js'
+import FormSection from '#lib/components/form-section.svelte'
+import ModalitySelect from '#lib/components/modality-select.svelte'
+import { localeState } from '#lib/localization.svelte.js'
+import { providerModelSelectionPolicyLabel } from '#lib/provider-model-labels.js'
+import type { ProviderModelDetail, ProviderModelMetadata, ProviderModelSelectionPolicy } from '#lib/types.js'
 import {
   buildProviderModelMetadataJson,
   emptyProviderModelCost,
@@ -21,14 +21,14 @@ import {
   type ProviderModelCostForm,
   type ProviderModelPriceForm,
 } from './provider-model-form.js'
-import { Button } from '$lib/components/ui/button'
-import * as Alert from '$lib/components/ui/alert'
-import * as Collapsible from '$lib/components/ui/collapsible'
-import * as Field from '$lib/components/ui/field'
-import { Input } from '$lib/components/ui/input'
-import * as Select from '$lib/components/ui/select'
-import { Textarea } from '$lib/components/ui/textarea'
-import { inputValue } from '$lib/utils.js'
+import { Button } from '#lib/components/ui/button/index.js'
+import * as Alert from '#lib/components/ui/alert/index.js'
+import * as Collapsible from '#lib/components/ui/collapsible/index.js'
+import * as Field from '#lib/components/ui/field/index.js'
+import { Input } from '#lib/components/ui/input/index.js'
+import * as Select from '#lib/components/ui/select/index.js'
+import { Textarea } from '#lib/components/ui/textarea/index.js'
+import { inputValue } from '#lib/utils.js'
 
 interface Props {
   detail: ProviderModelDetail

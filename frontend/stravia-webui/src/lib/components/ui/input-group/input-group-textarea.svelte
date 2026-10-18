@@ -1,7 +1,7 @@
 <script lang="ts">
-import { Textarea } from '$lib/components/ui/textarea/index.js'
-import { cn } from '$lib/utils.js'
-import type { TextareaProps } from '$lib/components/ui/textarea/props.js'
+import { Textarea } from '#lib/components/ui/textarea/index.js'
+import { cn } from '#lib/utils.js'
+import type { TextareaProps } from '#lib/components/ui/textarea/props.js'
 
 let { ref = $bindable(null), value = $bindable(), class: className, ...props }: TextareaProps = $props()
 </script>

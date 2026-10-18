@@ -1,25 +1,25 @@
 <script lang="ts">
-import * as m from '$lib/paraglide/messages.js'
+import * as m from '#lib/paraglide/messages.js'
 import { resolve } from '$app/paths'
 import { createQuery, useQueryClient } from '@tanstack/svelte-query'
 import { toast } from 'svelte-sonner'
-
-import { admin } from '$lib/admin-client'
-import { localizeBackendErrorMessage } from '$lib/backend-error'
-import type { MediaGenerationConfig, MediaGenerationConfigView } from '$lib/types'
-import PageHeader from '$lib/components/page-header.svelte'
-import RequestFailure from '$lib/components/request-failure.svelte'
-import * as Alert from '$lib/components/ui/alert'
-import { Badge } from '$lib/components/ui/badge'
-import { Button } from '$lib/components/ui/button'
-import * as Field from '$lib/components/ui/field'
-import * as Select from '$lib/components/ui/select'
-import { Skeleton } from '$lib/components/ui/skeleton'
-import { Spinner } from '$lib/components/ui/spinner'
-import { Switch } from '$lib/components/ui/switch'
+import { admin } from '#lib/admin-client.js'
+import { localizeBackendErrorMessage } from '#lib/backend-error.js'
+import type { MediaGenerationConfig, MediaGenerationConfigView } from '#lib/types.js'
+import PageHeader from '#lib/components/page-header.svelte'
+import RequestFailure from '#lib/components/request-failure.svelte'
+import * as Alert from '#lib/components/ui/alert/index.js'
+import { Badge } from '#lib/components/ui/badge/index.js'
+import { Button } from '#lib/components/ui/button/index.js'
+import * as Field from '#lib/components/ui/field/index.js'
+import * as Select from '#lib/components/ui/select/index.js'
+import { Skeleton } from '#lib/components/ui/skeleton/index.js'
+import { Spinner } from '#lib/components/ui/spinner/index.js'
+import { Switch } from '#lib/components/ui/switch/index.js'
 
 const UNBOUND_ROUTE = '__media_generation_unbound__'
 const queryClient = useQueryClient()
+
 const configQuery = createQuery(() => ({
   queryKey: ['media-generation-config'],
   queryFn: admin.mediaGeneration.config.get,
@@ -35,7 +35,6 @@ let toggleSaving = $state(false)
 let toggleError = $state('')
 let saving = $state(false)
 let saveError = $state('')
-
 const eligibleRoutes = $derived(eligibleRoutesQuery.data ?? [])
 const savedRouteId = $derived(configQuery.data?.config.image.route_id ?? null)
 const hasChanges = $derived(Boolean(configQuery.data) && routeId !== savedRouteId)
@@ -44,13 +43,18 @@ const savedConfigurationValid = $derived(
 )
 const canSave = $derived(Boolean(configQuery.data) && hasChanges && !saving && !toggleSaving)
 const selectedRoute = $derived(eligibleRoutes.find((route) => route.id === routeId))
+
 const selectedRouteLabel = $derived(routeId ? selectedRoute?.name || routeId : m.media_generation_no_route())
+
 const validationMessage = $derived.by(() => {
   const validation = configQuery.data?.validation
+
   if (!validation || validation.valid) return ''
   if (!validation.code) return validation.message?.trim() ?? ''
+
   return localizeBackendErrorMessage({ code: validation.code, message: validation.message ?? undefined })
 })
+
 const validationNeedsProvider = $derived(
   configQuery.data?.validation.code === 'media_generation_provider_missing' ||
     configQuery.data?.validation.code === 'media_generation_target_incompatible',
@@ -58,7 +62,9 @@ const validationNeedsProvider = $derived(
 
 $effect(() => {
   const view = configQuery.data
+
   if (!view || initialized) return
+
   routeId = view.config.image.route_id
   initialized = true
 })
@@ -69,6 +75,7 @@ function updateCachedConfig(view: MediaGenerationConfigView): void {
 
 async function toggleEnabled(enabled: boolean): Promise<void> {
   const current = configQuery.data
+
   if (
     !current ||
     saving ||
@@ -93,10 +100,12 @@ async function toggleEnabled(enabled: boolean): Promise<void> {
 
 async function saveRoute(): Promise<void> {
   const current = configQuery.data
+
   if (!current || !canSave) return
 
   saving = true
   saveError = ''
+
   try {
     const input: MediaGenerationConfig = {
       enabled: current.config.enabled && Boolean(routeId),
@@ -183,13 +192,12 @@ async function clearReference(): Promise<void> {
             <Alert.Description>
               <p>{validationMessage || m.media_generation_route_required()}</p>
               <div class="flex flex-wrap gap-2">
-                <Button href={resolve('/models')} variant="outline" size="sm">
-                  {m.media_generation_manage_routes()}
-                </Button>
+                <Button href={resolve('models')} variant="outline" size="sm"
+                  >{m.media_generation_manage_routes()}</Button>
+
                 {#if validationNeedsProvider}
-                  <Button href={resolve('/providers')} variant="outline" size="sm">
-                    {m.media_generation_manage_model_services()}
-                  </Button>
+                  <Button href={resolve('providers')} variant="outline" size="sm"
+                    >{m.media_generation_manage_model_services()}</Button>
                 {/if}
               </div>
             </Alert.Description>

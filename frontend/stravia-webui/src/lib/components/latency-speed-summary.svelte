@@ -1,10 +1,10 @@
 <script lang="ts">
 import CircleHelpIcon from '@lucide/svelte/icons/circle-help'
 
-import * as m from '$lib/paraglide/messages.js'
-import { formatNumber } from '$lib/format'
-import type { StatsOverview } from '$lib/types'
-import * as Tooltip from '$lib/components/ui/tooltip'
+import * as m from '#lib/paraglide/messages.js'
+import { formatNumber } from '#lib/format.js'
+import type { StatsOverview } from '#lib/types.js'
+import * as Tooltip from '#lib/components/ui/tooltip/index.js'
 
 let { overview }: { overview?: Pick<StatsOverview, 'avg_first_token_ms' | 'avg_output_tps'> } = $props()
 const hintId = $props.id()

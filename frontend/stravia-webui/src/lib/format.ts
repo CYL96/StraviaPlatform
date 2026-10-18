@@ -1,4 +1,4 @@
-import { getLocale, type Locale } from '$lib/paraglide/runtime.js'
+import { getLocale, type Locale } from '#lib/paraglide/runtime.js'
 
 type DateInput = Date | number | string | null | undefined
 

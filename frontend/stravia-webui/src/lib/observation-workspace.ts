@@ -1,7 +1,7 @@
-import { CanvasLinkIndex } from '$lib/interaction-canvas-links'
-import { hiddenFailureNode } from '$lib/observation-chain-visibility'
-import { mergeObservationRuns, retainLiveBlocks, withoutCommittedBlocks } from '$lib/observation-state'
-import type { ObservationSubscription } from '$lib/observation-stream'
+import { CanvasLinkIndex } from '#lib/interaction-canvas-links.js'
+import { hiddenFailureNode } from '#lib/observation-chain-visibility.js'
+import { mergeObservationRuns, retainLiveBlocks, withoutCommittedBlocks } from '#lib/observation-state.js'
+import type { ObservationSubscription } from '#lib/observation-stream.js'
 import type {
   BundleResourceKind,
   FailedRequestDetail,
@@ -20,7 +20,7 @@ import type {
   ObservationLiveUpdate,
   RootChangesQuery,
   RootChangesPage,
-} from '$lib/types/observation'
+} from '#lib/types/observation.js'
 
 export const OBSERVATION_BATCH_SIZE = 12
 export const OBSERVATION_MAX_WINDOW_MS = 86_400_000

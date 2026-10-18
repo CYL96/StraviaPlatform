@@ -1,6 +1,6 @@
-import * as m from '$lib/paraglide/messages.js'
-import { priorityLanes } from '$lib/components/route-targets-form'
-import type { Provider, Route, RouteSelectionStrategy, Target } from '$lib/types'
+import * as m from '#lib/paraglide/messages.js'
+import { priorityLanes } from '#lib/components/route-targets-form.js'
+import type { Provider, Route, RouteSelectionStrategy, Target } from '#lib/types.js'
 
 export type TargetUnavailableReason =
   'provider_disabled' | 'credential_invalid' | 'allowance_suspended' | 'output_modality_mismatch'

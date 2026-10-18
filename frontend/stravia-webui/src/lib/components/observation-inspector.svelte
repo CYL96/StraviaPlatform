@@ -1,10 +1,10 @@
 <script lang="ts">
-import * as m from '$lib/paraglide/messages.js'
+import * as m from '#lib/paraglide/messages.js'
 import { onDestroy } from 'svelte'
 import { MediaQuery } from 'svelte/reactivity'
-import type { InteractionDetail, LiveContentBlock, FailedRequestDetail } from '$lib/types'
-import ObservationInspectorContent from '$lib/components/observation-inspector-content.svelte'
-import * as Sheet from '$lib/components/ui/sheet'
+import type { InteractionDetail, LiveContentBlock, FailedRequestDetail } from '#lib/types.js'
+import ObservationInspectorContent from '#lib/components/observation-inspector-content.svelte'
+import * as Sheet from '#lib/components/ui/sheet/index.js'
 
 interface Props {
   interaction?: InteractionDetail

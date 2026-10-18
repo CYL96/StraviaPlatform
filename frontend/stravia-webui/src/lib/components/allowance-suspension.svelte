@@ -1,10 +1,10 @@
 <script lang="ts">
-import * as m from '$lib/paraglide/messages.js'
-import type { AllowanceSuspension } from '$lib/types/provider-allowance'
-import { formatLogTime } from '$lib/format'
-import { localeState } from '$lib/localization.svelte'
-import StatusIndicator from '$lib/components/status-indicator.svelte'
-import * as Tooltip from '$lib/components/ui/tooltip'
+import * as m from '#lib/paraglide/messages.js'
+import type { AllowanceSuspension } from '#lib/types/provider-allowance.js'
+import { formatLogTime } from '#lib/format.js'
+import { localeState } from '#lib/localization.svelte.js'
+import StatusIndicator from '#lib/components/status-indicator.svelte'
+import * as Tooltip from '#lib/components/ui/tooltip/index.js'
 let { suspension }: { suspension: AllowanceSuspension } = $props()
 const hintId = $props.id()
 let open = $state(false)

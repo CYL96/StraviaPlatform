@@ -444,7 +444,6 @@ mod tests {
                 elements,
                 ..Default::default()
             }],
-            ..Default::default()
         };
         let mut out = Cursor::new(Vec::new());
         office_oxide::create::create_from_ir_to_writer(

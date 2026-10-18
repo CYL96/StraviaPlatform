@@ -1,4 +1,4 @@
-import * as m from '$lib/paraglide/messages.js'
+import * as m from '#lib/paraglide/messages.js'
 import AudioLinesIcon from '@lucide/svelte/icons/audio-lines'
 import FileQuestionIcon from '@lucide/svelte/icons/file-question'
 import FileTextIcon from '@lucide/svelte/icons/file-text'
@@ -6,7 +6,7 @@ import ImageIcon from '@lucide/svelte/icons/image'
 import TypeIcon from '@lucide/svelte/icons/type'
 import VideoIcon from '@lucide/svelte/icons/video'
 
-import { formatNumber } from '$lib/format'
+import { formatNumber } from '#lib/format.js'
 
 export function formatSpecificationTokens(value: number): string {
   if (value >= 1_000_000 && value % 10_000 === 0) return `${value / 1_000_000}M`

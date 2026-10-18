@@ -1,6 +1,6 @@
 import { createContext } from 'svelte'
 
-import { ProductUpdateController } from '$lib/product-update'
+import { ProductUpdateController } from '#lib/product-update.js'
 import type {
   AvailableUpdate,
   DesktopUpdateBridge,
@@ -9,7 +9,7 @@ import type {
   UpdateApi,
   UpdateCheckStatus,
   UpdateStatus,
-} from '$lib/product-update'
+} from '#lib/product-update.js'
 
 export type {
   AvailableUpdate,
@@ -22,8 +22,8 @@ export type {
   UpdateCheckStatus,
   UpdateFailure,
   UpdateStatus,
-} from '$lib/product-update'
-export { createDesktopUpdateBridge } from '$lib/product-update'
+} from '#lib/product-update.js'
+export { createDesktopUpdateBridge } from '#lib/product-update.js'
 
 const initialViewState: ProductUpdateViewState = {
   phase: 'idle',

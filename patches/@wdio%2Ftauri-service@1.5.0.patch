@@ -1,8 +1,10 @@
 diff --git a/dist/cjs/index.js b/dist/cjs/index.js
-index c14f1e3d83824dbc24a130c7aab60572036650be..bfabb4de4b9fb1020fd50fcbbea195a1a523dfac 100644
+index 7707403ba38c4493db29a82e50802051f58d64e0..dad21959f03659c037b1b62037a4d599c4441388 100644
 --- a/dist/cjs/index.js
 +++ b/dist/cjs/index.js
-@@ -1681,16 +1681,17 @@ async function findMsEdgeDriver() {
+@@ -1674,18 +1674,19 @@ async function findMsEdgeDriver() {
+     }
+     try {
          // Try to find in PATH
 -        const { stdout: pathResult } = await execAsync('where msedgedriver.exe 2>nul', {
 +        const { stdout: pathResult } = await execFileAsync('where.exe', ['msedgedriver.exe'], {
@@ -11,7 +13,7 @@ index c14f1e3d83824dbc24a130c7aab60572036650be..bfabb4de4b9fb1020fd50fcbbea195a1
 -        const driverPath = pathResult.trim().split('\n')[0];
 +        // where.exe emits CRLF; trim each selected path, not only the complete output.
 +        const driverPath = pathResult.split(/\r?\n/)[0].trim();
-         if (driverPath && existsSync(driverPath)) {
+         if (driverPath && node_fs.existsSync(driverPath)) {
              // Get version
              try {
 -                const { stdout: versionOutput } = await execAsync(`"${driverPath}" --version`, {
@@ -25,10 +27,12 @@ index c14f1e3d83824dbc24a130c7aab60572036650be..bfabb4de4b9fb1020fd50fcbbea195a1
                      log$7.debug(`Found msedgedriver ${match[1]} at ${driverPath}`);
                      return { path: driverPath, version: match[1] };
 diff --git a/dist/esm/index.js b/dist/esm/index.js
-index 7f49bdefae0380e164bfb2c8a149288cc80193ad..6002575413db7c775e17fb594cd256d4d839858b 100644
+index daf24be418bf9009ae5076595add15a1affe6af6..82a578d62751d6c114fb7ad4ac9764d67d10da44 100644
 --- a/dist/esm/index.js
 +++ b/dist/esm/index.js
-@@ -1677,16 +1677,17 @@ async function findMsEdgeDriver() {
+@@ -1670,18 +1670,19 @@ async function findMsEdgeDriver() {
+     }
+     try {
          // Try to find in PATH
 -        const { stdout: pathResult } = await execAsync('where msedgedriver.exe 2>nul', {
 +        const { stdout: pathResult } = await execFileAsync('where.exe', ['msedgedriver.exe'], {

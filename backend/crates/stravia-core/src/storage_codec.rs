@@ -126,6 +126,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn decodes_existing_v1_zstd_payload() -> anyhow::Result<()> {
+        // 由 zstd 0.13.3 的实际 encode 路径生成；固定旧样本，避免同版往返掩盖历史数据不兼容。
+        let encoded = [
+            40, 181, 47, 253, 100, 128, 8, 125, 1, 0, 100, 2, 108, 101, 103, 97, 99, 121, 32, 116,
+            111, 111, 108, 32, 114, 101, 115, 117, 108, 116, 58, 32, 229, 183, 165, 229, 133, 183,
+            231, 187, 147, 230, 158, 156, 10, 240, 159, 152, 128, 0, 1, 0, 190, 74, 242, 213, 19,
+            67, 182, 74, 144, 1, 0, 0, 0, 0, 128, 9, 0, 0, 0, 0, 0, 0, 1,
+        ];
+        assert_eq!(
+            decode(&encoded)?,
+            "legacy tool result: 工具结果\n😀\0".repeat(64).into_bytes()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn round_trip_preserves_binary_and_large_unicode_contents() -> anyhow::Result<()> {
         for input in [
             Vec::new(),

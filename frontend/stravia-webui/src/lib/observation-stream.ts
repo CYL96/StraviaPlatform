@@ -1,9 +1,9 @@
 import { createParser, type EventSourceMessage } from 'eventsource-parser'
 
-import { apiBase, authenticatedFetch, isTauri } from '$lib/auth'
-import { openExternalUrl } from '$lib/open-external'
-import { isLiveContentBlock } from '$lib/observation-state'
-import type { DownloadTicket, ObservationChange, ObservationLiveUpdate, ObservationStreamUpdate } from '$lib/types'
+import { apiBase, authenticatedFetch, isTauri } from '#lib/auth.js'
+import { openExternalUrl } from '#lib/open-external.js'
+import { isLiveContentBlock } from '#lib/observation-state.js'
+import type { DownloadTicket, ObservationChange, ObservationLiveUpdate, ObservationStreamUpdate } from '#lib/types.js'
 
 export interface ObservationSubscription {
   close(): void

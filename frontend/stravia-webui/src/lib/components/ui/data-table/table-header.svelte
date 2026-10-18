@@ -4,12 +4,12 @@ import ArrowDownIcon from '@lucide/svelte/icons/arrow-down'
 import ArrowUpDownIcon from '@lucide/svelte/icons/arrow-up-down'
 import ArrowUpIcon from '@lucide/svelte/icons/arrow-up'
 
-import { cn } from '$lib/utils.js'
-import { Button } from '$lib/components/ui/button'
-import { Checkbox } from '$lib/components/ui/checkbox'
-import { Input } from '$lib/components/ui/input'
-import * as Select from '$lib/components/ui/select'
-import * as Table from '$lib/components/ui/table'
+import { cn } from '#lib/utils.js'
+import { Button } from '#lib/components/ui/button/index.js'
+import { Checkbox } from '#lib/components/ui/checkbox/index.js'
+import { Input } from '#lib/components/ui/input/index.js'
+import * as Select from '#lib/components/ui/select/index.js'
+import * as Table from '#lib/components/ui/table/index.js'
 import FilterMenu from './filter-menu.svelte'
 import type {
   DataTable,

@@ -1,5 +1,5 @@
 <script lang="ts">
-import * as m from '$lib/paraglide/messages.js'
+import * as m from '#lib/paraglide/messages.js'
 import { createQuery, useQueryClient } from '@tanstack/svelte-query'
 import { renderSnippet } from '@tanstack/svelte-table'
 import MoreHorizontalIcon from '@lucide/svelte/icons/more-horizontal'
@@ -7,28 +7,28 @@ import PlusIcon from '@lucide/svelte/icons/plus'
 import { toast } from 'svelte-sonner'
 import { onMount } from 'svelte'
 
-import { admin } from '$lib/admin-client'
-import { getConnectSetup } from '$lib/connect-setup'
-import { localizeBackendErrorMessage } from '$lib/backend-error'
-import { getDataTableLabels } from '$lib/data-table-labels'
-import { formatLogTime } from '$lib/format'
-import { effectiveModelDisplayName } from '$lib/logical-model'
-import type { ApiKey } from '$lib/types'
-import ApiKeyEditor from '$lib/components/api-key-editor.svelte'
-import PageHeader from '$lib/components/page-header.svelte'
-import RequestFailure from '$lib/components/request-failure.svelte'
-import StatusIndicator from '$lib/components/status-indicator.svelte'
-import * as AlertDialog from '$lib/components/ui/alert-dialog'
-import { Button } from '$lib/components/ui/button'
+import { admin } from '#lib/admin-client.js'
+import { getConnectSetup } from '#lib/connect-setup.js'
+import { localizeBackendErrorMessage } from '#lib/backend-error.js'
+import { getDataTableLabels } from '#lib/data-table-labels.js'
+import { formatLogTime } from '#lib/format.js'
+import { effectiveModelDisplayName } from '#lib/logical-model.js'
+import type { ApiKey } from '#lib/types.js'
+import ApiKeyEditor from '#lib/components/api-key-editor.svelte'
+import PageHeader from '#lib/components/page-header.svelte'
+import RequestFailure from '#lib/components/request-failure.svelte'
+import StatusIndicator from '#lib/components/status-indicator.svelte'
+import * as AlertDialog from '#lib/components/ui/alert-dialog/index.js'
+import { Button } from '#lib/components/ui/button/index.js'
 import {
   DataTable,
   createDataTableColumnHelper,
   type DataTableCellContext,
   type DataTableRowPointerEvent,
-} from '$lib/components/ui/data-table'
-import * as DropdownMenu from '$lib/components/ui/dropdown-menu'
-import * as Empty from '$lib/components/ui/empty'
-import { Skeleton } from '$lib/components/ui/skeleton'
+} from '#lib/components/ui/data-table/index.js'
+import * as DropdownMenu from '#lib/components/ui/dropdown-menu/index.js'
+import * as Empty from '#lib/components/ui/empty/index.js'
+import { Skeleton } from '#lib/components/ui/skeleton/index.js'
 
 const queryClient = useQueryClient()
 const connectSetup = getConnectSetup()

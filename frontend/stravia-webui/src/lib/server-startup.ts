@@ -1,4 +1,4 @@
-import type { StartupProgress } from '$lib/startup-progress'
+import type { StartupProgress } from '#lib/startup-progress.js'
 
 export interface ServerStartupState {
   status: 'starting' | 'ready' | 'failed'

@@ -1,5 +1,5 @@
-import { admin, isTauri } from '$lib/admin-client'
-import type { ConnectClientApplyRequest } from '$lib/connect'
+import { admin, isTauri } from '#lib/admin-client.js'
+import type { ConnectClientApplyRequest } from '#lib/connect.js'
 
 export interface ConnectClientApplyPlan {
   paths: string[]

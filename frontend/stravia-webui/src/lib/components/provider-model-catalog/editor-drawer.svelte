@@ -1,12 +1,12 @@
 <script lang="ts">
-import * as m from '$lib/paraglide/messages.js'
-import type { ProviderModelDetail, ProviderModelSelectionPolicy } from '$lib/types'
+import * as m from '#lib/paraglide/messages.js'
+import type { ProviderModelDetail, ProviderModelSelectionPolicy } from '#lib/types.js'
 
-import ProviderModelEditor from '$lib/components/provider-model-editor.svelte'
-import { Badge } from '$lib/components/ui/badge'
-import { Button } from '$lib/components/ui/button'
-import * as Sheet from '$lib/components/ui/sheet'
-import { Spinner } from '$lib/components/ui/spinner'
+import ProviderModelEditor from '#lib/components/provider-model-editor.svelte'
+import { Badge } from '#lib/components/ui/badge/index.js'
+import { Button } from '#lib/components/ui/button/index.js'
+import * as Sheet from '#lib/components/ui/sheet/index.js'
+import { Spinner } from '#lib/components/ui/spinner/index.js'
 
 interface Props {
   open?: boolean

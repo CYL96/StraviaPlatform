@@ -1,7 +1,7 @@
-import * as m from '$lib/paraglide/messages.js'
-import type { Locale } from '$lib/localization.svelte'
-import { resolvePluginText } from '$lib/plugin-text'
-import type { ProviderDescriptor, VendorChannelDescriptor } from '$lib/types'
+import * as m from '#lib/paraglide/messages.js'
+import type { Locale } from '#lib/localization.svelte.js'
+import { resolvePluginText } from '#lib/plugin-text.js'
+import type { ProviderDescriptor, VendorChannelDescriptor } from '#lib/types.js'
 
 export interface ProviderOption {
   key: string

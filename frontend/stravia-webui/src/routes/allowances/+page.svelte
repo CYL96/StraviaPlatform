@@ -1,6 +1,6 @@
 <script lang="ts">
-import * as m from '$lib/paraglide/messages.js'
-import RequestFailure from '$lib/components/request-failure.svelte'
+import * as m from '#lib/paraglide/messages.js'
+import RequestFailure from '#lib/components/request-failure.svelte'
 import { onMount } from 'svelte'
 import { useQueryClient } from '@tanstack/svelte-query'
 import ChevronDownIcon from '@lucide/svelte/icons/chevron-down'
@@ -9,25 +9,25 @@ import CircleHelpIcon from '@lucide/svelte/icons/circle-help'
 import Clock3Icon from '@lucide/svelte/icons/clock-3'
 import ShieldCheckIcon from '@lucide/svelte/icons/shield-check'
 import GaugeIcon from '@lucide/svelte/icons/gauge'
-import { Spinner } from '$lib/components/ui/spinner'
-import { Progress } from '$lib/components/ui/progress'
-import * as Collapsible from '$lib/components/ui/collapsible'
-import * as Accordion from '$lib/components/ui/accordion'
-import * as Empty from '$lib/components/ui/empty'
-import * as Alert from '$lib/components/ui/alert'
+import { Spinner } from '#lib/components/ui/spinner/index.js'
+import { Progress } from '#lib/components/ui/progress/index.js'
+import * as Collapsible from '#lib/components/ui/collapsible/index.js'
+import * as Accordion from '#lib/components/ui/accordion/index.js'
+import * as Empty from '#lib/components/ui/empty/index.js'
+import * as Alert from '#lib/components/ui/alert/index.js'
 import RefreshCwIcon from '@lucide/svelte/icons/refresh-cw'
 import SearchIcon from '@lucide/svelte/icons/search'
 import TrendingDownIcon from '@lucide/svelte/icons/trending-down'
 import { SvelteMap, SvelteSet } from 'svelte/reactivity'
 import { toast } from 'svelte-sonner'
 
-import { admin } from '$lib/admin-client'
-import { localizeBackendErrorMessage } from '$lib/backend-error'
-import { formatLogTime } from '$lib/format'
-import { localeState } from '$lib/localization.svelte'
-import { formatAllowanceAmount, formatAllowancePercent } from '$lib/provider-allowance-format'
-import { ProviderAllowanceRead } from '$lib/provider-allowance-read.svelte'
-import type { ProviderAllowanceReadEntry } from '$lib/provider-allowance-read'
+import { admin } from '#lib/admin-client.js'
+import { localizeBackendErrorMessage } from '#lib/backend-error.js'
+import { formatLogTime } from '#lib/format.js'
+import { localeState } from '#lib/localization.svelte.js'
+import { formatAllowanceAmount, formatAllowancePercent } from '#lib/provider-allowance-format.js'
+import { ProviderAllowanceRead } from '#lib/provider-allowance-read.svelte.js'
+import type { ProviderAllowanceReadEntry } from '#lib/provider-allowance-read.js'
 import {
   effectiveAllowanceCondition,
   forecastBucket,
@@ -36,7 +36,7 @@ import {
   summarizeForecast,
   usableRemainingPercent,
   worstAllowanceCondition,
-} from '$lib/provider-allowance-summary'
+} from '#lib/provider-allowance-summary.js'
 import type {
   Allowance,
   AllowanceCondition,
@@ -45,21 +45,21 @@ import type {
   ProviderAllowanceSnapshot,
   ProviderAllowanceStatus,
   ProviderAllowanceTarget,
-} from '$lib/types'
-import PageHeader from '$lib/components/page-header.svelte'
-import StatusIndicator from '$lib/components/status-indicator.svelte'
-import { Badge, type BadgeVariant } from '$lib/components/ui/badge'
-import { Button } from '$lib/components/ui/button'
-import * as Card from '$lib/components/ui/card'
-import * as InputGroup from '$lib/components/ui/input-group'
-import * as Select from '$lib/components/ui/select'
-import { Skeleton } from '$lib/components/ui/skeleton'
-import { Switch } from '$lib/components/ui/switch'
-import * as Table from '$lib/components/ui/table'
-import * as ToggleGroup from '$lib/components/ui/toggle-group'
-import * as Tooltip from '$lib/components/ui/tooltip'
-import AllowanceSuspension from '$lib/components/allowance-suspension.svelte'
-import { cn } from '$lib/utils'
+} from '#lib/types.js'
+import PageHeader from '#lib/components/page-header.svelte'
+import StatusIndicator from '#lib/components/status-indicator.svelte'
+import { Badge, type BadgeVariant } from '#lib/components/ui/badge/index.js'
+import { Button } from '#lib/components/ui/button/index.js'
+import * as Card from '#lib/components/ui/card/index.js'
+import * as InputGroup from '#lib/components/ui/input-group/index.js'
+import * as Select from '#lib/components/ui/select/index.js'
+import { Skeleton } from '#lib/components/ui/skeleton/index.js'
+import { Switch } from '#lib/components/ui/switch/index.js'
+import * as Table from '#lib/components/ui/table/index.js'
+import * as ToggleGroup from '#lib/components/ui/toggle-group/index.js'
+import * as Tooltip from '#lib/components/ui/tooltip/index.js'
+import AllowanceSuspension from '#lib/components/allowance-suspension.svelte'
+import { cn } from '#lib/utils.js'
 
 interface VisibleProvider extends ProviderAllowanceReadEntry {
   allowances: Allowance[]

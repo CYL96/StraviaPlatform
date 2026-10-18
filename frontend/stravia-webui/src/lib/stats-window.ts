@@ -1,4 +1,4 @@
-import type { StatsWindow } from '$lib/types/stats'
+import type { StatsWindow } from '#lib/types/stats.js'
 
 export const STATS_QUARTER_MS = 900_000
 

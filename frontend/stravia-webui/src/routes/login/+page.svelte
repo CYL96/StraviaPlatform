@@ -1,17 +1,17 @@
 <script lang="ts">
 import { goto } from '$app/navigation'
 import { resolve } from '$app/paths'
-import * as m from '$lib/paraglide/messages.js'
-import SecretInput from '$lib/components/secret-input.svelte'
+import * as m from '#lib/paraglide/messages.js'
+import SecretInput from '#lib/components/secret-input.svelte'
 
-import { login } from '$lib/auth'
-import BrandMark from '$lib/components/brand-mark.svelte'
-import BrandWordmark from '$lib/components/brand-wordmark.svelte'
-import LanguageSelector from '$lib/components/language-selector.svelte'
-import { Button } from '$lib/components/ui/button'
-import * as Field from '$lib/components/ui/field'
-import { Input } from '$lib/components/ui/input'
-import { Spinner } from '$lib/components/ui/spinner'
+import { login } from '#lib/auth.js'
+import BrandMark from '#lib/components/brand-mark.svelte'
+import BrandWordmark from '#lib/components/brand-wordmark.svelte'
+import LanguageSelector from '#lib/components/language-selector.svelte'
+import { Button } from '#lib/components/ui/button/index.js'
+import * as Field from '#lib/components/ui/field/index.js'
+import { Input } from '#lib/components/ui/input/index.js'
+import { Spinner } from '#lib/components/ui/spinner/index.js'
 
 let username = $state('')
 let password = $state('')
@@ -35,7 +35,7 @@ async function submit(): Promise<void> {
   errorKind = undefined
   try {
     await login(submittedUsername, password)
-    await goto(resolve('/'), { replaceState: true })
+    await goto(resolve('/'), { replace: true })
   } catch (cause) {
     const status = (cause as { status?: number }).status
     errorKind = status === 400 || status === 401 ? 'invalid' : 'unavailable'

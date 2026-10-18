@@ -1,5 +1,5 @@
-import * as m from '$lib/paraglide/messages.js'
-import { localeState } from '$lib/localization.svelte'
+import * as m from '#lib/paraglide/messages.js'
+import { localeState } from '#lib/localization.svelte.js'
 
 export const allCatalogFilterValue = 'all'
 

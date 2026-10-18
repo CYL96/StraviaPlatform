@@ -1,8 +1,8 @@
-import { computeTps, formatDuration, formatNumber, formatTps, type TpsInput } from '$lib/format'
-import { failureOriginLabel, observationContextStatusLabel, observationStatusLabel } from '$lib/observation-labels'
-import { payloadCount, payloadRecord } from '$lib/observation-payload'
-import * as m from '$lib/paraglide/messages.js'
-import type { ObservationEvent } from '$lib/types/observation'
+import { computeTps, formatDuration, formatNumber, formatTps, type TpsInput } from '#lib/format.js'
+import { failureOriginLabel, observationContextStatusLabel, observationStatusLabel } from '#lib/observation-labels.js'
+import { payloadCount, payloadRecord } from '#lib/observation-payload.js'
+import * as m from '#lib/paraglide/messages.js'
+import type { ObservationEvent } from '#lib/types/observation.js'
 
 type EventSummary = {
   title: string

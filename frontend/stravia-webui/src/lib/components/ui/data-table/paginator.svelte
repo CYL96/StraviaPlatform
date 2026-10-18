@@ -5,9 +5,9 @@ import ArrowRightToLineIcon from '@lucide/svelte/icons/arrow-right-to-line'
 import ChevronLeftIcon from '@lucide/svelte/icons/chevron-left'
 import ChevronRightIcon from '@lucide/svelte/icons/chevron-right'
 
-import { Button } from '$lib/components/ui/button'
-import * as Pagination from '$lib/components/ui/pagination'
-import * as Select from '$lib/components/ui/select'
+import { Button } from '#lib/components/ui/button/index.js'
+import * as Pagination from '#lib/components/ui/pagination/index.js'
+import * as Select from '#lib/components/ui/select/index.js'
 import type { DataTable, DataTableLabels } from './data-table.js'
 
 type PaginationPageItem = { key: string } & ({ type: 'page'; value: number } | { type: 'ellipsis' })

@@ -2,10 +2,10 @@
 import CircleHelpIcon from '@lucide/svelte/icons/circle-help'
 import type { Label as LabelPrimitive } from 'bits-ui'
 
-import * as m from '$lib/paraglide/messages.js'
-import { Label } from '$lib/components/ui/label/index.js'
-import * as Tooltip from '$lib/components/ui/tooltip'
-import { cn } from '$lib/utils.js'
+import * as m from '#lib/paraglide/messages.js'
+import { Label } from '#lib/components/ui/label/index.js'
+import * as Tooltip from '#lib/components/ui/tooltip/index.js'
+import { cn } from '#lib/utils.js'
 
 let {
   ref = $bindable(null),

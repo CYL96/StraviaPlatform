@@ -1,5 +1,5 @@
 <script lang="ts">
-import * as m from '$lib/paraglide/messages.js'
+import * as m from '#lib/paraglide/messages.js'
 import { goto } from '$app/navigation'
 import { resolve } from '$app/paths'
 import { createQuery, useQueryClient } from '@tanstack/svelte-query'
@@ -8,40 +8,42 @@ import MoreHorizontalIcon from '@lucide/svelte/icons/more-horizontal'
 import PlusIcon from '@lucide/svelte/icons/plus'
 import { tick } from 'svelte'
 import { toast } from 'svelte-sonner'
+import { admin } from '#lib/admin-client.js'
+import { getModelChanges } from '#lib/model-changes.js'
+import { localizeBackendErrorMessage } from '#lib/backend-error.js'
+import { getDataTableLabels } from '#lib/data-table-labels.js'
+import { formatDuration } from '#lib/format.js'
+import { effectiveModelDisplayName, logicalModelSecondaryId } from '#lib/logical-model.js'
 
-import { admin } from '$lib/admin-client'
-import { getModelChanges } from '$lib/model-changes'
-import { localizeBackendErrorMessage } from '$lib/backend-error'
-import { getDataTableLabels } from '$lib/data-table-labels'
-import { formatDuration } from '$lib/format'
-import { effectiveModelDisplayName, logicalModelSecondaryId } from '$lib/logical-model'
-import type { ImageCapabilityDrift, Provider, ProviderDescriptor, Route, VendorChannelDescriptor } from '$lib/types'
-import PageHeader from '$lib/components/page-header.svelte'
-import ProviderEditor from '$lib/components/provider-editor.svelte'
-import ProviderOAuthAuthorization from '$lib/components/provider-oauth-authorization.svelte'
-import ProviderMark from '$lib/components/provider-mark.svelte'
-import StatusIndicator from '$lib/components/status-indicator.svelte'
-import AllowanceSuspension from '$lib/components/allowance-suspension.svelte'
-import TechnicalValue from '$lib/components/technical-value.svelte'
-import * as AlertDialog from '$lib/components/ui/alert-dialog'
-import { Badge } from '$lib/components/ui/badge'
-import { Button } from '$lib/components/ui/button'
-import { Checkbox } from '$lib/components/ui/checkbox'
+import type { ImageCapabilityDrift, Provider, ProviderDescriptor, Route, VendorChannelDescriptor } from '#lib/types.js'
+import PageHeader from '#lib/components/page-header.svelte'
+import ProviderEditor from '#lib/components/provider-editor.svelte'
+import ProviderOAuthAuthorization from '#lib/components/provider-oauth-authorization.svelte'
+import ProviderMark from '#lib/components/provider-mark.svelte'
+import StatusIndicator from '#lib/components/status-indicator.svelte'
+import AllowanceSuspension from '#lib/components/allowance-suspension.svelte'
+import TechnicalValue from '#lib/components/technical-value.svelte'
+import * as AlertDialog from '#lib/components/ui/alert-dialog/index.js'
+import { Badge } from '#lib/components/ui/badge/index.js'
+import { Button } from '#lib/components/ui/button/index.js'
+import { Checkbox } from '#lib/components/ui/checkbox/index.js'
 import {
   DataTable,
   createDataTableColumnHelper,
   type DataTableCellContext,
   type DataTableRowPointerEvent,
-} from '$lib/components/ui/data-table'
-import * as DropdownMenu from '$lib/components/ui/dropdown-menu'
-import * as Dialog from '$lib/components/ui/dialog'
-import * as Empty from '$lib/components/ui/empty'
-import * as Field from '$lib/components/ui/field'
-import { Skeleton } from '$lib/components/ui/skeleton'
+} from '#lib/components/ui/data-table/index.js'
+
+import * as DropdownMenu from '#lib/components/ui/dropdown-menu/index.js'
+import * as Dialog from '#lib/components/ui/dialog/index.js'
+import * as Empty from '#lib/components/ui/empty/index.js'
+import * as Field from '#lib/components/ui/field/index.js'
+import { Skeleton } from '#lib/components/ui/skeleton/index.js'
 
 const queryClient = useQueryClient()
 const providersQuery = createQuery(() => ({ queryKey: ['providers'], queryFn: admin.providers.list }))
 const modelsQuery = createQuery(() => ({ queryKey: ['models'], queryFn: admin.models.list }))
+
 const profileDescriptorsQuery = createQuery(() => ({
   queryKey: ['provider-descriptors'],
   queryFn: admin.providers.descriptors,
@@ -66,10 +68,10 @@ let reauthorizationSessionId = $state<string>()
 let reauthorizationBinding = $state(false)
 let reauthorizationError = $state('')
 let reauthorization = $state<{ begin: () => Promise<void>; consume: () => void }>()
-
 const providers = $derived(providersQuery.data ?? [])
 const models = $derived(modelsQuery.data ?? [])
 const providerDependenciesUnavailable = $derived(modelsQuery.isPending || modelsQuery.isError)
+
 const driftsByProvider = $derived.by(() => {
   const grouped: Record<string, ImageCapabilityDrift[]> = {}
   for (const drift of capabilityDriftsQuery.data ?? []) {
@@ -154,7 +156,7 @@ function openCreate(): void {
 
 function openProvider(provider: Provider, event: MouseEvent): void {
   if (event.target instanceof Element && event.target.closest('a, button, [role="button"]')) return
-  void goto(resolve(`/providers/${encodeURIComponent(provider.id)}?view=connection`))
+  void goto(resolve(`providers/${encodeURIComponent(provider.id)}?view=connection`))
 }
 
 function getProviderRowId(provider: Provider): string {
@@ -174,7 +176,7 @@ function providerReferences(provider: Provider): Array<{ route: Route; target: R
 function providerSaved(provider: Provider): void {
   const canDiscoverModels = providerChannel(provider)?.capabilities.includes('model_discovery') ?? false
   const view = canDiscoverModels ? 'models&sync=created' : 'connection'
-  void goto(resolve(`/providers/${encodeURIComponent(provider.id)}?view=${view}`))
+  void goto(resolve(`providers/${encodeURIComponent(provider.id)}?view=${view}`))
 }
 
 function askDelete(provider: Provider): void {

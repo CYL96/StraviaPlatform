@@ -1,9 +1,14 @@
+import adapter from '@sveltejs/adapter-static'
+import process from 'node:process'
 import { fileURLToPath } from 'node:url'
 import tailwindcss from '@tailwindcss/vite'
 import { sveltekit } from '@sveltejs/kit/vite'
 import { defineConfig, loadEnv } from 'vite'
 
 const repositoryRoot = fileURLToPath(new URL('../..', import.meta.url))
+
+// 桌面测试包含 native smoke bridge，不能覆盖服务端验收使用的生产资源。
+const outputDirectory = process.env.STRAVIA_WEBUI_DIST ?? 'dist'
 
 export default defineConfig(({ mode }) => {
   const { STRAVIA_PORT = '23471' } = loadEnv(mode, repositoryRoot, 'STRAVIA_')
@@ -14,7 +19,15 @@ export default defineConfig(({ mode }) => {
 
   return {
     envDir: repositoryRoot,
-    plugins: [tailwindcss(), sveltekit()],
+    plugins: [
+      tailwindcss(),
+      sveltekit({
+        paths: { relative: false },
+        adapter: adapter({ assets: outputDirectory, fallback: 'index.html', pages: outputDirectory }),
+        // 产品更新沿用后端更新服务，不额外轮询静态部署版本。
+        version: { pollInterval: 0 },
+      }),
+    ],
     build: { rolldownOptions: { checks: { pluginTimings: false } } },
     optimizeDeps: {
       include: ['style-to-object'],

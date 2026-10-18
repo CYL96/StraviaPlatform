@@ -1,6 +1,6 @@
 import { getContext, setContext } from 'svelte'
 
-import type { ToggleVariants } from '$lib/components/ui/toggle/index.js'
+import type { ToggleVariants } from '#lib/components/ui/toggle/index.js'
 
 export interface ToggleGroupContext extends ToggleVariants {
   spacing?: number

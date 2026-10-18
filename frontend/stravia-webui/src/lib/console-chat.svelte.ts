@@ -1,12 +1,12 @@
 import { createContext } from 'svelte'
-import { ConsoleChatController } from '$lib/console-chat'
-import { consoleAdminCatalog, fetchResponsesTransport, IndexedDbConversationStore } from '$lib/console-chat-adapters'
+import { ConsoleChatController } from '#lib/console-chat.js'
+import { consoleAdminCatalog, fetchResponsesTransport, IndexedDbConversationStore } from '#lib/console-chat-adapters.js'
 import type {
   ConsoleChatControllerOptions,
   ConsoleChatSnapshot,
   ConsoleImageAttachment,
   ConsoleThinkingSelection,
-} from '$lib/console-chat-types'
+} from '#lib/console-chat-types.js'
 
 export class ConsoleChat {
   snapshot: ConsoleChatSnapshot

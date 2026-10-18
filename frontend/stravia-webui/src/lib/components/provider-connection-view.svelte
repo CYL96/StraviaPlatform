@@ -1,26 +1,25 @@
 <script lang="ts">
-import * as m from '$lib/paraglide/messages.js'
+import * as m from '#lib/paraglide/messages.js'
 import { beforeNavigate } from '$app/navigation'
 import { createQuery, useQueryClient } from '@tanstack/svelte-query'
 import { onDestroy, untrack } from 'svelte'
 import { toast } from 'svelte-sonner'
-
-import { admin } from '$lib/admin-client'
-import { localizeBackendErrorMessage } from '$lib/backend-error'
-import { formatDuration } from '$lib/format'
-import { localeState } from '$lib/localization.svelte'
-import { resolvePluginText } from '$lib/plugin-text'
-import { ProviderConnectionDraft, type ProviderConnectionSubmission } from '$lib/provider-connection-draft.svelte'
-import type { Provider, UpdateProvider } from '$lib/types'
-import FormSection from '$lib/components/form-section.svelte'
-import ProviderConfigFields from '$lib/components/provider-config-fields.svelte'
-import ProviderOAuthAuthorization from '$lib/components/provider-oauth-authorization.svelte'
-import * as Alert from '$lib/components/ui/alert'
-import { Button } from '$lib/components/ui/button'
-import * as Field from '$lib/components/ui/field'
-import { Input } from '$lib/components/ui/input'
-import { Spinner } from '$lib/components/ui/spinner'
-import { Switch } from '$lib/components/ui/switch'
+import { admin } from '#lib/admin-client.js'
+import { localizeBackendErrorMessage } from '#lib/backend-error.js'
+import { formatDuration } from '#lib/format.js'
+import { localeState } from '#lib/localization.svelte.js'
+import { resolvePluginText } from '#lib/plugin-text.js'
+import { ProviderConnectionDraft, type ProviderConnectionSubmission } from '#lib/provider-connection-draft.svelte.js'
+import type { Provider, UpdateProvider } from '#lib/types.js'
+import FormSection from '#lib/components/form-section.svelte'
+import ProviderConfigFields from '#lib/components/provider-config-fields.svelte'
+import ProviderOAuthAuthorization from '#lib/components/provider-oauth-authorization.svelte'
+import * as Alert from '#lib/components/ui/alert/index.js'
+import { Button } from '#lib/components/ui/button/index.js'
+import * as Field from '#lib/components/ui/field/index.js'
+import { Input } from '#lib/components/ui/input/index.js'
+import { Spinner } from '#lib/components/ui/spinner/index.js'
+import { Switch } from '#lib/components/ui/switch/index.js'
 
 interface Props {
   provider: Provider
@@ -32,6 +31,7 @@ const initialProvider = untrack(() => provider)
 const queryClient = useQueryClient()
 let testing = $state(false)
 let connectionError = $state('')
+
 let oauthAuthorization = $state<{
   cancel: () => Promise<void>
   consume: () => void
@@ -42,6 +42,7 @@ const providerDescriptorsQuery = createQuery(() => ({
   queryKey: ['provider-descriptors'],
   queryFn: admin.providers.descriptors,
 }))
+
 const vendorId = $derived(provider.vendor ?? '')
 const descriptor = $derived(providerDescriptorsQuery.data?.find((item) => item.provider_id === vendorId))
 const channel = $derived(descriptor?.channels.find((item) => item.id === provider.channel))
@@ -59,6 +60,7 @@ function updateProvider(submission: ProviderConnectionSubmission): Promise<Provi
     vendor_options: submission.options,
     ...(Object.keys(submission.credentials).length > 0 ? { adapter_credentials: submission.credentials } : {}),
   }
+
   return admin.providers.update(provider.id, input)
 }
 
@@ -70,6 +72,7 @@ const draft = new ProviderConnectionDraft({
     useProxy: initialProvider.use_proxy,
     values: { ...(initialProvider.vendor_options ?? {}) },
   },
+
   target: () => (descriptor && channel ? { kind: 'edit', provider, descriptor, channel } : undefined),
   api: admin.providers,
   writer: { write: updateProvider, bind: (saved, sessionId) => admin.providers.bindOAuth(saved.id, sessionId) },
@@ -93,6 +96,7 @@ const draft = new ProviderConnectionDraft({
         queryClient.invalidateQueries({ queryKey: ['providers'] }),
         queryClient.invalidateQueries({ queryKey: ['provider-models', provider.id] }),
       ]).catch((error) => toast.error(localizeBackendErrorMessage(error)))
+
       onSaved?.(saved)
     },
   },
@@ -105,6 +109,7 @@ const previewIssueError = $derived(
     .map((issue) => resolvePluginText(issue.message, localeState.current))
     .join(' ') || (previewIssues.length > 0 ? m.provider_config_fix_issues_before_save() : ''),
 )
+
 const submitMessage = $derived(
   draft.partialSaveError !== undefined
     ? m.provider_config_saved_auth_bind_failed({ error: localizeBackendErrorMessage(draft.partialSaveError) })
@@ -115,6 +120,7 @@ const submitMessage = $derived(
 
 // 提交期间（preview → write → bind）封住页面内导航；刷新/关页由 onbeforeunload 原生提示。
 beforeNavigate((navigation) => {
+  if (navigation.shallow && navigation.type === 'goto') return
   if (draft.submitting) navigation.cancel()
 })
 

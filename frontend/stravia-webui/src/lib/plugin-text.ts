@@ -1,4 +1,4 @@
-import type { LocalizedText } from '$lib/types'
+import type { LocalizedText } from '#lib/types.js'
 
 /** Plugin text is selected by exact locale, then the contract's required default. */
 export function resolvePluginText(text: LocalizedText, locale: string): string {

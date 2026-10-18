@@ -1,13 +1,13 @@
-import * as m from '$lib/paraglide/messages.js'
+import * as m from '#lib/paraglide/messages.js'
 import { createContext } from 'svelte'
 import type {
   ModelChangeSource,
   ModelChangeType,
   ProviderModelSyncSummary,
   ProviderModelSelectionPolicy,
-} from '$lib/types'
+} from '#lib/types.js'
 import { toast } from 'svelte-sonner'
-import { localizeBackendErrorMessage } from '$lib/backend-error'
+import { localizeBackendErrorMessage } from '#lib/backend-error.js'
 
 export interface ModelChanges {
   show: (providerId?: string) => void

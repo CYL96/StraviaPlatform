@@ -1,15 +1,15 @@
 <script lang="ts">
-import * as m from '$lib/paraglide/messages.js'
+import * as m from '#lib/paraglide/messages.js'
 import { page } from '$app/state'
 import { createQuery } from '@tanstack/svelte-query'
 
-import { admin } from '$lib/admin-client'
-import { localizeBackendErrorMessage } from '$lib/backend-error'
-import ModelEditor from '$lib/components/model-editor.svelte'
-import PageHeader from '$lib/components/page-header.svelte'
-import RequestFailure from '$lib/components/request-failure.svelte'
-import { Button } from '$lib/components/ui/button'
-import { Spinner } from '$lib/components/ui/spinner'
+import { admin } from '#lib/admin-client.js'
+import { localizeBackendErrorMessage } from '#lib/backend-error.js'
+import ModelEditor from '#lib/components/model-editor.svelte'
+import PageHeader from '#lib/components/page-header.svelte'
+import RequestFailure from '#lib/components/request-failure.svelte'
+import { Button } from '#lib/components/ui/button/index.js'
+import { Spinner } from '#lib/components/ui/spinner/index.js'
 
 const providersQuery = createQuery(() => ({ queryKey: ['providers'], queryFn: admin.providers.list }))
 const initialProviderId = $derived(page.url.searchParams.get('provider') ?? '')

@@ -3,8 +3,8 @@ import type { Column, RowData } from '@tanstack/svelte-table'
 import ChevronDownIcon from '@lucide/svelte/icons/chevron-down'
 import Columns3Icon from '@lucide/svelte/icons/columns-3'
 
-import { Button } from '$lib/components/ui/button'
-import * as DropdownMenu from '$lib/components/ui/dropdown-menu'
+import { Button } from '#lib/components/ui/button/index.js'
+import * as DropdownMenu from '#lib/components/ui/dropdown-menu/index.js'
 import { dataTableFeatures, type DataTable } from './data-table.js'
 
 interface Props {

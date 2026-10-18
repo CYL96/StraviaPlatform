@@ -8,10 +8,10 @@ import GripVerticalIcon from '@lucide/svelte/icons/grip-vertical'
 import PencilIcon from '@lucide/svelte/icons/pencil'
 import XIcon from '@lucide/svelte/icons/x'
 
-import { cn } from '$lib/utils.js'
-import { Button } from '$lib/components/ui/button'
-import { Checkbox } from '$lib/components/ui/checkbox'
-import * as Table from '$lib/components/ui/table'
+import { cn } from '#lib/utils.js'
+import { Button } from '#lib/components/ui/button/index.js'
+import { Checkbox } from '#lib/components/ui/checkbox/index.js'
+import * as Table from '#lib/components/ui/table/index.js'
 import type {
   DataTableCell,
   DataTableEditMode,

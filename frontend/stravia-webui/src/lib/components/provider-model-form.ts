@@ -1,5 +1,5 @@
-import * as m from '$lib/paraglide/messages.js'
-import type { ProviderModelMetadata, ProviderModelPrices } from '$lib/types'
+import * as m from '#lib/paraglide/messages.js'
+import type { ProviderModelMetadata, ProviderModelPrices } from '#lib/types.js'
 
 export interface ProviderModelPriceForm {
   input: string

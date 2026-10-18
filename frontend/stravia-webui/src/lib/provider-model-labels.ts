@@ -1,6 +1,6 @@
-import * as m from '$lib/paraglide/messages.js'
-import { type Locale } from '$lib/localization.svelte'
-import type { ProviderModelSelectionPolicy } from '$lib/types'
+import * as m from '#lib/paraglide/messages.js'
+import { type Locale } from '#lib/localization.svelte.js'
+import type { ProviderModelSelectionPolicy } from '#lib/types.js'
 
 export function providerModelSelectionPolicyLabel(policy: ProviderModelSelectionPolicy, locale: Locale): string {
   if (policy === 'force_enabled') return m.common_always_allow({}, { locale: locale })

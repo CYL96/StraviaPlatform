@@ -1,8 +1,8 @@
 <script lang="ts">
-import MarkdownContent from '$lib/components/markdown-content.svelte'
-import StreamingMarkdown from '$lib/components/streaming-markdown.svelte'
+import MarkdownContent from '#lib/components/markdown-content.svelte'
+import StreamingMarkdown from '#lib/components/streaming-markdown.svelte'
 import { tick } from 'svelte'
-import * as Tooltip from '$lib/components/ui/tooltip'
+import * as Tooltip from '#lib/components/ui/tooltip/index.js'
 
 let {
   text,

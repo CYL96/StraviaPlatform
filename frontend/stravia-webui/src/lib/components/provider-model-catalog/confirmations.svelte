@@ -1,10 +1,10 @@
 <script lang="ts">
 import { resolve } from '$app/paths'
-import * as m from '$lib/paraglide/messages.js'
-import { effectiveModelDisplayName, logicalModelSecondaryId } from '$lib/logical-model'
-import type { ProviderModelDetail, Route } from '$lib/types'
+import * as m from '#lib/paraglide/messages.js'
+import { effectiveModelDisplayName, logicalModelSecondaryId } from '#lib/logical-model.js'
+import type { ProviderModelDetail, Route } from '#lib/types.js'
 
-import * as AlertDialog from '$lib/components/ui/alert-dialog'
+import * as AlertDialog from '#lib/components/ui/alert-dialog/index.js'
 
 interface Props {
   discardOpen?: boolean

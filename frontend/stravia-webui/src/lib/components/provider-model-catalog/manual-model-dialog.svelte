@@ -1,12 +1,12 @@
 <script lang="ts">
-import * as m from '$lib/paraglide/messages.js'
-import type { CanonicalModelSummary } from '$lib/types'
+import * as m from '#lib/paraglide/messages.js'
+import type { CanonicalModelSummary } from '#lib/types.js'
 
-import ModelCombobox from '$lib/components/model-combobox.svelte'
-import { Button } from '$lib/components/ui/button'
-import * as Dialog from '$lib/components/ui/dialog'
-import * as Field from '$lib/components/ui/field'
-import { Spinner } from '$lib/components/ui/spinner'
+import ModelCombobox from '#lib/components/model-combobox.svelte'
+import { Button } from '#lib/components/ui/button/index.js'
+import * as Dialog from '#lib/components/ui/dialog/index.js'
+import * as Field from '#lib/components/ui/field/index.js'
+import { Spinner } from '#lib/components/ui/spinner/index.js'
 
 interface Props {
   open?: boolean

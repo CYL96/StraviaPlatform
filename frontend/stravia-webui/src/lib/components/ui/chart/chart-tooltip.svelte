@@ -1,7 +1,7 @@
 <script lang="ts">
 import { getChartContext, Tooltip as TooltipPrimitive } from 'layerchart'
-import { formatNumber } from '$lib/format'
-import { cn, type WithElementRef, type WithoutChildren } from '$lib/utils.js'
+import { formatNumber } from '#lib/format.js'
+import { cn, type WithElementRef, type WithoutChildren } from '#lib/utils.js'
 import { getPayloadConfigFromPayload, useChart, type TooltipPayload } from './chart-utils.js'
 import type { Snippet } from 'svelte'
 import type { HTMLAttributes } from 'svelte/elements'

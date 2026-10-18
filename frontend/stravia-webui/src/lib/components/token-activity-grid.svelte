@@ -1,8 +1,8 @@
 <script lang="ts">
-import * as m from '$lib/paraglide/messages.js'
-import * as Tooltip from '$lib/components/ui/tooltip'
-import { formatCompactCount, formatMinuteTime, formatMonthDay } from '$lib/format'
-import type { ActivityCell, ActivityGridModel } from '$lib/stats-chart'
+import * as m from '#lib/paraglide/messages.js'
+import * as Tooltip from '#lib/components/ui/tooltip/index.js'
+import { formatCompactCount, formatMinuteTime, formatMonthDay } from '#lib/format.js'
+import type { ActivityCell, ActivityGridModel } from '#lib/stats-chart.js'
 
 interface Props {
   model: ActivityGridModel

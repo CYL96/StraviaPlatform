@@ -3,9 +3,9 @@ import EyeIcon from '@lucide/svelte/icons/eye'
 import EyeOffIcon from '@lucide/svelte/icons/eye-off'
 import type { HTMLTextareaAttributes } from 'svelte/elements'
 
-import * as m from '$lib/paraglide/messages.js'
-import { cn } from '$lib/utils.js'
-import * as InputGroup from '$lib/components/ui/input-group'
+import * as m from '#lib/paraglide/messages.js'
+import { cn } from '#lib/utils.js'
+import * as InputGroup from '#lib/components/ui/input-group/index.js'
 
 type Props = HTMLTextareaAttributes & {
   ref?: HTMLTextAreaElement | null

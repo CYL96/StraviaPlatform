@@ -1,12 +1,12 @@
 <script lang="ts">
-import * as m from '$lib/paraglide/messages.js'
+import * as m from '#lib/paraglide/messages.js'
 import DownloadIcon from '@lucide/svelte/icons/download'
 import ExternalLinkIcon from '@lucide/svelte/icons/external-link'
 import XIcon from '@lucide/svelte/icons/x'
 
-import * as Alert from '$lib/components/ui/alert'
-import { Button } from '$lib/components/ui/button'
-import type { AvailableUpdate } from '$lib/product-update'
+import * as Alert from '#lib/components/ui/alert/index.js'
+import { Button } from '#lib/components/ui/button/index.js'
+import type { AvailableUpdate } from '#lib/product-update.js'
 
 let {
   update,

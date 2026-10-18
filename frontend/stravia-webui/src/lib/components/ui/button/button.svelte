@@ -1,7 +1,7 @@
 <script lang="ts">
 import { resolve } from '$app/paths'
 
-import { cn } from '$lib/utils.js'
+import { cn } from '#lib/utils.js'
 import { buttonVariants, type ButtonProps } from './variants.js'
 
 let {

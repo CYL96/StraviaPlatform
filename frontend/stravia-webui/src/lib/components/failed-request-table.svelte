@@ -1,11 +1,15 @@
 <script lang="ts">
-import * as m from '$lib/paraglide/messages.js'
+import * as m from '#lib/paraglide/messages.js'
 import { renderSnippet } from '@tanstack/svelte-table'
-import { formatDuration, formatLogTime } from '$lib/format'
-import { getDataTableLabels } from '$lib/data-table-labels'
-import { failureOriginLabel } from '$lib/observation-labels'
-import type { FailedRequestSummary } from '$lib/types'
-import { DataTable, createDataTableColumnHelper, type DataTableRowPointerEvent } from '$lib/components/ui/data-table'
+import { formatDuration, formatLogTime } from '#lib/format.js'
+import { getDataTableLabels } from '#lib/data-table-labels.js'
+import { failureOriginLabel } from '#lib/observation-labels.js'
+import type { FailedRequestSummary } from '#lib/types.js'
+import {
+  DataTable,
+  createDataTableColumnHelper,
+  type DataTableRowPointerEvent,
+} from '#lib/components/ui/data-table/index.js'
 
 let {
   items,

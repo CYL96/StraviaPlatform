@@ -1,31 +1,32 @@
 <script lang="ts">
-import { browser } from '$app/environment'
-import * as m from '$lib/paraglide/messages.js'
+import { browser } from '$app/env'
+import * as m from '#lib/paraglide/messages.js'
 import ArrowRightIcon from '@lucide/svelte/icons/arrow-right'
 import DownloadIcon from '@lucide/svelte/icons/download'
 import ExternalLinkIcon from '@lucide/svelte/icons/external-link'
 import RefreshCwIcon from '@lucide/svelte/icons/refresh-cw'
 import { toast } from 'svelte-sonner'
 import { createQuery, useQueryClient } from '@tanstack/svelte-query'
-import { admin } from '$lib/admin-client'
-import { localizeBackendErrorMessage } from '$lib/backend-error'
-import * as Field from '$lib/components/ui/field'
-import { Switch } from '$lib/components/ui/switch'
-import RequestFailure from '$lib/components/request-failure.svelte'
-
-import * as Alert from '$lib/components/ui/alert'
-import { Progress } from '$lib/components/ui/progress'
-import { Button } from '$lib/components/ui/button'
-import { Spinner } from '$lib/components/ui/spinner'
-import { openExternalUrl } from '$lib/open-external'
-import { supportsInAppInstallProgress } from '$lib/product-update'
-import { getProductUpdateCoordinator } from '$lib/product-update.svelte'
+import { admin } from '#lib/admin-client.js'
+import { localizeBackendErrorMessage } from '#lib/backend-error.js'
+import * as Field from '#lib/components/ui/field/index.js'
+import { Switch } from '#lib/components/ui/switch/index.js'
+import RequestFailure from '#lib/components/request-failure.svelte'
+import * as Alert from '#lib/components/ui/alert/index.js'
+import { Progress } from '#lib/components/ui/progress/index.js'
+import { Button } from '#lib/components/ui/button/index.js'
+import { Spinner } from '#lib/components/ui/spinner/index.js'
+import { openExternalUrl } from '#lib/open-external.js'
+import { supportsInAppInstallProgress } from '#lib/product-update.js'
+import { getProductUpdateCoordinator } from '#lib/product-update.svelte.js'
 
 const queryClient = useQueryClient()
+
 const proxyPreferenceQuery = createQuery(() => ({
   queryKey: ['setting', 'update_use_proxy'],
   queryFn: () => admin.settings.get('update_use_proxy'),
 }))
+
 const useProxy = $derived(proxyPreferenceQuery.data === 'true')
 let savingProxy = $state(false)
 let proxyError = $state('')
@@ -64,9 +65,12 @@ const busy = $derived(['downloading', 'installing'].includes(updates.state.phase
 const showInstallingProgress = $derived(supportsInAppInstallProgress(browser ? navigator.userAgent : ''))
 const progressPercent = $derived.by(() => {
   const total = updates.state.totalBytes
+
   if (!total || total <= 0) return null
+
   return Math.min(100, Math.round((updates.state.downloadedBytes / total) * 100))
 })
+
 const lastChecked = $derived(
   updates.status?.last_success_at
     ? new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'short' }).format(

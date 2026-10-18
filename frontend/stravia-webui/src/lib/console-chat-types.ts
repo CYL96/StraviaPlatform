@@ -1,5 +1,5 @@
-import type { ApiKey, Provider, Route, ThinkingLevel } from '$lib/types'
-import type { ThinkingActivity } from '$lib/observation-activities'
+import type { ApiKey, Provider, Route, ThinkingLevel } from '#lib/types.js'
+import type { ThinkingActivity } from '#lib/observation-activities.js'
 
 export type ConsoleThinkingSelection = 'default' | ThinkingLevel
 export type ConsoleApiKey = Omit<ApiKey, 'key'>

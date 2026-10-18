@@ -18,8 +18,8 @@ export type InputGroupButtonSize = VariantProps<typeof inputGroupButtonVariants>
 </script>
 
 <script lang="ts">
-import { Button, type ButtonProps } from '$lib/components/ui/button/index.js'
-import { cn } from '$lib/utils.js'
+import { Button, type ButtonProps } from '#lib/components/ui/button/index.js'
+import { cn } from '#lib/utils.js'
 
 let {
   ref = $bindable(null),

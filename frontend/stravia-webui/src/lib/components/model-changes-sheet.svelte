@@ -1,11 +1,11 @@
 <script lang="ts">
-import * as m from '$lib/paraglide/messages.js'
+import * as m from '#lib/paraglide/messages.js'
 import { createInfiniteQuery, createQuery } from '@tanstack/svelte-query'
 import { tick } from 'svelte'
 import { SvelteMap } from 'svelte/reactivity'
-import { admin } from '$lib/admin-client'
-import { localizeBackendErrorMessage } from '$lib/backend-error'
-import { formatLogTime } from '$lib/format'
+import { admin } from '#lib/admin-client.js'
+import { localizeBackendErrorMessage } from '#lib/backend-error.js'
+import { formatLogTime } from '#lib/format.js'
 import {
   changeTypes,
   changeLabel,
@@ -14,19 +14,19 @@ import {
   specificationField,
   specificationValue,
   modelChangeReason,
-} from '$lib/model-changes'
-import type { ModelChangeType, ModelChangeSource, ModelChangeRecord } from '$lib/types'
-import * as Sheet from '$lib/components/ui/sheet'
-import * as Select from '$lib/components/ui/select'
-import * as Empty from '$lib/components/ui/empty'
-import { Input } from '$lib/components/ui/input'
-import { Button } from '$lib/components/ui/button'
-import { Badge } from '$lib/components/ui/badge'
-import { Spinner } from '$lib/components/ui/spinner'
-import RequestFailure from '$lib/components/request-failure.svelte'
+} from '#lib/model-changes.js'
+import type { ModelChangeType, ModelChangeSource, ModelChangeRecord } from '#lib/types.js'
+import * as Sheet from '#lib/components/ui/sheet/index.js'
+import * as Select from '#lib/components/ui/select/index.js'
+import * as Empty from '#lib/components/ui/empty/index.js'
+import { Input } from '#lib/components/ui/input/index.js'
+import { Button } from '#lib/components/ui/button/index.js'
+import { Badge } from '#lib/components/ui/badge/index.js'
+import { Spinner } from '#lib/components/ui/spinner/index.js'
+import RequestFailure from '#lib/components/request-failure.svelte'
 import ChevronRightIcon from '@lucide/svelte/icons/chevron-right'
 import SearchIcon from '@lucide/svelte/icons/search'
-import { cn } from '$lib/utils.js'
+import { cn } from '#lib/utils.js'
 let open = $state(false)
 let providerId = $state('')
 let type = $state<ModelChangeType | ''>('')

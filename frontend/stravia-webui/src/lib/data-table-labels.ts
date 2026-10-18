@@ -1,6 +1,6 @@
-import * as m from '$lib/paraglide/messages.js'
+import * as m from '#lib/paraglide/messages.js'
 
-import type { DataTableFilterMatchMode, DataTableLabels } from '$lib/components/ui/data-table'
+import type { DataTableFilterMatchMode, DataTableLabels } from '#lib/components/ui/data-table/index.js'
 
 function getFilterMatchModeLabel(mode: DataTableFilterMatchMode): string {
   return {

@@ -1,12 +1,12 @@
 <script lang="ts">
-import * as m from '$lib/paraglide/messages.js'
+import * as m from '#lib/paraglide/messages.js'
 import { toast } from 'svelte-sonner'
 import TypeIcon from '@lucide/svelte/icons/case-sensitive'
 import RegexIcon from '@lucide/svelte/icons/regex'
 import TrashIcon from '@lucide/svelte/icons/trash-2'
 
-import { admin } from '$lib/admin-client'
-import { localizeBackendErrorMessage } from '$lib/backend-error'
+import { admin } from '#lib/admin-client.js'
+import { localizeBackendErrorMessage } from '#lib/backend-error.js'
 import {
   customRuleFieldError,
   draftFromRule,
@@ -15,19 +15,19 @@ import {
   isFieldError,
   type CustomRuleField,
   type CustomRuleFieldError,
-} from '$lib/credential-custom-rule'
-import type { CustomCredentialRule } from '$lib/types'
-import SecretTextarea from '$lib/components/secret-textarea.svelte'
-import * as Accordion from '$lib/components/ui/accordion'
-import * as Alert from '$lib/components/ui/alert'
-import * as AlertDialog from '$lib/components/ui/alert-dialog'
-import { Button } from '$lib/components/ui/button'
-import * as Field from '$lib/components/ui/field'
-import { Input } from '$lib/components/ui/input'
-import * as Sheet from '$lib/components/ui/sheet'
-import { Spinner } from '$lib/components/ui/spinner'
-import { Switch } from '$lib/components/ui/switch'
-import * as Tabs from '$lib/components/ui/tabs'
+} from '#lib/credential-custom-rule.js'
+import type { CustomCredentialRule } from '#lib/types.js'
+import SecretTextarea from '#lib/components/secret-textarea.svelte'
+import * as Accordion from '#lib/components/ui/accordion/index.js'
+import * as Alert from '#lib/components/ui/alert/index.js'
+import * as AlertDialog from '#lib/components/ui/alert-dialog/index.js'
+import { Button } from '#lib/components/ui/button/index.js'
+import * as Field from '#lib/components/ui/field/index.js'
+import { Input } from '#lib/components/ui/input/index.js'
+import * as Sheet from '#lib/components/ui/sheet/index.js'
+import { Spinner } from '#lib/components/ui/spinner/index.js'
+import { Switch } from '#lib/components/ui/switch/index.js'
+import * as Tabs from '#lib/components/ui/tabs/index.js'
 
 let { onchanged }: { onchanged: () => void } = $props()
 

@@ -1,7 +1,7 @@
-import { formatNumber, formatPercent } from '$lib/format'
-import * as m from '$lib/paraglide/messages.js'
-import type { Locale } from '$lib/paraglide/runtime.js'
-import type { AllowanceAmount } from '$lib/types'
+import { formatNumber, formatPercent } from '#lib/format.js'
+import * as m from '#lib/paraglide/messages.js'
+import type { Locale } from '#lib/paraglide/runtime.js'
+import type { AllowanceAmount } from '#lib/types.js'
 
 export function formatAllowanceAmount(amount: AllowanceAmount | undefined, locale: Locale): string {
   if (!amount || !Number.isFinite(amount.value)) return '–'

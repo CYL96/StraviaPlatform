@@ -322,7 +322,11 @@ async fn captured_records(
     let mut records: Vec<serde_json::Value> = Vec::new();
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index).unwrap();
-        if entry.name().ends_with("/events.jsonl") {
+        if entry
+            .name()
+            .expect("valid bundle entry name")
+            .ends_with("/events.jsonl")
+        {
             let mut text = String::new();
             entry.read_to_string(&mut text).unwrap();
             records.extend(text.lines().map(|line| serde_json::from_str(line).unwrap()));

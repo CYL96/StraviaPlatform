@@ -1,7 +1,7 @@
 import dagre from '@dagrejs/dagre'
 
 import { interactionNodeWidth as nodeWidth, interactionNodeHeight as nodeHeight } from './interaction-node-geometry'
-import type { InteractionSummary } from '$lib/types'
+import type { InteractionSummary } from '#lib/types.js'
 
 export interface LayoutPosition {
   id: string

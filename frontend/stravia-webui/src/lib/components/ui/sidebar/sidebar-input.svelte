@@ -1,7 +1,7 @@
 <script lang="ts">
-import { Input } from '$lib/components/ui/input/index.js'
-import { cn } from '$lib/utils.js'
-import type { InputProps } from '$lib/components/ui/input/props.js'
+import { Input } from '#lib/components/ui/input/index.js'
+import { cn } from '#lib/utils.js'
+import type { InputProps } from '#lib/components/ui/input/props.js'
 
 let { ref = $bindable(null), value = $bindable(''), class: className, ...restProps }: InputProps = $props()
 </script>

@@ -1,5 +1,5 @@
 <script lang="ts">
-import { browser } from '$app/environment'
+import { browser } from '$app/env'
 import { afterNavigate } from '$app/navigation'
 import { resolve } from '$app/paths'
 import { page } from '$app/state'
@@ -7,35 +7,37 @@ import { QueryClient, QueryClientProvider } from '@tanstack/svelte-query'
 import { ModeWatcher } from 'mode-watcher'
 import { onMount } from 'svelte'
 import type { Snippet } from 'svelte'
-
 import '../app.css'
-import AppShell from '$lib/components/app-shell.svelte'
-import DesktopStartup from '$lib/components/desktop-startup.svelte'
-import ServerStartup from '$lib/components/server-startup.svelte'
-import { connectServerStartup, initialServerStartupState } from '$lib/server-startup'
-import type { ServerStartupState } from '$lib/server-startup'
-import DesktopStartupNotices from '$lib/components/desktop-startup-notices.svelte'
-import ProductUpdateOverlay from '$lib/components/product-update-overlay.svelte'
-import ModelChangesSheet from '$lib/components/model-changes-sheet.svelte'
-import { setModelChanges, type ModelChanges } from '$lib/model-changes'
-import { Button } from '$lib/components/ui/button'
-import { Toaster } from '$lib/components/ui/sonner'
-import * as Tooltip from '$lib/components/ui/tooltip'
-import { setConnectSetup } from '$lib/connect-setup'
-import { createConsoleChat, setConsoleChat } from '$lib/console-chat.svelte'
-import { apiKeyExpiryTime } from '$lib/connect'
-import type { ConnectSetup } from '$lib/connect-setup'
-import { connectDesktopStartup, desktopFrontendFailure, initialDesktopStartupState } from '$lib/desktop-startup'
-import type { DesktopStartupState } from '$lib/desktop-startup'
-import { localeState } from '$lib/localization.svelte'
-import * as m from '$lib/paraglide/messages.js'
-import { admin, isTauri } from '$lib/admin-client'
-import { getAuthState, restoreAuthentication } from '$lib/auth'
+import AppShell from '#lib/components/app-shell.svelte'
+import DesktopStartup from '#lib/components/desktop-startup.svelte'
+import ServerStartup from '#lib/components/server-startup.svelte'
+import { connectServerStartup, initialServerStartupState } from '#lib/server-startup.js'
+import type { ServerStartupState } from '#lib/server-startup.js'
+import DesktopStartupNotices from '#lib/components/desktop-startup-notices.svelte'
+import ProductUpdateOverlay from '#lib/components/product-update-overlay.svelte'
+import ModelChangesSheet from '#lib/components/model-changes-sheet.svelte'
+import { setModelChanges, type ModelChanges } from '#lib/model-changes.js'
+import { Button } from '#lib/components/ui/button/index.js'
+import { Toaster } from '#lib/components/ui/sonner/index.js'
+import * as Tooltip from '#lib/components/ui/tooltip/index.js'
+import { setConnectSetup } from '#lib/connect-setup.js'
+import { createConsoleChat, setConsoleChat } from '#lib/console-chat.svelte.js'
+import { apiKeyExpiryTime } from '#lib/connect.js'
+import type { ConnectSetup } from '#lib/connect-setup.js'
+
+import { connectDesktopStartup, desktopFrontendFailure, initialDesktopStartupState } from '#lib/desktop-startup.js'
+
+import type { DesktopStartupState } from '#lib/desktop-startup.js'
+import { localeState } from '#lib/localization.svelte.js'
+import * as m from '#lib/paraglide/messages.js'
+import { admin, isTauri } from '#lib/admin-client.js'
+import { getAuthState, restoreAuthentication } from '#lib/auth.js'
+
 import {
   createDesktopUpdateBridge,
   ProductUpdateCoordinator,
   setProductUpdateCoordinator,
-} from '$lib/product-update.svelte'
+} from '#lib/product-update.svelte.js'
 
 let { children }: { children: Snippet } = $props()
 const connectSetup = $state<ConnectSetup>({ draft: undefined, createKey: false })
@@ -48,11 +50,15 @@ setModelChanges({
   reveal: (recordId) => modelChanges?.reveal(recordId),
 })
 const isSetupResource = $derived(/^\/(providers|models|api-keys)(\/|$)/.test(page.url.pathname))
-afterNavigate(({ from }) => {
-  if (!isSetupResource && page.url.pathname !== resolve('/connect')) {
+
+afterNavigate(({ from, shallow, type }) => {
+  if (shallow && type === 'goto') return
+
+  if (!isSetupResource && page.url.pathname !== resolve('connect')) {
     connectSetup.draft = undefined
     connectSetup.createKey = false
   }
+
   if (
     authReady &&
     page.url.pathname !== '/login' &&
@@ -90,15 +96,19 @@ const serverSurfaceState = $derived<ServerStartupState>(
       }
     : serverStartup,
 )
+
 const desktopSurfaceState = $derived<DesktopStartupState>(
   desktopStartup.status === 'ready' && !authReady
     ? { ...desktopStartup, status: 'starting', stage: 'session', progress: null }
     : desktopStartup,
 )
+
 const queryClient = new QueryClient({
   defaultOptions: { queries: { refetchOnWindowFocus: false, retry: 1, staleTime: 10_000 } },
 })
+
 const updates = new ProductUpdateCoordinator(admin.updates, browser && isTauri ? createDesktopUpdateBridge() : null)
+
 setProductUpdateCoordinator(updates)
 
 // The WDIO plugin installs a desktop automation bridge as a module side effect, so desktop-e2e must load it before startup/auth work.
@@ -116,7 +126,9 @@ onMount(() => {
 
   const failDesktopStartup = (stage: 'session' | 'desktop', details: string) => {
     if (disposed) return
+
     authReady = false
+
     desktopStartup = { ...desktopFrontendFailure(stage, details), logPath: desktopStartup.logPath }
   }
 
@@ -141,12 +153,14 @@ onMount(() => {
           return false
         }
       }
+
       if (
         (state.mode === 'desktop' ||
           ((state.mode === 'server' || state.mode === 'unavailable') && state.authenticated)) &&
         (authenticationPage || setupPage)
       ) {
         window.location.replace('/')
+
         return false
       }
     } catch {
@@ -164,13 +178,16 @@ onMount(() => {
 
   const initializeApplication = async (desktop: boolean) => {
     if (applicationInitializationStarted || disposed) return
+
     applicationInitializationStarted = true
 
     if (!(await initializeAuth(desktop)) || disposed) return
     if (desktop && desktopStartup.status !== 'ready') return
+
     authReady = true
 
     if (window.location.pathname === '/login' || window.location.pathname === '/setup') return
+
     try {
       if (import.meta.env.MODE === 'desktop-e2e') await updates.load()
       else await updates.automaticCheck()
@@ -234,7 +251,9 @@ onMount(() => {
 </script>
 
 <svelte:window onpagehide={() => void chat.stopAll()} onbeforeunload={() => void chat.stopAll()} />
+
 <ModeWatcher defaultMode="system" modeStorageKey="stravia-theme" />
+
 {#if isTauri && (!authReady || desktopStartup.status !== 'ready')}
   <DesktopStartup state={desktopSurfaceState} />
 {:else if !isTauri && (!authReady || serverStartup.status !== 'ready' || serverConnectionError)}
@@ -258,7 +277,7 @@ onMount(() => {
             <div class="mb-6 flex flex-wrap items-center justify-between gap-3 border-b pb-4">
               <p class="text-sm text-muted-foreground">{m.connect_continue_setup_description()}</p>
               <Button
-                href={resolve('/connect')}
+                href={resolve('connect')}
                 variant="outline"
                 onclick={() => {
                   void queryClient.invalidateQueries({ queryKey: ['models'] })

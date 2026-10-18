@@ -1,10 +1,13 @@
 import js from '@eslint/js'
+import paraglide from '@inlang/paraglide-js/eslint'
 import pluginQuery from '@tanstack/eslint-plugin-query'
-import svelteConfig from './svelte.config.js'
+import { loadConfig } from '@sveltejs/load-config'
 import svelte from 'eslint-plugin-svelte'
 import globals from 'globals'
 import tseslint from 'typescript-eslint'
 import { defineConfig, globalIgnores } from 'eslint/config'
+
+const svelteConfig = (await loadConfig('./', { traverse: false }))?.config
 
 export default defineConfig([
   globalIgnores(['.svelte-kit', 'build', 'dist', 'dist-desktop-e2e', 'src/lib/paraglide']),
@@ -41,6 +44,11 @@ export default defineConfig([
   },
   svelte.configs.recommended,
   ...pluginQuery.configs['flat/recommended'],
+  {
+    files: ['src/**/*.{js,ts,svelte}'],
+    plugins: { paraglide },
+    rules: { 'paraglide/no-dynamic-message-access': 'error' },
+  },
   {
     files: ['**/*.svelte', '**/*.svelte.ts', '**/*.svelte.js'],
     languageOptions: {

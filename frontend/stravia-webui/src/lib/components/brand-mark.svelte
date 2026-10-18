@@ -2,7 +2,7 @@
 import { onMount } from 'svelte'
 import brandMarkup from '../../assets/logos/stravia-logo.svg?raw'
 
-import { cn } from '$lib/utils.js'
+import { cn } from '#lib/utils.js'
 
 interface Props {
   class?: string

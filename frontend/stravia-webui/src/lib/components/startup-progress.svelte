@@ -1,8 +1,8 @@
 <script lang="ts">
-import { Progress } from '$lib/components/ui/progress'
-import * as m from '$lib/paraglide/messages.js'
-import { startupPhaseLabel } from '$lib/startup-progress'
-import type { StartupProgress } from '$lib/startup-progress'
+import { Progress } from '#lib/components/ui/progress/index.js'
+import * as m from '#lib/paraglide/messages.js'
+import { startupPhaseLabel } from '#lib/startup-progress.js'
+import type { StartupProgress } from '#lib/startup-progress.js'
 
 let { progress }: { progress: StartupProgress } = $props()
 const label = $derived(startupPhaseLabel(progress))

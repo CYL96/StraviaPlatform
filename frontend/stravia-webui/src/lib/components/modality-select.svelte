@@ -1,7 +1,7 @@
 <script lang="ts">
-import * as m from '$lib/paraglide/messages.js'
-import { specificationModalities, specificationModality } from '$lib/model-specification'
-import * as Select from '$lib/components/ui/select'
+import * as m from '#lib/paraglide/messages.js'
+import { specificationModalities, specificationModality } from '#lib/model-specification.js'
+import * as Select from '#lib/components/ui/select/index.js'
 
 interface Props {
   id: string

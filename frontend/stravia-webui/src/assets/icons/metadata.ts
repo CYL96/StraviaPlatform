@@ -1,5 +1,5 @@
 // Icon metadata for search and categorization
-import type { IconMetadata } from '@/types/icon'
+import type { IconMetadata } from '../../types/icon.js'
 
 export const iconMetadata: Record<string, IconMetadata> = {
   aigocode: {

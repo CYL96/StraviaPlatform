@@ -1,4 +1,4 @@
-import * as m from '$lib/paraglide/messages.js'
+import * as m from '#lib/paraglide/messages.js'
 
 export type AuthMode = 'setup' | 'server' | 'desktop' | 'unavailable'
 
@@ -34,7 +34,7 @@ interface ErrorPayload {
   code?: string
   params?: Record<string, unknown>
   data?: unknown
-  details?: { sync_summary?: import('$lib/types').ProviderModelSyncSummary }
+  details?: { sync_summary?: import('#lib/types.js').ProviderModelSyncSummary }
 }
 
 export const isTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window

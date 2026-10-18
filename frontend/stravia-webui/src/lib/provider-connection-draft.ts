@@ -6,7 +6,7 @@ import type {
   ProviderDescriptor,
   VendorChannelDescriptor,
   VendorConfigField,
-} from '$lib/types'
+} from '#lib/types.js'
 
 /**
  * Provider 连接草稿的字段。视图通过 Svelte 壳代理直接写入；

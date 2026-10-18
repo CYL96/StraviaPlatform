@@ -1,5 +1,5 @@
 <script lang="ts">
-import * as m from '$lib/paraglide/messages.js'
+import * as m from '#lib/paraglide/messages.js'
 import { goto } from '$app/navigation'
 import { resolve } from '$app/paths'
 import { createQuery, useQueryClient } from '@tanstack/svelte-query'
@@ -7,51 +7,55 @@ import { renderSnippet } from '@tanstack/svelte-table'
 import MoreHorizontalIcon from '@lucide/svelte/icons/more-horizontal'
 import PlusIcon from '@lucide/svelte/icons/plus'
 import { toast } from 'svelte-sonner'
+import { admin } from '#lib/admin-client.js'
+import { localizeBackendErrorMessage } from '#lib/backend-error.js'
+import { getDataTableLabels } from '#lib/data-table-labels.js'
+import { effectiveModelDisplayName, sortLogicalModels } from '#lib/logical-model.js'
+import { formatSpecificationTokens } from '#lib/model-specification.js'
 
-import { admin } from '$lib/admin-client'
-import { localizeBackendErrorMessage } from '$lib/backend-error'
-import { getDataTableLabels } from '$lib/data-table-labels'
-import { effectiveModelDisplayName, sortLogicalModels } from '$lib/logical-model'
-import { formatSpecificationTokens } from '$lib/model-specification'
 import {
   formatRouteDestinations,
   routeDestinationSeverity,
   summarizeRouteDestinations,
   type RouteDestinationSummary,
-} from '$lib/route-destinations'
-import { cn } from '$lib/utils'
-import type { Route } from '$lib/types'
-import PageHeader from '$lib/components/page-header.svelte'
-import RequestFailure from '$lib/components/request-failure.svelte'
-import StatusIndicator from '$lib/components/status-indicator.svelte'
-import TechnicalValue from '$lib/components/technical-value.svelte'
-import * as AlertDialog from '$lib/components/ui/alert-dialog'
-import { Button } from '$lib/components/ui/button'
+} from '#lib/route-destinations.js'
+import { cn } from '#lib/utils.js'
+import type { Route } from '#lib/types.js'
+import PageHeader from '#lib/components/page-header.svelte'
+import RequestFailure from '#lib/components/request-failure.svelte'
+import StatusIndicator from '#lib/components/status-indicator.svelte'
+import TechnicalValue from '#lib/components/technical-value.svelte'
+import * as AlertDialog from '#lib/components/ui/alert-dialog/index.js'
+import { Button } from '#lib/components/ui/button/index.js'
 import {
   DataTable,
   createDataTableColumnHelper,
   type DataTableCellContext,
   type DataTableRowPointerEvent,
-} from '$lib/components/ui/data-table'
-import * as DropdownMenu from '$lib/components/ui/dropdown-menu'
-import * as Empty from '$lib/components/ui/empty'
-import { Skeleton } from '$lib/components/ui/skeleton'
+} from '#lib/components/ui/data-table/index.js'
+
+import * as DropdownMenu from '#lib/components/ui/dropdown-menu/index.js'
+import * as Empty from '#lib/components/ui/empty/index.js'
+import { Skeleton } from '#lib/components/ui/skeleton/index.js'
 
 const queryClient = useQueryClient()
 const modelsQuery = createQuery(() => ({ queryKey: ['models'], queryFn: admin.models.list }))
 const providersQuery = createQuery(() => ({ queryKey: ['providers'], queryFn: admin.providers.list }))
 const apiKeysQuery = createQuery(() => ({ queryKey: ['api-keys'], queryFn: admin.apiKeys.list }))
+
 const webSearchQuery = createQuery(() => ({ queryKey: ['web-search-config'], queryFn: admin.webSearch.config.get }))
+
 const mediaUnderstandingQuery = createQuery(() => ({
   queryKey: ['media-understanding-config'],
   queryFn: admin.mediaUnderstanding.get,
 }))
+
 let deleteTarget = $state<Route>()
 let deleteOpen = $state(false)
 let actingModelId = $state<string>()
-
 const models = $derived(sortLogicalModels(modelsQuery.data ?? []))
 const providers = $derived(providersQuery.data ?? [])
+
 // 先读取全部查询状态，避免短路跳过订阅后错过先完成的依赖。
 const resourcesPending = $derived.by(() => {
   const models = modelsQuery.isPending
@@ -66,8 +70,10 @@ const resourcesFetching = $derived.by(() => {
 const resourceError = $derived.by(() => {
   const models = modelsQuery.error
   const providers = providersQuery.error
+
   return models ?? providers
 })
+
 const apiKeys = $derived(apiKeysQuery.data ?? [])
 const tableLabels = $derived(getDataTableLabels())
 const modelColumnHelper = createDataTableColumnHelper<Route>()
@@ -120,6 +126,7 @@ const modelColumns = modelColumnHelper.columns([
 function getModelRowId(model: Route): string {
   return model.id
 }
+
 const routeDependenciesUnavailable = $derived(
   apiKeysQuery.isPending ||
     apiKeysQuery.isError ||
@@ -128,9 +135,11 @@ const routeDependenciesUnavailable = $derived(
     mediaUnderstandingQuery.isPending ||
     mediaUnderstandingQuery.isError,
 )
+
 const deleteApiKeyReferences = $derived(
   deleteTarget ? apiKeys.filter((apiKey) => apiKey.model_ids.includes(deleteTarget!.id)) : [],
 )
+
 const deletesWebSearchRoute = $derived(
   Boolean(
     deleteTarget &&
@@ -148,7 +157,7 @@ function destinationSummary(model: Route): RouteDestinationSummary {
 
 function openModel(model: Route, event: MouseEvent): void {
   if (event.target instanceof Element && event.target.closest('a, button, [role="button"]')) return
-  void goto(resolve(`/models/${encodeURIComponent(model.model_id)}`))
+  void goto(resolve(`models/${encodeURIComponent(model.model_id)}`))
 }
 
 function handleModelTableRowClick({ event, original }: DataTableRowPointerEvent<Route>): void {
@@ -354,9 +363,9 @@ async function deleteModel(): Promise<void> {
         {#each models as model (model.id)}
           <div class="route-mobile-row">
             <div class="min-w-0">
-              <a class="block truncate font-medium" href={resolve(`/models/${encodeURIComponent(model.model_id)}`)}>
-                {effectiveModelDisplayName(model)}
-              </a>
+              <a class="block truncate font-medium" href={resolve(`models/${encodeURIComponent(model.model_id)}`)}
+                >{effectiveModelDisplayName(model)}</a>
+
               <TechnicalValue value={model.model_id} copyable />
               {@render outputState(model)}
               <p class="mt-1 text-xs text-muted-foreground">

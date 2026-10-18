@@ -1,8 +1,8 @@
 <script lang="ts">
-import * as m from '$lib/paraglide/messages.js'
-import { specificationModality } from '$lib/model-specification'
-import { cn } from '$lib/utils'
-import * as Tooltip from '$lib/components/ui/tooltip'
+import * as m from '#lib/paraglide/messages.js'
+import { specificationModality } from '#lib/model-specification.js'
+import { cn } from '#lib/utils.js'
+import * as Tooltip from '#lib/components/ui/tooltip/index.js'
 
 interface Props {
   values: readonly string[] | undefined

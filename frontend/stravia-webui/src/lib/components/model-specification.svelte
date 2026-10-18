@@ -1,9 +1,9 @@
 <script lang="ts">
-import * as m from '$lib/paraglide/messages.js'
-import { formatNumber } from '$lib/format'
-import { formatSpecificationTokens } from '$lib/model-specification'
-import type { ModelSpecification } from '$lib/types'
-import ModalityIcons from '$lib/components/modality-icons.svelte'
+import * as m from '#lib/paraglide/messages.js'
+import { formatNumber } from '#lib/format.js'
+import { formatSpecificationTokens } from '#lib/model-specification.js'
+import type { ModelSpecification } from '#lib/types.js'
+import ModalityIcons from '#lib/components/modality-icons.svelte'
 
 interface Props {
   specification: ModelSpecification

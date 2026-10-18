@@ -1,6 +1,6 @@
 <script lang="ts">
-import { markdownBlocks } from '$lib/markdown'
-import MarkdownRenderedBlock from '$lib/components/markdown-rendered-block.svelte'
+import { markdownBlocks } from '#lib/markdown.js'
+import MarkdownRenderedBlock from '#lib/components/markdown-rendered-block.svelte'
 
 let {
   text,

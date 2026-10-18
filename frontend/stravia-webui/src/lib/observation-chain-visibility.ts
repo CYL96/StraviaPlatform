@@ -1,4 +1,4 @@
-import type { InteractionSummary } from '$lib/types'
+import type { InteractionSummary } from '#lib/types.js'
 
 // 交互链路成员规则（CONTEXT.md「交互链路」）：从未向客户端交付任何可见输出且最终失败的
 // 交互不是链路成员，其失败事实归宿于「失败的请求」视图；取消、断线与观察丢失仍保留。

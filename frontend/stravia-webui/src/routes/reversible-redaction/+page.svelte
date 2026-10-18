@@ -1,21 +1,22 @@
 <script lang="ts">
-import * as m from '$lib/paraglide/messages.js'
+import * as m from '#lib/paraglide/messages.js'
 import { onMount } from 'svelte'
 import { resolve } from '$app/paths'
 import { createQuery, useQueryClient } from '@tanstack/svelte-query'
 import { toast } from 'svelte-sonner'
+import { admin } from '#lib/admin-client.js'
+import { localizeBackendErrorMessage } from '#lib/backend-error.js'
+import { formatLogTime, formatNumber } from '#lib/format.js'
+import { observationStatusLabel } from '#lib/observation-labels.js'
 
-import { admin } from '$lib/admin-client'
-import { localizeBackendErrorMessage } from '$lib/backend-error'
-import { formatLogTime, formatNumber } from '$lib/format'
-import { observationStatusLabel } from '$lib/observation-labels'
-import type { CredentialDiscoverySummary, CredentialMatch, CredentialRule, CustomCredentialRule } from '$lib/types'
-import PageHeader from '$lib/components/page-header.svelte'
-import * as Accordion from '$lib/components/ui/accordion'
-import * as Alert from '$lib/components/ui/alert'
-import { Button } from '$lib/components/ui/button'
-import * as Empty from '$lib/components/ui/empty'
-import * as Field from '$lib/components/ui/field'
+import type { CredentialDiscoverySummary, CredentialMatch, CredentialRule, CustomCredentialRule } from '#lib/types.js'
+
+import PageHeader from '#lib/components/page-header.svelte'
+import * as Accordion from '#lib/components/ui/accordion/index.js'
+import * as Alert from '#lib/components/ui/alert/index.js'
+import { Button } from '#lib/components/ui/button/index.js'
+import * as Empty from '#lib/components/ui/empty/index.js'
+import * as Field from '#lib/components/ui/field/index.js'
 import { renderSnippet } from '@tanstack/svelte-table'
 import ListFilterIcon from '@lucide/svelte/icons/list-filter'
 import HistoryIcon from '@lucide/svelte/icons/history'
@@ -23,33 +24,38 @@ import ScanTextIcon from '@lucide/svelte/icons/scan-text'
 import ArrowRightIcon from '@lucide/svelte/icons/arrow-right'
 import RefreshCwIcon from '@lucide/svelte/icons/refresh-cw'
 import InfoIcon from '@lucide/svelte/icons/info'
-import { Badge } from '$lib/components/ui/badge'
-import * as Select from '$lib/components/ui/select'
+import { Badge } from '#lib/components/ui/badge/index.js'
+import * as Select from '#lib/components/ui/select/index.js'
 import CustomRuleSheet from './custom-rule-sheet.svelte'
 import PlusIcon from '@lucide/svelte/icons/plus'
-import * as Tabs from '$lib/components/ui/tabs'
-import * as Sheet from '$lib/components/ui/sheet'
+import * as Tabs from '#lib/components/ui/tabs/index.js'
+import * as Sheet from '#lib/components/ui/sheet/index.js'
+
 import {
   DataTable,
   createDataTableColumnHelper,
   type DataTableCellContext,
   type DataTableInstance,
   type DataTableRowPointerEvent,
-} from '$lib/components/ui/data-table'
-import { getDataTableLabels } from '$lib/data-table-labels'
-import { Spinner } from '$lib/components/ui/spinner'
-import { Switch } from '$lib/components/ui/switch'
-import { Textarea } from '$lib/components/ui/textarea'
+} from '#lib/components/ui/data-table/index.js'
+
+import { getDataTableLabels } from '#lib/data-table-labels.js'
+import { Spinner } from '#lib/components/ui/spinner/index.js'
+import { Switch } from '#lib/components/ui/switch/index.js'
+import { Textarea } from '#lib/components/ui/textarea/index.js'
 
 const settingKey = 'reversible_redaction_enabled'
 const queryKey = ['setting', settingKey]
 const customRulesKey = ['credential-protection-custom-rules']
+
 // 内置与自定义规则在同一张表浏览；详情与编辑各自沿用唯一的表面。
 type RuleRow =
   | { origin: 'builtin'; id: string; name: string; rule: CredentialRule }
   | { origin: 'custom'; id: string; name: string; rule: CustomCredentialRule }
+
 const queryClient = useQueryClient()
 const settingQuery = createQuery(() => ({ queryKey, queryFn: () => admin.settings.get(settingKey) }))
+
 const rulesQuery = createQuery(() => ({
   queryKey: ['credential-protection-rules'],
   queryFn: admin.credentialProtection.rules,
@@ -173,8 +179,10 @@ async function loadDiscoveries(append: boolean): Promise<void> {
       cursor: append ? (nextCursor ?? undefined) : undefined,
       limit: 20,
     })
+
     discoveries = append ? [...discoveries, ...result.items] : result.items
     nextCursor = result.next_cursor
+
     observationGap = append ? observationGap || result.observation_gap : result.observation_gap
   } catch {
     discoveriesError = true
@@ -510,6 +518,7 @@ function selectMatch(match: CredentialMatch): void {
                         >{m.credential_protection_discoveries_count({
                           count: formatNumber(discovery.new_credential_count),
                         })}</span>
+
                       <span class="truncate text-xs font-normal text-muted-foreground"
                         >{discovery.rule_ids.map((id) => ruleNames.get(id) ?? id).join(' · ')}</span>
                     </span>
@@ -542,7 +551,7 @@ function selectMatch(match: CredentialMatch): void {
                   <Button
                     class="mt-4"
                     variant="outline"
-                    href={resolve(`/logs?interaction=${encodeURIComponent(discovery.interaction_id)}`)}
+                    href={resolve(`logs?interaction=${encodeURIComponent(discovery.interaction_id)}`)}
                     >{m.credential_protection_discoveries_open()}</Button>
                 </Accordion.Content>
               </Accordion.Item>
