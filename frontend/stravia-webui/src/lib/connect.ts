@@ -29,6 +29,7 @@ export interface ClientModelDefinition {
   outputModality: RouteOutputModality | null
   displayName: string
   supportedThinkingLevels: readonly ThinkingLevel[]
+  defaultThinkingLevel?: ThinkingLevel
   supportsImageInput: boolean
   contextWindow?: number
 }
@@ -94,6 +95,7 @@ export function defineClientModel(model: Route): ClientModelDefinition {
     outputModality: model.output_modality,
     displayName: effectiveModelDisplayName(model),
     supportedThinkingLevels: [...new Set(model.supported_thinking_levels ?? [])],
+    ...(model.default_thinking_level ? { defaultThinkingLevel: model.default_thinking_level } : {}),
     supportsImageInput: model.supports_image_input ?? false,
     ...(model.context_window ? { contextWindow: model.context_window } : {}),
   }

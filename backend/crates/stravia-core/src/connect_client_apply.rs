@@ -32,6 +32,7 @@ pub struct ConnectClientModel {
     pub output_modality: Option<crate::db::models::RouteOutputModality>,
     #[serde(default)]
     pub supported_thinking_levels: Vec<String>,
+    pub default_thinking_level: Option<String>,
     #[serde(default)]
     pub supports_image_input: bool,
     pub context_window: Option<u64>,
@@ -769,6 +770,14 @@ fn open_responses_models(input: &ConnectClientApplyInput) -> JsonValue {
                 }),
             ),
         ]);
+        if let Some(default_level) = model.default_thinking_level.as_deref() {
+            let effort = if default_level == "off" {
+                "none"
+            } else {
+                default_level
+            };
+            value.insert("options".to_owned(), json!({ "reasoningEffort": effort }));
+        }
         if let Some(context) = model.context_window {
             value.insert("limit".to_owned(), json!({ "context": context }));
         }
@@ -781,16 +790,14 @@ fn responses_provider(input: &ConnectClientApplyInput, base_url_key: &str) -> Js
         .models
         .iter()
         .map(|model| {
-            let levels = model
+            let reasoning = model
                 .supported_thinking_levels
                 .iter()
-                .filter(|level| level.as_str() != "off")
-                .cloned()
-                .collect::<Vec<_>>();
+                .any(|level| level != "off");
             let mut value = JsonMap::from_iter([
                 ("id".to_owned(), json!(model.model_id)),
                 ("name".to_owned(), json!(model.display_name)),
-                ("reasoning".to_owned(), json!(!levels.is_empty())),
+                ("reasoning".to_owned(), json!(reasoning)),
                 (
                     "input".to_owned(),
                     json!(input_modalities(
@@ -799,17 +806,18 @@ fn responses_provider(input: &ConnectClientApplyInput, base_url_key: &str) -> Js
                     )),
                 ),
             ]);
-            if !levels.is_empty() {
+            if reasoning && matches!(input.tool, ConnectClientId::Omp) {
+                let levels = model
+                    .supported_thinking_levels
+                    .iter()
+                    .filter(|level| level.as_str() != "off")
+                    .collect::<Vec<_>>();
                 let mut thinking = JsonMap::from_iter([
                     ("mode".to_owned(), json!("effort")),
                     ("efforts".to_owned(), json!(levels)),
                 ]);
-                if model
-                    .supported_thinking_levels
-                    .iter()
-                    .any(|level| level == "medium")
-                {
-                    thinking.insert("defaultLevel".to_owned(), json!("medium"));
+                if let Some(default_level) = &model.default_thinking_level {
+                    thinking.insert("defaultLevel".to_owned(), json!(default_level));
                 }
                 value.insert("thinking".to_owned(), JsonValue::Object(thinking));
             }
@@ -1261,18 +1269,10 @@ fn codex_catalog(input: &ConnectClientApplyInput) -> JsonValue {
                     })
                 })
                 .collect::<Vec<_>>();
-            let default_level = if model
-                .supported_thinking_levels
-                .iter()
-                .any(|level| level == "medium")
-            {
-                Some("medium")
-            } else {
-                model
-                    .supported_thinking_levels
-                    .first()
-                    .map(|level| if level == "off" { "none" } else { level.as_str() })
-            };
+            let default_level = model
+                .default_thinking_level
+                .as_deref()
+                .map(|level| if level == "off" { "none" } else { level });
             let mut entry = JsonMap::from_iter([
                 ("slug".to_owned(), json!(model.model_id)),
                 ("display_name".to_owned(), json!(model.display_name)),
@@ -1379,6 +1379,7 @@ mod tests {
             display_name: display_name.to_owned(),
             output_modality: Some(crate::db::models::RouteOutputModality::Text),
             supported_thinking_levels: vec!["off".to_owned(), "medium".to_owned()],
+            default_thinking_level: None,
             supports_image_input: true,
             context_window: Some(200_000),
         }
@@ -1578,6 +1579,148 @@ name = "Other"
             .find(|file| file.path.ends_with(suffix))
             .unwrap_or_else(|| panic!("planned file ending with {suffix}"));
         String::from_utf8(file.bytes.clone()).expect("UTF-8 config")
+    }
+
+    #[test]
+    fn omp_uses_each_routes_default_thinking_level() {
+        let defaults = [
+            Some("high"),
+            Some("xhigh"),
+            Some("off"),
+            Some("medium"),
+            Some("low"),
+            Some("minimal"),
+            Some("max"),
+            None,
+        ];
+        let models = defaults
+            .iter()
+            .enumerate()
+            .map(|(index, default)| serde_json::json!({
+                "modelId": format!("route-{index}"),
+                "displayName": format!("Route {index}"),
+                "supportedThinkingLevels": ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
+                "defaultThinkingLevel": default,
+            }))
+            .collect::<Vec<_>>();
+        let input: ConnectClientApplyInput = serde_json::from_value(serde_json::json!({
+            "tool": "omp",
+            "host": "http://127.0.0.1:7331",
+            "apiKey": "synthetic-only",
+            "models": models,
+        }))
+        .expect("valid input");
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let plan =
+            plan_connect_client_apply(&input, &environment(temporary.path()), &BTreeMap::new())
+                .expect("OMP plan");
+        let document =
+            serde_saphyr::from_str::<serde_json::Value>(&planned_text(&plan, "models.yml"))
+                .expect("OMP YAML");
+        for (model, expected) in document["providers"]["stravia"]["models"]
+            .as_array()
+            .expect("models")
+            .iter()
+            .zip(defaults)
+        {
+            assert_eq!(
+                model["thinking"]["defaultLevel"].as_str(),
+                expected,
+                "model {}",
+                model["id"],
+            );
+        }
+    }
+
+    #[test]
+    fn codex_catalog_uses_saved_defaults_without_selecting_global_effort() {
+        let cases = [
+            (Some("high"), vec!["medium", "high"], Some("high")),
+            (Some("xhigh"), vec!["medium", "xhigh"], Some("xhigh")),
+            (Some("off"), vec!["off", "medium"], Some("none")),
+            (None, vec!["medium", "high"], None),
+            (None, vec!["low", "high"], None),
+            (Some("high"), vec!["low"], Some("high")),
+        ];
+        let mut input = standard_input(ConnectClientId::CodexCli);
+        input.models = cases
+            .iter()
+            .enumerate()
+            .map(|(index, (default, supported, _))| {
+                let mut model = model(&format!("route-{index}"), "Route");
+                model.default_thinking_level = default.map(str::to_owned);
+                model.supported_thinking_levels =
+                    supported.iter().map(|level| (*level).to_owned()).collect();
+                model
+            })
+            .collect();
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let path = temporary.path().join(".codex").join("config.toml");
+        let existing = BTreeMap::from([(
+            path,
+            b"model = 'other/current'\nmodel_reasoning_effort = 'low'\n".to_vec(),
+        )]);
+        let plan = plan_connect_client_apply(&input, &environment(temporary.path()), &existing)
+            .expect("Codex plan");
+        let config: TomlValue =
+            toml::from_str(&planned_text(&plan, "config.toml")).expect("Codex TOML");
+        assert_eq!(config["model"].as_str(), Some("other/current"));
+        assert_eq!(config["model_reasoning_effort"].as_str(), Some("low"));
+        let catalog: serde_json::Value =
+            serde_json::from_str(&planned_text(&plan, "stravia-models.json"))
+                .expect("Codex catalog");
+        for (model, (_, _, expected)) in catalog["models"]
+            .as_array()
+            .expect("models")
+            .iter()
+            .zip(cases)
+        {
+            assert_eq!(model["default_reasoning_level"].as_str(), expected);
+        }
+    }
+
+    #[test]
+    fn opencode_uses_model_defaults_without_changing_effort_variants() {
+        let defaults = [
+            Some("off"),
+            Some("minimal"),
+            Some("low"),
+            Some("medium"),
+            Some("high"),
+            Some("xhigh"),
+            Some("max"),
+            None,
+        ];
+        let mut input = standard_input(ConnectClientId::Opencode);
+        input.models = defaults
+            .iter()
+            .enumerate()
+            .map(|(index, default)| {
+                let mut model = model(&format!("route-{index}"), "Route");
+                model.default_thinking_level = default.map(str::to_owned);
+                model.supported_thinking_levels =
+                    vec!["off".to_owned(), "medium".to_owned(), "max".to_owned()];
+                model
+            })
+            .collect();
+        let plan = preview_connect_client_apply(&input).expect("OpenCode preview");
+        let (_, preview) = plan.preview.split_once('\n').expect("config path header");
+        let document: serde_json::Value = serde_json::from_str(preview).expect("OpenCode JSON");
+        for (index, default) in defaults.into_iter().enumerate() {
+            let model = &document["provider"]["stravia"]["models"][format!("route-{index}")];
+            assert_eq!(
+                model["options"]["reasoningEffort"].as_str(),
+                default.map(|level| if level == "off" { "none" } else { level }),
+            );
+            assert_eq!(
+                model["variants"],
+                serde_json::json!({
+                    "none": { "reasoningEffort": "none" },
+                    "medium": { "reasoningEffort": "medium" },
+                    "max": { "reasoningEffort": "max" },
+                }),
+            );
+        }
     }
 
     #[test]
