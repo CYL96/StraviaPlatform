@@ -159,6 +159,15 @@ impl<'a> Security<'a> {
         })
     }
 
+    pub(crate) async fn transparent_injection_enabled(
+        &self,
+        principal: &stravia_runtime_contract::Principal,
+    ) -> Result<bool, GatewayError> {
+        let key = self.principal_key(principal).await?;
+        validate_key_state(&key)?;
+        Ok(key.transparent_injection_enabled)
+    }
+
     pub(crate) async fn media_transparent_injection_enabled(
         &self,
         principal: &stravia_runtime_contract::Principal,

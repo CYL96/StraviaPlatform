@@ -2063,7 +2063,8 @@ async fn drive_vendor_attempt(
             prepared.protocol_hint.clone(),
             prepared.egress_base_url.clone(),
             prepared.first_token_timed_out.clone(),
-        );
+        )
+        .with_usage_ledger(prepared.root_request.confirmed_usage.clone());
         // 每次派发都从实际请求重建事实；恢复、续传回退与凭据恢复不能沿用旧声明。
         update_protected_reasoning_metadata(
             &mut prepared.metadata,

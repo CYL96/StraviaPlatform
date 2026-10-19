@@ -38,6 +38,8 @@ Artifact 仅因所属 Principal 的鉴权使用刷新保留期：模型请求实
 
 > **局部被取代。** [ADR-0063](0063-record-four-direction-wire-debug-at-transport-boundaries.md) 仅对显式开启的 Debug Wire 取代上一段的媒体外置要求：Wire 在实际传输边界原样保留媒体，不转换为 Artifact 引用。普通 Observation、历史、日志及其他业务持久化仍遵守本 ADR 的媒体收存和外置边界。
 
+媒体外置不代表下载授权或其他凭据已被诊断过滤。普通 Observation 与 Debug Wire 现在均仅遮盖实际 HTTP `Authorization` header 值；普通记录的实时展示、落盘和导出可能保留签名下载地址及其他凭据。此变化不扩大普通 Observation 的媒体捕获范围，不改变 Artifact 保留期或授权有效期，不自动刷新、续签或恢复过期媒体，也不回写旧记录。
+
 ## 文件大小与暂存限制
 
 现阶段保留现有 Artifact 限制：单文件最大 100 MiB，每个 Principal 最多 16 个未完成且未过期的上传任务，合计声明文件大小最多 400 MiB。同一 API Key 的多个客户端共享该额度；一个文件的多个上传分片只计一个任务，上传完成后释放名额，已完成文件不占用此额度。达到上限时拒绝新建上传任务，不自动排队；放弃但尚未过期的任务仍占用额度，过期后不再计数。普通上传、临时上传授权、URL 收存与请求内 base64 附件均执行同一套适用限制，不因入口或内部／S3 存储后端不同而放宽。

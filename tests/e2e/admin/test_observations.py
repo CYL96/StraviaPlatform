@@ -525,11 +525,12 @@ def test_failed_request_preserves_verified_source_before_run_admission(admin_env
 
 @pytest.mark.e2e
 @pytest.mark.admin
-def test_failed_request_has_one_row_for_all_attempts_and_redacted_full_error(admin_env: dict[str, Any]) -> None:
+def test_failed_request_preserves_diagnostics_but_redacts_client_error(admin_env: dict[str, Any]) -> None:
     model = "observation-always-failed-diagnostics"
     route_id, key = _create_route(admin_env, model, retry_budget=2)
-    status, _ = _proxy(admin_env, key, model, [{"role": "user", "content": model}])
+    status, client_error = _proxy(admin_env, key, model, [{"role": "user", "content": model}])
     assert status >= 500
+    assert "upstream-secret" not in json.dumps(client_error)
     failure = _wait_for(
         "all exhausted attempts",
         lambda: next(iter(_failed_requests(admin_env, model=route_id)["items"]), None),
@@ -542,7 +543,7 @@ def test_failed_request_has_one_row_for_all_attempts_and_redacted_full_error(adm
         error = attempt["payload"]["error"]
         assert error["status_code"] == 503
         assert "long detail " * 200 in error["message"]
-    assert "upstream-secret" not in json.dumps(detail)
+    assert "upstream-secret" in json.dumps(detail)
     assert key not in json.dumps(detail)
     _, _, archive = download_observation_bundle(admin_env, detail)
     with zipfile.ZipFile(io.BytesIO(archive)) as bundle:
@@ -554,7 +555,7 @@ def test_failed_request_has_one_row_for_all_attempts_and_redacted_full_error(adm
         event["payload"]["error"] for event in attempts
     ]
     assert "long detail " * 200 in failure["error"]["message"]
-    assert "upstream-secret" not in json.dumps(failure)
+    assert "upstream-secret" in json.dumps(failure)
     assert key not in json.dumps(failure)
     usage = detail["interaction"]["usage"]
     for _ in range(2):
@@ -565,7 +566,7 @@ def test_failed_request_has_one_row_for_all_attempts_and_redacted_full_error(adm
             headers=admin_env["auth"],
         )
         assert status == 200
-        assert "upstream-secret" not in json.dumps(response)
+        assert "upstream-secret" in json.dumps(response)
     after = _detail(admin_env, failure["interaction_id"])
     assert len(after["runs"]) == 1
     assert after["interaction"]["usage"] == usage
@@ -613,11 +614,12 @@ def test_failed_request_excludes_client_disconnect_during_stream(admin_env: dict
 
 @pytest.mark.e2e
 @pytest.mark.admin
-def test_failed_request_redacts_nested_json_error_credentials(admin_env: dict[str, Any]) -> None:
+def test_failed_request_preserves_nested_diagnostics_but_redacts_client_error(admin_env: dict[str, Any]) -> None:
     model = "observation-always-failed-structured-error"
     route_id, key = _create_route(admin_env, model, retry_budget=0)
-    status, _ = _proxy(admin_env, key, model, [{"role": "user", "content": model}])
+    status, client_error = _proxy(admin_env, key, model, [{"role": "user", "content": model}])
     assert status >= 400
+    assert "nested-diagnostic-secret" not in json.dumps(client_error)
     failure = _wait_for(
         "structured upstream failure",
         lambda: next(iter(_failed_requests(admin_env, model=route_id)["items"]), None),
@@ -627,7 +629,8 @@ def test_failed_request_redacts_nested_json_error_credentials(admin_env: dict[st
         headers=admin_env["auth"],
     )
     assert status == 200
-    assert "nested-diagnostic-secret" not in json.dumps([failure, detail])
+    assert "nested-diagnostic-secret" in json.dumps(failure)
+    assert "nested-diagnostic-secret" in json.dumps(detail)
     message = json.loads(failure["error"]["message"])
     assert json.loads(message["detail"])["hint"] == "provider detail"
 
@@ -1037,7 +1040,7 @@ def test_observation_http_sse_usage_and_legacy_cutover(admin_env: dict[str, Any]
 
 @pytest.mark.e2e
 @pytest.mark.admin
-def test_input_preview_filters_latest_user_before_unicode_limit_with_debug_off(
+def test_input_preview_preserves_latest_user_before_unicode_limit_with_debug_off(
     admin_env: dict[str, Any],
 ) -> None:
     route_id, api_key = _create_route(admin_env, "observation-input-preview")
@@ -1051,18 +1054,18 @@ def test_input_preview_filters_latest_user_before_unicode_limit_with_debug_off(
         {"role": "user", "content": "old-user-context"},
         {"role": "assistant", "content": "old-assistant-context"},
         {"role": "user", "content": [
-            {"type": "text", "text": "api_key=" + "credential" * 600},
+            {"type": "text", "text": "api_key=" + "credential" * 60},
             {"type": "text", "text": "文" * 4200},
         ]},
     ])
     assert status == 200, response
     summary = _wait_for(
-        "redacted ordinary-mode input preview",
+        "ordinary-mode input preview",
         lambda: next((item for item in _route_interactions(admin_env, route_id)
                       if item["input_preview"] is not None), None),
     )
     preview = summary["input_preview"]
-    assert preview == ("api_key=***\n" + "文" * 4200)[:4096]
+    assert preview == ("api_key=" + "credential" * 60 + "\n" + "文" * 4200)[:4096]
     assert _detail(admin_env, summary["id"])["interaction"]["input_preview"] == preview
 
 
@@ -1645,7 +1648,7 @@ def test_debug_switch_is_snapshotted_per_run_within_one_interaction(
 
 @pytest.mark.e2e
 @pytest.mark.admin
-def test_debug_snapshot_redaction_bundle_ticket_and_clear_active_history(
+def test_debug_snapshot_preserves_content_masks_authorization_and_clears_history(
     admin_env: dict[str, Any],
 ) -> None:
     status, _ = http_request(
@@ -1725,7 +1728,7 @@ def test_debug_snapshot_redaction_bundle_ticket_and_clear_active_history(
         [{"role": "user", "content": "debug payload"}],
         extra_headers={"x-api-key": sentinel, "cookie": f"session={sentinel}"},
         query=f"?access_token={sentinel}",
-        body_extra={"metadata": {"nested": {"password": sentinel}}},
+        body_extra={"metadata": {"nested": {"password": sentinel, "Authorization": sentinel}}},
     )
     assert status == 200, response
     interaction = _wait_for("debug Interaction", lambda: _route_interactions(admin_env, route_id))[0]
@@ -1746,6 +1749,13 @@ def test_debug_snapshot_redaction_bundle_ticket_and_clear_active_history(
 
     ticket_data, headers, archive = download_observation_bundle(admin_env, detail)
     records = observation_bundle_events(archive)
+    client_head = next(
+        record for record in records
+        if record["direction"] == "client_to_platform" and record["headers"]
+    )
+    assert client_head["headers"]["authorization"] == "***"
+    assert client_head["headers"]["x-api-key"] == sentinel
+    assert client_head["headers"]["cookie"] == f"session={sentinel}"
     assert "debug payload" in json.dumps(
         [event["payload"] for event in records if event.get("layer") == "wire"]
     )
@@ -1776,6 +1786,7 @@ def test_debug_snapshot_redaction_bundle_ticket_and_clear_active_history(
         assert manifest["fidelity"] == "application_protocol_capture_not_packet_capture"
         bundle_payload = b"".join(bundle.read(name) for name in names)
         assert sentinel.encode() in bundle_payload
+        assert api_key.encode() not in bundle_payload
 
     replay_status, _, replay_body = http_bytes("GET", download_url)
     random_status, _, random_body = http_bytes(

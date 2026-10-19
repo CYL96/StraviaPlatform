@@ -17,6 +17,7 @@ import type {
   ConsoleResponsesEvent,
   ConsoleThinkingSelection,
   ConsoleTokenUsage,
+  ConsoleOutputBlock,
 } from '#lib/console-chat-types.js'
 import type { Route } from '#lib/types.js'
 import type { ThinkingActivity } from '#lib/observation-activities.js'
@@ -65,6 +66,33 @@ export function consoleAssistantContent(message: ConsoleAssistantMessage): { tex
 
 function hasVisibleThinkingText(activity: ThinkingActivity): boolean {
   return activity.text.trim().length > 0
+}
+
+/** 输出项本身提供顺序；旧的中断检查点缺少交错依据，保持其已记录布局。 */
+export function consoleAssistantBlocks(message: ConsoleAssistantMessage): ConsoleOutputBlock[] {
+  if (message.status === 'stopped' || message.status === 'failed') {
+    if (message.partialBlocks)
+      return message.partialBlocks
+        .map((block) => ({ ...block, text: consoleVisibleText(block.text) }))
+        .filter((block) => block.text.trim())
+    const text = consoleVisibleText(message.partialText ?? '')
+    return [
+      ...consoleReasoningActivities(message),
+      ...(text.trim() ? [{ kind: 'text' as const, id: `${message.id}:text`, text }] : []),
+    ]
+  }
+  return message.outputItems.flatMap((output, index): ConsoleOutputBlock[] => {
+    const item = record(output)
+    const id = typeof item?.id === 'string' ? item.id : `${message.id}:output:${index}`
+    if (item?.type === 'reasoning') {
+      const text =
+        consoleVisibleText(readableParts(item.summary)) ||
+        consoleVisibleText(readableParts(item.content) || readableParts(item.text))
+      return text.trim() ? [{ kind: 'thinking', id, at: Date.parse(message.createdAt), text, live: false }] : []
+    }
+    const text = item?.type === 'message' ? consoleVisibleText(readableParts(item.content)) : ''
+    return text.trim() ? [{ kind: 'text', id, text }] : []
+  })
 }
 
 export function consoleReasoningActivities(message: ConsoleAssistantMessage): ThinkingActivity[] {
@@ -155,6 +183,7 @@ interface ActiveRequest {
   message: ConsoleAssistantMessage
   generation: ConsoleGeneration
   reasoningItems: Map<number, ReasoningItem>
+  outputBlocks: Map<number, ConsoleOutputBlock>
 }
 
 interface ReasoningItem {
@@ -758,8 +787,9 @@ export class ConsoleChatController {
     const active: ActiveRequest = {
       abort: new AbortController(),
       message,
-      generation: { text: '', summary: '', reasoning: '', activities: [], followedThinkingIds: [] },
+      generation: { text: '', summary: '', reasoning: '', activities: [], followedThinkingIds: [], blocks: [] },
       reasoningItems: new Map(),
+      outputBlocks: new Map(),
     }
     conversation.messages.push(message)
     conversation.updatedAt = this.time()
@@ -785,9 +815,21 @@ export class ConsoleChatController {
         const generation = active.generation
         if (event.type === 'response.output_text.delta' || event.type === 'response.refusal.delta') {
           generation.text += event.delta ?? ''
+          const index = event.output_index ?? Math.max(-1, ...active.reasoningItems.keys()) + 1
+          const id = `${message.id}:text:${index}`
+          // 已发布快照与 keyed 子块持有旧对象；后续分片必须发布新身份。
+          active.outputBlocks.set(index, {
+            kind: 'text',
+            id,
+            text: (active.outputBlocks.get(index)?.text ?? '') + (event.delta ?? ''),
+          })
           followReasoning(active, event.output_index)
         } else if (updateReasoning(active, event, this.now())) {
-          // Per-item lifecycle is independent of the surrounding response.
+          for (const [index, item] of active.reasoningItems) {
+            const activity = generation.activities.find((activity) => activity.id === item.id)
+            if (activity) active.outputBlocks.set(index, activity)
+            else active.outputBlocks.delete(index)
+          }
         } else if (event.type === 'response.output_item.added') {
           // 消息或工具调用等非 reasoning 输出项开始；只有其收起思考时才需要发布。
           if (!followReasoning(active, event.output_index)) continue
@@ -812,14 +854,20 @@ export class ConsoleChatController {
           delete message.partialText
           delete message.partialThinking
           delete message.partialActivities
+          delete message.partialBlocks
           generation.activities = consoleReasoningActivities(message)
+          generation.blocks = consoleAssistantBlocks(message)
           this.publish()
           terminal = true
           break
         } else continue
+        generation.blocks = [...active.outputBlocks].sort(([a], [b]) => a - b).map(([, block]) => block)
         // 流式检查点按 stopped 持久化，刷新时不依赖卸载阶段的异步写入。
         message.partialText = consoleVisibleText(generation.text)
         message.partialActivities = generation.activities.map((activity) => ({ ...activity, live: false }))
+        message.partialBlocks = generation.blocks.map((block) =>
+          block.kind === 'thinking' ? { ...block, live: false } : { ...block },
+        )
         message.partialThinking = message.partialActivities.map((activity) => activity.text).join('\n\n')
         conversation.updatedAt = this.time()
         this.publish()
@@ -872,6 +920,9 @@ export class ConsoleChatController {
     active.message.partialThinking =
       consoleVisibleText(active.generation.summary) || consoleVisibleText(active.generation.reasoning)
     active.message.partialActivities = active.generation.activities.map((activity) => ({ ...activity, live: false }))
+    active.message.partialBlocks = active.generation.blocks?.map((block) =>
+      block.kind === 'thinking' ? { ...block, live: false } : { ...block },
+    )
     conversation.updatedAt = this.time()
     this.publish()
     await this.save(conversation)

@@ -13,7 +13,6 @@ use tokio_stream::wrappers::ReceiverStream;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
-use super::redaction::redact_value;
 use super::store::ObservationStore;
 use super::trace::{TraceHandle, TraceManager, TraceSnapshot};
 use super::types::{
@@ -181,7 +180,6 @@ impl BundleExport {
         };
         self.describe_legacy_media(&mut snapshot).await?;
         self.remove_expired();
-        redact_value(&mut snapshot.summary);
         let expires_at = snapshot
             .exported_at
             .saturating_add(TICKET_TTL.as_millis() as i64);
@@ -551,8 +549,7 @@ fn stream_bundle(snapshot: BundleSnapshot) -> BundleStream {
     Box::pin(ReceiverStream::new(receiver))
 }
 
-fn write_bundle(writer: ChunkWriter, mut snapshot: BundleSnapshot) -> io::Result<()> {
-    redact_value(&mut snapshot.summary);
+fn write_bundle(writer: ChunkWriter, snapshot: BundleSnapshot) -> io::Result<()> {
     let completeness = bundle_completeness(&snapshot);
     let manifest = BundleManifest::from_snapshot(&snapshot, completeness);
     let mut zip = ZipWriter::new_stream(writer);

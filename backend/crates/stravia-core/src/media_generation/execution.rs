@@ -114,6 +114,14 @@ pub(crate) async fn generate(
     let input = parse_input(&input)?;
     let references = input.input.reference_images.unwrap_or_default();
     let route = config::validated_route(gateway).await?;
+    let download_settings = crate::media::ingest::settings(gateway)
+        .await
+        .map_err(|error| {
+            GenerationError::new("artifact_download_unavailable", error.to_string())
+        })?;
+    download_settings.validate_for_save().map_err(|error| {
+        GenerationError::new("artifact_download_unavailable", error.to_string())
+    })?;
     check_execution(&cancellation, deadline)?;
 
     let mut observation_request = reference_request(
@@ -176,14 +184,19 @@ pub(crate) async fn generate(
                 },
             )
     });
+    let mut context = VendorCallContext::new(
+        cancellation,
+        stravia_runtime_contract::Deadline::fixed(deadline),
+    );
+    context.observer = Some(observer.clone());
     let result = generate_image(
         gateway,
         &route,
         request,
         principal,
-        cancellation,
         deadline,
-        observer.clone(),
+        context,
+        &download_settings,
     )
     .await;
     if standalone {
@@ -210,15 +223,11 @@ async fn generate_image(
     route: &crate::db::models::RouteConfig,
     request: MediaImageRequest,
     principal: Principal,
-    cancellation: CancellationToken,
     deadline: Instant,
-    observer: crate::interaction_observation::RunObserver,
+    context: VendorCallContext,
+    download_settings: &stravia_runtime_contract::artifact::ArtifactSettings,
 ) -> Result<(Value, tokio::sync::OwnedRwLockReadGuard<()>), GenerationError> {
-    let mut context = VendorCallContext::new(
-        cancellation.clone(),
-        stravia_runtime_contract::Deadline::fixed(deadline),
-    );
-    context.observer = Some(observer);
+    let cancellation = context.cancellation.clone();
     let execution = gateway
         .execute_vendor_route(
             &principal,
@@ -291,18 +300,28 @@ async fn generate_image(
         },
     };
 
-    Ok((
-        json!({
-            "path": artifact.reference(),
-            "mime_type": artifact.mime_type,
-            "size": artifact.size,
-            "media": {
-                "width": width,
-                "height": height,
-            },
-        }),
-        publication,
-    ))
+    let mut value = json!({
+        "path": artifact.reference(),
+        "mime_type": artifact.mime_type,
+        "size": artifact.size,
+        "media": {
+            "width": width,
+            "height": height,
+        },
+    });
+    let download = store
+        .download_relay(&principal, &artifact.id, retention, download_settings)
+        .await
+        .map_err(|error| {
+            let mut failure = GenerationError::new(
+                "artifact_download_failed",
+                format!("Image was generated and stored, but its download link could not be issued: {error}. Use the retained Artifact reference to obtain a new download link; do not regenerate the image."),
+            );
+            failure.artifact = Some(value.clone());
+            failure
+        })?;
+    value["download_url"] = Value::String(download.url);
+    Ok((value, publication))
 }
 
 fn reference_request(model: String, prompt: String, references: Vec<String>) -> AiRequest {

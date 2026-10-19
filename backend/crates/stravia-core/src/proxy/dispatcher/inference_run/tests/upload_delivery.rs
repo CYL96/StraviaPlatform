@@ -251,7 +251,7 @@ async fn upload_delivery_roundtrip(stream: bool) {
     let first_interaction = finished_upload_interaction(&mut observations).await;
 
     // Replaying an expired delivered key while injection is disabled must still
-    // restore placeholders before Provider input and every new platform record.
+    // restore placeholders before admission and Provider input, not raw wire capture.
     now.fetch_add(16 * 60 * 1000, Ordering::SeqCst);
     settings.upload_prompt_injection = false;
     gateway
@@ -290,7 +290,7 @@ async fn upload_delivery_roundtrip(stream: bool) {
     let replay_messages = captured.last().unwrap()["messages"].to_string();
     assert!(replay_messages.contains(&format!("Replay {PLACEHOLDER}")));
     assert!(replay_messages.contains(&format!("upload {PLACEHOLDER} now")));
-    for id in [first_interaction, replay_interaction] {
+    for id in std::collections::BTreeSet::from([first_interaction, replay_interaction]) {
         let detail = gateway
             .observation
             .get_interaction(&id, Default::default())
@@ -298,7 +298,7 @@ async fn upload_delivery_roundtrip(stream: bool) {
             .unwrap()
             .unwrap();
         let record = serde_json::to_string(&detail).unwrap();
-        assert!(!record.contains("stravia_upload_"));
+        assert!(record.contains(key));
         assert!(record.contains(PLACEHOLDER));
     }
     gateway.shutdown().await;

@@ -713,6 +713,7 @@ pub(super) fn spawn(deps: WriterDeps) -> (WriterSender, tokio::task::JoinHandle<
             RunAttribution::new(ObservationEvidence::new(store.clone(), generation_chains));
         // Volatile previews may be coalesced for live subscribers only. Durable
         // diagnostic content arrives separately at canonical item boundaries.
+        let mut receive_order = 0_u64;
         let mut pending_text = TextBuffer {
             retained_bytes: 0,
             blocks: HashMap::new(),
@@ -1184,13 +1185,16 @@ pub(super) fn spawn(deps: WriterDeps) -> (WriterSender, tokio::task::JoinHandle<
                         return false;
                     };
                     let mut event = event;
-                    super::redaction::redact_run_event(&mut event);
+                    receive_order += 1;
+
                     let id = delta_block_id(&event, &run_id);
                     let part_index = delta_part_index(&event);
                     let incoming = std::mem::take(text_mut(&mut event).expect("text event"));
                     let retained_bytes = pending_text.retained_bytes;
                     let block = pending_text.blocks.entry(id).or_insert_with(|| {
-                        TextBlock::new(event, interaction.clone(), run_id.clone())
+                        let mut block = TextBlock::new(event, interaction.clone(), run_id.clone());
+                        block.receive_order = Some(receive_order);
+                        block
                     });
                     if block.overflowed {
                         // Canonical close is persisted independently; a capacity
@@ -1244,11 +1248,13 @@ pub(super) fn spawn(deps: WriterDeps) -> (WriterSender, tokio::task::JoinHandle<
                     }
                 }
                 Some(WriterCommand::Event { run_id, event }) => {
+                    receive_order += 1;
                     let block_id = canonical_block_id(&event);
                     // Optional diagnostic writes must not roll back usage facts in
                     // the same transaction and poison their durability barrier.
                     let usage_bearing = affects_usage(&event);
                     let mut batch = vec![(event, block_id, now())];
+                    let mut received = vec![(batch[0].2, receive_order)];
                     let mut batch_spans = Vec::new();
                     while batch.len() < 64 {
                         match rx.try_recv().map(CommandEnvelope::dequeue) {
@@ -1272,6 +1278,8 @@ pub(super) fn spawn(deps: WriterDeps) -> (WriterSender, tokio::task::JoinHandle<
                                     causal_epoch = context.epoch()
                                 ));
                                 let block_id = canonical_block_id(&event);
+                                receive_order += 1;
+                                received.push((now(), receive_order));
                                 batch.push((event, block_id, now()))
                             }
                             Ok(command) => {
@@ -1281,7 +1289,7 @@ pub(super) fn spawn(deps: WriterDeps) -> (WriterSender, tokio::task::JoinHandle<
                             Err(_) => break,
                         }
                     }
-                    for (event, block_id, occurred_at) in &batch {
+                    for (index, (event, block_id, occurred_at)) in batch.iter().enumerate() {
                         if block_id.is_some()
                             || matches!(
                                 event,
@@ -1293,6 +1301,7 @@ pub(super) fn spawn(deps: WriterDeps) -> (WriterSender, tokio::task::JoinHandle<
                         }
                         if let Some(id) = block_id {
                             if let Some(block) = pending_text.blocks.remove(id) {
+                                received[index] = (block.at, block.receive_order.unwrap_or(received[index].1));
                                 pending_text.retained_bytes -= block.allocated_bytes;
                             }
                             pending_text.live.remove(id);
@@ -1317,10 +1326,11 @@ pub(super) fn spawn(deps: WriterDeps) -> (WriterSender, tokio::task::JoinHandle<
                     if let Some(interaction) = attribution.interaction_for_run(&run_id) {
                         let at = now();
                         match store
-                            .persist_run_events(
+                            .persist_ordered_run_events(
                                 interaction,
                                 &run_id,
                                 &batch,
+                                &received,
                                 expires(at, retention_days.load(Ordering::Relaxed)),
                             )
                             .await
@@ -1832,6 +1842,7 @@ struct TextBlock {
     run: String,
     event: RunEvent,
     at: i64,
+    receive_order: Option<u64>,
     revision: u64,
     published: u64,
     parts: std::collections::BTreeMap<CanonicalPartIndex, String>,
@@ -1846,6 +1857,7 @@ impl TextBlock {
             run,
             event,
             at: now(),
+            receive_order: None,
             revision: 0,
             published: 0,
             parts: Default::default(),
@@ -1923,6 +1935,7 @@ impl TextBlock {
             model_turn_id: turn,
             attempt_id: attempt,
             occurred_at: self.at,
+            receive_order: self.receive_order,
             revision: self.revision,
             text: text.clone(),
         }

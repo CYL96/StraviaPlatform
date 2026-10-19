@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { observationConversationMessages } from '../src/lib/observation-conversation'
+import { observationConversationBlocks, observationConversationMessages } from '../src/lib/observation-conversation'
 import { mergeObservationRuns, retainLiveBlocks, withoutCommittedBlocks } from '../src/lib/observation-state'
 import type { InteractionDetail, LiveContentBlock, ObservationEvent, RunDetail } from '../src/lib/types/observation'
 
@@ -75,6 +75,65 @@ function detail(runs: RunDetail[], tail = ''): InteractionDetail {
 }
 
 describe('observation conversation', () => {
+  test('rendered blocks retain first reception order when canonical text closes after tools', () => {
+    const tool = event('first', 2, 'platform_tool_started', {
+      tool_id: 'search',
+      name: 'Search',
+      receive_order: 3,
+      first_received_at: 1,
+    })
+    const finished = event('first', 3, 'platform_tool_finished', {
+      tool_id: 'search',
+      status: 'completed',
+      content: 'result',
+      receive_order: 4,
+    })
+    const current = detail([run('first', 1, [tool, finished])])
+    const thought: LiveContentBlock = {
+      block_id: 'thought',
+      interaction_id: 'interaction',
+      run_id: 'first',
+      kind: 'model_thinking_delta',
+      model_turn_id: 'turn',
+      attempt_id: 'attempt',
+      occurred_at: 1,
+      receive_order: 1,
+      revision: 1,
+      text: 'Reasoning',
+    }
+    const before: LiveContentBlock = {
+      ...thought,
+      block_id: 'before',
+      kind: 'client_visible_content_delta',
+      receive_order: 2,
+      text: 'Before',
+    }
+    const after: LiveContentBlock = { ...before, block_id: 'after', receive_order: 5, text: 'After' }
+    const live = observationConversationBlocks(current, [thought, before, after]).get('assistant:first')!
+    const durable = detail([
+      run('first', 1, [
+        tool,
+        finished,
+        event('first', 4, 'client_visible_content', { block_id: 'after', text: 'After', receive_order: 5 }),
+        event('first', 5, 'client_visible_content', { block_id: 'before', text: 'Before', receive_order: 2 }),
+        event('first', 6, 'model_thinking', { block_id: 'thought', text: 'Reasoning', receive_order: 1 }),
+        event('first', 7, 'client_visible_content', {
+          block_id: 'marker',
+          text: '<!--history marker-->',
+          receive_order: 6,
+        }),
+      ]),
+    ])
+    const refreshed = observationConversationBlocks(durable, [thought, before, after]).get('assistant:first')!
+    const visible = (items: typeof live) =>
+      items.map((item) =>
+        item.kind === 'tool' ? item.name : item.kind === 'result' ? item.activity.results[0].content : item.text,
+      )
+    expect(visible(live)).toEqual(['Reasoning', 'Before', 'Search', 'result', 'After'])
+    expect(visible(refreshed)).toEqual(visible(live))
+    expect(refreshed.find((item) => item.kind === 'tool')?.results).toEqual([])
+  })
+
   test('prepending and replaying overlapping event pages preserves causal text and existing messages', () => {
     const first = run('first', 1, [event('first', 2, 'client_visible_content', { text: 'Unchanged' })])
     const latest = run('latest', 2, [event('latest', 5, 'client_visible_content', { text: 'B' })])

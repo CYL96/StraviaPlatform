@@ -18,6 +18,7 @@ use stravia_runtime_contract::protocol::ids::ProtocolId;
 use stravia_runtime_contract::protocol::ir::{AiItem, AiResponse, Usage};
 
 use super::super::{RunTerminalContext, StreamDeliveryCompletion};
+use crate::run_usage::add_usage;
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock()
@@ -59,6 +60,7 @@ pub(in crate::proxy::dispatcher::inference_run) struct RunLedger {
     hidden_rounds: Arc<Mutex<HiddenRoundState>>,
     published: Arc<Mutex<PublishedPlatformExecutions>>,
     stream_completion: Arc<Mutex<Option<StreamDeliveryCompletion>>>,
+    confirmed_usage: crate::run_usage::ConfirmedUsageLedger,
 }
 
 impl RunLedger {
@@ -72,6 +74,7 @@ impl RunLedger {
             hidden_rounds: Arc::new(Mutex::new(HiddenRoundState::default())),
             published: Arc::new(Mutex::new(PublishedPlatformExecutions::default())),
             stream_completion: Arc::new(Mutex::new(None)),
+            confirmed_usage: crate::rpm::current_root_request().confirmed_usage,
         }
     }
 
@@ -136,11 +139,19 @@ impl RunLedger {
         state.round_count = state.round_count.saturating_add(1);
     }
 
+    pub(super) fn confirmed_usage_snapshot(&self) -> Option<Usage> {
+        self.confirmed_usage.snapshot()
+    }
+
     /// Prepend every retained hidden round and merge their usage into the
     /// visible response about to complete.
     pub(super) fn apply_hidden_rounds(&self, response: &mut AiResponse) {
         let state = lock(&self.hidden_rounds);
+        let confirmed_usage = self.confirmed_usage_snapshot();
         if state.round_count == 0 {
+            if let Some(usage) = confirmed_usage {
+                response.usage = usage;
+            }
             return;
         }
         if !state.items.is_empty() {
@@ -157,7 +168,12 @@ impl RunLedger {
                 )
                 .or_insert_with(|| value.clone());
         }
-        add_usage(&mut response.usage, &state.usage);
+        if let Some(usage) = confirmed_usage {
+            response.usage = usage;
+        } else {
+            // Executors without upstream calls retain their own response usage.
+            add_usage(&mut response.usage, &state.usage);
+        }
     }
 
     pub(super) fn record_published_executions(&self, references: impl IntoIterator<Item = String>) {
@@ -176,39 +192,6 @@ impl RunLedger {
         &self,
     ) -> Option<StreamDeliveryCompletion> {
         lock(&self.stream_completion).take()
-    }
-}
-
-fn add_usage(total: &mut Usage, usage: &Usage) {
-    total.prompt_tokens = total.prompt_tokens.saturating_add(usage.prompt_tokens);
-    total.required_components_known =
-        total.required_components_known && usage.required_components_known;
-    total.completion_tokens = total
-        .completion_tokens
-        .saturating_add(usage.completion_tokens);
-    total.total_tokens = total.total_tokens.saturating_add(usage.total_tokens);
-    total.cache_read_tokens = sum_optional(total.cache_read_tokens, usage.cache_read_tokens);
-    total.cache_creation_tokens =
-        sum_optional(total.cache_creation_tokens, usage.cache_creation_tokens);
-    total.reasoning_tokens = sum_optional(total.reasoning_tokens, usage.reasoning_tokens);
-    match (&mut total.server_tool_use, &usage.server_tool_use) {
-        (Some(total), Some(usage)) => {
-            total.web_search_requests = total
-                .web_search_requests
-                .saturating_add(usage.web_search_requests);
-            total.web_fetch_requests = total
-                .web_fetch_requests
-                .saturating_add(usage.web_fetch_requests);
-        }
-        (None, Some(usage)) => total.server_tool_use = Some(usage.clone()),
-        _ => {}
-    }
-}
-
-fn sum_optional(left: Option<u32>, right: Option<u32>) -> Option<u32> {
-    match (left, right) {
-        (None, None) => None,
-        (left, right) => Some(left.unwrap_or(0).saturating_add(right.unwrap_or(0))),
     }
 }
 

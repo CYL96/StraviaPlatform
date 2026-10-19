@@ -2,7 +2,11 @@
 import type { Snippet } from 'svelte'
 import * as m from '#lib/paraglide/messages.js'
 import { formatLogTime } from '#lib/format.js'
-import { observationConversationMessages, type ObservationChatMessage } from '#lib/observation-conversation.js'
+import {
+  observationConversationBlocks,
+  observationConversationMessages,
+  type ObservationChatMessage,
+} from '#lib/observation-conversation.js'
 import { observationConversationActivities } from '#lib/observation-activities.js'
 import ObservationActivity from '#lib/components/observation-activity.svelte'
 import ConversationMessage from '#lib/components/conversation-message.svelte'
@@ -50,6 +54,7 @@ const groups = $derived.by(() => {
 })
 const durableActivities = $derived(observationConversationActivities(detail))
 const activities = $derived(observationConversationActivities(detail, liveBlocks, durableActivities))
+const responseBlocks = $derived(observationConversationBlocks(detail, liveBlocks, activities))
 </script>
 
 <ObservationLogViewport
@@ -66,24 +71,20 @@ const activities = $derived(observationConversationActivities(detail, liveBlocks
         {@const actor = user ? m.observation_chat_you() : group[0].model || m.observation_chat_model()}
         <ConversationMessage {user} label={actor}>
           {#each group as message (message.id)}
-            {#if !user}
-              {#each activities.get(message.id) ?? [] as activity (activity.id)}
-                {#if activity.kind === 'thinking'}
-                  <ObservationActivity {activity} {liveActive} {liveContentEpoch} />
-                {/if}
-              {/each}
-            {/if}
-            <!-- 首次输出前保留流式实例，但不显示空白气泡。 -->
-            <div hidden={!message.text}>
-              <StreamingMarkdown
-                text={message.text}
-                active={!user && message.live && liveActive}
-                snapshotKey={liveContentEpoch} />
-            </div>
-            {#if !user}
-              {#each activities.get(message.id) ?? [] as activity (activity.id)}
-                {#if activity.kind === 'tool'}
-                  <ObservationActivity {activity} />
+            {#if user}
+              <StreamingMarkdown text={message.text} active={false} snapshotKey={liveContentEpoch} />
+            {:else}
+              {#each responseBlocks.get(message.id) ?? [] as block (block.id)}
+                {#if block.kind === 'text'}
+                  <StreamingMarkdown
+                    text={block.text}
+                    active={block.live && liveActive}
+                    snapshotKey={liveContentEpoch}
+                    allowImages />
+                {:else if block.kind === 'result'}
+                  <ObservationActivity activity={block.activity} resultOnly />
+                {:else}
+                  <ObservationActivity activity={block} {liveActive} {liveContentEpoch} />
                 {/if}
               {/each}
             {/if}

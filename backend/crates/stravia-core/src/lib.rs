@@ -29,6 +29,7 @@ pub mod proxy;
 pub(crate) mod reversible_redaction;
 pub mod router;
 pub mod rpm;
+mod run_usage;
 mod runtime_cache;
 mod runtime_config;
 pub mod startup_progress;

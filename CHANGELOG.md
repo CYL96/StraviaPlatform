@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Fixed
+
+- Transparent injection now always includes basic `StraviaRead` access to owned Artifact downloads and tool-execution queries, without enabling unselected networking or media-understanding capabilities.
+- Generated images now return a 15-minute `download_url` through the configured client access URL, including its deployment prefix. Missing or invalid configuration fails before generation; a later link-issuance failure preserves the stored image and its Artifact reference without regenerating. Existing Provider and S3 transfer policies are unchanged.
+- Client response usage now includes confirmed internal capability calls, including image generation and retries, without counting parent model rounds twice or inventing unknown usage. Existing request history is not rewritten.
+- Console Chat and request-record conversations preserve received output order instead of grouping all thinking, text and tools by type. Tool results appear at their actual return positions; new durable observation metadata and interrupted console checkpoints retain that order after refresh. Further text deltas update the same live output item immediately, including completed formulas and diagrams, without waiting for the final response.
+- Conversation bodies preview only configured Artifact image-download links, with in-app image viewing, independent downloads, and a stable reference fallback when supplied. Closing an image restores its trigger focus without closing the outer observation details. Expired or unavailable images show an error without automatically renewing links or generating another image; arbitrary external images remain blocked.
+
+### Changed
+
+- Ordinary Observation now follows the same Authorization-only filtering rule as Debug wire captures: only actual HTTP `Authorization` header values are masked. Other captured headers, URLs, body and tool content, known-secret literals, and transfer grants may remain in live records, stored history, and exported events, even with Debug off. Treat these records as sensitive. Capture scope, retention, access control, model-side credential protection, process-log and client-error redaction remain unchanged; existing records are not rewritten.
+
 ## [0.5.2] - 2026-10-18
 
 ### Added

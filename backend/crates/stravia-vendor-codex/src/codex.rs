@@ -1041,7 +1041,10 @@ pub(super) fn usage_from_response(response: &Value) -> Option<Usage> {
             .pointer("/output_tokens_details/reasoning_tokens")
             .and_then(Value::as_u64)
             .and_then(|value| u32::try_from(value).ok()),
-        cache_creation_tokens: None,
+        cache_creation_tokens: usage
+            .pointer("/input_tokens_details/cache_write_tokens")
+            .and_then(Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok()),
         server_tool_use: (web_search_requests > 0).then_some(ServerToolUsage {
             web_search_requests,
             web_fetch_requests: 0,

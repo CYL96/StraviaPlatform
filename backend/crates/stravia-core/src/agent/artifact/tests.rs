@@ -20,6 +20,83 @@ fn artifact_reference_identity_ignores_question_and_rejects_non_digest_identitie
 }
 
 #[tokio::test]
+async fn generated_download_relay_preserves_client_prefix_and_owner_with_live_settings() {
+    let directory = tempfile::tempdir().unwrap();
+    let pool = crate::db::init_pool(directory.path()).await.unwrap();
+    crate::migrations::migrate_sqlite(&pool, None)
+        .await
+        .unwrap();
+    let store = LocalArtifactStore::sqlite(pool.clone(), directory.path().join("artifacts"));
+    let owner = Principal::new("generated-owner");
+    let artifact = store
+        .ingest(
+            &owner,
+            "image/png",
+            None,
+            bytes_stream(Bytes::from_static(b"stored image bytes")),
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+    let settings = ArtifactSettings {
+        client_base_url: "http://client.example:8123/deploy/nested/".into(),
+        external_signed_downloads: true,
+        file_public_base_url: Some("https://files.example/public".into()),
+        ..Default::default()
+    };
+    sqlx::query("INSERT INTO settings(name,value) VALUES('artifact_settings',?)")
+        .bind(serde_json::to_string(&settings).unwrap())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let ordinary = store
+        .download(&owner, &artifact.id, Duration::from_secs(60), &settings)
+        .await
+        .unwrap();
+    assert!(
+        ordinary
+            .url
+            .starts_with("https://files.example/public/v1/artifacts/downloads/")
+    );
+    let before = chrono::Utc::now().timestamp_millis();
+    let relay = store
+        .download_relay(
+            &owner,
+            &artifact.id,
+            Duration::from_secs(60),
+            &ArtifactSettings::default(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        relay
+            .url
+            .starts_with("http://client.example:8123/deploy/nested/v1/artifacts/downloads/")
+    );
+    assert!(relay.expires_at >= before + 900_000);
+    assert!(relay.expires_at <= chrono::Utc::now().timestamp_millis() + 900_000);
+    let reader = store
+        .read_download(relay.url.rsplit('/').next().unwrap())
+        .await
+        .unwrap();
+    let ArtifactSource::LocalPath(path) = &reader.source else {
+        panic!("local relay");
+    };
+    assert_eq!(tokio::fs::read(path).await.unwrap(), b"stored image bytes");
+    assert!(matches!(
+        store
+            .download_relay(
+                &Principal::new("foreign"),
+                &artifact.id,
+                Duration::from_secs(60),
+                &settings
+            )
+            .await,
+        Err(ArtifactError::NotFound)
+    ));
+}
+
+#[tokio::test]
 async fn download_grants_and_readers_survive_expiry_and_store_reconstruction() {
     let directory = tempfile::tempdir().unwrap();
     let pool = crate::db::init_pool(directory.path()).await.unwrap();
@@ -893,6 +970,24 @@ async fn s3_multipart_native_download_and_platform_relay_preserve_bytes() {
         .await
         .unwrap();
     assert!(native.url.starts_with(&endpoint));
+    let forced_relay = rebuilt
+        .download_relay(&owner, &artifact.id, Duration::from_secs(60), &settings)
+        .await
+        .unwrap();
+    assert!(
+        forced_relay
+            .url
+            .starts_with("https://client.example/prefix/v1/artifacts/downloads/")
+    );
+    let relayed = rebuilt
+        .read_download(forced_relay.url.rsplit('/').next().unwrap())
+        .await
+        .unwrap();
+    let ArtifactSource::LocalPath(path) = &relayed.source else {
+        panic!("S3 platform relay");
+    };
+    assert_eq!(tokio::fs::read(path).await.unwrap(), b"s3 complete bytes");
+    drop(relayed);
     let response = reqwest::get(&native.url).await.unwrap();
     assert!(response.status().is_success());
     assert_eq!(

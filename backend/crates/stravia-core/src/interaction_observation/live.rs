@@ -282,6 +282,7 @@ mod tests {
             model_turn_id: None,
             attempt_id: None,
             occurred_at: 1,
+            receive_order: None,
             revision,
             text: text.into(),
         }

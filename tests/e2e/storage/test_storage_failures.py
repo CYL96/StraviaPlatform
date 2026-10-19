@@ -313,8 +313,10 @@ def test_storage_failure_preserves_active_and_following_inference(
                     # Fail a Run event write, not the separate best-effort
                     # rejection recorder, so public Interaction gap is evidence.
                     release.set()
+                    # 模型投影本身也可能丢失；隔离实例只有本次推理，不能用模型筛掉缺口。
                     _wait_for('failed observation task leaves a durable gap', lambda: any(
-                        item['observation_gap'] for item in _route_interactions(env, route_id)
+                        item['observation_gap'] for root in _forest(env)['roots']
+                        for item in root['interactions']
                     ))
                 trigger = HTTPConnection('127.0.0.1', int(env['proxy'].rsplit(':', 1)[1]), timeout=20)
                 try:

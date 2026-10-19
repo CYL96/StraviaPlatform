@@ -268,7 +268,18 @@ impl ArtifactStore for LocalArtifactStore {
         retention: Duration,
         settings: &ArtifactSettings,
     ) -> Result<ArtifactDownload, ArtifactError> {
-        self.issue_download(principal, id, retention, settings)
+        self.issue_download(principal, id, retention, settings, false)
+            .await
+    }
+
+    async fn download_relay(
+        &self,
+        principal: &Principal,
+        id: &ArtifactId,
+        retention: Duration,
+        settings: &ArtifactSettings,
+    ) -> Result<ArtifactDownload, ArtifactError> {
+        self.issue_download(principal, id, retention, settings, true)
             .await
     }
 

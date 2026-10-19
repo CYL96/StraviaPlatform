@@ -1573,23 +1573,21 @@ fn parse_dated_usage(response: &Value) -> Result<Usage> {
         prompt_tokens: required("input_tokens", usage.get("input_tokens"))?,
         completion_tokens: required("output_tokens", usage.get("output_tokens"))?,
         total_tokens: required("total_tokens", usage.get("total_tokens"))?,
-        cache_read_tokens: Some(required(
-            "input_tokens_details.cached_tokens",
-            usage
-                .get("input_tokens_details")
-                .and_then(|details| details.get("cached_tokens")),
-        )?),
+        cache_read_tokens: usage
+            .get("input_tokens_details")
+            .and_then(|details| details.get("cached_tokens"))
+            .and_then(Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok()),
         cache_creation_tokens: usage
             .get("input_tokens_details")
             .and_then(|details| details.get("cache_write_tokens"))
             .and_then(Value::as_u64)
             .and_then(|value| u32::try_from(value).ok()),
-        reasoning_tokens: Some(required(
-            "output_tokens_details.reasoning_tokens",
-            usage
-                .get("output_tokens_details")
-                .and_then(|details| details.get("reasoning_tokens")),
-        )?),
+        reasoning_tokens: usage
+            .get("output_tokens_details")
+            .and_then(|details| details.get("reasoning_tokens"))
+            .and_then(Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok()),
         required_components_known: true,
         ..Usage::default()
     })

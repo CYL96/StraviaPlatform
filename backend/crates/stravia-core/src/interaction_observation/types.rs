@@ -567,6 +567,8 @@ pub struct LiveContentBlock {
     pub model_turn_id: Option<String>,
     pub attempt_id: Option<String>,
     pub occurred_at: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub receive_order: Option<u64>,
     pub revision: u64,
     pub text: String,
 }
@@ -614,7 +616,7 @@ pub struct InteractionSummary {
     pub status: String,
     pub started_at: i64,
     pub last_active_at: i64,
-    /// Redacted opening text of the initiating user message; absent for uncaptured input.
+    /// Opening text of the normalized initiating user message; absent for uncaptured input.
     pub input_preview: Option<String>,
     pub visible_tail: String,
     /// The interaction contains at least one run qualifying as a Failed Request

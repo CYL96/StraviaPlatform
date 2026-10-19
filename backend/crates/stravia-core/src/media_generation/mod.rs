@@ -12,6 +12,7 @@ pub use config::{
 pub struct GenerationError {
     pub code: &'static str,
     pub message: String,
+    pub artifact: Option<serde_json::Value>,
 }
 
 impl GenerationError {
@@ -19,6 +20,7 @@ impl GenerationError {
         Self {
             code,
             message: message.into(),
+            artifact: None,
         }
     }
 }

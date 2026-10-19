@@ -1,9 +1,21 @@
 import DOMPurify from 'dompurify'
-import { MARKDOWN_SANITIZE, renderMarkdownFragment, type MarkdownBlock, type MarkdownFragment } from './markdown'
+import { buttonVariants } from '#lib/components/ui/button/index.js'
+import {
+  MARKDOWN_SANITIZE,
+  renderMarkdownFragment,
+  type MarkdownBlock,
+  type MarkdownFragment,
+  type MarkdownImage,
+} from './markdown'
+
+const IMAGE_ACTION_CLASS = buttonVariants({ variant: 'link', size: 'sm' })
 
 interface RenderErrors {
   math: string
   mermaid: string
+  image: string
+  openImage: string
+  downloadImage: string
 }
 
 interface FragmentEntry {
@@ -37,12 +49,110 @@ function fitDiagram(svg: SVGSVGElement): void {
 }
 
 /** Owns only the empty attachment host; Svelte never owns or reconciles its children. */
-export function createMarkdownBlockRenderer(root: HTMLDivElement) {
+export function createMarkdownBlockRenderer(
+  root: HTMLDivElement,
+  onOpenImage: (image: MarkdownImage, trigger: HTMLButtonElement) => void,
+) {
   const entries = new Map<string, FragmentEntry>()
+  const images = new Map<string, ReturnType<typeof renderImage>>()
   let previousHtml: string | undefined
+  let previousBase: string | undefined
   let disposed = false
   let streaming = false
-  let errors: RenderErrors = { math: '', mermaid: '' }
+  let errors: RenderErrors = { math: '', mermaid: '', image: '', openImage: '', downloadImage: '' }
+
+  function imageUrl(value: string, clientBase: string): string | null {
+    if (!clientBase) return null
+    try {
+      const base = new URL(clientBase)
+      const url = new URL(value)
+      if (
+        !['http:', 'https:'].includes(base.protocol) ||
+        base.username ||
+        base.password ||
+        base.search ||
+        base.hash ||
+        url.origin !== base.origin ||
+        url.username ||
+        url.password ||
+        url.search ||
+        url.hash
+      )
+        return null
+      const prefix = `${base.pathname.replace(/\/+$/, '')}/v1/artifacts/downloads/`
+      return url.pathname.startsWith(prefix) && /^[0-9a-f]{64}$/.test(url.pathname.slice(prefix.length))
+        ? url.href
+        : null
+    } catch {
+      return null
+    }
+  }
+
+  function renderImage(image: MarkdownImage, clientBase: string) {
+    const host = document.createElement('span')
+    host.className = 'markdown-artifact-image'
+    const caption = document.createElement('span')
+    caption.textContent = image.alt
+    const unavailable = document.createElement('span')
+    unavailable.className = 'markdown-render-error'
+    unavailable.textContent = errors.image
+    host.append(caption)
+    if (image.artifact) {
+      const reference = document.createElement('code')
+      reference.textContent = image.artifact
+      host.append(reference)
+    }
+    const url = imageUrl(image.url, clientBase)
+    if (!url) {
+      host.append(unavailable)
+      return {
+        node: host,
+        updateMessages(messages: RenderErrors) {
+          unavailable.textContent = messages.image
+        },
+      }
+    }
+    const preview = document.createElement('img')
+    preview.alt = image.alt
+    preview.referrerPolicy = 'no-referrer'
+    const actions = document.createElement('span')
+    actions.className = 'markdown-image-actions'
+    const open = document.createElement('button')
+    open.type = 'button'
+    open.className = IMAGE_ACTION_CLASS
+    open.textContent = errors.openImage
+    open.setAttribute('aria-haspopup', 'dialog')
+    open.addEventListener('click', () => onOpenImage({ ...image, url }, open))
+    const download = document.createElement('a')
+    download.className = IMAGE_ACTION_CLASS
+    download.href = url
+    download.textContent = errors.downloadImage
+    download.target = '_blank'
+    download.rel = 'external noopener noreferrer'
+    download.referrerPolicy = 'no-referrer'
+    download.download = ''
+    actions.append(open, download)
+    preview.addEventListener(
+      'error',
+      () => {
+        preview.remove()
+        actions.remove()
+        host.append(unavailable)
+      },
+      { once: true },
+    )
+    host.prepend(preview)
+    host.append(actions)
+    preview.src = url
+    return {
+      node: host,
+      updateMessages(messages: RenderErrors) {
+        unavailable.textContent = messages.image
+        open.textContent = messages.openImage
+        download.textContent = messages.downloadImage
+      },
+    }
+  }
 
   function presentError(entry: FragmentEntry) {
     if (!streaming && (entry.status === 'failed' || !entry.fragment.complete)) {
@@ -80,14 +190,19 @@ export function createMarkdownBlockRenderer(root: HTMLDivElement) {
       })
   }
 
-  function update(block: MarkdownBlock, live: boolean, messages: RenderErrors) {
+  function update(block: MarkdownBlock, live: boolean, messages: RenderErrors, clientBase = '') {
     if (disposed) return
     streaming = live
     errors = messages
     const keys = new Set(block.fragments.map(identity))
     for (const key of entries.keys()) if (!keys.has(key)) entries.delete(key)
+    const imageKey = (image: MarkdownImage) => JSON.stringify([image.id, image.url, image.alt, image.artifact])
+    const imageKeys = new Set(block.images.map(imageKey))
+    const imagesChanged = imageKeys.size !== images.size || [...imageKeys].some((key) => !images.has(key))
+    for (const key of images.keys()) if (!imageKeys.has(key)) images.delete(key)
+    if (previousBase !== clientBase) images.clear()
 
-    if (previousHtml !== block.html) {
+    if (previousHtml !== block.html || previousBase !== clientBase || imagesChanged) {
       const template = document.createElement('template')
       template.innerHTML = DOMPurify.sanitize(block.html, MARKDOWN_SANITIZE)
       for (const fragment of block.fragments) {
@@ -108,10 +223,23 @@ export function createMarkdownBlockRenderer(root: HTMLDivElement) {
           entries.set(key, { node: placeholder, fragment, status: 'source', error: null })
         }
       }
+      for (const image of block.images) {
+        const placeholder = template.content.querySelector<HTMLElement>(`[data-markdown-image="${image.id}"]`)
+        if (!placeholder) continue
+        const key = imageKey(image)
+        let node = images.get(key)
+        if (!node) {
+          node = renderImage(image, clientBase)
+          images.set(key, node)
+        }
+        placeholder.replaceWith(node.node)
+      }
       root.replaceChildren(template.content)
       previousHtml = block.html
+      previousBase = clientBase
     }
 
+    for (const image of images.values()) image.updateMessages(messages)
     for (const fragment of block.fragments) {
       const key = identity(fragment)
       const entry = entries.get(key)
@@ -124,6 +252,7 @@ export function createMarkdownBlockRenderer(root: HTMLDivElement) {
   function destroy() {
     disposed = true
     entries.clear()
+    images.clear()
   }
 
   return { update, destroy }

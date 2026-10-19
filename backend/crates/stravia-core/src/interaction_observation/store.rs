@@ -1024,6 +1024,18 @@ impl ObservationStore {
         events: &[(RunEvent, Option<String>, i64)],
         expires_at: i64,
     ) -> anyhow::Result<Vec<ObservationEvent>> {
+        self.persist_ordered_run_events(interaction_id, run_id, events, &[], expires_at)
+            .await
+    }
+
+    pub(super) async fn persist_ordered_run_events(
+        &self,
+        interaction_id: &str,
+        run_id: &str,
+        events: &[(RunEvent, Option<String>, i64)],
+        received: &[(i64, u64)],
+        expires_at: i64,
+    ) -> anyhow::Result<Vec<ObservationEvent>> {
         #[cfg(feature = "test-support")]
         crate::storage_test_faults::inject_io("observation")?;
         #[cfg(feature = "test-support")]
@@ -1036,7 +1048,7 @@ impl ObservationStore {
             }
         }
         let mut prepared = Vec::with_capacity(events.len());
-        for (run_event, block_id, now) in events {
+        for (index, (run_event, block_id, now)) in events.iter().enumerate() {
             let now = *now;
             if matches!(run_event, RunEvent::CredentialMappingsCreated { discoveries } if discoveries.is_empty())
             {
@@ -1122,6 +1134,10 @@ impl ObservationStore {
             }
             if let Some(id) = block_id {
                 payload["block_id"] = Value::String(id.clone());
+            }
+            if let Some((at, order)) = received.get(index) {
+                payload["first_received_at"] = serde_json::json!(at);
+                payload["receive_order"] = serde_json::json!(order);
             }
             if let RunEvent::NativeCompactionAssociated {
                 source_generation_id,

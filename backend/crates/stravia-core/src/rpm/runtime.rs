@@ -39,6 +39,8 @@ impl DestinationKey {
 pub(crate) struct RootRequest {
     wait: Arc<Mutex<RootWait>>,
     pub(crate) cooldown: crate::router::selector::CooldownAttempts,
+    /// Fresh for each Inference Run; clones follow all internal execution tasks.
+    pub(crate) confirmed_usage: crate::run_usage::ConfirmedUsageLedger,
 }
 
 #[derive(Default)]

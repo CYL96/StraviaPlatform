@@ -1,4 +1,6 @@
 import { expect, test, type Locator, type Page, type Route } from '@playwright/test'
+import { once } from 'node:events'
+import { createServer } from 'node:http'
 
 import {
   observation_no_visible_output,
@@ -2640,6 +2642,98 @@ test.describe('Interaction Observation canvas', () => {
     expect(observed.slice(2)).toEqual(expected)
   })
 
+  test('keeps thought, text, tool and final text in received order after reload', async ({ page }) => {
+    await installObservationFixture(page, false, false, true, (detail) => {
+      const run = detail.runs[0]
+      const rows: Array<[string, Record<string, unknown>]> = [
+        ['model_thinking', { text: 'ordered reasoning', block_id: 'order-thought', first_received_at: startedAt + 1 }],
+        [
+          'client_visible_content',
+          { text: 'Before ordered tool', block_id: 'order-before', first_received_at: startedAt + 2 },
+        ],
+        ['platform_tool_started', { tool_id: 'order-tool', name: 'Ordered search', input: {} }],
+        ['platform_tool_finished', { tool_id: 'order-tool', status: 'completed', content: 'ordered result' }],
+        [
+          'client_visible_content',
+          { text: 'After ordered tool', block_id: 'order-after', first_received_at: startedAt + 5 },
+        ],
+      ]
+      run.events = rows.map(([kind, payload], index) => ({
+        sequence: 20 + index,
+        occurred_at: startedAt + index + 1,
+        interaction_id: detail.interaction.id,
+        run_id: run.id,
+        rejection_id: null,
+        kind,
+        payload,
+      }))
+    })
+    await page.goto('/logs?interaction=interaction-cinder')
+    const answer = page.getByRole('log', { name: 'Conversation' }).getByRole('article', { name: 'Cinder', exact: true })
+    const assertOrder = async () => {
+      await expect(answer).toContainText('After ordered tool')
+      const text = await answer.innerText()
+      expect(text.indexOf('Thinking')).toBeLessThan(text.indexOf('Before ordered tool'))
+      expect(text.indexOf('Before ordered tool')).toBeLessThan(text.indexOf('Ordered search'))
+      expect(text.indexOf('Ordered search')).toBeLessThan(text.indexOf('After ordered tool'))
+    }
+    await assertOrder()
+    await page.reload()
+    await assertOrder()
+  })
+
+  test('places concurrent tool results at their actual finish positions live and after reload', async ({ page }) => {
+    const fixture = await installObservationFixture(page, false, false, true, (detail) => {
+      if (detail.interaction.id === 'interaction-cinder')
+        detail.runs[0].events = detail.runs[0].events.filter((event) => event.sequence >= 20)
+    })
+    await installPersistentObservationStream(page)
+    await page.goto('/logs?interaction=interaction-cinder')
+    const rows: Array<[string, Record<string, unknown>]> = [
+      ['platform_tool_started', { tool_id: 'a', name: 'Concurrent A', input: {} }],
+      ['client_visible_content', { block_id: 'concurrent-text-1', text: 'between-first' }],
+      ['platform_tool_started', { tool_id: 'b', name: 'Concurrent B', input: {} }],
+      ['platform_tool_finished', { tool_id: 'b', status: 'completed', content: 'Finished B' }],
+      ['client_visible_content', { block_id: 'concurrent-text-2', text: 'between-results' }],
+      ['platform_tool_finished', { tool_id: 'a', status: 'completed', content: 'Finished A' }],
+    ]
+    for (const [index, [kind, payload]] of rows.entries()) {
+      const event: ObservationEvent = {
+        sequence: 20 + index,
+        occurred_at: startedAt + 299_000,
+        interaction_id: 'interaction-cinder',
+        run_id: 'run-interaction-cinder',
+        rejection_id: null,
+        kind,
+        payload: { ...payload, receive_order: index + 1, first_received_at: startedAt + 299_000 },
+      }
+      fixture.emit(event)
+      await sendObservation(page, 'observation', event, event.sequence)
+    }
+    const conversation = page.getByRole('log', { name: 'Conversation' })
+    const assertOrder = async () => {
+      await expect(conversation.getByRole('button', { name: 'Tool result · Concurrent A', exact: true })).toBeVisible()
+      const text = await conversation.innerText()
+      const ordered = [
+        'Tool call Concurrent A',
+        'between-first',
+        'Tool call Concurrent B',
+        'Tool result · Concurrent B',
+        'between-results',
+        'Tool result · Concurrent A',
+      ]
+      for (let index = 1; index < ordered.length; index++)
+        expect(text.indexOf(ordered[index - 1])).toBeLessThan(text.indexOf(ordered[index]))
+      await expect(conversation.locator('[data-activity-kind="tool"]')).toHaveCount(2)
+      await expect(conversation.locator('[data-activity-kind="result"]')).toHaveCount(2)
+    }
+    await assertOrder()
+    await page.reload()
+    await assertOrder()
+    await conversation.getByRole('button', { name: 'Tool result · Concurrent B', exact: true }).click()
+    await expect(conversation.getByText('Finished B', { exact: true })).toBeVisible()
+  })
+
   test('groups only consecutive same-name client tools and shows attempt-local output speed', async ({ page }) => {
     const fixture = await installObservationFixture(page)
     const rows: Array<[string, Record<string, unknown>]> = [
@@ -2834,7 +2928,9 @@ test.describe('Interaction Observation canvas', () => {
     await advance(3, 458)
     await expect(b).not.toContainText('Returned')
     await expect(b).not.toContainText('Waiting ended: Run continued')
-    await expect(b.getByText('legitimate late evidence', { exact: true })).toBeVisible()
+    await expect(b.getByText('legitimate late evidence', { exact: true })).toHaveCount(0)
+    await conversation.getByRole('button', { name: 'Client result · Read B', exact: true }).click()
+    await expect(conversation.getByText('legitimate late evidence', { exact: true })).toBeVisible()
     await expect(b.getByRole('button')).toHaveAttribute('aria-expanded', 'true')
     await page.reload()
     await expect(search).toHaveAttribute('aria-busy', 'false')
@@ -3037,12 +3133,15 @@ test.describe('Interaction Observation canvas', () => {
       await expect(responseTime).toHaveAttribute('datetime', new Date(startedAt + 299_006).toISOString())
       await tool.press('Enter')
       await expect(conversation.getByRole('heading', { name: 'Tool input', exact: true })).toBeVisible()
+      const clientResult = conversation.getByRole('button', { name: 'Client result · Bash', exact: true })
+      await clientResult.click()
       await expect(conversation.getByText('Client result', { exact: true })).toBeVisible()
       await expect(conversation.getByText(/printf/)).toBeVisible()
       await expect(conversation.getByText('tool-output-sentinel', { exact: true })).toBeVisible()
       const platform = conversation.getByRole('button', { name: 'Tool call Web search', exact: true })
       await expect(platform).toHaveAttribute('aria-expanded', 'false')
       await platform.press('Enter')
+      await conversation.getByRole('button', { name: 'Tool result · Web search', exact: true }).press('Enter')
       await expect(conversation.getByText('Tool result', { exact: true })).toBeVisible()
       await expect(conversation.getByText(/platform-output-sentinel/)).toBeVisible()
       await thinking.click()
@@ -3548,6 +3647,91 @@ test.describe('Interaction Observation canvas', () => {
     await expect(answer.locator('code').filter({ hasText: '\\invalidmacro{x}' })).toHaveCount(2)
     await expect(answer.locator('code').filter({ hasText: 'invalid diagram' })).toHaveCount(2)
     await expect(answer.locator('.markdown-render-error')).toHaveCount(4)
+  })
+
+  test('previews only configured Artifact image grants and retains references when links expire', async ({ page }) => {
+    const artifact = `stravia://artifacts/${'a'.repeat(55)}`
+    const validToken = '1'.repeat(64)
+    const expiredToken = '2'.repeat(64)
+    const downloads: string[] = []
+    let externalRequests = 0
+    const image = Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=',
+      'base64',
+    )
+    const server = createServer((request, response) => {
+      const token = request.url?.split('/').at(-1) ?? ''
+      downloads.push(token)
+      if (token === validToken) {
+        response.writeHead(200, {
+          'content-type': 'image/png',
+          'content-disposition': 'attachment; filename="generated.png"',
+        })
+        response.end(image)
+      } else {
+        response.writeHead(410).end()
+      }
+    })
+    server.listen(0, '127.0.0.1')
+    await once(server, 'listening')
+    try {
+      const origin = `http://127.0.0.1:${(server.address() as { port: number }).port}`
+      await installObservationFixture(page, false, false, false, (detail) => {
+        if (detail.interaction.id !== 'interaction-atlas') return
+        const text = [
+          `![Generated portrait](${origin}/client/v1/artifacts/downloads/${validToken} "${artifact}")`,
+          `![Expired portrait](${origin}/client/v1/artifacts/downloads/${expiredToken} "${artifact}")`,
+          `![External tracker](https://untrusted.invalid/v1/artifacts/downloads/${validToken})`,
+        ].join('\n\n')
+        detail.runs[0].events = detail.runs[0].events.map((event) =>
+          event.kind === 'client_visible_content'
+            ? { ...event, payload: { text, block_id: 'artifact-images', complete: true } }
+            : event,
+        )
+      })
+      await page.route('**/api/v1/settings/artifact_settings', (route) =>
+        route.fulfill({ json: { data: JSON.stringify({ client_base_url: `${origin}/client` }) } }),
+      )
+      await page.route('https://untrusted.invalid/**', (route) => {
+        externalRequests++
+        return route.abort()
+      })
+      await installPersistentObservationStream(page)
+      await page.goto('/logs?interaction=interaction-atlas')
+      const conversation = page.getByRole('log', { name: 'Conversation' })
+      const portrait = conversation.getByRole('img', { name: 'Generated portrait', exact: true })
+      await expect(portrait).toBeVisible()
+      await expect
+        .poll(() => portrait.evaluate((image) => (image instanceof HTMLImageElement ? image.naturalWidth : 0)))
+        .toBe(1)
+      await conversation.getByText('Open image', { exact: true }).click()
+      const viewer = page.getByRole('dialog', { name: 'Open image', exact: true })
+      await expect(viewer).toBeVisible()
+      await expect(viewer.getByRole('img', { name: 'Generated portrait', exact: true })).toBeVisible()
+      const downloadPromise = page.waitForEvent('download')
+      await viewer.getByRole('link', { name: 'Download image', exact: true }).click()
+      const download = await downloadPromise
+      await download.path()
+      expect(download.suggestedFilename()).toBe('generated.png')
+      await expect(viewer).toBeVisible()
+      await page.keyboard.press('Escape')
+      await expect(viewer).toHaveCount(0)
+      await expect(conversation.getByRole('button', { name: 'Open image', exact: true })).toBeFocused()
+      await expect(conversation.getByRole('link', { name: 'Download image', exact: true })).toHaveCount(1)
+      await expect(conversation).toContainText('Image unavailable')
+      await expect(conversation).toContainText(artifact)
+      await expect(conversation.getByRole('img', { name: 'External tracker', exact: true })).toHaveCount(0)
+      expect(externalRequests).toBe(0)
+      expect(downloads.filter((token) => token === expiredToken)).toHaveLength(1)
+      await page.reload()
+      await expect(portrait).toBeVisible()
+      await expect(conversation).toContainText(artifact)
+      expect(externalRequests).toBe(0)
+    } finally {
+      server.closeAllConnections()
+      if (server.listening)
+        await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())))
+    }
   })
 
   test('renders safe Markdown and keeps the newest output line inside the card', async ({ page }) => {

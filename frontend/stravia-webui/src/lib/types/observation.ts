@@ -211,6 +211,7 @@ export interface LiveContentBlock {
   model_turn_id: string | null
   attempt_id: string | null
   occurred_at: number
+  receive_order?: number
   revision: number
   text: string
 }

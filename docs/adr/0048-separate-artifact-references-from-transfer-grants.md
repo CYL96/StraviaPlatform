@@ -20,7 +20,7 @@ Artifact Reference 保留现有 Principal 归属边界：引用本身不授予�
 
 该规则对上传凭据优先于当时 Wire Debug Capture 的一般正文保留约定：诊断记录不得因追求 wire 原文完整性而保存真实上传凭据。
 
-> **局部被取代。** [ADR-0063](0063-record-four-direction-wire-debug-at-transport-boundaries.md) 仅对显式开启的 Debug Wire 取代上一段的诊断例外：Wire 只遮盖 HTTP `Authorization`，因此其他位置的真实 Artifact Upload Grant 也可能按原始传输内容保留。模型上下文、普通 Observation、历史、日志及业务侧凭据保护仍完整遵守本 ADR，不因 Debug Wire 的例外而放宽。
+> **局部被取代。** [ADR-0063](0063-record-four-direction-wire-debug-at-transport-boundaries.md) 及[请求记录设计 §7.2](../design/interaction-observation.md#72-脱敏) 取代上述普通 Observation 与 Debug Wire 的诊断凭据保护承诺：两者只遮盖实际 HTTP `Authorization` header 值，因此其他位置的真实 Artifact Upload Grant 也可能保留在实时观测、落盘记录与导出中。普通 Observation 的捕获范围不扩大，也不要求开启 Debug；旧记录不回写。模型上下文、平台历史、进程日志、面向客户端的普通错误及业务侧凭据保护仍完整遵守本 ADR；上传授权有效期和消费规则不变。
 
 ## 上传授权有效期与消费规则
 

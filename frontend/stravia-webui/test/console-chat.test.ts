@@ -3,6 +3,7 @@ import { rejects } from 'node:assert/strict'
 import {
   ConsoleChatController,
   consoleAssistantContent,
+  consoleAssistantBlocks,
   consoleReasoningActivities,
   consoleVisibleText,
 } from '../src/lib/console-chat'
@@ -19,6 +20,61 @@ import type {
   ResponsesTransport,
 } from '../src/lib/console-chat-types'
 import type { Route } from '../src/lib/types'
+
+test('console rendered output preserves interleaved item order and hides empty history markers', () => {
+  const message = {
+    id: 'ordered',
+    role: 'assistant' as const,
+    status: 'completed' as const,
+    routeId: 'route',
+    thinkingLevel: 'default' as const,
+    createdAt: '2026-01-01T00:00:00Z',
+    outputItems: [
+      { id: 'r1', type: 'reasoning', summary: [{ text: 'Thought one' }] },
+      { id: 'm1', type: 'message', content: [{ text: 'Text one' }] },
+      { id: 'r2', type: 'reasoning', summary: [{ text: 'Thought two' }] },
+      { id: 'marker', type: 'message', content: [{ text: '<!--history marker-->' }] },
+      { id: 'm2', type: 'message', content: [{ text: 'Text two' }] },
+    ],
+  }
+  const blocks = consoleAssistantBlocks(message)
+  expect(blocks.map((block) => block.text)).toEqual(['Thought one', 'Text one', 'Thought two', 'Text two'])
+  expect(
+    consoleAssistantBlocks({ ...message, status: 'stopped', partialBlocks: blocks, outputItems: [] }).map(
+      (block) => block.text,
+    ),
+  ).toEqual(blocks.map((block) => block.text))
+})
+
+test('console streaming and saved response expose the same interleaved blocks', async () => {
+  const snapshots: string[][] = []
+  const output = [
+    { type: 'reasoning', id: 'r1', summary: [{ text: 'First thought' }] },
+    { type: 'message', id: 'm1', content: [{ type: 'output_text', text: 'First text' }] },
+    { type: 'reasoning', id: 'r2', summary: [{ text: 'Second thought' }] },
+    { type: 'message', id: 'm2', content: [{ type: 'output_text', text: 'Second text' }] },
+  ]
+  const h = harness({
+    onSnapshot: (snapshot) => {
+      for (const generation of Object.values(snapshot.generations))
+        snapshots.push((generation.blocks ?? []).map((block) => block.text))
+    },
+    script: function* () {
+      yield { type: 'response.reasoning_summary_text.delta', output_index: 0, item_id: 'r1', delta: 'First thought' }
+      yield { type: 'response.output_text.delta', output_index: 1, delta: 'First text' }
+      yield { type: 'response.reasoning_summary_text.delta', output_index: 2, item_id: 'r2', delta: 'Second thought' }
+      yield { type: 'response.output_text.delta', output_index: 3, delta: 'Second text' }
+      yield complete('', { output })
+    },
+  })
+  await h.controller.start()
+  await h.controller.send('Order')
+  const expected = ['First thought', 'First text', 'Second thought', 'Second text']
+  expect(snapshots).toContainEqual(expected)
+  const answer = h.controller.snapshot.currentConversation!.messages[1]
+  if (answer.role !== 'assistant') throw new Error('Expected assistant')
+  expect(consoleAssistantBlocks(answer).map((block) => block.text)).toEqual(expected)
+})
 
 function key(id = 'key-a', overrides: Partial<ConsoleApiKey> = {}): ConsoleApiKey {
   return {

@@ -761,6 +761,52 @@ fn stream_events_have_matching_names_and_strict_sequence_numbers() {
     assert_eq!(events.last().expect("DONE").data, "[DONE]");
 }
 #[test]
+fn terminal_usage_preserves_unknown_optional_counts_and_explicit_zero() {
+    for count in [None, Some(0)] {
+        let mut formatter = ResponsesStreamFormatter::new();
+        let events = formatter.format_deltas(&[
+            AiStreamDelta::MessageStart {
+                id: "resp-optional-usage".into(),
+                model: "logical-model".into(),
+            },
+            AiStreamDelta::Usage(Usage {
+                prompt_tokens: 12,
+                completion_tokens: 8,
+                total_tokens: 20,
+                cache_read_tokens: count,
+                cache_creation_tokens: count,
+                reasoning_tokens: count,
+                required_components_known: true,
+                ..Usage::default()
+            }),
+            AiStreamDelta::Done {
+                stop_reason: "stop".into(),
+            },
+        ]);
+        let completed = events
+            .iter()
+            .filter_map(|event| serde_json::from_str::<serde_json::Value>(&event.data).ok())
+            .find(|body| body["type"] == "response.completed")
+            .expect("usage terminal");
+        let usage = &completed["response"]["usage"];
+        assert_eq!(usage["input_tokens"], 12);
+        assert_eq!(usage["output_tokens"], 8);
+        assert_eq!(usage["total_tokens"], 20);
+        let expected = if count.is_some() {
+            serde_json::json!(0)
+        } else {
+            serde_json::Value::Null
+        };
+        assert_eq!(usage["input_tokens_details"]["cached_tokens"], expected);
+        assert_eq!(
+            usage["input_tokens_details"]["cache_write_tokens"],
+            expected
+        );
+        assert_eq!(usage["output_tokens_details"]["reasoning_tokens"], expected);
+    }
+}
+
+#[test]
 fn terminal_usage_distinguishes_known_zero_counts_from_missing_usage() {
     let mut known = ResponsesStreamFormatter::new();
     let events = known.format_deltas(&[

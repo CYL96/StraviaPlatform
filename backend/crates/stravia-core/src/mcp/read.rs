@@ -1131,6 +1131,10 @@ impl HookSession for ReadPlanningSession {
         let enabled = self.tool.capabilities(&self.principal).await;
         let explicit = read_scope == ReadExposureScope::FULL;
         let security = crate::proxy::security::Security::new(self.tool.gateway.storage.auth());
+        let basic = security
+            .transparent_injection_enabled(&self.principal)
+            .await
+            .unwrap_or(false);
         let networking = enabled.networking()
             && security
                 .authorize_principal_web_search(&self.principal)
@@ -1146,7 +1150,7 @@ impl HookSession for ReadPlanningSession {
         } else {
             ReadExposureScope::new(networking, media)
         };
-        if !explicit && !networking && !media {
+        if !explicit && !basic && !networking && !media {
             return Ok(ActionBatch::default());
         }
         let visible = if explicit { enabled } else { scope };

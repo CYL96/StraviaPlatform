@@ -1,27 +1,39 @@
 <script lang="ts">
 import { markdownBlocks } from '#lib/markdown.js'
 import MarkdownRenderedBlock from '#lib/components/markdown-rendered-block.svelte'
+import { createQuery } from '@tanstack/svelte-query'
+import { admin } from '#lib/admin-client.js'
 
 let {
   text,
   minimumHeadingLevel = 1,
   streaming = false,
   variant = 'compact',
+  allowImages = false,
 }: {
   text: string
   minimumHeadingLevel?: 1 | 2
   streaming?: boolean
   /** `compact` 用于观测与思考等窄区域，标题与正文同号；`document` 用于对话回答，标题按原文级别分级。 */
   variant?: 'compact' | 'document'
+  allowImages?: boolean
 } = $props()
 
 // 用原文起点区分重复段落，追加正文时不替换已经完成的块。
 const blocks = $derived(markdownBlocks(text, minimumHeadingLevel))
+const artifactSettings = createQuery(() => ({
+  queryKey: ['artifact-settings'],
+  queryFn: admin.settings.artifacts,
+  enabled: allowImages && blocks.some((block) => block.images.length > 0),
+}))
 </script>
 
 <div class="markdown-content" data-variant={variant}>
   {#each blocks as block (block.id)}
-    <MarkdownRenderedBlock {block} {streaming} />
+    <MarkdownRenderedBlock
+      {block}
+      {streaming}
+      clientBase={allowImages ? (artifactSettings.data?.client_base_url ?? '') : ''} />
   {/each}
 </div>
 

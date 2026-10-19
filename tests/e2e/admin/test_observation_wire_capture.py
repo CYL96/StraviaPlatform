@@ -240,7 +240,7 @@ def test_observation_decodes_exact_large_unicode_upstream_content(
     [(True, False), (False, True)],
     ids=["debug-complete-message", "ordinary-fragmented-content"],
 )
-def test_client_visible_credentials_are_redacted_from_observation_artifacts(
+def test_client_visible_content_is_preserved_in_observation_artifacts(
     admin_env: dict[str, Any],
     debug_enabled: bool,
     fragmented: bool,
@@ -252,7 +252,7 @@ def test_client_visible_credentials_are_redacted_from_observation_artifacts(
         headers=admin_env["auth"],
     )
     assert status == 200, body
-    model = "visible-content-fragmented" if fragmented else "visible-content-redaction"
+    model = "visible-content-fragmented" if fragmented else "visible-content-preservation"
     route_id, api_key = _create_route(admin_env, model)
     sentinel = "VISIBLE_RESPONSE_SECRET_7c91"
     safe = "retain-visible-business-output"
@@ -283,14 +283,10 @@ def test_client_visible_credentials_are_redacted_from_observation_artifacts(
     assert client_content == expected_content
 
     detail = _wait_for(
-        "finalized visible-content redaction trace",
+        "finalized visible-content trace",
         lambda: _finalized_route_detail(admin_env, route_id),
     )
-    serialized_detail = json.dumps(detail)
-    assert sentinel not in serialized_detail
-    assert safe in serialized_detail
-    assert sentinel not in detail["interaction"]["visible_tail"]
-    assert safe in detail["interaction"]["visible_tail"]
+    assert detail["interaction"]["visible_tail"] == expected_content
 
     visible_event = next(
         event
@@ -302,10 +298,7 @@ def test_client_visible_credentials_are_redacted_from_observation_artifacts(
         for event in detail["runs"][0]["events"]
         if event["kind"] == "client_visible_content"
     )
-    assert sentinel not in persisted_content
-    assert safe in persisted_content
-    assert "example.test/cb" in persisted_content
-    assert "name=Ada" in persisted_content
+    assert persisted_content == expected_content
 
     replay = _sse_event(
         admin_env,
@@ -333,7 +326,6 @@ def test_client_visible_credentials_are_redacted_from_observation_artifacts(
     )
     assert snapshot["event"] == "live_snapshot"
     assert snapshot["id"] == ""
-    assert sentinel not in json.dumps(snapshot)
     # Finalized text may already have left the volatile mirror. Its authoritative
     # business content is checked above in the actual persisted detail.
     for block in snapshot["data"]["blocks"]:
@@ -351,20 +343,20 @@ def test_client_visible_credentials_are_redacted_from_observation_artifacts(
         if event["kind"] == "client_visible_content"
     )
     assert exported_content == persisted_content
-    assert sentinel not in json.dumps(exported)
-    if debug_enabled:
-        # Debug wire records deliberately preserve the real network body, unlike
-        # redacted observation facts and selected-scope previews.
-        assert any(sentinel.encode() in content for content in contents)
-    else:
-        assert all(sentinel.encode() not in content for content in contents)
+    assert exported_content == expected_content
+    assert any(sentinel.encode() in content for content in contents)
     assert any(safe.encode() in content for content in contents)
 
     data_dir = Path(admin_env["data_dir"])
-    # Generation Chain preserves business content; only diagnostic artifacts use this policy.
+    # Ordinary facts preserve business content even when wire capture is off.
     trace = detail["runs"][0]["trace"]
     if debug_enabled:
         assert trace is not None
+        client_head = next(
+            record for record in records
+            if record["direction"] == "client_to_platform" and record["headers"]
+        )
+        assert client_head["headers"]["authorization"] == "***"
         for event in records:
             if event.get("transport") != "sse" or not isinstance(event.get("payload"), str):
                 continue
@@ -447,7 +439,7 @@ def test_rejected_json_records_actual_body_without_execution_metadata(
 
 @pytest.mark.e2e
 @pytest.mark.admin
-def test_chunk_split_http_credential_is_redacted_only_after_complete_body(
+def test_chunk_split_http_body_preserves_credential_named_metadata(
     admin_env: dict[str, Any],
 ) -> None:
     _enable_debug(admin_env)
@@ -457,7 +449,7 @@ def test_chunk_split_http_credential_is_redacted_only_after_complete_body(
         {
             "model": "wire-chunk-redaction",
             "messages": [{"role": "user", "content": "chunked request"}],
-            "metadata": {"api_key": sentinel},
+            "metadata": {"api_key": sentinel, "Authorization": sentinel},
         },
         separators=(",", ":"),
     ).encode("utf-8")
@@ -480,11 +472,9 @@ def test_chunk_split_http_credential_is_redacted_only_after_complete_body(
         "finalized chunk-redaction trace",
         lambda: _finalized_route_detail(admin_env, route_id),
     )
-    serialized = json.dumps(detail)
-    assert sentinel not in serialized
     _, _, archive = download_observation_bundle(admin_env, detail)
     records = observation_bundle_events(archive)
     events = _request_body_events(records)
     assert len(events) == 1
     assert isinstance(events[0]["payload"], str)
-    assert sentinel in events[0]["payload"]
+    assert events[0]["payload"] == raw.decode("utf-8")

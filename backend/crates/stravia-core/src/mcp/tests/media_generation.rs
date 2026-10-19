@@ -1378,12 +1378,7 @@ async fn generated_image_downloads_real_bytes_and_can_be_edited() {
     assert_eq!(image["media"], json!({"width":1,"height":1}));
     let reference = image["path"].as_str().unwrap();
     assert!(reference.starts_with("stravia://artifacts/"));
-    assert!(image.get("artifact_reference").is_none());
-    assert_eq!(
-        image.as_object().unwrap().len(),
-        4,
-        "one stable identity, no transport secrets"
-    );
+
     let grant = client
         .call_tool(
             CallToolRequestParams::new("StraviaRead").with_arguments(

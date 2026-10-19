@@ -67,7 +67,7 @@ def test_media_shaped_business_json_is_preserved_in_diagnostics(
 @pytest.mark.e2e
 @pytest.mark.admin
 @pytest.mark.parametrize("enabled", [True, False])
-def test_reserved_expired_upload_grant_never_enters_diagnostics(
+def test_reserved_expired_upload_grant_is_preserved_only_in_raw_wire(
     admin_env: dict[str, Any], enabled: bool,
 ) -> None:
     # Reserved syntax is protected even without a recognition registry or a valid signature.
@@ -89,6 +89,7 @@ def test_reserved_expired_upload_grant_never_enters_diagnostics(
             ])
             assert status == 200, body
             assert grant not in json.dumps(received)
+            assert "<stravia-upload-key>" in json.dumps(received)
             assert ordinary in json.dumps(received)
 
             def finished() -> dict[str, Any] | None:
@@ -103,6 +104,8 @@ def test_reserved_expired_upload_grant_never_enters_diagnostics(
 
             detail = _wait_for("finalized upload grant diagnostics", finished)
             encoded = json.dumps(detail)
+            # Admission already receives media-normalized input. The diagnostic
+            # policy must not undo upload-grant protection or widen capture.
             assert grant not in encoded
             assert "<stravia-upload-key>" in encoded
             assert ordinary in encoded
@@ -121,7 +124,7 @@ def test_reserved_expired_upload_grant_never_enters_diagnostics(
 @pytest.mark.admin
 @pytest.mark.parametrize("tool,stream", [(False, False), (False, True), (True, False), (True, True)])
 @pytest.mark.parametrize("enabled", [True, False])
-def test_restored_plaintext_is_scrubbed_from_diagnostics(
+def test_restored_plaintext_is_preserved_in_diagnostics(
     admin_env: dict[str, Any], tool: bool, stream: bool, enabled: bool,
 ) -> None:
     def reply(content: str) -> str:
@@ -186,10 +189,11 @@ def test_restored_plaintext_is_scrubbed_from_diagnostics(
                         return detail
                 return None
 
-            detail = _wait_for("scrubbed finalized trace", finished)
-            assert SECRET not in json.dumps(detail)
+            detail = _wait_for("plaintext finalized trace", finished)
+            assert detail["interaction"]["input_preview"] == reference.group()
+            assert SECRET in json.dumps(detail)
             if not tool:
-                assert detail["interaction"]["visible_tail"] == "ordinary-before *** ordinary-after"
+                assert detail["interaction"]["visible_tail"] == expected
             _, _, archive = download_observation_bundle(env, detail)
             events = observation_bundle_events(archive)
             wire_records = [event for event in events if event.get("layer") == "wire"]

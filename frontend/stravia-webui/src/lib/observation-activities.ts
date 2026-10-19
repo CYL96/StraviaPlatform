@@ -7,6 +7,8 @@ export interface ThinkingActivity {
   at: number
   text: string
   live: boolean
+  receiveOrder?: number
+  sequence?: number
 }
 export interface ActivityToolResult {
   id: string
@@ -14,6 +16,9 @@ export interface ActivityToolResult {
   source: 'client' | 'platform'
   content: unknown
   isError: boolean
+  sequence?: number
+  receiveOrder?: number
+  runId?: string
 }
 export interface ToolActivity {
   kind: 'tool'
@@ -25,6 +30,8 @@ export interface ToolActivity {
   reason?: string
   input?: unknown
   results: ActivityToolResult[]
+  receiveOrder?: number
+  sequence?: number
 }
 export type ObservationActivity = ThinkingActivity | ToolActivity
 
@@ -91,6 +98,7 @@ function durableActivities(detail: InteractionDetail): Map<string, ObservationAc
           live: true,
           status: source === 'client' ? 'waiting' : 'running',
           results: [],
+          sequence,
         }
         existing = { callId: id, modelTurnId, source, sequence, activity }
         calls.push(existing)
@@ -116,9 +124,11 @@ function durableActivities(detail: InteractionDetail): Map<string, ObservationAc
           activity = {
             kind: 'thinking',
             id: identity(...prefix, 'thinking', key),
-            at: event.occurred_at,
+            at: typeof payload.first_received_at === 'number' ? payload.first_received_at : event.occurred_at,
             text: '',
             live: false,
+            receiveOrder: typeof payload.receive_order === 'number' ? payload.receive_order : undefined,
+            sequence: event.sequence,
           }
           thoughts.set(key, activity)
           activities.push(activity)
@@ -133,6 +143,7 @@ function durableActivities(detail: InteractionDetail): Map<string, ObservationAc
         if (entry?.source !== source) entry = undefined
         entry ??= call(id, string(payload.name), turn, event.occurred_at, source, event.sequence)
         if (entry) {
+          entry.activity.receiveOrder = typeof payload.receive_order === 'number' ? payload.receive_order : undefined
           if (turn) entry.modelTurnId = turn
           entry.activity.at = Math.min(entry.activity.at, event.occurred_at)
           if (Object.hasOwn(payload, 'input')) entry.activity.input = payload.input
@@ -147,6 +158,9 @@ function durableActivities(detail: InteractionDetail): Map<string, ObservationAc
             source: 'platform',
             content: payload.content,
             isError: payload.status === 'failed',
+            sequence: event.sequence,
+            receiveOrder: typeof payload.receive_order === 'number' ? payload.receive_order : undefined,
+            runId: run.id,
           })
         }
       } else if (event.kind === 'client_tool_result' && Object.hasOwn(payload, 'content')) {
@@ -246,6 +260,8 @@ function durableActivities(detail: InteractionDetail): Map<string, ObservationAc
       source: 'client',
       content: result.block.content,
       isError: result.block.is_error === true,
+      sequence: result.sequence,
+      runId: result.run.id,
     })
   }
   return output
@@ -274,7 +290,14 @@ export function observationConversationActivities(
     const index = activities.findIndex((activity) => activity.id === id)
     const prior = activities[index]
     if (prior?.kind === 'thinking') continue
-    activities.push({ kind: 'thinking', id, at: block.occurred_at, text: block.text, live: true })
+    activities.push({
+      kind: 'thinking',
+      id,
+      at: block.occurred_at,
+      text: block.text,
+      live: true,
+      receiveOrder: block.receive_order,
+    })
   }
   return output
 }

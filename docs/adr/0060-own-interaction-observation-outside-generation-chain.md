@@ -36,6 +36,7 @@ Stravia 以 crate-private `InteractionObservation` 深模块拥有 Connect Clien
 - 旧 `request_logs`、`LogStore`、`STRAVIA_WIRE_CAPTURE_DIR` 与 `/api/v1/logs` contract 干净删除；升级不迁移旧请求记录。
 - Route Scheduling Strategy 继续通过 `UsageStatsStore` 读取 Model Turn/Target attempt Observation 的精确短期窗口；管理用量分析改读同一数据库内独立长期保存的 15 分钟 Stats Usage。源事实修订与汇总替换在同一事务提交，诊断详情清理只回收相应工作检查点，不撤销已发生的汇总；不新增永久逐请求计量档案。具体指标、升级回填和绝对时间查询契约见所链接设计。
 - Observation 与 Debug Trace 跟随同一保留期；清理用 tombstone 和启动回收保证数据库索引与本地分段文件最终一致。
+- 普通 Observation 与 Debug Trace 均只遮盖实际 HTTP `Authorization` header 值（名称不区分大小写），普通正文和工具参数中的同名字段原样保留。普通记录的实时通道、落盘和导出可能保留下载授权及其他凭据，应按敏感诊断处理；这不扩大普通捕获范围，不改变保留期、权限、进程日志、普通客户端错误或模型侧凭据保护，也不回写旧记录或自动续签授权。
 - Debug Trace 只保存四方向应用协议传输边界的原始内容，不是 packet capture；只在入队前替换 HTTP `Authorization` header 值，其他 header、URL、body、message 与媒体原样保留。Canonical Item 内容属于普通 Observation，不复制为 Debug checkpoint。
 - 当前只承诺单 Gateway 实例实时行为。多实例通知、共享 Debug payload storage 和集群级易失开关需要另行决策，不能由 PostgreSQL 共享表暗示已经支持。
 - 完整接口、状态、存储、Admin contract、画布和验收场景见 [`docs/design/interaction-observation.md`](../design/interaction-observation.md)。

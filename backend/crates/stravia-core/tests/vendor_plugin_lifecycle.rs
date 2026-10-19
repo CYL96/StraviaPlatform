@@ -649,8 +649,7 @@ async fn vendor_network_diagnostics_preserve_raw_selected_protocol_ndjson_bytes(
 }
 
 #[tokio::test]
-async fn vendor_network_wire_only_masks_authorization_while_observations_stay_safe()
--> anyhow::Result<()> {
+async fn vendor_network_wire_and_observations_only_mask_authorization() -> anyhow::Result<()> {
     const LICENSE: &str = "license-7B9Q-X5M2";
     const PRIVATE_STATE: &str = "state-4N8P-C6R3";
 
@@ -695,10 +694,9 @@ async fn vendor_network_wire_only_masks_authorization_while_observations_stay_sa
         live.contains("second-live-business"),
         "live diagnostic content: {live}"
     );
-    assert!(live.contains("***"), "live diagnostic content: {live}");
-    assert!(!live.contains(LICENSE), "live diagnostic content: {live}");
+    assert!(live.contains(LICENSE), "live diagnostic content: {live}");
     assert!(
-        !live.contains(PRIVATE_STATE),
+        live.contains(PRIVATE_STATE),
         "live diagnostic content: {live}"
     );
 
@@ -743,8 +741,8 @@ async fn vendor_network_wire_only_masks_authorization_while_observations_stay_sa
 }
 
 #[tokio::test]
-async fn protocol_selection_errors_protect_connection_secrets_in_diagnostics() -> anyhow::Result<()>
-{
+async fn protocol_selection_errors_preserve_diagnostics_but_protect_client_errors()
+-> anyhow::Result<()> {
     const LICENSE: &str = "license-7B9Q-X5M2";
     let directory = tempfile::tempdir()?;
     let gateway = new_gateway(directory.path().to_owned()).await?;
@@ -771,7 +769,7 @@ async fn protocol_selection_errors_protect_connection_secrets_in_diagnostics() -
 
     let (_, live) = finished_observation(&gateway, &mut observations).await?;
     assert!(live.contains("selection-business-rejected"));
-    assert!(!live.contains(LICENSE));
+    assert!(live.contains(LICENSE));
     let admin = gateway.admin();
     admin.observation_flush().await?;
     let failures = admin.failed_requests(Default::default()).await?;
@@ -786,7 +784,7 @@ async fn protocol_selection_errors_protect_connection_secrets_in_diagnostics() -
         }),
         "persisted failure diagnostics: {persisted}"
     );
-    assert!(!persisted.contains(LICENSE));
+    assert!(persisted.contains(LICENSE));
     Ok(())
 }
 

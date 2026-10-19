@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import { observationConversationActivities, type ToolActivity } from '../src/lib/observation-activities'
-import { observationConversationMessages } from '../src/lib/observation-conversation'
+
 import type { InteractionDetail, RunDetail } from '../src/lib/types/observation'
 
 const usage = {
@@ -169,38 +169,6 @@ describe('observation activities', () => {
       reason: 'process_restarted',
       results: [],
     })
-  })
-
-  test('reconciles a durable thinking item with its live block without losing paragraphs', () => {
-    const root = run('root')
-    root.debug_enabled = false
-    const value = detail([root])
-    const text = '**Selecting top five candidate features**\n\n**Implementing temp path and timestamp retrieval**'
-    const block = {
-      block_id: 'thinking',
-      interaction_id: 'interaction',
-      run_id: root.id,
-      kind: 'model_thinking_delta' as const,
-      model_turn_id: 'turn',
-      attempt_id: 'attempt',
-      occurred_at: 1,
-      revision: 1,
-      text,
-    }
-    const live = observationConversationActivities(value, [block]).get('assistant:root')![0]
-    expect(live).toMatchObject({ text, live: true })
-    event(root, 1, 'model_thinking', {
-      model_turn_id: 'turn',
-      attempt_id: 'attempt',
-      block_id: block.block_id,
-      item: 'thinking:0',
-      text,
-      parts: [{ type: 'text', text }],
-      complete: true,
-    })
-    expect(observationConversationActivities(value, [block]).get('assistant:root')).toEqual([{ ...live, live: false }])
-    expect(observationConversationActivities(value).get('assistant:root')).toEqual([{ ...live, live: false }])
-    expect(observationConversationMessages(value).find((message) => message.id === 'assistant:root')?.text).toBe('')
   })
 
   test('keeps partial failed thinking durable and reconciles retries independently', () => {

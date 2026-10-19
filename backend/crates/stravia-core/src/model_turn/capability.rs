@@ -328,6 +328,7 @@ impl Gateway {
                         provider.base_url.clone(),
                         None,
                     )
+                    .with_usage_ledger(context.root_request.confirmed_usage.clone())
                 };
                 let preparation_failure = if prepared.is_none() {
                     let vendor_id = provider
@@ -462,6 +463,8 @@ impl Gateway {
                         }
                         if let Some(usage) = operation_usage(&execution.output) {
                             attempt.confirm_usage(usage);
+                        } else {
+                            attempt.record_unreported_usage();
                         }
                         attempt.finish("completed", None, None, None, None);
                         let target_id = selected_target_key(&target);

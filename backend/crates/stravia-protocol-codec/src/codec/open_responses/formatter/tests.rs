@@ -201,6 +201,39 @@ fn mixed_assistant_response_preserves_reasoning_text_and_all_unique_calls() {
 }
 
 #[test]
+fn formats_optional_usage_as_unknown_or_explicit_zero() {
+    for count in [None, Some(0)] {
+        let mut response = AiResponse::new("resp_optional_usage", "model");
+        response.usage = Usage {
+            prompt_tokens: 12,
+            completion_tokens: 3,
+            total_tokens: 15,
+            required_components_known: true,
+            cache_read_tokens: count,
+            cache_creation_tokens: count,
+            reasoning_tokens: count,
+            ..Usage::default()
+        };
+
+        let formatted = ResponsesResponseFormatter.format_response(&response);
+        let usage = &formatted["usage"];
+        assert_eq!(usage["input_tokens"], 12);
+        assert_eq!(usage["output_tokens"], 3);
+        let expected = if count.is_some() {
+            serde_json::json!(0)
+        } else {
+            Value::Null
+        };
+        assert_eq!(usage["input_tokens_details"]["cached_tokens"], expected);
+        assert_eq!(
+            usage["input_tokens_details"]["cache_write_tokens"],
+            expected
+        );
+        assert_eq!(usage["output_tokens_details"]["reasoning_tokens"], expected);
+    }
+}
+
+#[test]
 fn formats_cache_write_tokens_when_known() {
     let mut response = AiResponse::new("resp_usage", "model");
     response.usage = Usage {

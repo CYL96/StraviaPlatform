@@ -273,9 +273,8 @@ impl InteractionObservation {
             }),
         }
     }
-    pub(crate) fn observe_ingress(&self, mut start: IngressStart) -> IngressObserver {
+    pub(crate) fn observe_ingress(&self, start: IngressStart) -> IngressObserver {
         let received_at = writer::now();
-        redaction::redact_ingress(&mut start);
         let debug = self.inner.debug.load(Ordering::Acquire);
         // 保留一个控制槽，最终状态与 Trace 关闭不能被普通事件挤出队列。
         let finalization = self.inner.writer.clone().try_reserve_owned().ok();
@@ -815,12 +814,12 @@ impl IngressCapture {
 
 impl IngressObserver {
     pub(crate) fn set_model(&mut self, model: &str) {
-        self.metadata.model = Some(redaction::redact_text(model));
+        self.metadata.model = Some(model.to_owned());
     }
 
     pub(crate) fn set_authenticated_source(&mut self, key_id: &str, key_name: &str) {
         self.metadata.api_key_id = Some(key_id.to_owned());
-        self.metadata.api_key_name = Some(redaction::redact_text(key_name));
+        self.metadata.api_key_name = Some(key_name.to_owned());
     }
 
     pub(crate) fn is_websocket(&self) -> bool {
@@ -916,8 +915,7 @@ impl IngressObserver {
             generation_commit_fences: Mutex::new(Vec::new()),
             pending_input: Mutex::new(None),
             pending_tool_results: Mutex::new(Vec::new()),
-            thinking_redaction: Mutex::new(std::collections::BTreeMap::new()),
-            visible_redaction: Mutex::new(std::collections::BTreeMap::new()),
+            active_thinking: Mutex::new(std::collections::BTreeMap::new()),
             protected,
         };
         // 先保留准入、收据、终态与最终清理的容量，再遍历正文准备准入证据。
@@ -973,8 +971,7 @@ impl IngressObserver {
     pub(crate) fn reject(mut self, outcome: RejectedOutcome) {
         self.reject_inner(outcome);
     }
-    fn reject_inner(&mut self, mut outcome: RejectedOutcome) {
-        redaction::redact_rejected_outcome(&mut outcome);
+    fn reject_inner(&mut self, outcome: RejectedOutcome) {
         if let Some(start) = self.start.take() {
             if self
                 .observation
@@ -1051,15 +1048,7 @@ struct RunObserverInner {
     // Canonical user text remains memory-only until Model Turn protection succeeds.
     pending_input: Mutex<Option<Arc<stravia_runtime_contract::protocol::ir::AiRequest>>>,
     pending_tool_results: Mutex<Vec<RunEvent>>,
-    thinking_redaction: Mutex<
-        std::collections::BTreeMap<
-            (String, String, usize, CanonicalPartIndex),
-            redaction::VisibleTextRedactor,
-        >,
-    >,
-    visible_redaction: Mutex<
-        std::collections::BTreeMap<(usize, CanonicalPartIndex), redaction::VisibleTextRedactor>,
-    >,
+    active_thinking: Mutex<std::collections::BTreeMap<String, std::collections::BTreeSet<String>>>,
     protected: redaction::ProtectedSecrets,
 }
 impl RunObserver {
@@ -1143,7 +1132,7 @@ impl RunObserver {
         let Some(text) = redaction::user_input_text(&input.items) else {
             return;
         };
-        let preview = redaction::input_preview(text, &self.inner.protected);
+        let preview = redaction::input_preview(text);
         self.inner.queued_text.lock().take();
         if self
             .inner
@@ -1256,63 +1245,39 @@ impl RunObserver {
         if let RunEvent::ModelThinkingDelta {
             model_turn_id,
             attempt_id,
-            item_ordinal,
-            part_index,
-            text,
-        } = event
+            ..
+        } = &event
         {
-            let ready = self
-                .inner
-                .thinking_redaction
-                .lock()
-                .entry((
+            let mut active = self.inner.active_thinking.lock();
+            if let Some(attempts) = active.get_mut(model_turn_id) {
+                if !attempts.contains(attempt_id) {
+                    attempts.insert(attempt_id.clone());
+                }
+            } else {
+                active.insert(
                     model_turn_id.clone(),
-                    attempt_id.clone(),
-                    item_ordinal,
-                    part_index,
-                ))
-                .or_insert_with(|| {
-                    redaction::VisibleTextRedactor::with_protected(self.inner.protected.clone())
-                })
-                .push(text);
-            if let Some(text) = ready {
-                self.send_event(RunEvent::ModelThinkingDelta {
-                    model_turn_id,
-                    attempt_id,
-                    item_ordinal,
-                    part_index,
-                    text,
-                });
+                    std::collections::BTreeSet::from([attempt_id.clone()]),
+                );
             }
-            return;
         }
         if let RunEvent::ModelThinkingFinished {
             model_turn_id,
             attempt_id,
         } = &event
         {
-            self.flush_thinking(model_turn_id, attempt_id);
+            self.close_thinking(model_turn_id, attempt_id);
         }
         if let RunEvent::TargetAttemptFinished {
             model_turn_id,
             attempt_id,
             ..
         } = &event
-            && self.flush_thinking(model_turn_id, attempt_id)
+            && self.close_thinking(model_turn_id, attempt_id)
         {
             self.send_event(RunEvent::ModelThinkingFinished {
                 model_turn_id: model_turn_id.clone(),
                 attempt_id: attempt_id.clone(),
             });
-        }
-        if let RunEvent::ClientVisibleContentDelta {
-            text,
-            item_ordinal,
-            part_index,
-        } = event
-        {
-            self.record_visible_delta(item_ordinal, part_index, &text);
-            return;
         }
         if let RunEvent::ModelThinking {
             model_turn_id,
@@ -1320,16 +1285,7 @@ impl RunObserver {
             ..
         } = &event
         {
-            self.flush_thinking(model_turn_id, attempt_id);
-        }
-        if matches!(event, RunEvent::ClientVisibleContent { .. }) {
-            self.flush_visible();
-        }
-        if matches!(
-            event,
-            RunEvent::ClientOutputCommitted | RunEvent::DeliveryFinished { .. }
-        ) {
-            self.flush_visible();
+            self.close_thinking(model_turn_id, attempt_id);
         }
         self.send_event(event);
     }
@@ -1343,83 +1299,35 @@ impl RunObserver {
         if !self.inner.admission_queued {
             return;
         }
-        let ready = self
-            .inner
-            .visible_redaction
-            .lock()
-            .entry((item_ordinal, part_index))
-            .or_insert_with(|| {
-                redaction::VisibleTextRedactor::with_protected(self.inner.protected.clone())
-            })
-            .push(text);
-        if let Some(text) = ready {
-            self.send_event(RunEvent::ClientVisibleContentDelta {
-                text,
-                item_ordinal,
-                part_index,
-            });
-        }
+        self.send_event(RunEvent::ClientVisibleContentDelta {
+            text: text.to_owned(),
+            item_ordinal,
+            part_index,
+        });
     }
-    fn flush_thinking(&self, model_turn_id: &str, attempt_id: &str) -> bool {
-        let mut states = self.inner.thinking_redaction.lock();
-        let keys: Vec<_> = states
-            .keys()
-            .filter(|(turn, attempt, _, _)| turn == model_turn_id && attempt == attempt_id)
-            .cloned()
-            .collect();
-        let had_pending = !keys.is_empty();
-        let pending: Vec<_> = keys
-            .into_iter()
-            .map(|key| {
-                let state = states.remove(&key).unwrap();
-                (key, state)
-            })
-            .collect();
-        drop(states);
-        for ((_, _, item_ordinal, part_index), mut state) in pending {
-            if let Some(text) = state.finish() {
-                self.send_event(RunEvent::ModelThinkingDelta {
-                    model_turn_id: model_turn_id.to_owned(),
-                    attempt_id: attempt_id.to_owned(),
-                    item_ordinal,
-                    part_index,
-                    text,
-                });
-            }
+    fn close_thinking(&self, model_turn_id: &str, attempt_id: &str) -> bool {
+        let mut active = self.inner.active_thinking.lock();
+        let Some(attempts) = active.get_mut(model_turn_id) else {
+            return false;
+        };
+        let removed = attempts.remove(attempt_id);
+        if attempts.is_empty() {
+            active.remove(model_turn_id);
         }
-        had_pending
+        removed
     }
     fn finish_thinking(&self) {
-        let pending = std::mem::take(&mut *self.inner.thinking_redaction.lock());
-        for ((model_turn_id, attempt_id, item_ordinal, part_index), mut state) in pending {
-            if let Some(text) = state.finish() {
-                self.send_event(RunEvent::ModelThinkingDelta {
+        let pending = std::mem::take(&mut *self.inner.active_thinking.lock());
+        for (model_turn_id, attempts) in pending {
+            for attempt_id in attempts {
+                self.send_event(RunEvent::ModelThinkingFinished {
                     model_turn_id: model_turn_id.clone(),
-                    attempt_id: attempt_id.clone(),
-                    item_ordinal,
-                    part_index,
-                    text,
-                });
-            }
-            self.send_event(RunEvent::ModelThinkingFinished {
-                model_turn_id,
-                attempt_id,
-            });
-        }
-    }
-    fn flush_visible(&self) {
-        let pending = std::mem::take(&mut *self.inner.visible_redaction.lock());
-        for ((item_ordinal, part_index), mut state) in pending {
-            if let Some(text) = state.finish() {
-                self.send_event(RunEvent::ClientVisibleContentDelta {
-                    text,
-                    item_ordinal,
-                    part_index,
+                    attempt_id,
                 });
             }
         }
     }
-    fn send_tool_results(&self, mut events: Vec<RunEvent>) {
+    fn send_tool_results(&self, events: Vec<RunEvent>) {
         if !self.inner.admission_queued {
             return;
         }
@@ -1427,10 +1335,6 @@ impl RunObserver {
             return;
         }
         self.inner.queued_text.lock().take();
-        for event in &mut events {
-            self.inner.protected.event(event);
-            redaction::redact_run_event(event);
-        }
         if self
             .inner
             .observation
@@ -1486,8 +1390,6 @@ impl RunObserver {
             }
             return;
         }
-        self.inner.protected.event(&mut event);
-        redaction::redact_run_event(&mut event);
         if let RunEvent::RequestFailed { error } = &event {
             *self.inner.failure.lock() = Some(error.clone());
         }
@@ -1594,20 +1496,8 @@ impl RunObserver {
             outcome.status = "failed".into();
             outcome.terminal_reason.clone_from(&error.code);
         }
-        self.flush_visible();
         self.finish_thinking();
         self.inner.queued_text.lock().take();
-        self.inner.protected.text(&mut outcome.status);
-        if let Some(delivery) = &mut outcome.delivery {
-            self.inner.protected.text(&mut delivery.status);
-            if let Some(reason) = &mut delivery.reason {
-                self.inner.protected.text(reason);
-            }
-        }
-        if let Some(reason) = &mut outcome.terminal_reason {
-            self.inner.protected.text(reason);
-        }
-        redaction::redact_run_outcome(&mut outcome);
         let _boundary = self.inner.event_boundary.lock();
         let mut generation_commit_fences = self.inner.generation_commit_fences.lock();
         if !self.inner.terminal.swap(true, Ordering::AcqRel) {
@@ -1657,9 +1547,7 @@ impl RunPublicationGuard {
             return;
         }
         let _boundary = self.inner.event_boundary.lock();
-        let mut event = RunEvent::CredentialMappingsCreated { discoveries };
-        self.inner.protected.event(&mut event);
-        redaction::redact_run_event(&mut event);
+        let event = RunEvent::CredentialMappingsCreated { discoveries };
         if self
             .inner
             .observation
@@ -1702,59 +1590,23 @@ impl Drop for RunObserverInner {
             }
             return;
         }
-        for ((model_turn_id, attempt_id, item_ordinal, part_index), mut state) in
-            std::mem::take(self.thinking_redaction.get_mut())
-        {
-            let delta = state.finish().map(|text| RunEvent::ModelThinkingDelta {
-                model_turn_id: model_turn_id.clone(),
-                attempt_id: attempt_id.clone(),
-                item_ordinal,
-                part_index,
-                text,
-            });
-            for event in [
-                delta,
-                Some(RunEvent::ModelThinkingFinished {
-                    model_turn_id,
-                    attempt_id,
-                }),
-            ]
-            .into_iter()
-            .flatten()
-            {
+        for (model_turn_id, attempts) in std::mem::take(self.active_thinking.get_mut()) {
+            for attempt_id in attempts {
                 if self
                     .observation
                     .inner
                     .writer
                     .try_send(WriterCommand::Event {
                         run_id: self.run_id.clone(),
-                        event,
+                        event: RunEvent::ModelThinkingFinished {
+                            model_turn_id: model_turn_id.clone(),
+                            attempt_id,
+                        },
                     })
                     .is_err()
                 {
                     *self.gap.get_mut() = true;
                 }
-            }
-        }
-        for ((item_ordinal, part_index), mut state) in
-            std::mem::take(self.visible_redaction.get_mut())
-        {
-            if let Some(text) = state.finish()
-                && self
-                    .observation
-                    .inner
-                    .writer
-                    .try_send(WriterCommand::Event {
-                        run_id: self.run_id.clone(),
-                        event: RunEvent::ClientVisibleContentDelta {
-                            text,
-                            item_ordinal,
-                            part_index,
-                        },
-                    })
-                    .is_err()
-            {
-                *self.gap.get_mut() = true;
             }
         }
         let mut pending_finish = None;
@@ -3236,6 +3088,12 @@ mod snapshot_tests {
         for index in 0..16384 {
             if index == 8192 {
                 parent.send_event(RunEvent::ClientOutputCommitted);
+                parent.record(RunEvent::PlatformToolStarted {
+                    model_turn_id: "burst-turn".into(),
+                    tool_id: "burst-search".into(),
+                    name: "Search".into(),
+                    input: None,
+                });
             }
             parent.send_event(RunEvent::ClientVisibleContentDelta {
                 text: "文".into(),
@@ -3243,7 +3101,15 @@ mod snapshot_tests {
                 part_index: (false, 0),
             });
         }
-        parent.record(visible_item("burst-item", &"文".repeat(16384)));
+        let block_id = canonical_item_block_id("burst-parent", 0);
+        parent.record(RunEvent::PlatformToolFinished {
+            model_turn_id: "burst-turn".into(),
+            tool_id: "burst-search".into(),
+            status: "completed".into(),
+            duration_ms: 1,
+            content: None,
+        });
+        parent.record(visible_item(&block_id, &"文".repeat(16384)));
         parent.finish(RunOutcome {
             client_output_committed: false,
             delivery: None,
@@ -3284,8 +3150,17 @@ mod snapshot_tests {
             .fetch_one(&pool).await?;
         let payload = stored_payload(&payload)?;
         assert_eq!(payload["text"], "文".repeat(16384));
-        assert_eq!(payload["block_id"], "burst-item");
+        assert_eq!(payload["block_id"], block_id);
         assert_eq!(payload["complete"], true);
+        assert!(payload["first_received_at"].is_i64());
+        assert!(payload["receive_order"].is_u64());
+        let tool_payload: Vec<u8> = sqlx::query_scalar("SELECT payload FROM observation_events WHERE run_id='burst-parent' AND kind='platform_tool_started'")
+            .fetch_one(&pool).await?;
+        let tool_payload = stored_payload(&tool_payload)?;
+        assert!(
+            payload["receive_order"].as_u64() < tool_payload["receive_order"].as_u64(),
+            "late canonical close must retain the text block's first reception order"
+        );
         let volatile_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM observation_events WHERE run_id='burst-parent' AND kind IN ('client_visible_content_delta','client_output_committed')")
             .fetch_one(&pool).await?;
         assert_eq!(volatile_rows, 0);
@@ -3853,7 +3728,7 @@ mod snapshot_tests {
         );
         for (_, payload) in previews {
             assert!(
-                !stored_payload(&payload)?["text"]
+                stored_payload(&payload)?["text"]
                     .as_str()
                     .unwrap()
                     .contains("preview-secret")
@@ -3876,7 +3751,7 @@ mod snapshot_tests {
                 for event in &run.events {
                     if event.kind == "input_preview_recorded" {
                         queried_previews.push(run.id.clone());
-                        assert!(!event.payload.to_string().contains("preview-secret"));
+                        assert!(event.payload.to_string().contains("preview-secret"));
                     }
                 }
             }
@@ -4540,7 +4415,161 @@ mod snapshot_tests {
     }
 
     #[tokio::test]
-    async fn ordinary_tool_payloads_wait_for_protection_and_stay_out_of_visible_output()
+    async fn ordinary_rejection_preserves_ingress_and_diagnostic_credentials() -> anyhow::Result<()>
+    {
+        let directory = tempfile::tempdir()?;
+        let pool = crate::test_support::migrated_sqlite_pool().await?;
+        let observation = test_observation(&pool, directory.path(), true).await;
+        let path = "/responses?api_key=ingress-key";
+        let diagnostic = "Authorization: Bearer rejected-secret Cookie: session=raw-cookie";
+        observation
+            .observe_ingress(IngressStart {
+                id: "raw-rejection".into(),
+                method: "POST".into(),
+                path: path.into(),
+                protocol: "responses".into(),
+            })
+            .reject(RejectedOutcome {
+                stage: "api_key=stage-key".into(),
+                code: "api_key=code-key".into(),
+                status_code: 400,
+                failure: Some(FailureDiagnostic {
+                    message: Some(diagnostic.into()),
+                    ..Default::default()
+                }),
+            });
+        observation.flush().await?;
+        let page = observation.query_rejections(Default::default()).await?;
+        let rejected = page.items.first().expect("persisted rejection");
+        assert_eq!(rejected.path, path);
+        assert_eq!(rejected.stage, "api_key=stage-key");
+        assert_eq!(rejected.code, "api_key=code-key");
+        let detail = observation
+            .get_rejection(&rejected.id)
+            .await?
+            .expect("queried rejection");
+        assert!(serde_json::to_string(&detail.events)?.contains(diagnostic));
+        observation.shutdown().await;
+        pool.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ordinary_credentials_survive_queue_live_and_historical_query() -> anyhow::Result<()> {
+        use futures::StreamExt;
+        use stravia_runtime_contract::protocol::ir::AiItem;
+
+        let directory = tempfile::tempdir()?;
+        let pool = crate::test_support::migrated_sqlite_pool().await?;
+        let observation = test_observation(&pool, directory.path(), false).await;
+        let text = "https://user:password@example.test/v1/artifacts/downloads/artifact-token?downloadToken=query-token&api_key=query-key Cookie: session=cookie-secret Authorization: body-value known-mapping";
+        let input = vec![AiItem {
+            role: stravia_runtime_contract::protocol::ir::Role::User,
+            content: stravia_runtime_contract::protocol::ir::MessageContent::Text(Arc::new(
+                text.into(),
+            )),
+            tool_calls: None,
+            tool_call_id: None,
+            meta: None,
+        }];
+        let run = test_run(&observation, "raw-observation", facts(input.clone()));
+        run.protect_secrets(["known-mapping"]);
+        run.capture_input_preview(Arc::new(
+            stravia_runtime_contract::protocol::ir::AiRequest::new("model", input),
+        ));
+        run.publish_input_preview();
+        for chunk in [
+            "https://user:pass",
+            "word@example.test/v1/artifacts/downloads/artifact-",
+            "token?downloadToken=query-token&api_key=query-key Cookie: session=cookie-secret Authorization: body-value known-",
+            "mapping",
+        ] {
+            run.record_visible_delta(0, (false, 0), chunk);
+        }
+        run.record(RunEvent::PlatformToolFinished {
+            model_turn_id: "turn".into(),
+            tool_id: "tool".into(),
+            status: "completed".into(),
+            duration_ms: 1,
+            content: Some(serde_json::json!({
+                "Authorization": "body-value",
+                "Cookie": "session=cookie-secret",
+                "api_key": "query-key",
+                "downloadURL": text,
+                "literal": "known-mapping"
+            })),
+        });
+        run.record(RunEvent::RequestFailed {
+            error: FailureDiagnostic {
+                message: Some(text.into()),
+                ..Default::default()
+            },
+        });
+        observation.flush().await?;
+        let id: String = sqlx::query_scalar(
+            "SELECT interaction_id FROM inference_run_observations WHERE id='raw-observation'",
+        )
+        .fetch_one(&pool)
+        .await?;
+        let mut live = observation.subscribe_live(id.clone());
+        assert!(matches!(
+            live.next().await,
+            Some(ObservationUpdate::LiveSnapshot { blocks })
+                if blocks.iter().map(|block| block.text.as_str()).collect::<String>() == text
+        ));
+        // Streaming deltas are volatile; only the canonical item closes durable output.
+        run.record(visible_item("raw-answer", text));
+        run.finish(RunOutcome {
+            client_output_committed: true,
+            delivery: None,
+            delivery_completed_at: Some(writer::now()),
+            status: "failed".into(),
+            terminal_reason: None,
+            generation_node_id: None,
+            generation_root_id: None,
+        });
+        drop(run);
+        observation.shutdown().await;
+        let detail = observation
+            .get_interaction(&id, ForestQuery::default())
+            .await?
+            .expect("persisted interaction");
+        assert_eq!(detail.interaction.visible_tail, text);
+        let page = observation
+            .get_interaction_events(
+                &id,
+                InteractionEventsQuery {
+                    after_sequence: Some(0),
+                    ..Default::default()
+                },
+            )
+            .await?
+            .expect("persisted events");
+        let events: Vec<_> = page.runs.iter().flat_map(|run| &run.events).collect();
+        assert!(
+            events.iter().any(
+                |event| event.kind == "input_preview_recorded" && event.payload["text"] == text
+            )
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.kind == "platform_tool_finished"
+                    && event.payload["content"]["Authorization"] == "body-value"
+                    && event.payload["content"]["downloadURL"] == text
+                    && event.payload["content"]["literal"] == "known-mapping"
+                    && event.payload["content"]["api_key"] == "query-key"
+                    && event.payload["content"]["Cookie"] == "session=cookie-secret")
+        );
+        assert!(events.iter().any(
+            |event| event.kind == "request_failed" && event.payload["error"]["message"] == text
+        ));
+        pool.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ordinary_tool_payloads_preserve_credentials_and_stay_out_of_visible_output()
     -> anyhow::Result<()> {
         use stravia_runtime_contract::protocol::ir::AiItem;
         let directory = tempfile::tempdir()?;
@@ -4635,10 +4664,10 @@ mod snapshot_tests {
             .map(|event| &event.1)
             .collect();
         assert_eq!(results.len(), 2);
-        assert_eq!(results[0]["content"], "***");
+        assert_eq!(results[0]["content"], "restored-tool-secret");
         assert_eq!(
             results[1]["content"],
-            serde_json::json!({"api_key":"***","result":"business result"})
+            serde_json::json!({"api_key":"CLIENT_TOOL_SECRET","result":"business result"})
         );
         let handoff = &events
             .iter()
@@ -4653,7 +4682,7 @@ mod snapshot_tests {
             .1;
         assert_eq!(
             started["input"],
-            serde_json::json!({"api_key":"***","query":"retain"})
+            serde_json::json!({"api_key":"PLATFORM_INPUT_SECRET","query":"retain"})
         );
         let finished = &events
             .iter()
@@ -4663,7 +4692,7 @@ mod snapshot_tests {
         assert_eq!(finished["status"], "failed");
         assert_eq!(
             finished["content"],
-            serde_json::json!({"error":"***","access_token":"***"})
+            serde_json::json!({"error":"restored-tool-secret","access_token":"PLATFORM_RESULT_SECRET"})
         );
         let thinking: String = events
             .iter()
@@ -4681,15 +4710,15 @@ mod snapshot_tests {
                 .await?;
         assert_eq!(visible, "public answer");
         let stored = serde_json::to_string(&events)?;
-        for excluded in [
+        for retained in [
             "restored-tool-secret",
             "CLIENT_TOOL_SECRET",
             "PLATFORM_INPUT_SECRET",
             "PLATFORM_RESULT_SECRET",
-            "not a received tool result",
         ] {
-            assert!(!stored.contains(excluded));
+            assert!(stored.contains(retained));
         }
+        assert!(!stored.contains("not a received tool result"));
         observation.shutdown().await;
         pool.close().await;
         Ok(())

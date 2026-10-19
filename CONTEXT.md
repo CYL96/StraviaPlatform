@@ -38,7 +38,7 @@ _避免使用_：Agent Turn、Model Turn、Inference Run、Agent Loop
 
 ## Interaction Observation
 
-Interaction Observation 是管理面用于查看 Connect Client Interaction 及其 Inference Run、Model Turn、工具调用、Target attempt、交付状态和 Confirmed Upstream Usage 的可持久化诊断投影。它可以实时变化并保留失败、取消或断线记录，但不是推理执行、Generation Chain 或模型历史的事实源；观察记录失败或丢失只影响相关诊断任务，不改变推理结果，也不终止实例。
+Interaction Observation 是管理面用于查看 Connect Client Interaction 及其 Inference Run、Model Turn、工具调用、Target attempt、交付状态和 Confirmed Upstream Usage 的可持久化诊断投影。它可以实时变化并保留失败、取消或断线记录，但不是推理执行、Generation Chain 或模型历史的事实源；观察记录失败或丢失只影响相关诊断任务，不改变推理结果，也不终止实例。它与 Debug Trace 均仅遮盖实际 HTTP Authorization header 值，实时、持久化与导出内容可能包含下载授权及其他凭据；相同过滤标准不表示相同捕获范围，普通 Observation 不是完整 wire 抓包。
 _避免使用_：Generation Chain、Request Log、Execution State Store
 
 ## 失败的请求（Failed Request）
@@ -931,4 +931,4 @@ Platform Capability Gate 是控制高级能力可用性的平台级总开关；W
 
 ## Transparent Injection
 
-Transparent Injection 是平台在客户端未显式声明工具时，按 API Key 的“联网搜索”与“多模态理解”选择自动暴露可用能力的行为；联网搜索包含搜索与网页读取，多项能力合并为一个 StraviaRead 声明，本次执行范围仅包含选中且平台已开启的能力。它是自动提供工具的偏好，不是 API Key 能力授权，不限制客户端显式声明工具或通过 MCP 使用平台已开启的能力；总开关关闭期间，已选择的注入项保留但不生效，重新打开后恢复。
+Transparent Injection 是平台在客户端未显式声明工具时自动提供工具的偏好，不是 API Key 能力授权；开启总开关即提供所属 Artifact 下载与工具执行查询的基础 Read，联网搜索、多模态理解和媒体生成则按 Key 的选择及平台可用性额外暴露。它不扩大基础 Read 的资源归属或联网、媒体理解范围，不限制显式调用与 MCP；总开关关闭期间，已选择的注入项保留但不生效，重新打开后恢复。

@@ -144,6 +144,7 @@ OpenAI（含 Codex OAuth）· Anthropic（API Key；Claude Pro/Max 订阅 OAuth 
 - 请求记录：在可缩放的画布上实时看到每次交互 —— 模型调用、重试、工具调用 —— 失败的请求单独成列，单次对话可逐条查看。
 - 查看服务商实际上报的 token 用量与配额。
 - 打开 Debug 可捕获 HTTP/SSE/WebSocket 流量并按交互下载诊断包；仅 HTTP `Authorization` 值会被遮盖，其他凭据、业务内容与媒体可能被保留。诊断包应按敏感数据处理，详见[请求记录设计](docs/design/interaction-observation.md)。
+- 普通请求观测即使在 Debug 关闭时也使用同一过滤：仅遮盖实际 HTTP `Authorization` header 值（名称不区分大小写），不遮盖正文或工具参数中的同名字段。实时展示、落盘记录和导出事件可能保留下载授权及其他原始凭据。这不将普通观测扩展为完整 Wire 抓包，不回写旧记录，不改变保留期、权限、进程日志／普通客户端错误脱敏或模型侧凭据保护，也不自动刷新或续签下载授权。
 
 ### 凭据保护
 

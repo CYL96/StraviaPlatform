@@ -19,6 +19,7 @@ let {
   expansionPolicy = 'manual',
   followed = false,
   minimumHeadingLevel = 1,
+  resultOnly = false,
 }: {
   activity: ObservationActivity
   liveActive?: boolean
@@ -27,6 +28,7 @@ let {
   /** 聊天策略：其后已开始正文或工具块。只有此信号变为 true 时才收起自动展开的思考。 */
   followed?: boolean
   minimumHeadingLevel?: 1 | 2
+  resultOnly?: boolean
 } = $props()
 const contentId = $props.id()
 const storageKey = $derived(`stravia:observation-activity:${activity.id}`)
@@ -36,7 +38,9 @@ const label = $derived(
     ? activity.live
       ? m.observation_activity_thinking()
       : m.observation_activity_thought()
-    : m.observation_activity_tool({ tool: activity.name }),
+    : resultOnly
+      ? `${activity.results[0]?.source === 'client' ? m.observation_activity_client_result() : m.observation_activity_platform_result()} · ${activity.name}`
+      : m.observation_activity_tool({ tool: activity.name }),
 )
 let open = $state(false)
 let observedIdentity = ''
@@ -140,7 +144,11 @@ function formatContent(content: unknown): string {
   {/if}
 {/snippet}
 
-<div class="activity" data-activity-id={activity.id} data-activity-kind={activity.kind} aria-busy={activity.live}>
+<div
+  class="activity"
+  data-activity-id={activity.id}
+  data-activity-kind={resultOnly ? 'result' : activity.kind}
+  aria-busy={activity.live}>
   {#if expandable}
     <Collapsible.Root {open} onOpenChange={changeOpen} class="min-w-0 w-full">
       <div role={activity.live ? 'status' : undefined}>

@@ -155,7 +155,6 @@ pub(super) async fn handle_model_turn_stream(input: ModelTurnStreamInput) -> Rou
             });
             let mut output = turn.output;
             let mut aborted = false;
-            let mut committed_failure_delivered = false;
             let mut terminal_failure = None;
             let mut transport = LiveTransportFlags::default();
             let mut preflight_failure = None;
@@ -389,13 +388,7 @@ pub(super) async fn handle_model_turn_stream(input: ModelTurnStreamInput) -> Rou
                         }
                     }
                     Some(LegAdvance::StreamError(error)) => {
-                        let error = [AiStreamDelta::StreamError { error }];
-                        if delivery.send_deltas(&error).await == DeliveryProgress::Sent
-                            && delivery.finish_stream("failed".into()).await
-                                == DeliveryProgress::Sent
-                        {
-                            committed_failure_delivered = true;
-                        }
+                        terminal_failure = Some(error);
                         aborted = true;
                     }
                     Some(LegAdvance::Outcome(outcome)) => {
@@ -627,7 +620,7 @@ pub(super) async fn handle_model_turn_stream(input: ModelTurnStreamInput) -> Rou
             };
 
             let mut delivery_completed_at = None;
-            if aborted && !preflight_failed && !committed_failure_delivered {
+            if aborted && !preflight_failed {
                 if !transport.disrupted() {
                     let native_error = stravia_protocol_codec::codec::compaction::native_compaction_requested(
                         &request,
@@ -639,7 +632,15 @@ pub(super) async fn handle_model_turn_stream(input: ModelTurnStreamInput) -> Rou
                     })
                     .flatten()
                     .cloned();
-                    let has_usage = response.usage.required_components_known
+                    // Failed legs still owe the caller every confirmed upstream
+                    // attempt, without replaying hidden output into the stream.
+                    let confirmed_usage = ledger.confirmed_usage_snapshot();
+                    let has_confirmed_usage = confirmed_usage.is_some();
+                    if let Some(usage) = confirmed_usage {
+                        response.usage = usage;
+                    }
+                    let has_usage = has_confirmed_usage
+                        || response.usage.required_components_known
                         || response.usage.prompt_tokens > 0
                         || response.usage.completion_tokens > 0;
                     let error = [
@@ -686,7 +687,6 @@ pub(super) async fn handle_model_turn_stream(input: ModelTurnStreamInput) -> Rou
             if delivery_completed_at.is_none()
                 && !aborted
                 && !preflight_failed
-                && !committed_failure_delivered
                 && !transport.protocol_failed
             {
                 // A protocol terminal may already have reached the caller while

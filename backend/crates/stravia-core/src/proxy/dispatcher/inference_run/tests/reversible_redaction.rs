@@ -334,7 +334,7 @@ async fn platform_tool_roundtrip(websocket: bool, array_output: bool, debug: boo
         .expect("ordinary platform input");
     assert_eq!(
         started.payload["input"],
-        serde_json::json!({"value": "***"})
+        serde_json::json!({"value": SECRET})
     );
     let finished = events
         .iter()
@@ -342,13 +342,12 @@ async fn platform_tool_roundtrip(websocket: bool, array_output: bool, debug: boo
         .expect("ordinary platform result");
     assert_eq!(finished.payload["tool_id"], started.payload["tool_id"]);
     assert_eq!(finished.payload["status"], "completed");
-    assert!(finished.payload.get("content").is_some());
-    if !array_output {
-        assert_eq!(
-            finished.payload["content"],
-            serde_json::json!({"api_key": "***", "configured": true})
-        );
-    }
+    let expected_result = if array_output {
+        serde_json::json!([{"type": "text", "value": format!("{SECRET} {TOOL_SECRET}")}])
+    } else {
+        serde_json::json!({"api_key": TOOL_SECRET, "configured": true})
+    };
+    assert_eq!(finished.payload["content"], expected_result);
     let mut thoughts = std::collections::BTreeMap::<String, String>::new();
     for event in &events {
         if event.kind == "model_thinking" {
@@ -408,7 +407,7 @@ async fn platform_tool_roundtrip(websocket: bool, array_output: bool, debug: boo
             .unwrap();
         assert!(
             wire_payloads.iter().any(|event| event.contains("***")),
-            "wire capture should retain ordinary redaction without semantic checkpoints"
+            "Authorization header values must remain masked in wire capture"
         );
     } else {
         assert!(

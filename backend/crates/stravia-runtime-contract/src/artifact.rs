@@ -260,6 +260,14 @@ pub trait ArtifactStore: Send + Sync {
         retention: Duration,
         settings: &ArtifactSettings,
     ) -> Result<ArtifactDownload, ArtifactError>;
+    /// 新生成产物固定经客户端入口中继，不改变普通下载的直传策略。
+    async fn download_relay(
+        &self,
+        principal: &Principal,
+        id: &ArtifactId,
+        retention: Duration,
+        settings: &ArtifactSettings,
+    ) -> Result<ArtifactDownload, ArtifactError>;
     async fn read_download(&self, token: &str) -> Result<ArtifactReader, ArtifactError>;
     async fn read_bytes(
         &self,

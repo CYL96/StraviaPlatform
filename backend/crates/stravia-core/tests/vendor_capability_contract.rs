@@ -1621,6 +1621,19 @@ async fn mixed_capability_channel_keeps_image_only_models_out_of_chat() -> anyho
         .await?;
 
     configure_image_generation(&harness.gateway, &image_route.model_id).await?;
+    harness
+        .gateway
+        .admin()
+        .set_setting(
+            "artifact_settings",
+            &json!({
+                "client_base_url": harness.endpoint.trim_end_matches("/mcp"),
+                "external_signed_downloads": true,
+                "file_public_base_url": "https://files.invalid/not-the-client"
+            })
+            .to_string(),
+        )
+        .await?;
     upstream
         .push_json("/image", StatusCode::OK, image_response())
         .await;
@@ -1632,6 +1645,21 @@ async fn mixed_capability_channel_keeps_image_only_models_out_of_chat() -> anyho
     .await;
     assert_ne!(generated.is_error, Some(true), "{generated:?}");
     assert_eq!(upstream.call_count("/image").await, 1);
+    let image = generated
+        .structured_content
+        .expect("generated image result");
+    let download_url = image["download_url"].as_str().expect("image download URL");
+    assert!(download_url.starts_with(harness.endpoint.trim_end_matches("/mcp")));
+    assert!(image.get("expires_at").is_none());
+    let downloaded = reqwest::get(download_url).await?;
+    assert_eq!(downloaded.status(), StatusCode::OK);
+    assert_eq!(downloaded.headers()["content-type"], "image/png");
+    assert_eq!(
+        downloaded.bytes().await?.as_ref(),
+        base64::engine::general_purpose::STANDARD
+            .decode(PNG_BASE64)?
+            .as_slice()
+    );
 
     let endpoint = harness.endpoint.trim_end_matches("/mcp").to_owned() + "/v1/responses";
     let rejected = reqwest::Client::new()
@@ -1671,6 +1699,80 @@ async fn mixed_capability_channel_keeps_image_only_models_out_of_chat() -> anyho
     assert_eq!(chat_status, StatusCode::OK, "{chat_body}");
     assert!(chat_body.contains("Legacy text inference remains available"));
     assert_eq!(upstream.call_count("/infer").await, 1);
+    for base in ["", "file:///invalid-client-base"] {
+        // 模拟缺失或损坏的持久配置；管理面正常保存会先拒绝这些值。
+        harness
+            .gateway
+            .storage
+            .settings()
+            .set(
+                "artifact_settings",
+                &json!({"client_base_url":base}).to_string(),
+            )
+            .await?;
+        let rejected = call_generate(
+            &client,
+            json!({"type":"image","input":{"prompt":"must not incur a paid call"}}),
+        )
+        .await;
+        assert_eq!(rejected.is_error, Some(true));
+        assert_eq!(upstream.call_count("/image").await, 1);
+    }
+
+    harness
+        .gateway
+        .admin()
+        .set_setting(
+            "artifact_settings",
+            &json!({"client_base_url":harness.endpoint.trim_end_matches("/mcp")}).to_string(),
+        )
+        .await?;
+    let (entered, release, responded) = upstream
+        .push_barrier("/image", StatusCode::OK, image_response())
+        .await;
+    let pending = {
+        let client = harness.connect().await;
+        tokio::spawn(async move {
+            call_generate(
+                &client,
+                json!({"type":"image","input":{"prompt":"retain this paid image"}}),
+            )
+            .await
+        })
+    };
+    entered.await?;
+    // Configuration changes after admission must not discard an already paid image.
+    harness
+        .gateway
+        .storage
+        .settings()
+        .set(
+            "artifact_settings",
+            &json!({"client_base_url":""}).to_string(),
+        )
+        .await?;
+    release.send(()).expect("release image response");
+    responded.await?;
+    let failed = pending.await?;
+    assert_eq!(failed.is_error, Some(true));
+    let failed = failed
+        .structured_content
+        .expect("structured download failure");
+    assert_eq!(failed["error"]["code"], "artifact_download_failed");
+    let retained =
+        ArtifactId::from_reference(failed["artifact"]["path"].as_str().expect("retained image"))?;
+    let reader = harness
+        .gateway
+        .artifact_store()
+        .unwrap()
+        .open(&Principal::new(harness.key_id.clone()), &retained)
+        .await?;
+    assert_eq!(reader.artifact.mime_type, "image/png");
+    assert_eq!(
+        upstream.call_count("/image").await,
+        2,
+        "issuance failure must not regenerate"
+    );
     Ok(())
 }
 

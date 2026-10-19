@@ -8,6 +8,8 @@ Media Generation 的用户可见名称为“媒体生成”，属于 Advanced Ca
 
 当前接入 Codex 托管图片工具和 Antigravity 原生图片模型。工具通过平台执行，支持显式调用、MCP 及可选透明注入。媒体生成使用独立平台总开关，关闭时所有入口均不可执行。总开关开启后，所有有效 API Key 可显式调用；MCP 另受既有 MCP 开关约束。API Key 增加“媒体生成”透明注入选项，新建及已有 Key 均默认不勾选；该选项只控制自动暴露，不是能力授权。沿用 [ADR-0016](../adr/0016-gate-advanced-capabilities-and-separate-transparent-injection.md)。
 
+透明注入总开关开启时同时提供基础 `StraviaRead`：所属 Artifact 的下载及公开工具执行状态／原始结果查询不依赖联网、多模态理解或媒体生成选择。联网与媒体理解仍按各自 Gate 和注入选择限制，不因基础 Read 自动开放。
+
 ## 2. 工具输入
 
 按 `type` 与 `input` 建立判别联合，不采用任意 JSON 参数袋，不将不同媒体类型的所有字段平铺为可选项。
@@ -62,6 +64,7 @@ type ImageGenerateOutput = {
   path: string; // stravia://artifacts/<artifact-id>
   mime_type: string;
   size: number; // 文件字节数
+  download_url: string; // 15 分钟 bearer 下载授权，不是稳定身份
   media: {
     width: number; // 实际像素宽度
     height: number; // 实际像素高度
@@ -71,7 +74,11 @@ type ImageGenerateOutput = {
 
 `media.width` 与 `media.height` 从实际生成文件读取，不以请求参数代填。结果不重复返回裸 Artifact ID，也不重复返回推算比例或分辨率档位。其他媒体类型的 `media` 字段随对应能力定义。
 
-下载使用既有 `StraviaRead({path: "stravia://artifacts/<artifact-id>?download=1"})` 获取限时下载授权，不将下载地址当作稳定身份。保留期、归属、上传与下载授权沿用 [ADR-0048](../adr/0048-separate-artifact-references-from-transfer-grants.md)、[ADR-0049](../adr/0049-snapshot-explicit-media-inputs-as-artifacts.md) 和 [ADR-0051](../adr/0051-disambiguate-artifact-download-and-understanding.md)。
+新生成结果直接附带 `download_url`，不增加 `expires_at`。它使用所属 Principal 的既有 15 分钟 bearer 下载授权，固定从配置的完整 `client_base_url`（含协议、端口及部署路径）经过平台读取实际存储文件，即使开启外部签名下载也不改用 S3 或文件公开入口。此规则不改变 Provider 交付及 `StraviaRead({path: "stravia://artifacts/<artifact-id>?download=1"})` 的既有下载策略，也不回写历史结果；异步执行查询原样保留生成结果中的链接，不自动续期或重新生成。
+
+工具描述要求用 `![图片描述](download_url "stravia://artifacts/<artifact-id>")` 展示结果，代入实际链接和稳定 `path`；title 在链接失效后保留产物身份，不代表自动续签或重新生成。有效链接的展示不要求额外调用 Read，稳定 `path` 仍用于后续参考图复用。
+
+调用上游前必须校验客户端入口非空且有效。图片已落盘但链接签发失败时，工具返回 `error.code = "artifact_download_failed"` 及 `artifact`（包含原 `path`、`mime_type`、`size`、`media`），保留图片与 Artifact，不重跑生成；调用方可使用保留的引用获取新的下载授权。保留期、归属、上传与下载授权沿用 [ADR-0048](../adr/0048-separate-artifact-references-from-transfer-grants.md)、[ADR-0049](../adr/0049-snapshot-explicit-media-inputs-as-artifacts.md) 和 [ADR-0051](../adr/0051-disambiguate-artifact-download-and-understanding.md)。
 
 ### 公开工具的等待与执行引用
 

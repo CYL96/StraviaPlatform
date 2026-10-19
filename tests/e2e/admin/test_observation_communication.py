@@ -33,9 +33,10 @@ def _next_live_event(response: Any) -> dict[str, Any]:
 
 @pytest.mark.e2e
 @pytest.mark.admin
-def test_scoped_current_snapshot_reconnect_and_global_redaction(admin_env: dict[str, Any]) -> None:
+def test_scoped_current_snapshot_preserves_content_with_global_metadata_only(admin_env: dict[str, Any]) -> None:
     release = threading.Event()
     emitted = {name: threading.Event() for name in ("scope-A", "scope-B")}
+    business_content = "Authorization: Bearer body-value callback=https://example.test/?access_token=download-value"
 
     class Provider(BaseHTTPRequestHandler):
         def log_message(self, *_args: object) -> None:
@@ -50,9 +51,7 @@ def test_scoped_current_snapshot_reconnect_and_global_redaction(admin_env: dict[
             self.end_headers()
             self.wfile.write(b"data: " + json.dumps({"id": "synthetic-scoped",
                 "object": "chat.completion.chunk", "model": body["model"],
-                # A chunk ending at "B" can legitimately retain that prefix
-                # while checking for the protected "Bearer ..." header.
-                "choices": [{"index": 0, "delta": {"role": "assistant", "content": f"{marker} first body "},
+                "choices": [{"index": 0, "delta": {"role": "assistant", "content": f"{marker} first body {business_content} "},
                              "finish_reason": None}]}).encode() + b"\n\n")
             self.wfile.flush()
             emitted[marker].set()
@@ -113,6 +112,7 @@ def test_scoped_current_snapshot_reconnect_and_global_redaction(admin_env: dict[
             assert snapshot["id"] == ""
             assert ("scope-B" if marker == "scope-A" else "scope-A") not in json.dumps(snapshot["data"])
             assert snapshot["data"]["blocks"]
+            assert business_content in json.dumps(snapshot["data"])
             reconnected = _sse_event(env, 0, interaction_id=interaction["id"])
             assert reconnected["event"] == "live_snapshot"
             assert reconnected["data"]["blocks"] == snapshot["data"]["blocks"]
@@ -148,6 +148,7 @@ def test_scoped_current_snapshot_reconnect_and_global_redaction(admin_env: dict[
             detail = _wait_for("persisted actual tail", lambda: (
                 value if (value := _detail(env, interaction["id"]))["interaction"]["status"] == "completed" else None))
             assert "-actual-tail" in json.dumps(detail)
+            assert business_content in json.dumps(detail)
     finally:
         release.set()
         subscriptions.close()

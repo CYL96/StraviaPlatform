@@ -198,6 +198,7 @@ impl LocalArtifactStore {
         id: &ArtifactId,
         retention: Duration,
         settings: &ArtifactSettings,
+        force_client_relay: bool,
     ) -> Result<ArtifactDownload, ArtifactError> {
         let settings = self.transfer_settings(Some(settings)).await?;
         let _guard = self.read_guard(id).await?;
@@ -206,7 +207,10 @@ impl LocalArtifactStore {
         let now = self.now();
         let mut expires_at = now.saturating_add(900_000);
         let token = hex_bytes(&rand::random::<[u8; 32]>());
-        let url = if settings.external_signed_downloads && row.storage_backend == "s3" {
+        let url = if !force_client_relay
+            && settings.external_signed_downloads
+            && row.storage_backend == "s3"
+        {
             let s3 = settings.s3.as_ref().ok_or_else(|| {
                 ArtifactError::Storage("S3 credentials are not configured".into())
             })?;
@@ -240,7 +244,7 @@ impl LocalArtifactStore {
                 std::time::UNIX_EPOCH + Duration::from_millis(now as u64),
             )?
         } else {
-            let base = if settings.external_signed_downloads {
+            let base = if !force_client_relay && settings.external_signed_downloads {
                 settings.file_public_base_url.as_deref().unwrap_or("")
             } else {
                 &settings.client_base_url

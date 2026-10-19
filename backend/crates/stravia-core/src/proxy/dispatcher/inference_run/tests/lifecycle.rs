@@ -1,6 +1,121 @@
 use super::*;
 
 #[tokio::test]
+async fn responses_failed_stream_retains_confirmed_hidden_round_usage() {
+    for (current_usage, expected_usage) in [
+        (
+            Some(serde_json::json!({
+                "prompt_tokens": 22, "completion_tokens": 2, "total_tokens": 24
+            })),
+            serde_json::json!({"input_tokens": 33, "output_tokens": 3, "total_tokens": 36}),
+        ),
+        (
+            None,
+            serde_json::json!({"input_tokens": 11, "output_tokens": 1, "total_tokens": 12}),
+        ),
+        (
+            Some(serde_json::json!({"prompt_tokens": 22})),
+            serde_json::Value::Null,
+        ),
+        (
+            Some(serde_json::json!({"prompt_tokens": 0})),
+            serde_json::Value::Null,
+        ),
+    ] {
+        let mut failing_leg = format!(
+            "data: {}\n\n",
+            serde_json::json!({
+                "id": "failing-leg", "model": "provider-model",
+                "choices": [{
+                    "index": 0,
+                    "delta": {"role": "assistant", "content": "partial answer"},
+                    "finish_reason": null
+                }]
+            })
+        );
+        if let Some(usage) = current_usage {
+            failing_leg.push_str(&format!(
+                "data: {}\n\n",
+                serde_json::json!({
+                    "id": "failing-leg", "model": "provider-model",
+                    "choices": [], "usage": usage
+                })
+            ));
+        }
+        failing_leg.push_str(&format!(
+            "data: {}\n\n",
+            serde_json::json!({
+                "error": {"message": "later leg failed", "type": "server_error", "code": "server_error"}
+            })
+        ));
+        let (base_url, provider_calls) =
+            serve_sse_sequence(vec![openai_sse_platform_tool_call(), failing_leg]).await;
+        let directory = tempfile::tempdir().expect("temporary data directory");
+        let (hook, _) = ExposeOrderedToolHook::counting();
+        let tool_calls = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let gateway = Gateway::builder(crate::config::GatewayConfig {
+            data_dir: directory.path().to_owned(),
+            ..Default::default()
+        })
+        .hook(Arc::new(hook))
+        .platform_tool(Arc::new(OrderedTool {
+            calls: tool_calls.clone(),
+        }))
+        .build()
+        .await
+        .expect("gateway init");
+        configure_route(&gateway, "failed-usage", &[base_url]).await;
+        let mut request = AiRequest::new("failed-usage", Vec::new());
+        request.stream.enabled = true;
+        let response = execute_request_with_headers(
+            gateway.clone(),
+            authorized_headers(&gateway).await,
+            request,
+            OPEN_RESPONSES_2026_04_24,
+            "/v1/responses",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        let body = std::str::from_utf8(&bytes).expect("SSE text");
+        let events: Vec<serde_json::Value> = body
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|data| serde_json::from_str(data).ok())
+            .collect();
+        let failures: Vec<_> = events
+            .iter()
+            .filter(|event| event["type"] == "response.failed")
+            .collect();
+        assert_eq!(failures.len(), 1, "{body}");
+        let failed = &failures[0]["response"];
+        assert_eq!(failed["status"], "failed", "{body}");
+        if expected_usage.is_null() {
+            assert!(failed["usage"].is_null(), "{body}");
+        } else {
+            for key in ["input_tokens", "output_tokens", "total_tokens"] {
+                assert_eq!(failed["usage"][key], expected_usage[key], "{body}");
+            }
+        }
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(*tool_calls.lock(), vec![1]);
+        assert_eq!(
+            failed["output"]
+                .as_array()
+                .expect("failed output")
+                .iter()
+                .filter(|item| item["type"] == "message")
+                .count(),
+            1,
+            "{body}"
+        );
+        close_test_gateway(gateway, directory).await;
+    }
+}
+
+#[tokio::test]
 async fn responses_preserve_usage_certainty_without_hidden_rounds() {
     use stravia_runtime_contract::protocol::ir::Usage;
 

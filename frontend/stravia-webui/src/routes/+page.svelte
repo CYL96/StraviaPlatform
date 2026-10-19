@@ -6,7 +6,7 @@ import { onMount, tick, untrack } from 'svelte'
 import { toast } from 'svelte-sonner'
 import { isTauri } from '#lib/admin-client.js'
 import { getConsoleChat } from '#lib/console-chat.svelte.js'
-import { consoleAssistantContent, consoleReasoningActivities, consoleVisibleText } from '#lib/console-chat.js'
+import { consoleAssistantBlocks, consoleAssistantContent, consoleVisibleText } from '#lib/console-chat.js'
 import type { ConsoleChatSnapshot, ConsoleConversation, ConsoleImageAttachment } from '#lib/console-chat-types.js'
 
 import { localizeBackendErrorMessage } from '#lib/backend-error.js'
@@ -355,24 +355,30 @@ async function submitEdit(id: string) {
             {@const content = consoleAssistantContent(message)}
             {@const usage = message.usage}
             {@const live = generation && message === lastMessage}
-            {@const activities = live ? generation.activities : consoleReasoningActivities(message)}
+            {@const blocks = live ? (generation.blocks ?? []) : consoleAssistantBlocks(message)}
             <ConversationMessage label={m.console_chat_assistant_response()}>
-              {#each activities as activity (activity.id)}
-                <ObservationActivity
-                  {activity}
-                  expansionPolicy="chat"
-                  followed={live && generation.followedThinkingIds.includes(activity.id)}
-                  minimumHeadingLevel={2} />{/each}
-              {#if live}<StreamingMarkdown
-                  text={consoleVisibleText(generation.text)}
-                  active
-                  minimumHeadingLevel={2}
-                  variant="document" />
-              {:else}<MarkdownContent
-                  text={consoleVisibleText(content.text)}
-                  minimumHeadingLevel={2}
-                  variant="document" />
-              {/if}
+              {#each blocks as block (block.id)}
+                {#if block.kind === 'thinking'}
+                  <ObservationActivity
+                    activity={block}
+                    expansionPolicy="chat"
+                    followed={live && generation.followedThinkingIds.includes(block.id)}
+                    minimumHeadingLevel={2} />
+                {:else if consoleVisibleText(block.text).trim()}
+                  {#if live}<StreamingMarkdown
+                      text={consoleVisibleText(block.text)}
+                      active
+                      allowImages
+                      minimumHeadingLevel={2}
+                      variant="document" />
+                  {:else}<MarkdownContent
+                      text={consoleVisibleText(block.text)}
+                      allowImages
+                      minimumHeadingLevel={2}
+                      variant="document" />
+                  {/if}
+                {/if}
+              {/each}
 
               {#if message.status === 'failed' && !live}
                 <div role="alert" class="text-destructive">

@@ -139,6 +139,8 @@ pub(crate) struct AttemptObservation {
     finished: AtomicBool,
     usage_confirmed: AtomicBool,
     confirmed_usage: Mutex<Option<ConfirmedUsage>>,
+    usage_ledger: Option<crate::run_usage::ConfirmedUsageLedger>,
+    received_usage: Mutex<Option<stravia_runtime_contract::protocol::ir::Usage>>,
     thinking_active: AtomicBool,
     thinking_items: Mutex<ObservedThinkingItems>,
     first_token_timed_out: Option<Arc<AtomicBool>>,
@@ -190,13 +192,57 @@ impl AttemptObservation {
             finished: AtomicBool::new(false),
             usage_confirmed: AtomicBool::new(false),
             confirmed_usage: Mutex::new(None),
+            usage_ledger: None,
+            received_usage: Mutex::new(None),
             thinking_active: AtomicBool::new(false),
             thinking_items: Mutex::new(ObservedThinkingItems::default()),
             first_token_timed_out,
         }
     }
 
+    pub(crate) fn with_usage_ledger(
+        mut self,
+        ledger: crate::run_usage::ConfirmedUsageLedger,
+    ) -> Self {
+        self.usage_ledger = Some(ledger);
+        self
+    }
+
+    pub(crate) fn record_unreported_usage(&self) {
+        if !self.usage_confirmed.swap(true, Ordering::AcqRel)
+            && let Some(ledger) = &self.usage_ledger
+        {
+            ledger.confirm(&Default::default());
+        }
+    }
+
     pub(crate) fn observe_delta(&self, delta: &AiStreamDelta) {
+        if let AiStreamDelta::Usage(usage) = delta {
+            let mut received = self.received_usage.lock();
+            let previous = received.get_or_insert_with(Default::default);
+            if usage.required_components_known || usage.prompt_tokens > 0 {
+                previous.prompt_tokens = usage.prompt_tokens;
+            }
+            if usage.required_components_known || usage.completion_tokens > 0 {
+                previous.completion_tokens = usage.completion_tokens;
+            }
+            if usage.required_components_known || usage.total_tokens > 0 {
+                previous.total_tokens = usage.total_tokens;
+            }
+            previous.required_components_known |= usage.required_components_known;
+            if usage.cache_read_tokens.is_some() {
+                previous.cache_read_tokens = usage.cache_read_tokens;
+            }
+            if usage.cache_creation_tokens.is_some() {
+                previous.cache_creation_tokens = usage.cache_creation_tokens;
+            }
+            if usage.reasoning_tokens.is_some() {
+                previous.reasoning_tokens = usage.reasoning_tokens;
+            }
+            if usage.server_tool_use.is_some() {
+                previous.server_tool_use = usage.server_tool_use.clone();
+            }
+        }
         let Some(observer) = &self.observer else {
             return;
         };
@@ -292,6 +338,9 @@ impl AttemptObservation {
         if self.usage_confirmed.swap(true, Ordering::AcqRel) {
             return;
         }
+        if let Some(ledger) = &self.usage_ledger {
+            ledger.confirm(usage);
+        }
         let usage = confirmed_usage(usage);
         *self.confirmed_usage.lock() = Some(usage.clone());
         if let Some(observer) = &self.observer {
@@ -338,6 +387,13 @@ impl AttemptObservation {
             span.record("status", "error");
         }
         self.finish_thinking();
+        if !self.usage_confirmed.load(Ordering::Acquire)
+            && let Some(usage) = self.received_usage.lock().as_ref()
+        {
+            // Presence records an actual upstream report, even when only one
+            // required component was supplied (including an explicit zero).
+            self.confirm_usage(usage);
+        }
         if self.observer.is_some() {
             let mut items = self.thinking_items.lock();
             let usage = &items.accumulator.usage;

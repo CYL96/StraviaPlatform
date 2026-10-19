@@ -17,6 +17,12 @@
 
 本设计同时适用于 SQLite 和 PostgreSQL 存储，但实时状态与 Debug 开关只承诺单 Gateway 实例。多实例聚合不在本设计范围内。
 
+对话正文与 Thinking、工具活动按同一 Run 的首次接收顺序交错展示，不再按类型分组。writer 在首次接收文本块时保存 `first_received_at` 和进程内单调 `receive_order`，易失块与 Canonical Item 收口事件沿用同一序号；工具生命周期事件在同一接收序列中取号。元数据仅存在既有 JSON payload 与 live block 中，不需要 SQL schema 迁移，也不改变事件自身的落盘 sequence 或 occurred_at。刷新后优先使用已记录的接收序号，不能把条目最终闭包的时间当作首次收到。没有这些元数据的历史仍使用已知事件 sequence，不推断或回写旧顺序；只包含 History Marker 的空正文不生成展示块。
+
+控制台对话按 Responses 输出项顺序渲染正文与公开思考；流式检查点另存交错的 `partialBlocks`，使中断、失败或刷新后保持已观察到的块布局。旧检查点缺少交错证据时保留其原有布局，不从拼接正文推测边界。
+
+工具调用与工具结果各占独立的可展开块：调用块仅展示参数及当前状态，结果块在实际 finish/result 事件的位置展示结果内容，不在调用块重复展示。并发调用按各自真实返回顺序呈现，不将晚返回结果提前挂到调用位置；客户端续接的结果展示在承载该结果的 Run 中，仍使用已确认祖先调用关联取得工具名称。
+
 Observation 使用统一平台身份契约：随机不透明 ID 是由密码学安全随机生成器均匀采样的 28 位 ASCII 小写字母（约 131.6 bit），完整 SHA-256 派生身份则用 55 位 ASCII 小写字母保留全部 256 bit。Artifact Reference 为 `stravia://artifacts/<55 位 ID>`，Turn Reference 为 `stravia://turns/<28 位 ID>`，Search Source 为 `stravia://turns/<28 位 ID>/sources/<ordinal>`；History Marker 为 `<!--sh:<28 位 ID>-->`，Projection Delimiter 为 `<!--sp:<28 位 ID>:<t|p>:<ordinal>:<s|e>-->`，可逆脱敏引用为 `<!--sr:<28 位 ID>-->`。这些外壳不授予访问权，外部 Provider／客户端 ID 与真实凭据 token 不变；旧平台引用不提供兼容解析，已有不可变或外部历史不回写。
 
 ## 2. 非目标
@@ -131,7 +137,7 @@ Token 活动图按实测可视宽度拥有独立查询范围，结束仍为顶�
 
 输入估算不进入 Confirmed Upstream Usage、卡片数值、用量统计或计费。普通模型请求的筛选与路由调度共用同一估算：将消息 `items`、独立系统提示词 `instructions` 和工具定义 `tools` 一并计算 JSON 序列化字节数，除以 4 向上取整；工具说明与参数 schema 也属于输入，不能只按用户消息估算。它不是模型 tokenizer 的精确计数。估算随 `model_turn_started` 写入独立的 nullable 字段，已有记录不重算，不从截断的输入预览或 Debug 内容回填。
 
-客户端响应的 Run 用量账本只合并实际执行的隐藏轮次。没有隐藏轮次时，保留终态响应已有的数值与 known 标志，包括明确报告的零；空账本不得把已知用量降级为未知。该规则不把未知值补零；客户端 wire 仍保留协议规定的总输入，管理面另在读取边界计算净输入。
+客户端响应的 Run 用量账本在上游 attempt 确认边界独立累计主模型、隐藏轮次、独立媒体生成等内部调用及重试已经报告的用量，每个 attempt 只确认一次；最终响应直接使用该快照，不再次叠加主轮或末轮。流式失败终态也使用该账本，即使失败的当前 leg 没有报告用量，仍保留此前确认事实及整体的不确定性；此路径只替换 usage，不重复拼接隐藏输出。账本通过本次请求新建的根执行句柄跨工具并发任务共享，不读取 Observation，也不受其持久化失败影响；后续客户端请求使用新的账本，不回写历史。缓存读、缓存写与 reasoning 分项只有全部已计入调用均明确报告时才返回合计，任一缺失则保持未知；显式报告的零参与合计，不与缺失混同。这与 Observation 对已报告部分的独立累计口径不同。没有实际上游确认调用的执行器保留其终态响应及隐藏轮已有的数值与 known 标志，包括明确报告的零；空账本不得把已知用量降级为未知。未知值不补零，Responses 可选分项以 null 表达未知；客户端 wire 仍保留协议规定的总输入，管理面另在读取边界计算净输入。
 
 Gemini `thoughtsTokenCount` 保留为 reasoning 子项，输出仍只包含一次该部分；终态之后的累计 usage 修订覆盖同一 attempt 的快照，不作为新增用量相加。标准 Gemini 缺失缓存字段仍为未知。Antigravity 仅对已确认完整的私有终态 usage 使用其 proto3 标量缺省零语义，缺失整个 usage 或中间帧不补零；事实来源和消息存在性边界见 [Antigravity 响应协议](../research/antigravity-oauth.md#响应)。这些归一化仅影响后续请求，不补写存量事件。
 
@@ -238,7 +244,7 @@ clear_history() -> ClearHistoryResult
 - Generation Chain 提供已确认的 node/root/parent 关联及按 Principal 隔离的祖先客户端历史读取，不接收运行中或失败 Observation 状态；
 - 归并判定集中在内部 Run Attribution 深模块：writer 在 Admit 处理中把 `RunStart` 与 `AdmissionFacts`（收到的 canonical client 请求与 Generation Chain 已确认证据）交给它，canonical fingerprint、入口接收时间与合并规则只在该模块内计算；writer 保留顺序、背压、持久化与发布职责。
 
-删除旧 `logging::LogEntry`、`run_collector`、`LogStore`、`proxy::observability::send_log` 和旧 `wire_capture` 的平行写入路径。普通 Observation 保留既有脱敏；Debug Wire 在 reqwest、WebSocket 与客户端传输边界捕获，并只替换 HTTP `Authorization` header 值。
+删除旧 `logging::LogEntry`、`run_collector`、`LogStore`、`proxy::observability::send_log` 和旧 `wire_capture` 的平行写入路径。普通 Observation 与 Debug Wire 采用相同的 Authorization-only 写入过滤；Debug Wire 仍独立在 reqwest、WebSocket 与客户端传输边界捕获，普通 Observation 不因此扩大内容范围。
 
 ## 5. 事件与投影
 
@@ -266,13 +272,13 @@ clear_history() -> ClearHistoryResult
 
 `platform_tool_started.input` 和 `client_tool_handoff.input` 保存工具输入，`platform_tool_finished.content` 保存平台工具返回；输入为可解析的 JSON 时保留其类型，否则保留原始参数字符串。旧事件缺少这些可选字段时表示未采集，字段值为 `null` 则表示实际采集到 JSON null。`client_tool_result` 保存收到的客户端返回及其调用 ID、错误标记，兼容显式 `tool_result` 块和 `role=tool` 消息；只采集收到的 canonical 窗口，不从恢复后的模型历史重新提取。客户端返回先留在内存，凭据映射注册完成后与输入预览共用发布边界，没有新用户文本的工具续跑也会发布。
 
-客户端工具结果只从已核验 Generation Chain 父节点的本次 `client_delta` 捕获，不再复制父节点完整窗口；没有已核验父节点时不从父历史推断结果。收到的本次新增结果再按批次查询当前 Run 及明确 `parent_run_id` 祖先，只使用同一 Principal、仍在保留期内的调用证据。最近一次 `client_tool_handoff` 确定调用边界；相同 ID 的新 handoff 是新调用。只有与该调用最近结果的脱敏后正文、`is_error` 均相同时才跳过重复写入。正文变化、错误状态变化、分支结果与新调用保留；没有 handoff 证据，或最近结果正文缺失、为 null 时，不跨越该不确定边界去重。比较状态只存在于当前批次，不另存正文副本或原始凭据摘要。工具去重本身不回写或删除既有结果；升级时事件编码与生命周期合并另按 ADR-0077 无损转换。
+客户端工具结果只从已核验 Generation Chain 父节点的本次 `client_delta` 捕获，不再复制父节点完整窗口；没有已核验父节点时不从父历史推断结果。收到的本次新增结果再按批次查询当前 Run 及明确 `parent_run_id` 祖先，只使用同一 Principal、仍在保留期内的调用证据。最近一次 `client_tool_handoff` 确定调用边界；相同 ID 的新 handoff 是新调用。只有与该调用最近结果的已记录正文、`is_error` 均相同时才跳过重复写入。正文变化、错误状态变化、分支结果与新调用保留；没有 handoff 证据，或最近结果正文缺失、为 null 时，不跨越该不确定边界去重。比较状态只存在于当前批次，不另存正文副本或原始凭据摘要。工具去重本身不回写或删除既有结果；升级时事件编码与生命周期合并另按 ADR-0077 无损转换。
 
 生命周期事件把 `usage_confirmed` 合并到 `target_attempt_finished.usage`（`ConfirmedUsage | null`），把 `delivery_finished` 合并到 `run_finished.delivery`（`{status, reason, completed_at} | null`）；失败、中断前已收到的用量与交付事实也保留，早到事实先更新投影，不能因尚未终态而丢弃。`delivery_completed_at` 保存于 Run 投影。`generation_associated`、`client_output_committed` 只更新投影，不再落独立事件；启动恢复以 `run_state_changed` 维持 SSE 唤醒。
 
-推理尝试已有失败诊断时，`target_attempt_finished.error` 保存可选的 `FailureDiagnostic`（`source`、`code`、`message`、`status_code`、`upstream_code`）。它沿用普通 Observation 的结构化凭据与已知秘密脱敏，随事件查询和 Bundle 导出；即使后续重试成功，该尝试的安全原因摘要也不会被丢弃。既有 `error_code` 与状态语义不变，成功尝试不附带 `error`，旧记录与没有诊断的恢复终态允许缺省；无需数据库迁移，也不为旧记录补造原因。恢复成功的内部失败仍不成为最终 Failed Request。
+推理尝试已有失败诊断时，`target_attempt_finished.error` 保存可选的 `FailureDiagnostic`（`source`、`code`、`message`、`status_code`、`upstream_code`）。它沿用普通 Observation 的 Authorization-only 写入过滤，随事件查询和 Bundle 导出，原因摘要可能包含原始凭据；即使后续重试成功，该尝试的原因摘要也不会被丢弃。既有 `error_code` 与状态语义不变，成功尝试不附带 `error`，旧记录与没有诊断的恢复终态允许缺省；无需数据库迁移，也不为旧记录补造原因。恢复成功的内部失败仍不成为最终 Failed Request；进程日志和面向客户端的普通错误继续使用原有强脱敏。
 
-`model_thinking_delta` 与 `client_visible_content_delta` 仅用于易失实时通道，不是持久化 kind。`model_thinking_delta` 只接收上游可读 thinking / reasoning summary 文本，并以 Model Turn、Target attempt、Canonical Item 与项内 part 隔离增量脱敏和汇聚状态。签名、密文、obfuscation 和不透明快照不作为普通思考正文。`client_visible_content_delta` 仍只接收 Client Projection 已交付的可见内容。
+`model_thinking_delta` 与 `client_visible_content_delta` 仅用于易失实时通道，不是持久化 kind。`model_thinking_delta` 只接收上游可读 thinking / reasoning summary 文本，并以 Model Turn、Target attempt、Canonical Item 与项内 part 隔离汇聚状态，不再执行正文凭据增量脱敏。签名、密文、obfuscation 和不透明快照不作为普通思考正文。`client_visible_content_delta` 仍只接收 Client Projection 已交付的可见内容。
 
 普通诊断内容按 Canonical Item 收口持久化为 `model_thinking` 或 `client_visible_content`：每个 item 一行，payload 保存 `text`、`parts`、`block_id`、`item` 与 `complete`，思考内容另带 Model Turn/attempt 关联。同一 item 的流式碎片汇聚为一项，保留项内 part 的边界和顺序；具有独立身份的 item 即使类型相同也不得合并。正常结束保存完整 item；可处理的失败或取消保存已实际收到的内容并标为未完成，不补造未收到的尾部。item 首次落盘只发生在收口时，不周期性持久化中间快照；进程突然崩溃可以丢失整个尚未落盘的 item。实时与持久内容共享 scope 与真实源 item ordinal：可见内容在 Run 内、thinking 在 attempt 内稳定编号，迟到 provider ID 不改变 block_id。WebSocket 仅累计已成功发送并确认的客户端帧，失败或断线收口为 `complete=false`，不补入未发送正文。
 
@@ -284,7 +290,7 @@ clear_history() -> ClearHistoryResult
 
 未收口内容作为选中 Interaction 的累计易失快照发布并替换显示，不带 SSE ID、不推进持久 cursor；界面明确未保存状态。第一段与完成、失败、取消边界立即处理，中间修订按固定首次截止的最多 100ms 发布窗口合并，只发布变化 block 的最新修订；持续输入不延后截止。同一 block 尚未消费的旧修订可被新修订替换，不能让累计全文无限排队或拖累持久通知。发送用的全文构造和编码只在发布时进行，不在每个原始 delta 上重复执行。下游转发与推理不等待观察发布、诊断 item 收口或落盘，也不因有无管理订阅改变记录行为。持久化失败、live gap 与进程崩溃丢失分别表达，不能把易失预览截断误报成已落盘历史丢失。
 
-思考和工具内容不进入 `visible_tail`，沿用普通 Observation 既有凭据脱敏及 `log_retention_days`，不受 Debug 开关控制；业务敏感内容仍可能保留。普通事件不保存完整 canonical request/response。
+思考和工具内容不进入 `visible_tail`，采用普通 Observation 的 Authorization-only 写入过滤及既有 `log_retention_days`，不受 Debug 开关控制；原始凭据与业务敏感内容可能保留。普通事件不保存完整 canonical request/response。
 
 ### 5.2 Debug 原始 Wire 捕获
 
@@ -429,7 +435,7 @@ diagnostics/observation-debug/
 
 传输失败、协议解码失败和规范化错误沿用普通 Observation 的错误分类、阶段、状态与安全原因摘要，不作为 Debug 内容记录。对应方向没有实际收发时不得补造 Wire；Trace manifest 如实表达缺失或 `partial`。这些诊断不改变重试、回退、超时或成功判定，也不为旧 Trace 补录原因。
 
-宿主网络传输错误的原因摘要保留外层错误及其 `Error::source()` 原因链，避免 WebSocket 包装错误的通用类别名遮蔽异常关闭、协议帧或 I/O 失败等底层原因。完整摘要沿用普通 Observation 的既有脱敏规则后进入日志、推理尝试终态及最终失败请求记录；不改变 Wire Debug 的捕获与脱敏边界，也不能恢复旧记录中已丢失的原因。
+宿主网络传输错误的原因摘要保留外层错误及其 `Error::source()` 原因链，避免 WebSocket 包装错误的通用类别名遮蔽异常关闭、协议帧或 I/O 失败等底层原因。推理尝试终态及最终失败请求的普通 Observation 采用 Authorization-only 写入过滤；进程日志和面向客户端的普通错误仍按既有强脱敏规则处理，不能直接复用观测原文。不改变 Wire Debug 的捕获边界，也不能恢复旧记录中已丢失的原因。
 
 文件路径只接受模块生成的 opaque trace ID 与固定文件名，所有导出读取都在 canonicalized root 内，防止 path traversal。
 
@@ -612,9 +618,11 @@ wpr -HeapTracingConfig stravia-server.exe disable
 
 ### 7.2 脱敏
 
-普通 Observation、错误与进程 log 的既有脱敏不变：credential header、URL userinfo 和凭据类 query、结构化 body 中明确的凭据字段，以及上传授权和签名下载 token 继续在写入前按现有规则替换；可逆脱敏引用仍作为机器原子处理。普通 Observation 不因 Debug 的捕获策略放宽保护。
+普通 Observation 与 Debug Trace 采用同一 Authorization-only 写入过滤：只遮盖实际 HTTP `Authorization` header 的值，header 名不区分大小写，并在进入异步队列、实时通道或存储前完成。body、工具参数或普通 JSON 中名为 `Authorization` 的字段不是 HTTP header，按原文保留。其他 header、URL userinfo、query、正文、思考、工具参数和结果不再做结构化凭据、已知秘密或签名 token 的额外替换。因此普通记录的实时展示、落盘、历史查询和 Bundle 事件导出都可能包含下载授权、上传授权及其他原始凭据，必须按敏感诊断处理，关闭 Debug 也不会改变这一点。
 
-Debug Trace 是明确的例外：只把 HTTP `Authorization` header 的值替换为 `***`，且必须在进入异步队列、临时文件或分段存储前完成。其他 header（包括 API key、Cookie、Set-Cookie 与 Proxy Authorization）、URL、query、body、prompt、工具参数、工具结果、媒体和 WebSocket message 均原样保留，不执行结构化字段递归脱敏、协议专用凭据识别、消息重组脱敏或媒体外置。Bundle 原样封装该 Trace，并在 manifest/README 说明只发生 Authorization redaction；开启确认必须明确这会保存其他凭据与全部业务内容。
+这只改变新写入普通 Observation 的过滤标准，不扩展其既有预览、Canonical Item、工具和失败诊断的捕获范围，不把它变成完整抓包，也不回写旧记录。已有输入预览的模型侧凭据保护与发布顺序、媒体外置、保留期、鉴权和权限不变；进程 log 与面向客户端的普通错误继续使用原有强脱敏，模型上下文、平台历史及可逆凭据保护不放宽。记录中保留下载授权不表示自动刷新或续签。
+
+Debug Trace 沿用仅把 HTTP `Authorization` header 值替换为 `***` 的规则，且必须在进入异步队列、临时文件或分段存储前完成。其他 header（包括 API key、Cookie、Set-Cookie 与 Proxy Authorization）、URL、query、body、prompt、工具参数、工具结果、媒体和 WebSocket message 均按捕获内容保留，不执行结构化字段递归脱敏、协议专用凭据识别、消息重组脱敏或媒体外置。Bundle 原样封装该 Trace；开启确认和导出说明须同时明确普通 Observation 也可能保留凭据，但两者捕获范围不同。
 
 ## 8. Interaction Debug Bundle
 
@@ -891,7 +899,7 @@ reset 恢复开启新的 view epoch，取消或拒绝旧上下文结果；在权
 - Confirmed Upstream Usage；未知字段显示等待上游，不显示 0；
 - 用量栏下显示同宽的输出预览框，约三行，底部对齐并裁去上方溢出，内容更新及字体或尺寸变化后仍显示最新一行；
 - 两个正文框以安全过滤后的 Markdown 渲染，不加载图片或嵌入资源；悬停或键盘聚焦时通过 Tooltip 查看更多，触控点按打开可关闭的内容浮层；长内容限高滚动，不误触卡片详情；
-- 输入预览在凭据脱敏后保留前 4,096 Unicode 字符，普通 Debug 关闭时也记录；同一交互的工具续跑不得覆盖初始输入，新用户子交互记录自己的输入。输入沿用请求记录的保留与清理周期；
+- 输入预览保留准入时客户端窗口的前 4,096 Unicode 字符，并沿用既有模型侧凭据保护完成后的发布边界，不再另做观测正文脱敏；普通 Debug 关闭时也记录。同一交互的工具续跑不得覆盖初始输入，新用户子交互记录自己的输入。输入沿用请求记录的保留与清理周期；
 - 输出框及其浮层只使用客户端可见内容的已保留尾部，不因 Debug 开关扩大为 canonical payload，也不宣称完整回答；
 - 不显示底部 Debug 捕获、筛选命中或因果上下文标签；
 - 保留选中路径、键盘 focus 与非命中节点弱化样式。
@@ -912,11 +920,11 @@ reset 恢复开启新的 view epoch，取消或拒绝旧上下文结果；在权
 - 只有用户显式展开某个 Run 的诊断详情时，才进入该 Run 的重型诊断内容需求，包括可读思考、工具参数与结果、Target attempt 详细内容。现有「对话」页中的思考或工具 Marker 展开，以及「诊断」页中对应 Run 的展开，均属于这项显式详情需求；不增加额外操作层级。
 - 关闭检查器时退出该 Interaction 的会话与 Run 详情需求；收起对应 Marker 或 Run 诊断时退出该层的重型诊断内容需求。此分层只约束管理页何时获取和订阅所需详情，不改变后台 Interaction Observation 的记录、保留、Debug 开关或 Debug Trace 契约。
 
-默认「对话」页与控制台复用只读消息框架展示当前 Interaction：用户靠右使用低对比度气泡，模型正文靠左平铺、不使用装饰气泡。两侧均不显示头像或独立身份行，也不保留头像占位；消息保留用户或模型的可访问名称。数据、分组与展开策略保持各自边界。连续同一模型的 Run 共用一组消息，正文和工具继续追加在同一块内，只在末尾显示最后一条消息的时间；换模型或出现用户消息时重新分组。时间旁不显示任何执行状态或预览说明，执行状态仍在画布与诊断中保留。初始用户消息取已脱敏的 `input_preview`，缺失时可用初始 Run 的 `input_preview_recorded.text` 补足；后续 Run 的输入事件在所属回复前生成独立用户消息，不因文本相同而去重。每个 Run 的回复拼接按 sequence 排序的持久 `client_visible_content`，并以稳定 block 身份叠加尚未落盘的选中易失正文；收口落盘后对应易失 block 退役，不重复显示同一正文。不把 Debug 或 Thinking 当作客户端回复。没有用户正文时不生成用户消息，没有助手正文时隐藏正文块，但保留流式组件实例，保证首个实时增量仍可逐字显示。
+默认「对话」页与控制台复用只读消息框架展示当前 Interaction：用户靠右使用低对比度气泡，模型正文靠左平铺、不使用装饰气泡。两侧均不显示头像或独立身份行，也不保留头像占位；消息保留用户或模型的可访问名称。数据、分组与展开策略保持各自边界。连续同一模型的 Run 共用一组消息，正文和工具继续追加在同一块内，只在末尾显示最后一条消息的时间；换模型或出现用户消息时重新分组。时间旁不显示任何执行状态或预览说明，执行状态仍在画布与诊断中保留。初始用户消息取 `input_preview`，缺失时可用初始 Run 的 `input_preview_recorded.text` 补足；后续 Run 的输入事件在所属回复前生成独立用户消息，不因文本相同而去重。每个 Run 的回复遵循前文的接收顺序规则，并以稳定 block 身份叠加尚未落盘的选中易失正文；收口落盘后对应易失 block 退役，不重复显示同一正文。不把 Debug 或 Thinking 当作客户端回复。没有用户正文时不生成用户消息，没有助手正文时隐藏正文块，但保留流式组件实例，保证首个实时增量仍可逐字显示。
 
-思考和工具使用官方 shadcn-svelte Marker，默认折叠；有真实详情才提供展开操作，没有可读思考则不显示条目，只有工具名称时显示静态行，不增加「未记录」说明。思考置于所属 Run 正文前，工具置于正文后；展开显示普通观察事件记录的可读思考、工具输入和返回，无需开启 Debug。详情与对话不读取 Debug Trace，也不从旧 Trace 补充内容或补录未采集的历史。签名、密文不进入普通思考正文。
+思考和工具使用官方 shadcn-svelte Marker，默认折叠；有真实详情才提供展开操作，没有可读思考则不显示条目，只有工具名称时显示静态行，不增加「未记录」说明。Marker 在所属 Run 的接收位置展示；展开显示普通观察事件记录的可读思考、工具输入和返回，无需开启 Debug。详情与对话不读取 Debug Trace，也不从旧 Trace 补充内容或补录未采集的历史。签名、密文不进入普通思考正文。
 
-活动转圈只表示有证据的进行中状态：平台工具有开始而无结束，客户端工具已交接且所属 Run 当前为 `waiting_client`。工具结果（包括错误）结束对应等待；`superseded`、断线、过期和进程恢复等权威终结停止转圈并保留真实原因，不冒充成功返回。响应交付不等于平台工具结束；后台开始尚未结束时继续显示活动，只有真实结束或已有未完成活动收口证据才终结。晚到客户端结果仍归回原调用并保留此前断线等原因。状态展示不自动展开 Marker、不改变人工展开记忆，也不为转圈加载重型详情。
+活动转圈只表示有证据的进行中状态：平台工具有开始而无结束，客户端工具已交接且所属 Run 当前为 `waiting_client`。工具结果（包括错误）结束对应等待；`superseded`、断线、过期和进程恢复等权威终结停止转圈并保留真实原因，不冒充成功返回。响应交付不等于平台工具结束；后台开始尚未结束时继续显示活动，只有真实结束或已有未完成活动收口证据才终结。晚到客户端结果仍关联原调用，但在实际接收位置显示，并保留此前断线等原因。状态展示不自动展开 Marker、不改变人工展开记忆，也不为转圈加载重型详情。
 
 工具调用按 Run 和调用 ID 关联：普通平台事件的 `tool_id` 就是调用 ID，客户端返回来自 `client_tool_result`。返回仅匹配明确 `parent_run_id` 祖先，祖先路径上的历史重放不重复展示，兄弟分支各自收到的返回独立保留。工具输入与返回以安全纯文本或 JSON 呈现，不递归猜测业务 JSON、不执行 HTML 或加载远程媒体。每条 Marker 以稳定活动 ID 独立保存 localStorage 展开布尔值，折叠时删除该项；不保存正文，存储失败明确提示但不阻断展开。展开已有内容不制造「新活动」提示；后续真实内容变化仍可提示，且不收起已展开条目或抢走阅读位置。
 

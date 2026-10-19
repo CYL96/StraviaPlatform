@@ -1,6 +1,125 @@
 use super::*;
 
 #[tokio::test]
+async fn master_only_injection_can_download_owned_artifacts_without_media_or_networking() {
+    for enabled in [true, false] {
+        let data_dir = tempfile::tempdir().expect("temporary data directory");
+        let gateway = Gateway::new(crate::config::GatewayConfig {
+            data_dir: data_dir.path().to_owned(),
+            ..Default::default()
+        })
+        .await
+        .expect("Gateway");
+        let admin = gateway.admin();
+        admin
+            .set_setting(
+                "artifact_settings",
+                r#"{"client_base_url":"http://localhost/client"}"#,
+            )
+            .await
+            .expect("download settings");
+        let key = admin
+            .create_api_key(crate::db::models::CreateApiKey {
+                key: None,
+                name: "Basic reader".into(),
+                rpm_limit: None,
+                expires_at: None,
+                mcp_access_enabled: false,
+                transparent_injection_enabled: enabled,
+                inject_web_search: false,
+                inject_media_generation: false,
+                inject_media_understanding: false,
+                model_ids: vec![],
+            })
+            .await
+            .expect("API key");
+        let artifact = gateway
+            .artifact_store()
+            .expect("Artifact store")
+            .ingest(
+                &stravia_runtime_contract::Principal::new(key.id.clone()),
+                "text/plain",
+                Some(5),
+                stravia_runtime_contract::artifact::bytes_stream(bytes::Bytes::from_static(
+                    b"hello",
+                )),
+                std::time::Duration::from_secs(3600),
+            )
+            .await
+            .expect("owned Artifact");
+        let mut first = openai_response("");
+        first["choices"][0]["message"]["tool_calls"] = serde_json::json!([{
+            "id":"owned-download",
+            "type":"function",
+            "function":{
+                "name":"StraviaRead",
+                "arguments":serde_json::json!({"path":format!("{}?download=1", artifact.reference())}).to_string()
+            }
+        }]);
+        first["choices"][0]["finish_reason"] = serde_json::json!("tool_calls");
+        let responses = if enabled {
+            vec![first, openai_response("Download is available.")]
+        } else {
+            vec![openai_response("No platform reader was offered.")]
+        };
+        let (url, _, requests) = serve_openai_sequence_with_requests(responses).await;
+        let route_id = configure_route_with_id(&gateway, "basic-reader", &[url]).await;
+        admin
+            .update_api_key(
+                &key.id,
+                serde_json::from_value(serde_json::json!({"model_ids":[route_id]})).unwrap(),
+            )
+            .await
+            .expect("bind model");
+        let mut user =
+            stravia_runtime_contract::protocol::ir::AiItem::output_text("Download my file.");
+        user.role = stravia_runtime_contract::protocol::ir::Role::User;
+        let response = execute_non_stream_request_with_headers(
+            gateway.clone(),
+            bearer_headers(&key.token),
+            AiRequest::new("basic-reader", vec![user]),
+        )
+        .await;
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        {
+            let requests = requests.lock();
+            let first: serde_json::Value =
+                serde_json::from_str(requests[0].split_once("\r\n\r\n").unwrap().1).unwrap();
+            let tools = first["tools"].as_array();
+            assert_eq!(
+                tools.is_some_and(|tools| tools
+                    .iter()
+                    .any(|tool| tool["function"]["name"] == "StraviaRead")),
+                enabled,
+                "master switch controls the basic reader"
+            );
+            if enabled {
+                let followup: serde_json::Value =
+                    serde_json::from_str(requests[1].split_once("\r\n\r\n").unwrap().1).unwrap();
+                let result = followup["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|message| message["role"] == "tool")
+                    .expect("download result");
+                let result: serde_json::Value =
+                    serde_json::from_str(result["content"].as_str().unwrap()).unwrap();
+                assert_eq!(result["path"], artifact.reference());
+                assert!(
+                    result["download_url"]
+                        .as_str()
+                        .expect("download URL")
+                        .starts_with("http://localhost/client/v1/artifacts/downloads/")
+                );
+            }
+        }
+        close_test_gateway(gateway, data_dir).await;
+    }
+}
+
+#[tokio::test]
 async fn media_only_injection_rejects_guessed_search_before_research_execution() {
     let mut tool_round = openai_response("");
     tool_round["choices"][0]["message"]["tool_calls"] = serde_json::json!([{

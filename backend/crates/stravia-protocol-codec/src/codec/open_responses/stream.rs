@@ -1486,7 +1486,7 @@ impl ResponsesStreamFormatter {
             serde_json::Value::Null
         } else {
             let mut input_tokens_details = serde_json::json!({
-                "cached_tokens": self.usage.cache_read_tokens.unwrap_or(0)
+                "cached_tokens": self.usage.cache_read_tokens
             });
             if let Some(cache_write_tokens) = self.usage.cache_creation_tokens {
                 input_tokens_details["cache_write_tokens"] = cache_write_tokens.into();
@@ -1497,7 +1497,7 @@ impl ResponsesStreamFormatter {
                 "total_tokens": self.usage.total_tokens,
                 "input_tokens_details": input_tokens_details,
                 "output_tokens_details": {
-                    "reasoning_tokens": self.usage.reasoning_tokens.unwrap_or(0)
+                    "reasoning_tokens": self.usage.reasoning_tokens
                 }
             })
         };

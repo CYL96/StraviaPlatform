@@ -144,6 +144,7 @@ All model Vendors run as self-contained Wasm Components. Stravia embeds the base
 - Request Records: watch every interaction live on a zoomable canvas — model calls, retries, and tool calls — with a separate failed-requests list and a per-conversation view.
 - See the token usage and provider quotas that services actually report.
 - Turn on Debug to capture HTTP/SSE/WebSocket traffic and download it as a debug bundle; only HTTP `Authorization` values are masked, while other credentials, content, and media may be retained. Treat bundles as sensitive; see the [Request Records design](docs/design/interaction-observation.md).
+- Ordinary request observations use the same filtering even with Debug off: only actual HTTP `Authorization` header values are masked (case-insensitive header name), not similarly named body or tool fields. Live views, saved records, and exported events may retain download grants and other raw credentials. This does not expand ordinary capture into full wire recording, rewrite old records, or change retention, permissions, process-log/client-error filtering, or model-side credential protection. Download grants are not automatically refreshed or renewed.
 
 ### Credential protection
 

@@ -4,8 +4,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use stravia_credential_protection::marker;
 
-use super::types::{FailureDiagnostic, IngressStart, RejectedOutcome, RunEvent, RunOutcome};
-
 pub(crate) const REDACTED: &str = "***";
 
 pub(crate) fn user_input_text(
@@ -43,16 +41,7 @@ pub(crate) fn user_input_text(
     (!text.is_empty()).then_some(text)
 }
 
-pub(crate) fn input_preview(mut text: Cow<'_, str>, protected: &ProtectedSecrets) -> String {
-    // Full text must cross both filters before taking a Unicode-safe opening window.
-    if !protected.0.read().is_empty() {
-        protected.text(text.to_mut());
-    }
-    if text_may_need_redaction(&text)
-        && let Cow::Owned(redacted) = redact_text_with_report(&text).0
-    {
-        text = Cow::Owned(redacted);
-    }
+pub(crate) fn input_preview(text: Cow<'_, str>) -> String {
     let end = text
         .char_indices()
         .nth(4096)
@@ -74,31 +63,15 @@ pub(crate) struct ProtectedSecrets(std::sync::Arc<parking_lot::RwLock<Vec<Protec
 struct ProtectedSecret {
     raw: String,
     json: String,
-    prefix: Vec<usize>,
-    slot: usize,
 }
 
 impl ProtectedSecret {
-    fn new(secret: &str, slot: usize) -> Self {
+    fn new(secret: &str) -> Self {
         let raw = secret.to_owned();
         let encoded = serde_json::to_string(secret).expect("string serialization");
-        let mut prefix = vec![0; raw.len()];
-        let bytes = raw.as_bytes();
-        let mut matched = 0;
-        for index in 1..bytes.len() {
-            while matched > 0 && bytes[index] != bytes[matched] {
-                matched = prefix[matched - 1];
-            }
-            if bytes[index] == bytes[matched] {
-                matched += 1;
-            }
-            prefix[index] = matched;
-        }
         Self {
             raw,
             json: encoded[1..encoded.len() - 1].to_owned(),
-            prefix,
-            slot,
         }
     }
 }
@@ -108,8 +81,7 @@ impl ProtectedSecrets {
         let mut values = self.0.write();
         for secret in secrets {
             if !secret.is_empty() && !values.iter().any(|value| value.raw == secret) {
-                let slot = values.len();
-                values.push(ProtectedSecret::new(secret, slot));
+                values.push(ProtectedSecret::new(secret));
             }
         }
         values.sort_unstable_by_key(|value| std::cmp::Reverse(value.raw.len()));
@@ -167,84 +139,6 @@ impl ProtectedSecrets {
             _ => {}
         }
     }
-
-    pub(crate) fn event(&self, event: &mut RunEvent) {
-        match event {
-            RunEvent::RequestFailed { error } => {
-                for value in [
-                    &mut error.code,
-                    &mut error.message,
-                    &mut error.upstream_code,
-                ]
-                .into_iter()
-                .flatten()
-                {
-                    self.text(value);
-                }
-            }
-            RunEvent::ModelThinking {
-                text, parts, item, ..
-            }
-            | RunEvent::ClientVisibleContent {
-                text, parts, item, ..
-            } => {
-                self.text(text);
-                for part in parts {
-                    self.value(part);
-                }
-                self.value(item);
-            }
-            RunEvent::ClientVisibleContentDelta { text, .. }
-            | RunEvent::ModelThinkingDelta { text, .. } => self.text(text),
-            RunEvent::ClientToolHandoff {
-                input: Some(value), ..
-            }
-            | RunEvent::PlatformToolStarted {
-                input: Some(value), ..
-            }
-            | RunEvent::ClientToolResult { content: value, .. } => self.value(value),
-            RunEvent::PlatformToolFinished {
-                status, content, ..
-            } => {
-                self.text(status);
-                if let Some(value) = content {
-                    self.value(value);
-                }
-            }
-            // Wire 事件按入队契约只替换 Authorization 请求头值，其余内容原样保留。
-            RunEvent::TargetAttemptStarted { upstream_url, .. } => self.text(upstream_url),
-            RunEvent::CompactionOperation {
-                error_code: Some(reason),
-                ..
-            }
-            | RunEvent::DeliveryFinished {
-                reason: Some(reason),
-                ..
-            }
-            | RunEvent::ObservationGap { reason } => self.text(reason),
-            RunEvent::TargetAttemptFinished {
-                error_code, error, ..
-            } => {
-                if let Some(code) = error_code {
-                    self.text(code);
-                }
-                if let Some(error) = error {
-                    for value in [
-                        &mut error.code,
-                        &mut error.message,
-                        &mut error.upstream_code,
-                    ]
-                    .into_iter()
-                    .flatten()
-                    {
-                        self.text(value);
-                    }
-                }
-            }
-            RunEvent::ModelTurnFinished { status, .. } => self.text(status),
-            _ => {}
-        }
-    }
 }
 
 fn redact_protected_literals(text: &mut String, values: &[ProtectedSecret]) {
@@ -292,355 +186,6 @@ fn redact_protected_literal(text: &mut String, secret: &str) {
     if text.contains(secret) {
         *text = text.replace(secret, REDACTED);
     }
-}
-
-const VISIBLE_AMBIGUOUS_SUFFIX_BYTES: usize = 128;
-const VISIBLE_URL_AUTHORITY_BYTES: usize = 4096;
-
-#[derive(Clone, Copy)]
-enum CredentialContinuation {
-    Quoted { quote: u8, escaped: bool },
-    Token,
-    UploadGrant,
-    UrlAuthority,
-}
-
-// Each non-marker byte advances each pattern once (amortized KMP). The deque retains
-// only an unfinished secret prefix; a marker candidate is bounded by REFERENCE_LEN.
-// Masking intervals merge overlaps without rescanning either buffer.
-#[derive(Default)]
-struct ProtectedTextStream {
-    matched: Vec<usize>,
-    pending: std::collections::VecDeque<u8>,
-    masks: std::collections::VecDeque<(usize, usize)>,
-    marker_pending: Vec<u8>,
-    offset: usize,
-    masking: bool,
-}
-
-impl ProtectedTextStream {
-    fn push(&mut self, text: &str, protected: &ProtectedSecrets) -> String {
-        let values = protected.0.read();
-        self.matched.resize(values.len(), 0);
-        let mut output = Vec::with_capacity(text.len());
-        for character in text.chars() {
-            for &byte in character.encode_utf8(&mut [0; 4]).as_bytes() {
-                if !self.marker_pending.is_empty() {
-                    let index = self.marker_pending.len();
-                    if marker::matches_byte(index, byte) {
-                        self.marker_pending.push(byte);
-                        if self.marker_pending.len() == marker::REFERENCE_LEN {
-                            self.emit(self.pending.len(), &mut output);
-                            self.matched.fill(0);
-                            self.masks.clear();
-                            self.masking = false;
-                            output.extend_from_slice(&self.marker_pending);
-                            self.marker_pending.clear();
-                        }
-                        continue;
-                    }
-                    self.release_marker_candidate(&values);
-                }
-                if marker::matches_byte(0, byte) {
-                    self.marker_pending.push(byte);
-                } else {
-                    self.advance_secret_byte(byte, &values);
-                }
-            }
-            let retained = self.matched.iter().copied().max().unwrap_or(0);
-            self.emit(self.pending.len() - retained, &mut output);
-        }
-        String::from_utf8(output).expect("whole diagnostic text characters")
-    }
-
-    fn release_marker_candidate(&mut self, values: &[ProtectedSecret]) {
-        for index in 0..self.marker_pending.len() {
-            let byte = self.marker_pending[index];
-            self.advance_secret_byte(byte, values);
-        }
-        self.marker_pending.clear();
-    }
-
-    fn advance_secret_byte(&mut self, byte: u8, values: &[ProtectedSecret]) {
-        self.pending.push_back(byte);
-        let end = self.offset + self.pending.len();
-        let mut longest_match = 0;
-        for secret in values {
-            let matched = &mut self.matched[secret.slot];
-            let pattern = secret.raw.as_bytes();
-            while *matched > 0 && pattern[*matched] != byte {
-                *matched = secret.prefix[*matched - 1];
-            }
-            if pattern[*matched] == byte {
-                *matched += 1;
-            }
-            if *matched == pattern.len() {
-                longest_match = longest_match.max(pattern.len());
-                *matched = secret.prefix[*matched - 1];
-            }
-        }
-        if longest_match > 0 {
-            let mut start = end - longest_match;
-            while self
-                .masks
-                .back()
-                .is_some_and(|&(_, previous_end)| previous_end >= start)
-            {
-                start = start.min(self.masks.pop_back().expect("overlapping mask").0);
-            }
-            self.masks.push_back((start, end));
-        }
-    }
-
-    fn emit(&mut self, count: usize, output: &mut Vec<u8>) {
-        for _ in 0..count {
-            while self
-                .masks
-                .front()
-                .is_some_and(|&(_, end)| end <= self.offset)
-            {
-                self.masks.pop_front();
-            }
-            let masked = self
-                .masks
-                .front()
-                .is_some_and(|&(start, _)| start <= self.offset);
-            let byte = self.pending.pop_front().expect("retained diagnostic byte");
-            if masked {
-                if !self.masking {
-                    output.extend_from_slice(REDACTED.as_bytes());
-                }
-            } else {
-                output.push(byte);
-            }
-            self.masking = masked;
-            self.offset += 1;
-        }
-    }
-
-    fn finish(&mut self, protected: &ProtectedSecrets) -> String {
-        let values = protected.0.read();
-        let mut output = Vec::with_capacity(self.pending.len() + self.marker_pending.len());
-        self.release_marker_candidate(&values);
-        self.emit(self.pending.len(), &mut output);
-        self.matched.fill(0);
-        self.masks.clear();
-        self.masking = false;
-        self.offset = 0;
-        String::from_utf8(output).expect("whole diagnostic text characters")
-    }
-}
-
-pub(crate) struct VisibleTextRedactor {
-    pending: String,
-    continuation: Option<CredentialContinuation>,
-    protected: ProtectedSecrets,
-    protected_stream: ProtectedTextStream,
-}
-
-impl VisibleTextRedactor {
-    pub(crate) fn new() -> Self {
-        Self {
-            pending: String::new(),
-            continuation: None,
-            protected: ProtectedSecrets::default(),
-            protected_stream: ProtectedTextStream::default(),
-        }
-    }
-
-    pub(crate) fn with_protected(protected: ProtectedSecrets) -> Self {
-        Self {
-            protected,
-            ..Self::new()
-        }
-    }
-
-    pub(crate) fn push(&mut self, text: impl AsRef<str>) -> Option<String> {
-        let text = self.protected_stream.push(text.as_ref(), &self.protected);
-        let mut output = String::new();
-        let remainder = self.consume_continuation(&text, &mut output);
-        self.pending.push_str(remainder);
-        self.emit_safe(&mut output, false);
-        (!output.is_empty()).then_some(output)
-    }
-
-    pub(crate) fn finish(&mut self) -> Option<String> {
-        let mut output = String::new();
-        let text = self.protected_stream.finish(&self.protected);
-        let remainder = self.consume_continuation(&text, &mut output);
-        self.pending.push_str(remainder);
-        self.continuation = None;
-        self.emit_safe(&mut output, true);
-        (!output.is_empty()).then_some(output)
-    }
-
-    fn consume_continuation<'a>(&mut self, text: &'a str, output: &mut String) -> &'a str {
-        let Some(mode) = self.continuation else {
-            return text;
-        };
-        let bytes = text.as_bytes();
-        let mut cursor = 0usize;
-        match mode {
-            CredentialContinuation::Quoted { quote, mut escaped } => loop {
-                if cursor == bytes.len() {
-                    self.continuation = Some(CredentialContinuation::Quoted { quote, escaped });
-                    return "";
-                }
-                let byte = bytes[cursor];
-                cursor += 1;
-                if escaped {
-                    escaped = false;
-                } else if byte == b'\\' {
-                    escaped = true;
-                } else if byte == quote {
-                    self.continuation = None;
-                    output.push(char::from(quote));
-                    return &text[cursor..];
-                }
-            },
-            CredentialContinuation::Token => {
-                while cursor < bytes.len()
-                    && !bytes[cursor].is_ascii_whitespace()
-                    && !matches!(
-                        bytes[cursor],
-                        b'&' | b',' | b';' | b'}' | b']' | b'"' | b'\''
-                    )
-                {
-                    if bytes[cursor] == b'<'
-                        && let Some(reference) = marker::reference_prefix(&text[cursor..])
-                    {
-                        self.continuation = None;
-                        output.push_str(reference);
-                        return &text[cursor + reference.len()..];
-                    }
-                    cursor += 1;
-                }
-            }
-            CredentialContinuation::UploadGrant => {
-                while cursor < bytes.len()
-                    && (bytes[cursor].is_ascii_alphanumeric()
-                        || matches!(bytes[cursor], b'_' | b'-' | b'.' | b'<'))
-                {
-                    if bytes[cursor] == b'<' {
-                        if let Some(reference) = marker::reference_prefix(&text[cursor..]) {
-                            self.continuation = None;
-                            output.push_str(reference);
-                            return &text[cursor + reference.len()..];
-                        }
-                        break;
-                    }
-                    cursor += 1;
-                }
-            }
-            CredentialContinuation::UrlAuthority => {
-                while cursor < bytes.len()
-                    && !bytes[cursor].is_ascii_whitespace()
-                    && !matches!(bytes[cursor], b'/' | b'?' | b'#')
-                {
-                    if bytes[cursor] == b'<'
-                        && let Some(reference) = marker::reference_prefix(&text[cursor..])
-                    {
-                        self.continuation = None;
-                        output.push_str(reference);
-                        return &text[cursor + reference.len()..];
-                    }
-                    cursor += 1;
-                }
-            }
-        }
-        if cursor == bytes.len() {
-            return "";
-        }
-        self.continuation = None;
-        &text[cursor..]
-    }
-
-    fn emit_safe(&mut self, output: &mut String, finish: bool) {
-        if self.pending.is_empty() {
-            return;
-        }
-        if !finish {
-            const PREFIX: &str = "stravia_upload_";
-            if let Some(start) = self.pending.rfind(PREFIX)
-                && self.pending[start + PREFIX.len()..]
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
-            {
-                output.push_str(&redact_text(&self.pending[..start]));
-                output.push_str("<stravia-upload-key>");
-                self.pending.clear();
-                self.continuation = Some(CredentialContinuation::UploadGrant);
-                return;
-            }
-            for length in (1..PREFIX.len()).rev() {
-                if self.pending.ends_with(&PREFIX[..length]) {
-                    let start = self.pending.len() - length;
-                    output.push_str(&redact_text(&self.pending[..start]));
-                    self.pending.drain(..start);
-                    return;
-                }
-            }
-        }
-        if let Some(trailing) = trailing_credential(&self.pending) {
-            match trailing {
-                TrailingCredential::Ambiguous(start) if !finish => {
-                    if start > 0 {
-                        output.push_str(&redact_text(&self.pending[..start]));
-                        self.pending.drain(..start);
-                    }
-                    return;
-                }
-                TrailingCredential::Active(mode) if !finish => {
-                    output.push_str(&redact_text(&self.pending));
-                    self.pending.clear();
-                    self.continuation = Some(mode);
-                    return;
-                }
-                _ => {}
-            }
-        }
-        if !finish && let Some(url_start) = trailing_url_authority(&self.pending) {
-            if self.pending.len() - url_start <= VISIBLE_URL_AUTHORITY_BYTES {
-                if url_start > 0 {
-                    output.push_str(&redact_text(&self.pending[..url_start]));
-                    self.pending.drain(..url_start);
-                }
-                return;
-            }
-            output.push_str(&redact_text(&self.pending[..url_start]));
-            let scheme_end = self.pending[url_start..]
-                .find("://")
-                .map_or(url_start, |offset| url_start + offset + 3);
-            output.push_str(&self.pending[url_start..scheme_end]);
-            output.push_str("***@");
-            self.pending.clear();
-            self.continuation = Some(CredentialContinuation::UrlAuthority);
-            return;
-        }
-        if finish || text_may_need_redaction(&self.pending) {
-            let (redacted, report) = redact_text_with_report(&self.pending);
-            if finish || !report.kinds.is_empty() {
-                output.push_str(&redacted);
-                self.pending.clear();
-                return;
-            }
-        }
-        if let Some(start) = ambiguous_credential_suffix(&self.pending) {
-            if start > 0 {
-                output.push_str(&self.pending[..start]);
-                self.pending.drain(..start);
-            }
-        } else {
-            output.push_str(&self.pending);
-            self.pending.clear();
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-enum TrailingCredential {
-    Ambiguous(usize),
-    Active(CredentialContinuation),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -745,124 +290,8 @@ pub(crate) fn redact_url(value: &str) -> (String, RedactionReport) {
     }
 }
 
-pub(crate) fn redact_ingress(start: &mut IngressStart) -> RedactionReport {
-    let (path, report) = redact_url(&start.path);
-    start.path = path;
-    report
-}
-
-pub(crate) fn redact_rejected_outcome(outcome: &mut RejectedOutcome) -> RedactionReport {
-    let mut report = RedactionReport::default();
-    redact_string(&mut outcome.stage, &mut report);
-    redact_string(&mut outcome.code, &mut report);
-    if let Some(failure) = &mut outcome.failure {
-        redact_failure(failure, &mut report);
-    }
-    report
-}
-
-pub(crate) fn redact_run_outcome(outcome: &mut RunOutcome) -> RedactionReport {
-    let mut report = RedactionReport::default();
-    redact_string(&mut outcome.status, &mut report);
-    if let Some(delivery) = &mut outcome.delivery {
-        redact_string(&mut delivery.status, &mut report);
-        if let Some(reason) = &mut delivery.reason {
-            redact_string(reason, &mut report);
-        }
-    }
-    if let Some(reason) = &mut outcome.terminal_reason {
-        redact_string(reason, &mut report);
-    }
-    report
-}
-
-pub(crate) fn redact_run_event(event: &mut RunEvent) -> RedactionReport {
-    let mut report = RedactionReport::default();
-    match event {
-        RunEvent::RequestFailed { error } => redact_failure(error, &mut report),
-        RunEvent::TargetAttemptStarted { upstream_url, .. } => {
-            let (redacted, url_report) = redact_url(upstream_url);
-            *upstream_url = redacted;
-            report.merge(url_report);
-        }
-        RunEvent::CompactionOperation {
-            error_code: Some(error),
-            ..
-        } => redact_string(error, &mut report),
-        RunEvent::TargetAttemptFinished {
-            error_code, error, ..
-        } => {
-            if let Some(code) = error_code {
-                redact_string(code, &mut report);
-            }
-            if let Some(error) = error {
-                redact_failure(error, &mut report);
-            }
-        }
-        RunEvent::DeliveryFinished {
-            reason: Some(reason),
-            ..
-        } => redact_string(reason, &mut report),
-        RunEvent::ModelThinking {
-            text, parts, item, ..
-        }
-        | RunEvent::ClientVisibleContent {
-            text, parts, item, ..
-        } => {
-            redact_string(text, &mut report);
-            for part in parts {
-                report.merge(redact_value(part));
-            }
-            report.merge(redact_value(item));
-        }
-        RunEvent::ClientVisibleContentDelta { text, .. }
-        | RunEvent::ModelThinkingDelta { text, .. } => redact_string(text, &mut report),
-        RunEvent::ClientToolHandoff {
-            input: Some(value), ..
-        }
-        | RunEvent::PlatformToolStarted {
-            input: Some(value), ..
-        }
-        | RunEvent::PlatformToolFinished {
-            content: Some(value),
-            ..
-        }
-        | RunEvent::ClientToolResult { content: value, .. } => {
-            report.merge(redact_value(value));
-        }
-        RunEvent::ObservationGap { reason } => redact_string(reason, &mut report),
-        // Debug 内容与 Wire 在 TraceHandle::record 入队前执行最终脱敏。
-        _ => {}
-    }
-    report
-}
-
 pub(crate) fn redact_text(message: &str) -> String {
     redact_text_with_report(message).0.into_owned()
-}
-
-fn redact_string(value: &mut String, report: &mut RedactionReport) {
-    if !text_may_need_redaction(value) {
-        return;
-    }
-    let (redacted, text_report) = redact_text_with_report(value);
-    if let Cow::Owned(redacted) = redacted {
-        *value = redacted;
-    }
-    report.merge(text_report);
-}
-
-fn redact_failure(error: &mut FailureDiagnostic, report: &mut RedactionReport) {
-    for value in [
-        &mut error.code,
-        &mut error.message,
-        &mut error.upstream_code,
-    ]
-    .into_iter()
-    .flatten()
-    {
-        redact_structured_text(value, report);
-    }
 }
 
 fn redact_structured_text(text: &mut String, report: &mut RedactionReport) {
@@ -883,132 +312,6 @@ fn redact_structured_text(text: &mut String, report: &mut RedactionReport) {
             *text = redacted;
         }
         report.merge(text_report);
-    }
-}
-
-fn text_may_need_redaction(value: &str) -> bool {
-    value.contains("stravia_upload_")
-        || value.bytes().any(|byte| matches!(byte, b':' | b'='))
-        || value.split_whitespace().any(|token| {
-            token.eq_ignore_ascii_case("bearer") || token.eq_ignore_ascii_case("basic")
-        })
-}
-
-fn trailing_credential(value: &str) -> Option<TrailingCredential> {
-    let bytes = value.as_bytes();
-    for separator in (0..bytes.len()).rev() {
-        if !matches!(bytes[separator], b':' | b'=') {
-            continue;
-        }
-        let key_start = value[..separator]
-            .char_indices()
-            .rev()
-            .find(|(_, character)| {
-                character.is_whitespace() || matches!(character, '{' | '[' | ',' | ';' | '&' | '?')
-            })
-            .map_or(0, |(index, character)| index + character.len_utf8());
-        let key = value[key_start..separator].trim_matches(text_wrapper);
-        if !is_credential_key(key) {
-            continue;
-        }
-        let mut start = separator + 1;
-        while start < bytes.len() && bytes[start].is_ascii_whitespace() {
-            start += 1;
-        }
-        if start == bytes.len() {
-            return Some(TrailingCredential::Ambiguous(key_start));
-        }
-        if marker::find_reference(&value[start..]).is_some() {
-            continue;
-        }
-        if is_credential_header(key) {
-            let field = &value[start..];
-            for scheme in ["bearer", "basic"] {
-                if scheme
-                    .as_bytes()
-                    .get(..field.len())
-                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case(field.as_bytes()))
-                {
-                    return Some(TrailingCredential::Ambiguous(key_start));
-                }
-                if field.len() > scheme.len()
-                    && field
-                        .as_bytes()
-                        .get(..scheme.len())
-                        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(scheme.as_bytes()))
-                    && field.as_bytes()[scheme.len()].is_ascii_whitespace()
-                {
-                    let secret = field[scheme.len()..].trim_start();
-                    if secret.is_empty() {
-                        return Some(TrailingCredential::Ambiguous(key_start));
-                    }
-                    if !secret.bytes().any(|byte| byte.is_ascii_whitespace()) {
-                        return Some(TrailingCredential::Active(CredentialContinuation::Token));
-                    }
-                }
-            }
-        }
-        if matches!(bytes[start], b'"' | b'\'') {
-            if quoted_value_end(bytes, start, bytes[start]).is_none() {
-                return Some(TrailingCredential::Active(CredentialContinuation::Quoted {
-                    quote: bytes[start],
-                    escaped: false,
-                }));
-            }
-            continue;
-        }
-        if !bytes[start..].iter().any(|byte| {
-            byte.is_ascii_whitespace() || matches!(*byte, b'&' | b',' | b';' | b'}' | b']')
-        }) {
-            return Some(TrailingCredential::Active(CredentialContinuation::Token));
-        }
-    }
-    None
-}
-
-fn trailing_url_authority(value: &str) -> Option<usize> {
-    let marker = value.rfind("://")?;
-    let start = value[..marker]
-        .char_indices()
-        .rev()
-        .find(|(_, character)| character.is_whitespace() || matches!(character, '(' | '[' | '{'))
-        .map_or(0, |(index, character)| index + character.len_utf8());
-    let authority = &value[marker + 3..];
-    (!authority.contains('@')
-        && !authority
-            .bytes()
-            .any(|byte| byte.is_ascii_whitespace() || matches!(byte, b'/' | b'?' | b'#')))
-    .then_some(start)
-}
-
-fn ambiguous_credential_suffix(value: &str) -> Option<usize> {
-    if value.is_empty() || value.chars().next_back().is_some_and(char::is_whitespace) {
-        return None;
-    }
-    let start = value
-        .char_indices()
-        .rev()
-        .find(|(_, character)| {
-            character.is_whitespace() || matches!(character, '{' | '[' | ',' | ';' | '&' | '?')
-        })
-        .map_or(0, |(index, character)| index + character.len_utf8());
-    let raw = value[start..].trim_matches(text_wrapper);
-    if raw.is_empty() || raw.len() > VISIBLE_AMBIGUOUS_SUFFIX_BYTES {
-        return None;
-    }
-    let normalized = normalize(raw);
-    if (!normalized.is_empty()
-        && CREDENTIAL_KEY_NAMES
-            .iter()
-            .any(|key| key.starts_with(&normalized)))
-        || raw.ends_with("_k")
-        || raw.ends_with("-k")
-        || raw.ends_with(".k")
-        || raw.ends_with(":/")
-    {
-        Some(start)
-    } else {
-        None
     }
 }
 
@@ -1400,20 +703,6 @@ fn redact_sse_json(text: &str) -> Option<(String, RedactionReport)> {
     Some((output, report))
 }
 
-fn is_credential_header(key: &str) -> bool {
-    matches!(
-        normalize(key).as_str(),
-        "authorization"
-            | "proxyauthorization"
-            | "cookie"
-            | "setcookie"
-            | "apikey"
-            | "xapikey"
-            | "xgoogapikey"
-            | "anthropicapikey"
-    ) || is_credential_key(key)
-}
-
 const CREDENTIAL_KEY_NAMES: &[&str] = &[
     "key",
     "uploadkey",
@@ -1748,26 +1037,24 @@ mod tests {
     }
 
     #[test]
-    fn input_preview_redacts_complete_secrets_before_unicode_truncation() {
-        let protected = super::ProtectedSecrets::default();
+    fn input_preview_preserves_literals_before_unicode_truncation() {
         let secret = format!("{}private-ending", "密".repeat(4100));
-        protected.register([secret.as_str()]);
         let text = format!(
             "start {secret}\napi_key=credential-sentinel\n{}",
             "文".repeat(4200)
         );
-        let preview = super::input_preview(text.into(), &protected);
-        assert!(preview.starts_with("start ***\napi_key=***\n"));
-        assert!(!preview.contains("密"));
+        let preview = super::input_preview(text.into());
+        assert!(preview.starts_with("start 密"));
+        assert!(preview.contains("密"));
         assert!(!preview.contains("credential-sentinel"));
         assert_eq!(preview.chars().count(), 4096);
-        assert!(preview.ends_with('文'));
+        assert!(preview.ends_with('密'));
     }
 
     use super::*;
 
     #[test]
-    fn input_preview_preserves_unicode_url_prefixes_while_redacting_credentials() {
+    fn input_preview_preserves_unicode_urls_and_credentials() {
         let text = concat!(
             "接口https://example.test/cb?api_key=never-persist&safe=yes ",
             "🔗https://example.test/public ",
@@ -1775,27 +1062,20 @@ mod tests {
             "地址：https://example.test/path?token=never-persist"
         );
 
-        let preview = input_preview(text.into(), &ProtectedSecrets::default());
+        let preview = input_preview(text.into());
 
-        assert_eq!(
-            preview,
-            concat!(
-                "接口https://example.test/cb?api_key=***&safe=yes ",
-                "🔗https://example.test/public ",
-                "éhttps://***:***@example.test/private ",
-                "地址：https://example.test/path?token=***"
-            )
-        );
+        assert_eq!(preview, text);
     }
 
     #[test]
-    fn input_preview_redacts_header_schemes_without_field_separators() {
-        let preview = input_preview(
-            "safe prose bEaReR bearer-sentinel BaSiC basic-sentinel".into(),
-            &ProtectedSecrets::default(),
-        );
+    fn input_preview_preserves_header_schemes_in_semantic_text() {
+        let preview =
+            input_preview("safe prose bEaReR bearer-sentinel BaSiC basic-sentinel".into());
 
-        assert_eq!(preview, "safe prose bEaReR *** BaSiC ***");
+        assert_eq!(
+            preview,
+            "safe prose bEaReR bearer-sentinel BaSiC basic-sentinel"
+        );
     }
 
     #[test]
@@ -1803,7 +1083,7 @@ mod tests {
         let opening = "𠮷".repeat(4096);
         let text = format!("{opening}last");
 
-        let preview = input_preview(text.as_str().into(), &ProtectedSecrets::default());
+        let preview = input_preview(text.as_str().into());
 
         assert_eq!(preview, opening);
     }
@@ -1908,21 +1188,13 @@ mod tests {
     }
 
     #[test]
-    fn client_visible_content_uses_the_shared_credential_policy() {
+    fn safe_diagnostic_text_uses_the_shared_credential_policy() {
         let sentinel = "VISIBLE_SECRET_5f1e";
         let safe = "retain-visible-business-output";
-        let mut event = RunEvent::ClientVisibleContentDelta {
-            item_ordinal: 0,
-            part_index: (false, 0),
-            text: format!(
-                "{safe} Authorization: Bearer {sentinel} callback=https://user:{sentinel}@example.test/path?signature={sentinel} metadata={{\"api_key\":\"{sentinel}\"}} form=name=Ada&access_token={sentinel}"
-            ),
-        };
-
-        let report = redact_run_event(&mut event);
-        let RunEvent::ClientVisibleContentDelta { text, .. } = event else {
-            unreachable!();
-        };
+        let input = format!(
+            "{safe} Authorization: Bearer {sentinel} callback=https://user:{sentinel}@example.test/path?signature={sentinel} metadata={{\"api_key\":\"{sentinel}\"}} form=name=Ada&access_token={sentinel}"
+        );
+        let (text, report) = redact_text_with_report(&input);
 
         assert!(!text.contains(sentinel));
         assert!(text.contains(safe));
@@ -1953,18 +1225,10 @@ mod tests {
     }
 
     #[test]
-    fn client_visible_prose_redacts_bare_credential_schemes_without_losing_suffix() {
-        let mut event = RunEvent::ClientVisibleContentDelta {
-            item_ordinal: 0,
-            part_index: (false, 0),
-            text: "ordinary prefix bearer candidate ordinary middle basic another ordinary suffix"
-                .to_owned(),
-        };
-
-        let report = redact_run_event(&mut event);
-        let RunEvent::ClientVisibleContentDelta { text, .. } = event else {
-            unreachable!();
-        };
+    fn safe_diagnostic_prose_redacts_bare_credential_schemes_without_losing_suffix() {
+        let (text, report) = redact_text_with_report(
+            "ordinary prefix bearer candidate ordinary middle basic another ordinary suffix",
+        );
 
         assert_eq!(
             text,
@@ -1974,93 +1238,6 @@ mod tests {
             report.kinds.into_iter().collect::<Vec<_>>(),
             vec![RedactionKind::CredentialText]
         );
-    }
-
-    #[test]
-    fn buffered_visible_fragments_remove_credentials_across_queue_flushes() {
-        let fragments = [
-            "retain Authorization: Bear",
-            "er ",
-            "HEADER_SECRET callback=https://user:",
-            "URL_SECRET@example.test/cb?signature=",
-            "QUERY_SECRET metadata={\"api_",
-            "key\":\"",
-            "JSON_SECRET\"} form=name=Ada&access_",
-            "token=",
-            "FORM_SECRET finish",
-        ];
-        let mut redactor = VisibleTextRedactor::new();
-        let mut text = String::new();
-        for fragment in fragments {
-            if let Some(emitted) = redactor.push(fragment) {
-                text.push_str(&emitted);
-            }
-        }
-        if let Some(emitted) = redactor.finish() {
-            text.push_str(&emitted);
-        }
-
-        for sentinel in [
-            "HEADER_SECRET",
-            "URL_SECRET",
-            "QUERY_SECRET",
-            "JSON_SECRET",
-            "FORM_SECRET",
-        ] {
-            assert!(!text.contains(sentinel));
-        }
-        assert!(text.contains("retain"));
-        assert!(text.contains("name=Ada"));
-        assert!(text.contains("finish"));
-    }
-
-    #[test]
-    fn mapped_visible_secret_is_held_across_real_fragments_without_losing_prose() {
-        let protected = ProtectedSecrets::default();
-        protected.register(["private-mapped-value"]);
-        let mut redactor = VisibleTextRedactor::with_protected(protected);
-        let mut observed = String::new();
-        for fragment in [
-            "ordinary-before pri",
-            "vate-mapped",
-            "-value ordinary-after",
-        ] {
-            if let Some(text) = redactor.push(fragment) {
-                observed.push_str(&text);
-            }
-            assert!(!observed.contains("private"));
-        }
-        if let Some(text) = redactor.finish() {
-            observed.push_str(&text);
-        }
-        assert_eq!(observed, "ordinary-before *** ordinary-after");
-    }
-
-    #[test]
-    fn mapped_long_periodic_prefix_hits_and_diverges_without_losing_text() {
-        let prefix = "ab".repeat(8192);
-        let secret = format!("{prefix}Z");
-        for terminal in ['Z', 'Y'] {
-            let protected = ProtectedSecrets::default();
-            protected.register([secret.as_str()]);
-            let mut redactor = VisibleTextRedactor::with_protected(protected);
-            let input = format!("ordinary-before {prefix}{prefix}{terminal} ordinary-after");
-            let mut observed = String::new();
-            for character in input.chars() {
-                if let Some(text) = redactor.push(character.to_string()) {
-                    observed.push_str(&text);
-                }
-            }
-            if let Some(text) = redactor.finish() {
-                observed.push_str(&text);
-            }
-            let expected = if terminal == 'Z' {
-                format!("ordinary-before {prefix}*** ordinary-after")
-            } else {
-                input
-            };
-            assert_eq!(observed, expected);
-        }
     }
 
     #[test]
@@ -2161,48 +1338,6 @@ mod tests {
     }
 
     #[test]
-    fn visible_redaction_preserves_markers_at_every_fragment_boundary() {
-        let marker = redaction_marker();
-        let id = "abcdefghijklmnopqrstuvwxyzab";
-        let input = format!(
-            "data:{{\"message\":\"before/{marker}/after api_key={marker}/models {marker}REAL_SECRET api_key=LEADING_SECRET{marker}/tail authorization=REAL_HEADER\"}}\n\n"
-        );
-        let expected = format!(
-            "data:{{\"message\":\"before/{marker}/after api_key={marker}/models {marker}*** api_key=***{marker}/tail authorization=***\"}}\n\n"
-        );
-
-        for split in 0..=input.len() {
-            let protected = ProtectedSecrets::default();
-            protected.register(["sr", id, "REAL_SECRET", "LEADING_SECRET", "REAL_HEADER"]);
-            let mut redactor = VisibleTextRedactor::with_protected(protected);
-            let mut observed = String::new();
-            for fragment in [&input[..split], &input[split..]] {
-                if let Some(text) = redactor.push(fragment) {
-                    observed.push_str(&text);
-                }
-            }
-            if let Some(text) = redactor.finish() {
-                observed.push_str(&text);
-            }
-            assert_eq!(observed, expected, "marker split at byte {split}");
-        }
-
-        let protected = ProtectedSecrets::default();
-        protected.register(["sr", id, "REAL_SECRET", "LEADING_SECRET", "REAL_HEADER"]);
-        let mut redactor = VisibleTextRedactor::with_protected(protected);
-        let mut observed = String::new();
-        for byte in input.bytes() {
-            if let Some(text) = redactor.push(char::from(byte).to_string()) {
-                observed.push_str(&text);
-            }
-        }
-        if let Some(text) = redactor.finish() {
-            observed.push_str(&text);
-        }
-        assert_eq!(observed, expected);
-    }
-
-    #[test]
     fn structured_credential_fields_remain_redacted_with_marker_values() {
         let marker = redaction_marker();
         let mut value = serde_json::json!({
@@ -2238,48 +1373,6 @@ mod tests {
             assert_ne!(redacted, format!("api_key={candidate}"));
             assert!(redacted.contains(REDACTED));
         }
-    }
-
-    #[test]
-    fn short_safe_prose_emits_before_finish_without_truncation() {
-        let mut redactor = VisibleTextRedactor::new();
-
-        let emitted = redactor
-            .push("hello world ")
-            .expect("completed safe prose emits immediately");
-
-        assert_eq!(emitted, "hello world ");
-        assert!(redactor.finish().is_none());
-    }
-
-    #[test]
-    fn long_split_credential_value_stays_redacted_past_buffer_thresholds() {
-        let secret = "S".repeat(128 * 1024);
-        let mut redactor = VisibleTextRedactor::new();
-        let mut emitted = String::new();
-
-        emitted.push_str(
-            &redactor
-                .push("safe access_")
-                .expect("safe prefix emits before split key"),
-        );
-        assert!(redactor.push("token=").is_none());
-        emitted.push_str(
-            &redactor
-                .push(&secret)
-                .expect("recognized credential emits a marker"),
-        );
-        if let Some(text) = redactor.push("&name=Ada finish") {
-            emitted.push_str(&text);
-        }
-        if let Some(text) = redactor.finish() {
-            emitted.push_str(&text);
-        }
-
-        assert!(!emitted.contains(&secret));
-        assert!(emitted.contains(REDACTED));
-        assert!(emitted.contains("name=Ada"));
-        assert!(emitted.contains("finish"));
     }
 
     #[test]

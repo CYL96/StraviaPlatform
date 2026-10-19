@@ -48,6 +48,7 @@ export interface ConsoleAssistantMessage {
   partialText?: string
   partialThinking?: string
   partialActivities?: ThinkingActivity[]
+  partialBlocks?: ConsoleOutputBlock[]
   requestReasoning?: ConsoleResponsesRequest['reasoning']
   usage?: ConsoleTokenUsage
   error?: ConsoleChatError
@@ -131,6 +132,8 @@ export interface ResponsesTransport {
   }): AsyncIterable<ConsoleResponsesEvent>
 }
 
+export type ConsoleOutputBlock = ThinkingActivity | { kind: 'text'; id: string; text: string }
+
 export interface ConsoleGeneration {
   text: string
   summary: string
@@ -139,6 +142,7 @@ export interface ConsoleGeneration {
   activities: ThinkingActivity[]
   /** 其后已开始正文或工具输出块的思考 item；聊天只在此时收起自动展开的思考，完成、停止或失败本身不收起。 */
   followedThinkingIds: string[]
+  blocks?: ConsoleOutputBlock[]
 }
 
 export interface ConsoleChatSnapshot {

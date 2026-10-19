@@ -73,7 +73,15 @@ function restoreFocus(): void {
 }
 
 function handleKey(event: KeyboardEvent): void {
-  if (mobile.current || !panel?.contains(document.activeElement) || event.key !== 'Escape') return
+  // 浮层可在同一次按键传播中先还原焦点；关闭归属应取按键发生时的目标。
+  if (
+    event.defaultPrevented ||
+    mobile.current ||
+    event.key !== 'Escape' ||
+    !(event.target instanceof Node) ||
+    !panel?.contains(event.target)
+  )
+    return
   event.preventDefault()
   onclose()
 }

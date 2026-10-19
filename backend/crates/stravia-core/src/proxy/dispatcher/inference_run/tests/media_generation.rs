@@ -28,6 +28,11 @@ impl Drop for GenerationHttpFixture {
 }
 
 fn response_resource(id: &str, output: Vec<Value>) -> Value {
+    let (input, output_tokens) = if id == "resp_generate_call" {
+        (526, 669)
+    } else {
+        (1393, 213)
+    };
     stravia_protocol_codec::codec::open_responses::formatter::response_resource_snapshot(
         id,
         "provider-model",
@@ -36,16 +41,23 @@ fn response_resource(id: &str, output: Vec<Value>) -> Value {
         Value::Null,
         Value::Null,
         json!({
-            "input_tokens": 1,
-            "output_tokens": 1,
-            "total_tokens": 2,
-            "input_tokens_details": {"cached_tokens": 0},
-            "output_tokens_details": {"reasoning_tokens": 0}
+            "input_tokens": input,
+            "output_tokens": output_tokens,
+            "total_tokens": input + output_tokens,
+            "input_tokens_details": {"cached_tokens": 3, "cache_write_tokens": 7},
+            "output_tokens_details": {"reasoning_tokens": 5}
         }),
     )
 }
 
-fn image_generation_sse() -> String {
+#[derive(Clone, Copy)]
+enum ImageUsage {
+    Unknown,
+    RequiredOnly,
+    Complete,
+}
+
+fn image_generation_sse(image_usage: ImageUsage) -> String {
     let image = json!({
         "type": "image_generation_call",
         "id": "ig_local",
@@ -71,13 +83,24 @@ fn image_generation_sse() -> String {
             vec![image.clone()],
             Value::Null,
             Value::Null,
-            json!({
-                "input_tokens": 10,
-                "output_tokens": 20,
-                "total_tokens": 30,
-                "input_tokens_details": {"cached_tokens": 0},
-                "output_tokens_details": {"reasoning_tokens": 0}
-            }),
+            if !matches!(image_usage, ImageUsage::Unknown) {
+                let mut usage = json!({
+                    "input_tokens": 109,
+                    "output_tokens": 2061,
+                    "total_tokens": 2170,
+                    "input_tokens_details": {"cached_tokens": 0},
+                    "output_tokens_details": {"reasoning_tokens": 0}
+                });
+                if matches!(image_usage, ImageUsage::Complete) {
+                    usage["input_tokens_details"]["cache_write_tokens"] = json!(0);
+                } else {
+                    usage["input_tokens_details"] = json!({});
+                    usage["output_tokens_details"] = json!({});
+                }
+                usage
+            } else {
+                Value::Null
+            },
         );
     let events = [
         json!({
@@ -125,6 +148,27 @@ async fn generation_http_fixture(
     transparent_injection_enabled: bool,
     inject_media_generation: bool,
 ) -> GenerationHttpFixture {
+    generation_http_fixture_with_usage(
+        execute_generate,
+        generation_enabled,
+        transparent_injection_enabled,
+        inject_media_generation,
+        1,
+        false,
+        ImageUsage::RequiredOnly,
+    )
+    .await
+}
+
+async fn generation_http_fixture_with_usage(
+    execute_generate: bool,
+    generation_enabled: bool,
+    transparent_injection_enabled: bool,
+    inject_media_generation: bool,
+    image_calls: usize,
+    retry_first_image: bool,
+    image_usage: ImageUsage,
+) -> GenerationHttpFixture {
     let parent_requests = Arc::new(parking_lot::Mutex::new(Vec::new()));
     let observed_parent = Arc::clone(&parent_requests);
     let parent = move |axum::Json(request): axum::Json<Value>| {
@@ -147,7 +191,7 @@ async fn generation_http_fixture(
                             .filter(|name| name.starts_with("stravia__generate"))
                     })
                     .expect("Media Generation tool in parent request");
-                return axum::Json(response_resource(
+                let mut response = response_resource(
                     "resp_generate_call",
                     vec![json!({
                         "type": "function_call",
@@ -164,7 +208,14 @@ async fn generation_http_fixture(
                         }).to_string(),
                         "status": "completed"
                     })],
-                ));
+                );
+                for index in 1..image_calls {
+                    let mut call = response["output"][0].clone();
+                    call["id"] = json!(format!("fc_generate_{index}"));
+                    call["call_id"] = json!(format!("call_generate_{index}"));
+                    response["output"].as_array_mut().unwrap().push(call);
+                }
+                return axum::Json(response);
             }
             axum::Json(response_resource(
                 "resp_parent_final",
@@ -188,10 +239,22 @@ async fn generation_http_fixture(
     let generation = move |axum::Json(request): axum::Json<Value>| {
         let observed_generation = Arc::clone(&observed_generation);
         async move {
-            observed_generation.lock().push(request);
+            let ordinal = {
+                let mut requests = observed_generation.lock();
+                let ordinal = requests.len();
+                requests.push(request);
+                ordinal
+            };
+            if retry_first_image && ordinal == 0 {
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    axum::Json(json!({"error":{"message":"local retry fixture","type":"rate_limit_error"}})),
+                ).into_response();
+            }
+            let stream = image_generation_sse(image_usage);
             (
                 [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
-                image_generation_sse(),
+                stream,
             )
                 .into_response()
         }
@@ -220,6 +283,14 @@ async fn generation_http_fixture(
     })
     .await
     .expect("Gateway");
+    gateway
+        .admin()
+        .set_setting(
+            "artifact_settings",
+            r#"{"client_base_url":"http://localhost/client"}"#,
+        )
+        .await
+        .expect("generated image download settings");
     crate::plugin::test_support::install_distributed_vendor(&gateway, "openai-codex")
         .await
         .expect("Codex vendor plugin");
@@ -299,7 +370,7 @@ async fn generation_http_fixture(
                 enabled: true,
                 priority: Some(0),
                 first_token_timeout_ms: None,
-                target_retry_budget: Some(0),
+                target_retry_budget: Some(if retry_first_image { 1 } else { 0 }),
                 target_cooldown_ms: None,
                 thinking_level_map: Vec::new(),
             }],
@@ -427,6 +498,148 @@ fn generated_tools(request: &Value) -> Vec<&Value> {
                 .is_some_and(|name| name.starts_with("stravia__generate"))
         })
         .collect()
+}
+
+#[tokio::test]
+async fn response_usage_includes_confirmed_image_generation_and_both_parent_rounds() {
+    let fixture = generation_http_fixture(true, true, false, false).await;
+    let (status, response) = post_responses(
+        &fixture,
+        json!({
+            "model": PARENT_MODEL,
+            "input": "Create a blue square.",
+            "tools": [explicit_generate_tool()],
+            "tool_choice": {"type":"function","name":"generate"}
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(fixture.parent_requests.lock().len(), 2);
+    assert_eq!(fixture.generation_requests.lock().len(), 1);
+    assert_eq!(response["usage"]["input_tokens"], 2028, "{response}");
+    assert_eq!(response["usage"]["output_tokens"], 2943, "{response}");
+    assert_eq!(response["usage"]["total_tokens"], 4971, "{response}");
+
+    let (status, next) = post_responses(
+        &fixture,
+        json!({"model": PARENT_MODEL, "input": "Answer without generating."}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{next}");
+    assert_eq!(next["usage"]["input_tokens"], 1393, "{next}");
+    assert_eq!(next["usage"]["output_tokens"], 213, "{next}");
+    assert_eq!(next["usage"]["total_tokens"], 1606, "{next}");
+}
+
+#[tokio::test]
+async fn response_usage_counts_parallel_image_calls_after_retry_without_inventing_unknown() {
+    for unknown in [false, true] {
+        let fixture = generation_http_fixture_with_usage(
+            true,
+            true,
+            false,
+            false,
+            2,
+            true,
+            if unknown {
+                ImageUsage::Unknown
+            } else {
+                ImageUsage::RequiredOnly
+            },
+        )
+        .await;
+        let (status, response) = post_responses(
+            &fixture,
+            json!({
+                "model": PARENT_MODEL,
+                "input": "Create two blue squares.",
+                "tools": [explicit_generate_tool()],
+                "tool_choice": {"type":"function","name":"generate"}
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        assert_eq!(fixture.parent_requests.lock().len(), 2);
+        assert_eq!(fixture.generation_requests.lock().len(), 3);
+        if unknown {
+            assert!(response["usage"].is_null(), "{response}");
+        } else {
+            assert_eq!(response["usage"]["input_tokens"], 2137, "{response}");
+            assert_eq!(response["usage"]["output_tokens"], 5004, "{response}");
+            assert_eq!(response["usage"]["total_tokens"], 7141, "{response}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn response_usage_preserves_unknown_cache_creation_across_internal_calls() {
+    for optional_components_known in [false, true] {
+        let fixture = generation_http_fixture_with_usage(
+            true,
+            true,
+            false,
+            false,
+            2,
+            true,
+            if optional_components_known {
+                ImageUsage::Complete
+            } else {
+                ImageUsage::RequiredOnly
+            },
+        )
+        .await;
+        let (status, response) = post_responses(
+            &fixture,
+            json!({
+                "model": PARENT_MODEL,
+                "input": "Create two blue squares.",
+                "tools": [explicit_generate_tool()],
+                "tool_choice": {"type":"function","name":"generate"}
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{response}");
+        assert_eq!(fixture.parent_requests.lock().len(), 2);
+        assert_eq!(fixture.generation_requests.lock().len(), 3);
+        assert_eq!(response["usage"]["input_tokens"], 2137, "{response}");
+        assert_eq!(response["usage"]["output_tokens"], 5004, "{response}");
+        assert_eq!(response["usage"]["total_tokens"], 7141, "{response}");
+        let cache_creation = &response["usage"]["input_tokens_details"]["cache_write_tokens"];
+        if optional_components_known {
+            assert_eq!(cache_creation, &json!(14), "{response}");
+            assert_eq!(
+                response["usage"]["input_tokens_details"]["cached_tokens"], 6,
+                "{response}"
+            );
+            assert_eq!(
+                response["usage"]["output_tokens_details"]["reasoning_tokens"], 10,
+                "{response}"
+            );
+        } else {
+            assert!(cache_creation.is_null(), "{response}");
+            assert!(
+                response["usage"]["input_tokens_details"]["cached_tokens"].is_null(),
+                "{response}"
+            );
+            assert!(
+                response["usage"]["output_tokens_details"]["reasoning_tokens"].is_null(),
+                "{response}"
+            );
+        }
+
+        let (status, next) = post_responses(
+            &fixture,
+            json!({"model": PARENT_MODEL, "input": "Answer without generating."}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{next}");
+        assert_eq!(
+            next["usage"]["input_tokens_details"]["cache_write_tokens"], 7,
+            "{next}"
+        );
+    }
 }
 
 #[tokio::test]

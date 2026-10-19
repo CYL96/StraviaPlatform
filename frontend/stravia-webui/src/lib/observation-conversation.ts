@@ -1,5 +1,132 @@
 import { payloadRecord, payloadString } from './observation-payload'
 import type { InteractionDetail, LiveContentBlock, ObservationOutputPreview, RunDetail } from './types/observation'
+import {
+  observationConversationActivities,
+  type ObservationActivity,
+  type ToolActivity,
+} from './observation-activities'
+
+export type ObservationConversationBlock =
+  | { kind: 'text'; id: string; text: string; live: boolean; at: number; sequence?: number; receiveOrder?: number }
+  | ObservationActivity
+  | { kind: 'result'; id: string; at: number; sequence?: number; receiveOrder?: number; activity: ToolActivity }
+
+function hasVisibleText(text: string): boolean {
+  return text.replace(/<!--[\s\S]*?(?:-->|$)/g, '').trim().length > 0
+}
+
+/** 正文与活动共享首次接收顺序；旧记录仅保留已知的落盘顺序，不重建未知到达时间。 */
+export function observationConversationBlocks(
+  detail: InteractionDetail,
+  blocks: LiveContentBlock[] = [],
+  activities = observationConversationActivities(detail, blocks),
+): Map<string, ObservationConversationBlock[]> {
+  const output = new Map<string, ObservationConversationBlock[]>()
+  const committed = new Set<string>()
+  const append = (runId: string, block: ObservationConversationBlock) => {
+    const key = `assistant:${runId}`
+    const items = output.get(key) ?? []
+    if (!output.has(key)) output.set(key, items)
+    items.push(block)
+  }
+  for (const [key, value] of activities) {
+    for (const activity of value) {
+      if (activity.kind === 'thinking') {
+        append(key.slice('assistant:'.length), activity)
+        continue
+      }
+      append(key.slice('assistant:'.length), { ...activity, results: [] })
+      for (const result of activity.results) {
+        append(result.runId ?? key.slice('assistant:'.length), {
+          kind: 'result',
+          id: result.id,
+          at: result.at,
+          sequence: result.sequence,
+          receiveOrder: result.receiveOrder,
+          activity: {
+            ...activity,
+            id: result.id,
+            at: result.at,
+            input: undefined,
+            live: false,
+            status: result.isError ? 'error' : 'returned',
+            reason: undefined,
+            results: [result],
+          },
+        })
+      }
+    }
+  }
+  for (const run of detail.runs) {
+    let legacy: Map<string, Array<{ sequence: number; at: number; text: string }>> | undefined
+    for (const event of run.events) {
+      if (event.run_id !== run.id || event.kind !== 'client_visible_content') continue
+      const payload = payloadRecord(event.payload)
+      const id = payloadString(payload.block_id)
+      if (id) committed.add(id)
+      const text = payloadString(payload.text) ?? ''
+      if (!id) {
+        // 旧物理封块不是语义 item；同一 scope 连续解析，避免切断表格、围栏和空白。
+        const scope = JSON.stringify([payloadString(payload.model_turn_id), payloadString(payload.attempt_id)])
+        legacy ??= new Map()
+        const parts = legacy.get(scope) ?? []
+        parts.push({ sequence: event.sequence, at: event.occurred_at, text })
+        legacy.set(scope, parts)
+        continue
+      }
+      if (!hasVisibleText(text)) continue
+      append(run.id, {
+        kind: 'text',
+        id,
+        text,
+        live: false,
+        at: typeof payload.first_received_at === 'number' ? payload.first_received_at : event.occurred_at,
+        sequence: event.sequence,
+        receiveOrder: typeof payload.receive_order === 'number' ? payload.receive_order : undefined,
+      })
+    }
+    if (!legacy) continue
+    for (const parts of legacy.values()) {
+      parts.sort((a, b) => a.sequence - b.sequence)
+      const text = parts.map((part) => part.text).join('')
+      if (!hasVisibleText(text)) continue
+      append(run.id, {
+        kind: 'text',
+        id: `legacy:${parts[0].sequence}`,
+        text,
+        live: false,
+        at: parts[0].at,
+        sequence: parts[0].sequence,
+      })
+    }
+  }
+  for (const block of blocks) {
+    if (
+      block.interaction_id !== detail.interaction.id ||
+      block.kind !== 'client_visible_content_delta' ||
+      committed.has(block.block_id) ||
+      !hasVisibleText(block.text)
+    )
+      continue
+    append(block.run_id, {
+      kind: 'text',
+      id: block.block_id,
+      text: block.text,
+      live: true,
+      at: block.occurred_at,
+      receiveOrder: block.receive_order,
+    })
+  }
+  for (const items of output.values())
+    items.sort((a, b) =>
+      a.receiveOrder !== undefined && b.receiveOrder !== undefined
+        ? a.receiveOrder - b.receiveOrder
+        : a.sequence !== undefined && b.sequence !== undefined
+          ? a.sequence - b.sequence
+          : a.at - b.at,
+    )
+  return output
+}
 
 export interface ObservationChatMessage {
   id: string
