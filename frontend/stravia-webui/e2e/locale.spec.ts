@@ -32,6 +32,16 @@ async function prepareLocalePage(page: Page, languages: string[], savedLocale?: 
   })
 }
 
+test('document declares the saved UI language before application modules load and opts out of translation', async ({
+  page,
+}) => {
+  await prepareLocalePage(page, ['en-US'], 'zh-CN')
+  await page.route('**/_app/**/*.js', (route) => route.abort())
+  await page.goto('/login', { waitUntil: 'domcontentloaded' })
+  await expect(page.locator('html')).toHaveAttribute('lang', 'zh-CN')
+  await expect(page.locator('html')).toHaveAttribute('translate', 'no')
+})
+
 for (const clientLocale of ['zh-CN', 'zh-SG', 'zh-Hans']) {
   test(`first visit selects and persists Simplified Chinese for ${clientLocale}`, async ({ page }) => {
     await prepareLocalePage(page, [clientLocale, 'en-US'])

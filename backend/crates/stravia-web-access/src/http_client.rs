@@ -164,7 +164,62 @@ impl HttpClient {
             let outgoing = wreq::RequestBuilder::from_parts(client.clone(), request)
                 .redirect(wreq::redirect::Policy::none())
                 .build()?;
-            let mut response = client.execute(outgoing).await?;
+            let exchange = crate::wire::Exchange::current(from.as_str(), "http");
+            if let Some(exchange) = &exchange {
+                exchange.event(
+                    "request",
+                    "headers",
+                    None,
+                    crate::wire::headers(
+                        outgoing
+                            .headers()
+                            .iter()
+                            .map(|(n, v)| (n.as_str(), v.as_bytes())),
+                    ),
+                    bytes::Bytes::new(),
+                );
+                if outgoing.body().is_some() {
+                    if let Some(mut replay) = outgoing.try_clone() {
+                        if let Some(body) = replay.body_mut().take() {
+                            match body.collect().await {
+                                Ok(body) => exchange.event(
+                                    "request",
+                                    "body_chunk",
+                                    None,
+                                    serde_json::Value::Null,
+                                    body.to_bytes(),
+                                ),
+                                Err(_) => exchange.gap("http_request_body_capture_failed"),
+                            }
+                        }
+                    } else {
+                        exchange.gap("http_request_stream_body_unavailable");
+                    }
+                }
+            }
+            let mut response = match client.execute(outgoing).await {
+                Ok(response) => response,
+                Err(error) => {
+                    if let Some(exchange) = &exchange {
+                        exchange.gap("http_request_transport_failed");
+                    }
+                    return Err(error.into());
+                }
+            };
+            if let Some(exchange) = &exchange {
+                exchange.event(
+                    "response",
+                    "headers",
+                    Some(response.status().as_u16()),
+                    crate::wire::headers(
+                        response
+                            .headers()
+                            .iter()
+                            .map(|(n, v)| (n.as_str(), v.as_bytes())),
+                    ),
+                    bytes::Bytes::new(),
+                );
+            }
             let target =
                 if follow && matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308) {
                     response
@@ -214,6 +269,9 @@ impl HttpClient {
                 }
                 *request.uri_mut() = to.as_str().parse()?;
                 // 未读取的重定向正文不得占用连接池或后台继续下载。
+                if let Some(exchange) = &exchange {
+                    exchange.gap("http_redirect_body_not_consumed");
+                }
                 response.forbid_recycle();
                 continue;
             }
@@ -223,14 +281,32 @@ impl HttpClient {
                     .content_length()
                     .is_some_and(|length| length > limit as u64)
                 {
+                    if let Some(exchange) = &exchange {
+                        exchange.gap("http_response_declared_size_limit");
+                    }
                     response.forbid_recycle();
                     return Err(ResponseTooLarge { limit, url: from }.into());
                 }
             }
             while let Some(frame) = response.frame().await {
-                if let Ok(data) = frame?.into_data() {
+                let frame = match frame {
+                    Ok(frame) => frame,
+                    Err(error) => {
+                        if let Some(exchange) = &exchange {
+                            exchange.gap("http_response_body_read_failed");
+                        }
+                        return Err(error.into());
+                    }
+                };
+                if let Ok(data) = frame.into_data() {
+                    if let Some(exchange) = &exchange {
+                        exchange.chunk(data.clone());
+                    }
                     if let Some(limit) = self.inner.response_limit {
                         if body.len().saturating_add(data.len()) > limit {
+                            if let Some(exchange) = &exchange {
+                                exchange.gap("http_response_body_size_limit");
+                            }
                             response.forbid_recycle();
                             return Err(ResponseTooLarge { limit, url: from }.into());
                         }
@@ -269,6 +345,53 @@ mod tests {
     use std::thread::{self, JoinHandle};
 
     use super::*;
+
+    #[derive(Clone, Default)]
+    struct WireEvents(Arc<Mutex<Vec<stravia_runtime_contract::wire_debug::WireEvent>>>);
+
+    impl stravia_runtime_contract::wire_debug::WireSink for WireEvents {
+        fn record(&self, event: stravia_runtime_contract::wire_debug::WireEvent) {
+            self.0.lock().push(event);
+        }
+        fn gap(&self, _: &'static str) {}
+    }
+
+    #[tokio::test]
+    async fn native_capture_observes_each_redirect_and_non_success_body() {
+        use stravia_runtime_contract::wire_debug::{scope, Capture};
+        let destination = spawn_server(vec![Reply::Fixed(
+            "HTTP/1.1 503 Unavailable\r\nContent-Length: 5\r\nX-Wire: original\r\nConnection: close\r\n\r\nerror",
+        )]);
+        let origin = spawn_server(vec![Reply::Redirect(destination.base_url.clone())]);
+        let events = WireEvents::default();
+        let (_, body) = scope(
+            Some(Capture::new(events.clone())),
+            client(None, false).fetch(get(&origin.base_url)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(body, b"error");
+        let events = events.0.lock();
+        let requests = events
+            .iter()
+            .filter(|event| {
+                event.direction == "upstream_request" && event.message_type == "request"
+            })
+            .map(|event| event.url.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].starts_with(&origin.base_url));
+        assert!(requests[1].starts_with(&destination.base_url));
+        assert!(events.iter().any(|event| event.status_code == Some(503)));
+        let observed = events
+            .iter()
+            .filter(|event| {
+                event.message_type == "body_chunk" && event.direction == "upstream_response"
+            })
+            .flat_map(|event| event.payload.iter().copied())
+            .collect::<Vec<_>>();
+        assert_eq!(observed, body);
+    }
 
     #[derive(Clone)]
     enum Reply {

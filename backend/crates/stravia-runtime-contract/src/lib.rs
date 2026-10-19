@@ -13,6 +13,7 @@ pub mod protocol;
 pub mod redaction;
 pub mod thinking;
 pub mod turn_chain;
+pub mod wire_debug;
 
 pub use cancellation::CancellationToken;
 pub use deadline::Deadline;

@@ -1,6 +1,7 @@
 import { Marked, Renderer, type Tokens } from 'marked'
 import DOMPurify from 'dompurify'
 import markedCjkFriendly from 'marked-cjk-friendly'
+import { createUuid } from '#lib/uuid.js'
 
 const MARKED_OPTIONS = { async: false, gfm: true, breaks: true } as const
 
@@ -273,7 +274,7 @@ export async function renderMarkdownFragment(fragment: MarkdownFragment): Promis
     return mermaid
   })
   const mermaid = await mermaidLibrary
-  const id = `markdown-diagram-${crypto.randomUUID()}`
+  const id = `markdown-diagram-${createUuid()}`
   const temporary = document.createElement('div')
   temporary.setAttribute('aria-hidden', 'true')
   temporary.style.cssText = 'position:fixed;left:-100000px;top:0;visibility:hidden'

@@ -171,6 +171,71 @@ const imageBytes = Buffer.from(
 )
 const imageData = `data:image/png;base64,${imageBytes.toString('base64')}`
 
+test.describe('mobile viewport', () => {
+  test.use({ isMobile: true, hasTouch: true })
+
+  test('mobile composer remains visible and usable as viewport height changes', async ({ page }) => {
+    await prepareChat(page)
+    await page.setViewportSize({ width: 390, height: 650 })
+    await page.goto('/')
+    const composer = page.getByRole('textbox', { name: 'Message', exact: true })
+    await expect(composer).toBeVisible()
+    const expectControlsInViewport = async () => {
+      await expect
+        .poll(() =>
+          page.evaluate(() => {
+            const viewport = window.visualViewport!
+            const controls = document.querySelector('.composer-dock')!.getBoundingClientRect()
+            return {
+              topVisible: controls.top >= viewport.offsetTop,
+              bottomVisible: controls.bottom <= viewport.offsetTop + viewport.height + 1,
+              documentFits: document.documentElement.scrollHeight <= window.innerHeight + 1,
+            }
+          }),
+        )
+        .toEqual({ topVisible: true, bottomVisible: true, documentFits: true })
+    }
+    await expectControlsInViewport()
+    await send(page, 'Mobile viewport question', 1)
+    await complete(page, 0, Array.from({ length: 30 }, (_, index) => `Answer paragraph ${index}.`).join('\n\n'))
+    await composer.fill('Next mobile question')
+    await expectControlsInViewport()
+    for (const height of [830, 430, 650]) {
+      await page.setViewportSize({ width: 390, height })
+      await expectControlsInViewport()
+    }
+    await page.getByRole('button', { name: 'Send', exact: true }).click()
+    await expect.poll(async () => (await requests(page)).length).toBe(2)
+    await complete(page, 1, 'Mobile controls remain usable')
+  })
+})
+
+test('chat, image attachments and diagrams work without crypto.randomUUID', async ({ page }) => {
+  await prepareChat(page)
+  await page.addInitScript(() => {
+    Object.defineProperty(crypto, 'randomUUID', { configurable: true, value: undefined })
+  })
+  await page.goto('/')
+  await send(page, 'Start without the secure-context UUID API', 1)
+  await complete(page, 0, 'First answer')
+  await page.getByRole('button', { name: 'Add images', exact: true }).click()
+  await page
+    .locator('input[type=file]')
+    .setInputFiles({ name: 'http-image.png', mimeType: 'image/png', buffer: imageBytes })
+  await expect(page.getByRole('img', { name: 'http-image.png', exact: true })).toBeVisible()
+  await send(page, 'Draw the image flow', 2)
+  const diagram = '```mermaid\nflowchart LR\n  Image --> Answer\n```'
+  await complete(page, 1, diagram)
+  await expect(page.locator('.markdown-fragment-block > svg')).toBeVisible()
+  const conversationUrl = page.url()
+  await page.reload()
+  await expect(page).toHaveURL(conversationUrl)
+  await expect(
+    page.getByRole('article', { name: 'Your message' }).getByRole('img', { name: 'http-image.png', exact: true }),
+  ).toBeVisible()
+  await expect(page.locator('.markdown-fragment-block > svg')).toBeVisible()
+})
+
 test('images require text and survive refresh, replay, failure, retry, regeneration and deletion', async ({ page }) => {
   await prepareChat(page)
   await page.goto('/')
@@ -685,14 +750,12 @@ test('stops live output and refresh interrupts another turn without losing recei
   await expect(page.getByRole('article', { name: 'Assistant response' })).toContainText('Partial retained answer')
   await page.getByRole('button', { name: 'Stop', exact: true }).click()
   await expect.poll(async () => (await requests(page))[0].aborted).toBe(true)
-  await expect(page.getByRole('article', { name: 'Assistant response' })).toContainText(/Stopped/)
   await send(page, 'Interrupted by refresh', 2)
   expect(JSON.stringify((await requests(page))[1].body.input)).toContain('Partial retained answer')
   await emit(page, 1, { type: 'response.output_text.delta', delta: 'Saved before refresh' })
   await expect(page.getByRole('article', { name: 'Assistant response' }).last()).toContainText('Saved before refresh')
   await page.reload()
   await expect(page.getByRole('article', { name: 'Assistant response' }).last()).toContainText('Saved before refresh')
-  await expect(page.getByRole('article', { name: 'Assistant response' }).last()).toContainText(/Stopped/)
 })
 
 test('failure requires manual retry and incomplete output remains available for continuation', async ({ page }) => {
@@ -903,11 +966,13 @@ test('history searches message content, renames, deletes and confirms exact clea
   const rename = page.getByRole('dialog', { name: 'Rename conversation' })
   await rename.getByRole('textbox').fill('Renamed browser conversation')
   await rename.getByRole('button', { name: /Save|Rename/, exact: true }).click()
+  await expect(rename).toHaveCount(0)
   await search.fill('Renamed')
   await expect(page.getByRole('main').getByRole('link', { name: 'Renamed browser conversation' })).toBeVisible()
   await page.getByRole('main').getByRole('button', { name: 'Conversation actions', exact: true }).click()
   await page.getByRole('menuitem', { name: 'Delete', exact: true }).click()
   await page.getByRole('alertdialog').getByRole('button', { name: 'Delete', exact: true }).click()
+  await expect(page.getByRole('alertdialog')).toHaveCount(0)
   await search.fill('')
   await page.getByRole('button', { name: 'Clear all conversations', exact: true }).click()
   const clear = page.getByRole('alertdialog', { name: 'Clear all conversations?' })
@@ -1055,7 +1120,7 @@ test('keyboard selection determines the identity, model and reasoning used for a
   await expect(picker).toHaveText(/Second model\s*High/)
   await page.getByRole('textbox', { name: 'Message', exact: true }).focus()
   await page.keyboard.type('Selected with keyboard')
-  await page.keyboard.press('ControlOrMeta+Enter')
+  await page.keyboard.press('Enter')
   await expect.poll(async () => (await requests(page)).length).toBe(1)
   const request = (await requests(page))[0]
   expect(request.authorization).toBe('Bearer sk-second-only')
@@ -1071,6 +1136,60 @@ test('keyboard selection determines the identity, model and reasoning used for a
   await recent.focus()
   await page.keyboard.press('Enter')
   await expect(page.getByRole('article', { name: 'Your message' })).toContainText('Selected with keyboard')
+})
+
+test('request timer runs before output and freezes per turn; Enter sends and Control+Enter inserts a newline', async ({
+  page,
+}) => {
+  await page.clock.install({ time: new Date('2026-01-01T00:00:00Z') })
+  await prepareChat(page)
+  await page.goto('/')
+  const input = page.getByRole('textbox', { name: 'Message', exact: true })
+  await input.fill('First line')
+  await input.press('Control+Enter')
+  await expect(input).toHaveValue('First line\n')
+  await input.press('a')
+  await expect(input).toHaveValue('First line\na')
+  expect(await requests(page)).toHaveLength(0)
+  await input.dispatchEvent('keydown', { key: 'Enter', isComposing: true })
+  expect(await requests(page)).toHaveLength(0)
+  await input.press('Enter')
+  await expect.poll(async () => (await requests(page)).length).toBe(1)
+  expect((await requests(page))[0].body.input).toEqual([{ role: 'user', content: 'First line\na' }])
+  const answers = page.getByRole('article', { name: 'Assistant response', exact: true })
+  await expect(answers.first().getByRole('timer')).toHaveText('0s')
+  await page.clock.fastForward(15_000)
+  await expect(answers.first().getByRole('timer')).toHaveText('15s')
+  await expect(answers.first()).toContainText('Processed')
+  await input.fill('Next question')
+  await input.press('Enter')
+  expect(await requests(page)).toHaveLength(1)
+  await page.getByRole('button', { name: 'Stop', exact: true }).click()
+  await expect(answers.first()).toContainText('Cancelled')
+  await page.clock.fastForward(5000)
+  await expect(answers.first().getByRole('timer')).toHaveText('15s')
+  await input.press('Enter')
+  await expect.poll(async () => (await requests(page)).length).toBe(2)
+  await page.clock.fastForward(3000)
+  await complete(page, 1, 'Completed answer')
+  await expect(answers.last().getByRole('timer')).toHaveText('3s')
+  await expect(answers.last().getByRole('status')).toHaveText('Completed')
+  await page.clock.fastForward(10_000)
+  await expect(answers.last().getByRole('timer')).toHaveText('3s')
+  await page.reload()
+  await expect(answers.first().getByRole('timer')).toHaveText('15s')
+  await expect(answers.last().getByRole('timer')).toHaveText('3s')
+  await page.getByRole('button', { name: 'Edit message', exact: true }).first().click()
+  const editor = page.locator('#chat-edit-message')
+  await editor.fill('Edited')
+  await editor.press('Control+Enter')
+  await expect(editor).toHaveValue('Edited\n')
+  expect(await requests(page)).toHaveLength(0)
+  await editor.press('a')
+  await editor.press('Enter')
+  await expect.poll(async () => (await requests(page)).length).toBe(1)
+  expect((await requests(page))[0].body.input).toEqual([{ role: 'user', content: 'Edited\na' }])
+  await complete(page, 0, 'Edited answer')
 })
 
 test.describe('UTC expiry boundaries', () => {

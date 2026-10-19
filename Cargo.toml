@@ -27,6 +27,7 @@ tokio = { version = "1", default-features = false }
 ammonia = "4.1.4"
 axum = { version = "0.8", default-features = false }
 rmcp = { version = "=3.5.1", default-features = false }
+sse-stream = "=0.2.6"
 # 与桌面更新器统一 TLS/代理编译特性；运行时代理由客户端显式选择。
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "system-proxy", "socks"] }
 reqwest-websocket = "0.6"

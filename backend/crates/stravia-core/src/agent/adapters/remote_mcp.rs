@@ -131,7 +131,9 @@ async fn connect_remote_mcp(
     if let Some(token) = source.bearer_token.as_ref() {
         config = config.auth_header(token.clone());
     }
-    ().serve(StreamableHttpClientTransport::from_config(config))
+    let transport =
+        stravia_web_access::remote::mcp_http_transport(reqwest::Client::default(), config);
+    ().serve(transport)
         .await
         .map_err(|error| AgentToolError::new("mcp_connect_failed", error.to_string()))
 }
@@ -172,6 +174,19 @@ mod tests {
 
     #[tokio::test]
     async fn remote_mcp_content_preserves_media_and_protects_readable_resources() {
+        use stravia_runtime_contract::wire_debug::{self, Capture, WireEvent, WireSink};
+
+        #[derive(Clone, Default)]
+        struct RemoteWire(Arc<parking_lot::Mutex<Vec<WireEvent>>>);
+
+        impl WireSink for RemoteWire {
+            fn record(&self, event: WireEvent) {
+                self.0.lock().push(event);
+            }
+
+            fn gap(&self, _: &'static str) {}
+        }
+
         const SECRET: &str = "Q8n4Vk7sT2p9X5a3Lc6D0h1R";
         let directory = tempfile::tempdir().unwrap();
         let gateway = crate::Gateway::from_storage(
@@ -218,7 +233,8 @@ mod tests {
             let endpoint = format!("http://{}/", listener.local_addr().unwrap());
             let router = axum::Router::new()
                 .route("/", axum::routing::post(mcp_reply))
-                .with_state(output);
+                .with_state(output.clone());
+            let expected_remote_output = output;
             let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
             let tools = discover_remote_mcp_tools(RemoteMcpToolSource {
                 namespace: "fixture".into(),
@@ -228,8 +244,10 @@ mod tests {
             })
             .await
             .unwrap();
-            let output = tools[0]
-                .execute(
+            let captured = RemoteWire::default();
+            let output = wire_debug::scope(
+                Some(Capture::new(captured.clone())),
+                tools[0].execute(
                     AgentToolContext {
                         principal: owner.clone(),
                         turn_id: AgentTurnId::agent(),
@@ -237,9 +255,36 @@ mod tests {
                         deadline: std::time::Instant::now() + std::time::Duration::from_secs(10),
                     },
                     serde_json::json!({}),
-                )
-                .await
-                .unwrap();
+                ),
+            )
+            .await
+            .unwrap();
+            {
+                let events = captured.0.lock();
+                assert!(events.iter().any(|event| {
+                    event.direction == "upstream_request"
+                        && serde_json::from_slice::<Value>(&event.payload)
+                            .is_ok_and(|body| body["method"] == "tools/call")
+                }));
+                let mut replies = Vec::<Vec<u8>>::new();
+                for event in events
+                    .iter()
+                    .filter(|event| event.direction == "upstream_response")
+                {
+                    if event.message_type == "response_headers" {
+                        replies.push(Vec::new());
+                    } else if event.message_type == "body_chunk" {
+                        replies
+                            .last_mut()
+                            .unwrap()
+                            .extend_from_slice(&event.payload);
+                    }
+                }
+                assert!(replies.iter().any(|body| {
+                    serde_json::from_slice::<Value>(body)
+                        .is_ok_and(|body| body["result"] == expected_remote_output)
+                }));
+            }
             let request = AiRequest::new(
                 "model",
                 vec![AiItem {

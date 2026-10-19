@@ -7,6 +7,7 @@ import StopIcon from '@lucide/svelte/icons/square'
 import { getConsoleChat } from '#lib/console-chat.svelte.js'
 import type { ConsoleImageAttachment } from '#lib/console-chat-types.js'
 import { localizeBackendErrorMessage } from '#lib/backend-error.js'
+import { createUuid } from '#lib/uuid.js'
 import * as m from '#lib/paraglide/messages.js'
 import ConsoleModelPicker from '#lib/components/console-model-picker.svelte'
 import { Button } from '#lib/components/ui/button/index.js'
@@ -60,7 +61,7 @@ function readImage(file: File): Promise<ConsoleImageAttachment> {
         return
       }
       resolve({
-        id: crypto.randomUUID(),
+        id: createUuid(),
         name: file.name,
         mediaType: file.type as ConsoleImageAttachment['mediaType'],
         dataUrl: reader.result,
@@ -156,9 +157,14 @@ function drop(event: DragEvent) {
           placeholder={m.console_chat_message_placeholder()}
           onpaste={paste}
           onkeydown={(event: KeyboardEvent) => {
-            if (event.key === 'Enter' && (event.ctrlKey || event.metaKey) && !event.isComposing) {
-              event.preventDefault()
-              if (!incompatible && !reading) void onsend()
+            if (event.key !== 'Enter' || event.isComposing) return
+            event.preventDefault()
+            if (event.ctrlKey || event.metaKey || event.shiftKey) {
+              const input = event.currentTarget as HTMLTextAreaElement
+              input.setRangeText('\n', input.selectionStart, input.selectionEnd, 'end')
+              input.dispatchEvent(new Event('input', { bubbles: true }))
+            } else if (!event.repeat && !generating && !incompatible && !reading) {
+              void onsend()
             }
           }} />
       </Field.Field>

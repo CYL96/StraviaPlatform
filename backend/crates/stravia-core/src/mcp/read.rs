@@ -113,6 +113,88 @@ impl ReadTool {
         )
     }
 
+    async fn read_standalone(
+        &self,
+        arguments: Value,
+        context: ToolExecutionContext,
+    ) -> Result<PlatformToolOutput, PlatformToolError> {
+        use crate::interaction_observation::{AdmissionFacts, IngressStart, RunOutcome, RunStart};
+        use stravia_runtime_contract::protocol::ir::{AiItem, AiRequest, MessageContent, Role};
+
+        let inherited = crate::interaction_observation::scope::current();
+        let standalone = inherited.is_none();
+        let observer = inherited.unwrap_or_else(|| {
+            let request = AiRequest::new(
+                TOOL_NAME,
+                vec![AiItem {
+                    role: Role::User,
+                    content: MessageContent::Text(Arc::new(arguments.to_string())),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    meta: None,
+                }],
+            );
+            self.gateway
+                .observation
+                .observe_ingress(IngressStart {
+                    id: context.run_id.clone(),
+                    method: "MCP".into(),
+                    path: format!("tools/call/{TOOL_NAME}"),
+                    protocol: "mcp".into(),
+                })
+                .admit(
+                    RunStart {
+                        id: context.run_id.clone(),
+                        principal: context.principal.api_key_id().into(),
+                        api_key_id: Some(context.principal.api_key_id().into()),
+                        api_key_name: None,
+                        route_id: TOOL_NAME.into(),
+                        model_display_name: Some(TOOL_NAME.into()),
+                        ingress_protocol: "mcp".into(),
+                    },
+                    AdmissionFacts {
+                        client_request: Arc::new(request),
+                        has_new_user: true,
+                        has_matching_pending_tool_result: false,
+                        generation_root_id: None,
+                        generation_parent_id: None,
+                    },
+                )
+        });
+        let cancellation = context.cancellation.clone();
+        let result = crate::interaction_observation::scope::scope(
+            Some(observer.clone()),
+            self.read(arguments, context),
+        )
+        .await;
+        if standalone {
+            let failed = result.as_ref().map_or(true, |output| output.is_error);
+            observer.finish(RunOutcome {
+                client_output_committed: false,
+                delivery: None,
+                delivery_completed_at: None,
+                status: if cancellation.is_cancelled() {
+                    "cancelled"
+                } else if failed {
+                    "failed"
+                } else {
+                    "completed"
+                }
+                .into(),
+                terminal_reason: if cancellation.is_cancelled() {
+                    Some("cancelled".into())
+                } else if failed {
+                    Some("tool_execution_failed".into())
+                } else {
+                    None
+                },
+                generation_node_id: None,
+                generation_root_id: None,
+            });
+        }
+        result
+    }
+
     async fn dispatch(
         &self,
         domain: StraviaReadDomain,
@@ -960,10 +1042,17 @@ impl McpTool for ReadTool {
             Ok(true) => self.read(arguments, context).await,
             Ok(false) => {
                 let tool = self.clone();
-                self.gateway.execute_public_tool(
-                self, arguments, context, crate::tool_execution::ExecutionSource::Mcp,
-                move |arguments, context| async move { tool.read(arguments, context).await },
-            ).await
+                self.gateway
+                    .execute_public_tool(
+                        self,
+                        arguments,
+                        context,
+                        crate::tool_execution::ExecutionSource::Mcp,
+                        move |arguments, context| async move {
+                            tool.read_standalone(arguments, context).await
+                        },
+                    )
+                    .await
             }
         };
         match result {

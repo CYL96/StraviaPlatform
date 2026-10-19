@@ -428,7 +428,7 @@ onMount(() => {
   isMobile={!isDesktopNavigation}
   style={`--sidebar-top: 2.5rem; --sidebar-surface: ${translucentChrome ? 'transparent' : 'var(--sidebar)'}`}
   class={[
-    'shell-root relative flex h-svh min-h-screen flex-col overflow-hidden text-foreground',
+    'shell-root relative flex h-svh min-h-0 flex-col overflow-hidden text-foreground',
     translucentChrome ? 'bg-transparent' : 'bg-background',
   ]}>
   <!-- svelte-ignore a11y_no_static_element_interactions -->

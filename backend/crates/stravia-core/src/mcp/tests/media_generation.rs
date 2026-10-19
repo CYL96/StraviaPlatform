@@ -1311,6 +1311,53 @@ async fn cancellation_stops_an_accepted_generation_without_retry() {
 }
 
 #[tokio::test]
+async fn upstream_business_refusal_reaches_platform_tool_without_retry() {
+    let fixture = generation_app().await;
+    let reason = "The image was filtered because it violated the upstream content policy";
+    fixture.replies.lock().push_back(GenerationReply::Status(
+        axum::http::StatusCode::BAD_REQUEST,
+        reason,
+    ));
+    let client = connect(&fixture.app).await;
+    let result = call_generate(
+        &client,
+        json!({"type":"image","input":{"prompt":"A square"}}),
+    )
+    .await;
+    assert_eq!(result.is_error, Some(true));
+    let output = result.structured_content.unwrap();
+    assert_eq!(output["error"]["code"], "upstream_generation_failed");
+    assert!(
+        output["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains(reason)
+    );
+    assert_eq!(fixture.requests.lock().len(), 1);
+}
+
+#[tokio::test]
+async fn upstream_business_refusal_redacts_credentials_in_public_message() {
+    let fixture = generation_app().await;
+    fixture.replies.lock().push_back(GenerationReply::Status(
+        axum::http::StatusCode::BAD_REQUEST,
+        "Image rejected; local-test-not-a-production-credential",
+    ));
+    let client = connect(&fixture.app).await;
+    let result = call_generate(
+        &client,
+        json!({"type":"image","input":{"prompt":"A square"}}),
+    )
+    .await;
+    assert_eq!(result.is_error, Some(true));
+    let output = result.structured_content.unwrap();
+    let message = output["error"]["message"].as_str().unwrap();
+    assert!(message.contains("Image rejected"));
+    assert!(!message.contains("local-test-not-a-production-credential"));
+    assert_eq!(fixture.requests.lock().len(), 1);
+}
+
+#[tokio::test]
 async fn upstream_credential_errors_do_not_echo_credentials_or_retry() {
     let fixture = generation_app().await;
     fixture.replies.lock().push_back(GenerationReply::Status(

@@ -646,7 +646,9 @@ async fn observe_effective_preserves_marker_without_repeating_public_tool_call()
     let mut effective = write.request().clone();
     effective.items = vec![user_message("question"), restored, stripped, result];
 
-    write.observe_effective(effective);
+    let client_view =
+        crate::history_marker::client_shaped_request(Arc::new(effective), write.request());
+    write.observe_effective(client_view);
 
     assert_eq!(
         write
@@ -749,7 +751,9 @@ async fn observe_effective_persists_marker_at_ordered_projection_atom() {
     );
     assert_eq!(effective.items[3].thinking_ref(), Some(("R2", None)));
 
-    write.observe_effective(effective);
+    let client_view =
+        crate::history_marker::client_shaped_request(Arc::new(effective), write.request());
+    write.observe_effective(client_view);
     let marker_text = crate::history_marker::render_history_marker_reference(&marker.reference);
     let unknown_marker_text =
         crate::history_marker::render_history_marker_reference(unknown_reference);

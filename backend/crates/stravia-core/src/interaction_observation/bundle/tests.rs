@@ -98,6 +98,102 @@ async fn download(
 }
 
 #[tokio::test]
+async fn platform_tool_remote_bytes_and_header_redaction_survive_bundle_export()
+-> anyhow::Result<()> {
+    use axum::{body::Bytes, response::IntoResponse};
+    use base64::Engine;
+    use std::io::Read;
+
+    let (_directory, pool, observation) = fixture().await?;
+    observation.set_debug_enabled(true);
+    let run = admit(&observation, "platform-http", None);
+    let request_body = br#"{"Authorization":"body-value-is-not-a-header"}"#;
+    let response_body = [0, 255, 128, 13, 10];
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let url = format!("http://{}/remote-tool", listener.local_addr()?);
+    let app = axum::Router::new().route(
+        "/remote-tool",
+        axum::routing::post(
+            move |headers: axum::http::HeaderMap, body: Bytes| async move {
+                assert_eq!(headers["authorization"], "Bearer request-header-secret");
+                assert_eq!(body.as_ref(), request_body);
+                (
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    [("authorization", "response-header-secret")],
+                    Bytes::copy_from_slice(&response_body),
+                )
+                    .into_response()
+            },
+        ),
+    );
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let web = stravia_web_access::LocalWeb::new(stravia_web_access::OutboundProxyMode::Direct)?;
+    let request = axum::http::Request::builder()
+        .method("POST")
+        .uri(&url)
+        .header("Authorization", "Bearer request-header-secret")
+        .body(request_body.to_vec())?;
+    let (response, body) =
+        scope::scope(Some(run.clone()), web.http_client().fetch(request.into())).await?;
+    assert_eq!(response.status().as_u16(), 503);
+    assert_eq!(body, response_body);
+    finish(&run, "completed", Some("platform-generation"));
+    let ticket = ticket(&observation).await?;
+    let token = ticket.download_url.rsplit('/').next().unwrap();
+    let mut stream = observation.consume_bundle_ticket(token).await?;
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        bytes.extend_from_slice(&chunk?);
+    }
+    let mut archive = zip::ZipArchive::new(Cursor::new(bytes))?;
+    let mut records = Vec::<Value>::new();
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index)?;
+        if !entry.name()?.ends_with("events.jsonl") {
+            continue;
+        }
+        let mut text = String::new();
+        entry.read_to_string(&mut text)?;
+        assert!(!text.contains("request-header-secret"));
+        assert!(!text.contains("response-header-secret"));
+        for line in text.lines() {
+            records.push(serde_json::from_str(line)?);
+        }
+    }
+    let outgoing = records
+        .iter()
+        .filter(|record| record["direction"] == "upstream_request")
+        .filter_map(|record| record["payload"].as_str())
+        .collect::<String>();
+    assert_eq!(outgoing.as_bytes(), request_body);
+    let incoming = records
+        .iter()
+        .filter(|record| {
+            record["direction"] == "upstream_response" && record["message_type"] == "body_chunk"
+        })
+        .flat_map(|record| {
+            assert_eq!(record["payload_encoding"], "base64");
+            base64::engine::general_purpose::STANDARD
+                .decode(record["payload"].as_str().unwrap())
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(incoming, response_body);
+    assert!(records.iter().any(|record| {
+        record["status_code"] == 503 && record["headers"]["authorization"] == "***"
+    }));
+    assert!(
+        records
+            .iter()
+            .all(|record| record["run_id"] == "platform-http")
+    );
+    server.abort();
+    observation.shutdown().await;
+    pool.close().await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn bundle_usage_revision_preserves_reported_fields_and_ticket_watermark() -> anyhow::Result<()>
 {
     let (_directory, pool, observation) = fixture().await?;

@@ -138,7 +138,13 @@ impl HttpBackend for DirectBackend {
                 .map_err(|error| {
                     FetchError::unavailable(format!("resource client failed: {error}"))
                 })?;
-            let response = client.get(url.as_str()).send().await.map_err(|error| {
+            let (response, exchange) = crate::wire::send(
+                client.get(url.as_str()),
+                stravia_runtime_contract::wire_debug::current(),
+                "http",
+            )
+            .await
+            .map_err(|error| {
                 FetchError::unavailable(format!("resource request failed: {error}"))
             })?;
             let connected = response.remote_addr().ok_or_else(|| {
@@ -162,6 +168,9 @@ impl HttpBackend for DirectBackend {
             let html = content_type.as_deref().is_some_and(is_html_content);
             // 重定向跳转与失败状态在响应头结束；HTML 探测同样不读正文。
             if !(200..300).contains(&status) || (self.stop_at_html && html) {
+                if let Some(exchange) = &exchange {
+                    exchange.gap("http_resource_body_not_consumed");
+                }
                 return Ok(HttpResponse {
                     status,
                     content_type,
@@ -177,10 +186,14 @@ impl HttpBackend for DirectBackend {
                 .and_then(|value| value.parse::<usize>().ok())
             {
                 if size > cap {
+                    if let Some(exchange) = &exchange {
+                        exchange.gap("http_response_declared_size_limit");
+                    }
                     return Err(response_too_large(cap));
                 }
             }
-            let mut stream = response.bytes_stream();
+            let stream = crate::wire::stream(response, exchange);
+            futures::pin_mut!(stream);
             let mut body = Vec::new();
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk.map_err(|error| {

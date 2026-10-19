@@ -565,6 +565,7 @@ fn append_restored_platform_round(
             meta: None,
         }
     }));
+    crate::history_marker::mark_current_run_projected(&mut request.items[output_start..]);
 }
 
 pub(super) async fn complete_canonical_response(
@@ -846,6 +847,231 @@ fn response_item_default_status(response: &AiResponse) -> AiItemStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn platform_hidden_rounds_persist_once_and_restore_once() {
+        use crate::history_marker::{
+            HistoryMarkerStore, PlatformExecutionState, PlatformMarkerInput,
+        };
+        use std::sync::Arc;
+        use stravia_runtime_contract::protocol::ids::OPEN_RESPONSES_2026_04_24;
+        use stravia_runtime_contract::protocol::ir::{AiItem, ToolCall};
+
+        let ttl = std::time::Duration::from_secs(60);
+        let pool = crate::test_support::migrated_sqlite_pool().await.unwrap();
+        let markers = Arc::new(crate::history_marker::SqlHistoryMarkerStore::sqlite(pool));
+        let backend = Arc::new(crate::turn_chain::test_store().await);
+        let chain = crate::generation_chain::GenerationChain::from_turn_chain(
+            backend.clone(),
+            ttl,
+            None,
+            crate::runtime_cache::RuntimeCache::tinyufo(16 * 1024 * 1024),
+        )
+        .with_history_markers(markers.clone());
+        let owner = stravia_runtime_contract::Principal::new("hidden-write-owner");
+        let mut input = AiRequest::new(
+            "model",
+            vec![AiItem {
+                role: stravia_runtime_contract::protocol::ir::Role::User,
+                content: MessageContent::Text(Arc::new("question".into())),
+                tool_calls: None,
+                tool_call_id: None,
+                meta: None,
+            }],
+        );
+        input.meta.source_protocol = Some(OPEN_RESPONSES_2026_04_24);
+        let mut write = chain.begin(owner.clone(), input.clone()).await.unwrap();
+        let mut model = input;
+        let mut output = AiResponse::new("final", "model");
+        for index in 0..3 {
+            let call = ToolCall {
+                id: format!("hidden-{index}").into(),
+                name: "search".into(),
+                arguments: "{}".into(),
+            };
+            let segment = HiddenHistorySegment::Platform {
+                call: call.clone(),
+                result: ContentBlock::ToolResult {
+                    tool_use_id: call.id.clone(),
+                    content: serde_json::json!({"answer": index}),
+                    content_kind: None,
+                    is_error: Some(false),
+                    cache_control: None,
+                },
+            };
+            let marker = markers
+                .create_platform(
+                    &owner,
+                    PlatformMarkerInput {
+                        tool_id: "search".into(),
+                        call: call.clone(),
+                        activity: "Searching".into(),
+                        execution_limit: ttl,
+                        pending_retention: ttl,
+                    },
+                )
+                .await
+                .unwrap();
+            markers
+                .claim_execution(&owner, &marker.reference, "worker", ttl)
+                .await
+                .unwrap();
+            markers
+                .finish_execution(
+                    &owner,
+                    &marker.reference,
+                    "worker",
+                    PlatformExecutionState::Completed,
+                    segment.clone(),
+                )
+                .await
+                .unwrap();
+            markers
+                .publish(&owner, std::slice::from_ref(&marker.reference), ttl)
+                .await
+                .unwrap();
+
+            let mut canonical = AiResponse::new(format!("round-{index}"), "model");
+            canonical.items = vec![
+                AiItem::thinking(format!("thinking-{index}"), None),
+                AiItem::output_text(format!("visible-{index}")),
+                AiItem::function_call(call),
+            ];
+            output.items.extend(canonical.items[..2].iter().cloned());
+            output.items.push(AiItem::thinking(
+                crate::history_marker::render_history_marker(&marker),
+                None,
+            ));
+            append_restored_platform_round(&mut model, &canonical, vec![segment]);
+            let snapshot = Arc::new(model.clone());
+            let client_view =
+                crate::history_marker::client_shaped_request(snapshot.clone(), write.request());
+            write.observe_effective(client_view);
+            assert_eq!(
+                snapshot
+                    .items
+                    .iter()
+                    .flat_map(|item| item.tool_calls.iter().flatten())
+                    .count(),
+                index + 1
+            );
+            assert_eq!(
+                write.request().items.len(),
+                1,
+                "new output belongs only to output"
+            );
+        }
+        output.items.push(AiItem::function_call(ToolCall {
+            id: "public-call".into(),
+            name: "client-tool".into(),
+            arguments: "{}".into(),
+        }));
+        let id = write.id().to_owned();
+        let source = crate::generation_chain::GenerationSource::Target(
+            crate::history_marker::ThinkingSource {
+                namespace: "provider:model".into(),
+                protocol: Some(OPEN_RESPONSES_2026_04_24.into()),
+                actual_model: "model".into(),
+                target_id: "provider:model".into(),
+                authority: None,
+                issued: Vec::new(),
+            },
+        );
+        assert!(write.stage(&mut output, &source, None));
+        write.persist().await.unwrap();
+
+        // A fresh cache forces the persisted delta/materialization path.
+        let cold = crate::generation_chain::GenerationChain::from_turn_chain(
+            backend,
+            ttl,
+            None,
+            crate::runtime_cache::RuntimeCache::tinyufo(16 * 1024 * 1024),
+        )
+        .with_history_markers(markers.clone());
+        let mut next = AiRequest::new(
+            "model",
+            vec![AiItem::function_call_output(
+                "public-call",
+                serde_json::json!("client result"),
+            )],
+        );
+        next.meta.source_protocol = Some(OPEN_RESPONSES_2026_04_24);
+        crate::router::stamp_previous_response_id(&mut next, &id);
+        let replay = cold.begin(owner.clone(), next).await.unwrap();
+        assert_eq!(
+            crate::history_marker::history_marker_references(&replay.request().items).len(),
+            3
+        );
+        assert_eq!(
+            replay
+                .request()
+                .items
+                .iter()
+                .flat_map(|item| item.tool_calls.iter().flatten())
+                .count(),
+            1
+        );
+        let mut restored = replay.request().clone();
+        crate::history_marker::resolve_request_markers(markers.as_ref(), &owner, &mut restored)
+            .await
+            .unwrap();
+        for index in 0..3 {
+            let id = format!("hidden-{index}");
+            assert_eq!(
+                restored
+                    .items
+                    .iter()
+                    .flat_map(|item| item.tool_calls.iter().flatten())
+                    .filter(|call| call.id == id)
+                    .count(),
+                1
+            );
+            assert_eq!(
+                restored
+                    .items
+                    .iter()
+                    .filter(|item| item.tool_call_id.as_deref() == Some(id.as_str()))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                restored
+                    .items
+                    .iter()
+                    .filter(
+                        |item| item.output_text_ref() == Some(format!("visible-{index}").as_str())
+                    )
+                    .count(),
+                1
+            );
+            assert_eq!(
+                restored
+                    .items
+                    .iter()
+                    .filter(|item| item.thinking_ref()
+                        == Some((format!("thinking-{index}").as_str(), None)))
+                    .count(),
+                1
+            );
+        }
+        assert_eq!(
+            restored
+                .items
+                .iter()
+                .flat_map(|item| item.tool_calls.iter().flatten())
+                .filter(|call| call.id == "public-call")
+                .count(),
+            1
+        );
+        assert_eq!(
+            restored
+                .items
+                .iter()
+                .filter(|item| item.tool_call_id.as_deref() == Some("public-call"))
+                .count(),
+            1
+        );
+    }
 
     #[test]
     fn platform_followup_keeps_explicit_reasoning_field_without_fake_thinking() {

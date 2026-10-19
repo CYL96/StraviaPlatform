@@ -20,28 +20,14 @@ function isLocale(value: string): value is Locale {
   return SUPPORTED_LOCALES.some((locale) => locale === value)
 }
 
-function detectClientLocale(): Locale {
-  const languages = navigator.languages.length > 0 ? navigator.languages : [navigator.language]
-
-  for (const language of languages) {
-    try {
-      const locale = new Intl.Locale(language).maximize()
-      if (locale.language === 'zh' && locale.script === 'Hans') return 'zh-CN'
-    } catch {
-      // Ignore malformed client locale tags and continue with the next preference.
-    }
-  }
-
-  return 'en-US'
-}
-
 class LocaleState {
   current = $state<Locale>('en-US')
   #desktopSyncReady = false
 
   restore(): void {
-    const saved = localStorage.getItem(LOCALE_STORAGE_KEY)
-    this.set(saved !== null && isLocale(saved) ? saved : detectClientLocale())
+    // app.html 已在解析 head 时按保存值和浏览器偏好选择语言。
+    const initial = document.documentElement.lang
+    this.set(isLocale(initial) ? initial : 'en-US')
   }
 
   set(next: Locale, persist = true): void {

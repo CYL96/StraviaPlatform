@@ -1141,7 +1141,9 @@ async fn acquire_turn(
     drop(span);
     let turn = first_attempt.map_err(model_turn_execute_failure)?;
     if let Some(write) = generation.write.as_mut() {
-        write.observe_effective(effective_request);
+        let client_view =
+            crate::history_marker::client_shaped_request(effective_request, write.request());
+        write.observe_effective(client_view);
     }
     Ok(turn)
 }

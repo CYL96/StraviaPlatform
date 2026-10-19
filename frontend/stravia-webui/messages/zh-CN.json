@@ -111,6 +111,9 @@
 
   "console_chat_resend": "重新发送",
   "console_chat_generating": "正在生成…",
+  "console_chat_processed": "已处理",
+  "console_chat_cancelled": "已取消",
+  "console_chat_failed": "已失败",
   "console_chat_stopped": "已停止",
   "console_chat_completed": "已完成",
   "console_chat_incomplete": "回答未完整",

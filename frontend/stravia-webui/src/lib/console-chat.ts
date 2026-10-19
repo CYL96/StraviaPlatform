@@ -1,4 +1,5 @@
 import { apiKeyAllowsModel, apiKeyReadOnlyReason } from '#lib/connect.js'
+import { createUuid } from '#lib/uuid.js'
 import type {
   ConsoleApiKey,
   ConsoleAssistantMessage,
@@ -317,7 +318,7 @@ export class ConsoleChatController {
     return new Date(this.now()).toISOString()
   }
   private id(): string {
-    return (this.options.createId ?? (() => crypto.randomUUID()))()
+    return (this.options.createId ?? createUuid)()
   }
   private current(): ConsoleConversation | null {
     return this.conversations.find((conversation) => conversation.id === this.currentId) ?? null
@@ -782,6 +783,7 @@ export class ConsoleChatController {
       requestReasoning: { ...request.reasoning },
       outputItems: [],
       partialText: '',
+      elapsedMs: 0,
       createdAt: this.time(),
     }
     const active: ActiveRequest = {
@@ -805,6 +807,7 @@ export class ConsoleChatController {
       return false
     }
     const alive = () => this.active.get(conversation.id) === active && this.conversations.includes(conversation)
+    const elapsed = () => Math.max(0, this.now() - Date.parse(message.createdAt))
     try {
       if (!alive()) return false
       const apiKey = await this.options.catalog.revealKey(conversation.apiKeyId)
@@ -812,6 +815,7 @@ export class ConsoleChatController {
       let terminal = false
       for await (const event of this.options.transport.stream({ apiKey, request, signal: active.abort.signal })) {
         if (!alive()) return false
+        message.elapsedMs = elapsed()
         const generation = active.generation
         if (event.type === 'response.output_text.delta' || event.type === 'response.refusal.delta') {
           generation.text += event.delta ?? ''
@@ -880,6 +884,7 @@ export class ConsoleChatController {
       if (!terminal) throw new Error('Response stream ended before completion')
     } catch (error) {
       if (!alive()) return false
+      message.elapsedMs = elapsed()
       if (active.abort.signal.aborted && !this.storageError) message.status = 'stopped'
       else {
         message.status = 'failed'
@@ -916,6 +921,7 @@ export class ConsoleChatController {
     this.active.delete(id)
     active.abort.abort()
     active.message.status = 'stopped'
+    active.message.elapsedMs = Math.max(0, this.now() - Date.parse(active.message.createdAt))
     active.message.partialText = consoleVisibleText(active.generation.text)
     active.message.partialThinking =
       consoleVisibleText(active.generation.summary) || consoleVisibleText(active.generation.reasoning)

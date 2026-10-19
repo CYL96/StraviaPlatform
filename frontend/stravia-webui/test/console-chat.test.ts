@@ -653,6 +653,50 @@ describe('request and presentation', () => {
 })
 
 describe('stream lifecycle and races', () => {
+  test.each(['completed', 'incomplete', 'stopped', 'failed'] as const)(
+    'elapsed time freezes at %s and survives late events, refresh and later requests',
+    async (status) => {
+      const entered = deferred<void>()
+      const resume = deferred<void>()
+      const h = harness({
+        script: async function* (_, index) {
+          if (index > 0) {
+            h.advance()
+            yield complete('Next answer')
+            return
+          }
+          h.advance()
+          yield { type: 'response.output_text.delta', delta: 'Partial' }
+          entered.resolve()
+          await resume.promise
+          if (status === 'failed') throw new Error('Upstream failed')
+          yield { ...complete(), type: `response.${status === 'stopped' ? 'completed' : status}` }
+        },
+      })
+      await h.controller.start()
+      const pending = h.controller.send('First question')
+      await entered.promise
+      const id = h.controller.snapshot.currentConversationId!
+      expect(h.store.conversations[0].messages[1]).toMatchObject({ elapsedMs: 1000, status: 'stopped' })
+      h.advance()
+      h.advance()
+      if (status === 'stopped') await h.controller.stop()
+      resume.resolve()
+      await pending
+      expect(h.controller.snapshot.currentConversation!.messages[1]).toMatchObject({ elapsedMs: 3000, status })
+      h.advance()
+      await h.controller.send('Next question')
+      expect(h.controller.snapshot.currentConversation!.messages[1]).toMatchObject({ elapsedMs: 3000, status })
+      expect(h.controller.snapshot.currentConversation!.messages[3]).toMatchObject({
+        elapsedMs: 1000,
+        status: 'completed',
+      })
+      const refreshed = harness({ store: h.store })
+      await refreshed.controller.start()
+      refreshed.controller.openConversation(id)
+      expect(refreshed.controller.snapshot.currentConversation!.messages[1]).toMatchObject({ elapsedMs: 3000, status })
+    },
+  )
   test('流式思考在非空 delta 后才显示并保持公开 id 与逐项生命周期', async () => {
     const h = harness({
       script: function* () {

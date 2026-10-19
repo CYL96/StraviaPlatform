@@ -11,6 +11,10 @@ publish = false
 workspace = true
 
 [dependencies]
+stravia-runtime-contract = { workspace = true }
+bytes = { workspace = true }
+http = { workspace = true }
+sse-stream = { workspace = true }
 stravia-web-access-contract = { workspace = true }
 ammonia = { workspace = true }
 anyhow = { workspace = true }

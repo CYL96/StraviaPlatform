@@ -179,6 +179,21 @@ struct ZhipuAdapter {
 
 type ZhipuMcpService = RunningService<RoleClient, InitializeRequestParams>;
 
+/// 创建远程工具的 MCP HTTP 传输，不发起网络请求。
+///
+/// 配置、认证与 SSE 限额遵循 rmcp；连接、协议和正文错误在使用传输时返回。
+/// 构造时绑定当前请求的 Debug 接收端，使后台 worker 和重连仍归属同一请求。
+pub fn mcp_http_transport(
+    client: reqwest::Client,
+    config: StreamableHttpClientTransportConfig,
+) -> impl rmcp::transport::Transport<RoleClient> {
+    let client = crate::mcp_http::Client::new(client);
+    let transport = StreamableHttpClientTransport::with_client(client.clone(), config);
+    let cancellation = transport.cancel_token();
+    client.cancel_on_event_limit(move || cancellation.cancel());
+    transport
+}
+
 #[async_trait::async_trait]
 impl WebProviderAdapter for ZhipuAdapter {
     fn provider_id(&self) -> &str {
@@ -251,7 +266,7 @@ async fn connect_zhipu_mcp(
 ) -> Result<ZhipuMcpService, ProviderFailure> {
     let config = StreamableHttpClientTransportConfig::with_uri(endpoint.to_string())
         .auth_header(api_key.to_string());
-    let transport = StreamableHttpClientTransport::with_client(client.clone(), config);
+    let transport = mcp_http_transport(client.clone(), config);
     let mut client_info = InitializeRequestParams::default();
     client_info.protocol_version = ProtocolVersion::V_2024_11_05;
     client_info
@@ -408,9 +423,18 @@ fn zhipu_transport_failure(message: &str, detail: &str) -> ProviderFailure {
 }
 
 async fn send_json(builder: reqwest::RequestBuilder) -> Result<Value, ProviderFailure> {
-    let response = builder.send().await.map_err(classify_transport_error)?;
+    let (response, exchange) = crate::wire::send(
+        builder,
+        stravia_runtime_contract::wire_debug::current(),
+        "http",
+    )
+    .await
+    .map_err(classify_transport_error)?;
     let status = response.status();
     if !status.is_success() {
+        if let Some(exchange) = &exchange {
+            exchange.gap("http_provider_error_body_not_consumed");
+        }
         return Err(ProviderFailure::new(
             if status.as_u16() == 429 {
                 WebAccessErrorCode::RateLimited
@@ -420,9 +444,10 @@ async fn send_json(builder: reqwest::RequestBuilder) -> Result<Value, ProviderFa
             format!("Web Provider returned HTTP {}", status.as_u16()),
         ));
     }
-    response
-        .json::<Value>()
+    let body = crate::wire::body(response, exchange)
         .await
+        .map_err(classify_transport_error)?;
+    serde_json::from_slice::<Value>(&body)
         .map_err(|_| invalid_response("Web Provider returned invalid JSON"))
 }
 

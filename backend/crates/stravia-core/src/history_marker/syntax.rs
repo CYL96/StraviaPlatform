@@ -851,6 +851,97 @@ pub async fn resolve_request_markers(
     Ok(summary)
 }
 
+/// 对照只属于本次恢复/执行视图，不改写任何已经持久化的历史。
+/// 输入历史的恢复项回到原 Marker；本 run 已投影到最终响应的轮次则只在
+/// output 中表达，不能同时作为 effective input 再落盘。
+pub(crate) fn client_shaped_request(
+    mut model: std::sync::Arc<AiRequest>,
+    client: &AiRequest,
+) -> std::sync::Arc<AiRequest> {
+    let restored = |item: &AiItem| {
+        item.meta
+            .as_ref()
+            .and_then(|meta| meta.get("__stravia_history_marker_restored"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+    };
+    let projected = |item: &AiItem| {
+        item.meta
+            .as_ref()
+            .and_then(|meta| meta.get("__stravia_current_run_projected"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+    };
+    let mut references = Vec::new();
+    for (source_index, item) in client.items.iter().enumerate() {
+        for reference in history_marker_references(std::slice::from_ref(item)) {
+            if !references
+                .iter()
+                .any(|(_, existing)| existing == &reference)
+            {
+                references.push((source_index, reference));
+            }
+        }
+    }
+    if references.is_empty()
+        && !model
+            .items
+            .iter()
+            .any(|item| restored(item) || projected(item))
+    {
+        return model;
+    }
+    let mut insertions = references
+        .into_iter()
+        .enumerate()
+        .map(|(ordinal, (source_index, reference))| {
+            let index = model
+                .items
+                .iter()
+                .position(|item| {
+                    restored(item)
+                        && item
+                            .meta
+                            .as_ref()
+                            .and_then(|meta| meta.get("__stravia_history_marker_reference"))
+                            .and_then(serde_json::Value::as_str)
+                            == Some(reference.as_str())
+                })
+                .map_or(source_index, |anchor| {
+                    model.items[..anchor]
+                        .iter()
+                        .filter(|item| !restored(item) && !projected(item))
+                        .count()
+                });
+            (index, ordinal, reference)
+        })
+        .collect::<Vec<_>>();
+    let request = std::sync::Arc::make_mut(&mut model);
+    request
+        .items
+        .retain(|item| !restored(item) && !projected(item));
+    insertions.sort_by_key(|(index, ordinal, _)| (*index, *ordinal));
+    for (offset, (index, _, reference)) in insertions.into_iter().enumerate() {
+        request.items.insert(
+            index.saturating_add(offset).min(request.items.len()),
+            AiItem::thinking(render_history_marker_reference(&reference), None),
+        );
+    }
+    model
+}
+
+pub(crate) fn mark_current_run_projected(items: &mut [AiItem]) {
+    for item in items {
+        item.meta
+            .get_or_insert_with(Default::default)
+            .insert_extension(
+                "__stravia_current_run_projected",
+                serde_json::Value::Bool(true),
+            )
+            .expect("projection ownership key is not reserved");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

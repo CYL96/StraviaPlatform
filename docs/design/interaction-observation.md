@@ -294,7 +294,13 @@ clear_history() -> ClearHistoryResult
 
 ### 5.2 Debug 原始 Wire 捕获
 
-Debug Trace 只记录四个方向的原始应用协议级收发：Connect Client → Stravia、Stravia → upstream、upstream → Stravia、Stravia → Connect Client。上游 HTTP 在 reqwest 实际请求与响应边界捕获；WebSocket 与客户端方向在各自实际传输边界捕获 handshake 元数据和应用 message。它不记录 TLS、TCP、HTTP/2 frame 或操作系统 packet，也不采集 decoded/restored/effective/canonical request、canonical content/terminal response、Hook 前后、Platform Tool 中间态、Client Projection、delivery terminal 或 stage timing 等语义阶段。
+Debug Trace 只记录四个方向的应用协议级收发：Connect Client → Stravia、Stravia → upstream、upstream → Stravia、Stravia → Connect Client。上游包括模型及平台工具的实际远程调用：reqwest / wreq HTTP、远程 MCP 的 HTTP JSON / SSE，以及浏览器 CDP 能观察到的网络内容。WebSocket 与客户端方向在各自实际传输边界捕获 handshake 元数据和应用 message。它不记录 TLS、TCP、HTTP/2 frame 或操作系统 packet，也不采集 decoded/restored/effective/canonical request、canonical content/terminal response、Hook 前后、Platform Tool 中间态、Client Projection、delivery terminal 或 stage timing 等语义阶段。
+
+平台工具继承调用请求的 Run / Trace；Agent 内嵌调用、嵌套 Agent、并发工具及公开执行转后台后产生的远程输入和返回都进入父请求原有的 Debug 包，不新建工具专属包。Agent 执行流在后续或其他任务中消费时恢复创建时的归属；搜索子任务、MCP worker / 重连和 Chromium 页面会话显式携带该归属，不能依赖共享客户端或事件泵的 task-local，也不能串入另一请求。没有父请求的独立 MCP `generate` / `StraviaRead` 才建立独立观测；生成参考图的远程下载也在其作用域内。导出票据仍是固定水位快照，后台尚未发生的收发需在完成后重新导出，不补写已下载的 ZIP。
+
+HTTP / MCP 在业务解析之前捕获实际请求正文、响应头及已读取的响应字节，包括非成功状态、二进制正文和原始 SSE 分隔符。wreq 的显式重定向逐跳记录；reqwest 自动重定向隐藏的中间跳、业务没有消费的正文或不可回放的请求流无法补造，须标记捕获缺口，不为 Debug 额外读取正文或改变执行结果。Debug 关闭时不复制诊断正文，也不追加浏览器正文读取。
+
+Chromium 记录页面及可归属子 frame / dedicated worker 的请求头、可获得的原始 POST 字节、响应头和 `Network.getResponseBody` 返回的实体正文，而非渲染后的 DOM。CDP 不能还原 HTTP 压缩 / 传输分块，也不能完整捕获浏览器流式分片、WebSocket / WebTransport、重定向正文或可靠归属 shared / service worker；这些限制显式使 Trace 标记 `partial`。正文不可得、页面关闭或读取取消同样标记缺口，不把错误文本、CDP 错误事件或重新编码的 POST 文本冒充远程原始字节。此限制不改变既有 Vendor WebSocket 的捕获。
 
 每条 Wire 记录保留必要的关联元数据，包括适用的 Interaction、Run、Model Turn、Target attempt、方向、协议、transport、顺序与 UTC 时间。既有 Target attempt 身份与生命周期、usage、工具事件、失败与取消继续由普通 Observation 持久化并随 Bundle 导出，不把旧 `target_selected` 迁入普通 Observation，也不复制到 Debug Trace。Debug 原始字节不等待 Canonical Item 收口，普通 Observation 的内容收口也不阻塞 wire 捕获或下游转发。
 

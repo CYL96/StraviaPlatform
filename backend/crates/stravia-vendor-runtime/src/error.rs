@@ -19,9 +19,9 @@ pub enum LoadError {
     CanonicalFormat { actual: u32, expected: u32 },
 }
 
-/// Execution failures expose only host-owned summaries. Guest-provided error
-/// messages and trap text remain available solely as redacted diagnostics in
-/// the host implementation; they are never used as `safe_summary`.
+/// Execution failures format only host-owned summaries. Guest-provided error
+/// messages and trap text are never used as `safe_summary`. Product-owned error
+/// projections may expose upstream diagnostics only after credential redaction.
 #[derive(thiserror::Error)]
 pub enum RuntimeError {
     #[error("{safe_summary}")]

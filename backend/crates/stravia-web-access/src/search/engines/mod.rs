@@ -761,7 +761,11 @@ mod tests {
         search.config = Arc::new(config_with_only(engine));
         let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
         let search_web = web.clone();
-        let handle = tokio::spawn(async move { search_web.search(search, progress_tx).await });
+        let capture = stravia_runtime_contract::wire_debug::current();
+        let handle = tokio::spawn(stravia_runtime_contract::wire_debug::scope(
+            capture,
+            async move { search_web.search(search, progress_tx).await },
+        ));
 
         let mut response = None;
         let mut errors = Vec::new();

@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use rmcp::ServiceExt;
 use rmcp::model::CallToolRequestParams;
-use rmcp::transport::StreamableHttpClientTransport;
+
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use serde_json::Value;
 

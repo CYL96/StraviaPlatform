@@ -86,6 +86,7 @@ struct Fixture {
     received: Mutex<Vec<(String, HeaderMap, Vec<u8>)>>,
     truncated: AtomicBool,
     error_stream: AtomicBool,
+    image_refusal: Mutex<Option<Value>>,
 }
 async fn upstream(
     State(fixture): State<Arc<Fixture>>,
@@ -180,6 +181,13 @@ async fn upstream(
             if request.pointer("/request/generationConfig/responseModalities")
                 == Some(&json!(["IMAGE"]))
             {
+                if let Some(refusal) = fixture.image_refusal.lock().as_ref() {
+                    return (
+                        [("content-type", "text/event-stream")],
+                        format!("data: {refusal}\n\n"),
+                    )
+                        .into_response();
+                }
                 let image = json!({"response":{
                     "candidates":[{"index":0,"content":{"role":"model","parts":[{
                         "inlineData":{"mimeType":"image/png","data":IMAGE_PNG}
@@ -354,6 +362,7 @@ fn artifact() -> std::path::PathBuf {
 
 const IMAGE_PNG: &str =
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+const IMAGE_POLICY_MESSAGE: &str = "Unable to show the generated image. The image was filtered out because it violated Google's [Generative AI Prohibited Use policy](https://policies.google.com/terms/generative-ai/use-policy). You will not be charged for blocked images. Try rephrasing the prompt. If you think this was an error, [send feedback](https://ai.google.dev/gemini-api/docs/troubleshooting).";
 
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires task build:vendors:all"]
@@ -490,6 +499,59 @@ async fn native_images_preserve_selected_model_and_references_at_real_http_bound
         aspect_ratio: None,
         resolution: None,
     };
+    for refusal in [
+        json!({"response":{"candidates":[{"content":{},"finishMessage":IMAGE_POLICY_MESSAGE}],"usageMetadata":{"promptTokenCount":398,"totalTokenCount":398},"modelVersion":"gemini-3.1-flash-image"}}),
+        json!({"response":{"candidates":[{"finishReason":"IMAGE_SAFETY","finishMessage":IMAGE_POLICY_MESSAGE}]}}),
+        json!({"response":{"promptFeedback":{"blockReason":"PROHIBITED_CONTENT","blockReasonMessage":IMAGE_POLICY_MESSAGE}}}),
+    ] {
+        *fixture.image_refusal.lock() = Some(refusal);
+        let error = run(
+            &runtime,
+            &plugin,
+            &services,
+            OperationInput::MediaImage {
+                provider: provider.clone(),
+                request: request.clone(),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.model_error_kind(), Some(AiErrorKind::ContentFiltered));
+        assert_eq!(error.diagnostic_message(), Some(IMAGE_POLICY_MESSAGE));
+    }
+    let failure_message = "The upstream renderer could not complete this image request";
+    *fixture.image_refusal.lock() = Some(json!({"response":{"candidates":[{
+        "finishReason":"OTHER","finishMessage":failure_message
+    }]}}));
+    let error = run(
+        &runtime,
+        &plugin,
+        &services,
+        OperationInput::MediaImage {
+            provider: provider.clone(),
+            request: request.clone(),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.diagnostic_message(), Some(failure_message));
+    assert_ne!(error.model_error_kind(), Some(AiErrorKind::ContentFiltered));
+    *fixture.image_refusal.lock() = Some(
+        json!({"response":{"candidates":[{"content":{},"finishMessage":"The image is still being generated"}]}}),
+    );
+    let error = run(
+        &runtime,
+        &plugin,
+        &services,
+        OperationInput::MediaImage {
+            provider: provider.clone(),
+            request: request.clone(),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.model_error_kind(), Some(AiErrorKind::UnexpectedEof));
+    *fixture.image_refusal.lock() = None;
     fixture.truncated.store(true, Ordering::Relaxed);
     let error = run(
         &runtime,

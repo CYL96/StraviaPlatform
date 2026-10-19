@@ -111,6 +111,9 @@
 
   "console_chat_resend": "Resend",
   "console_chat_generating": "Generating…",
+  "console_chat_processed": "Processed",
+  "console_chat_cancelled": "Cancelled",
+  "console_chat_failed": "Failed",
   "console_chat_stopped": "Stopped",
   "console_chat_completed": "Completed",
   "console_chat_incomplete": "Incomplete response",

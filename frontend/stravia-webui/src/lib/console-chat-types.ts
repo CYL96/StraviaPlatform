@@ -52,6 +52,8 @@ export interface ConsoleAssistantMessage {
   requestReasoning?: ConsoleResponsesRequest['reasoning']
   usage?: ConsoleTokenUsage
   error?: ConsoleChatError
+  /** 本轮客户端处理时长；流式检查点保存截至该次增量的时长，旧历史保持未知。 */
+  elapsedMs?: number
   createdAt: string
 }
 

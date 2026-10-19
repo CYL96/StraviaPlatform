@@ -4,6 +4,11 @@
 
 ### Fixed
 
+- Console Chat, image attachments, and Mermaid diagrams prefer native `crypto.randomUUID`, falling back to `crypto.getRandomValues` only when that API is unavailable. Local identifiers remain cryptographically random UUID v4 values when the management UI is accessed over HTTP.
+- The application shell and document no longer force a large-viewport minimum height over the small viewport, keeping the mobile chat composer above expanded browser toolbars.
+- The management UI declares its selected language before application modules load and opts out of automatic browser translation. Saved-language precedence, first-visit language detection, and in-app language switching are preserved.
+- Media-generation tool failures now return the upstream reason in `error.message` after credential redaction instead of a generic failure. Authentication failures retain safe summaries. Antigravity image-policy refusals, including responses with only `finishMessage`, preserve the refusal and stop without retrying; genuine truncated streams remain retryable. Rebuild and re-import the standalone `antigravity` plugin to update response parsing.
+- Newly written Generation Chain nodes no longer persist live hidden tool rounds both as expanded call/results and as client-projected Markers. Continued requests restore each hidden round once while preserving visible text, thinking, and client-owned tools. Existing history is not rewritten or deduplicated.
 - Transparent injection now always includes basic `StraviaRead` access to owned Artifact downloads and tool-execution queries, without enabling unselected networking or media-understanding capabilities.
 - Generated images now return a 15-minute `download_url` through the configured client access URL, including its deployment prefix. Missing or invalid configuration fails before generation; a later link-issuance failure preserves the stored image and its Artifact reference without regenerating. Existing Provider and S3 transfer policies are unchanged.
 - Client response usage now includes confirmed internal capability calls, including image generation and retries, without counting parent model rounds twice or inventing unknown usage. Existing request history is not rewritten.
@@ -12,7 +17,10 @@
 
 ### Changed
 
+- Debug exports now capture platform-tool remote HTTP, MCP JSON/SSE, and observable Chromium request/response content, including binary and non-success bodies actually read by the transport. Embedded Agent tools, concurrent calls, and background continuations retain the parent request's Debug bundle instead of creating separate tool traces. Standalone MCP generation and reads have their own observations. Authorization-only masking is unchanged; unread bodies and Chromium's decoded-body, streaming, and worker-attribution limits are explicit capture gaps, not fabricated wire data. Existing exports are not backfilled.
 - Ordinary Observation now follows the same Authorization-only filtering rule as Debug wire captures: only actual HTTP `Authorization` header values are masked. Other captured headers, URLs, body and tool content, known-secret literals, and transfer grants may remain in live records, stored history, and exported events, even with Debug off. Treat these records as sensitive. Capture scope, retention, access control, model-side credential protection, process-log and client-error redaction remain unchanged; existing records are not rewritten.
+- Console Chat now shows a live elapsed-time line before the first response text and throughout generation, freezing it as completed, cancelled, failed, or incomplete when the turn ends. Saved timings survive history reloads; older conversations without timings remain unchanged. Removed the duplicate completed label from the usage footer.
+- Console Chat and message editing now use Enter to send and Ctrl+Enter to insert a newline at the selection. Cmd+Enter and Shift+Enter also insert newlines; IME composition, held Enter, and an already-running turn do not submit another message.
 
 ## [0.5.2] - 2026-10-18
 

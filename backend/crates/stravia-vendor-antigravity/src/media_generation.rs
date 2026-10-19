@@ -127,6 +127,18 @@ impl ImageStream {
             return Err(error);
         }
         let mut inner = value.get_mut("response").map(Value::take).unwrap_or(value);
+        if let Some(reason) = inner
+            .pointer("/promptFeedback/blockReason")
+            .and_then(Value::as_str)
+            .filter(|reason| policy_reason(reason))
+        {
+            let message = inner
+                .pointer("/promptFeedback/blockReasonMessage")
+                .and_then(Value::as_str)
+                .filter(|message| !message.is_empty())
+                .unwrap_or(reason);
+            return Err(common::model_error(AiErrorKind::ContentFiltered, message));
+        }
         if let Some(candidates) = inner.get("candidates").and_then(Value::as_array) {
             if candidates.len() > 1 {
                 return Err(upstream("Antigravity returned multiple image candidates"));
@@ -143,6 +155,27 @@ impl ImageStream {
                 if self.terminal {
                     return Err(upstream(
                         "Antigravity image data followed its finish reason",
+                    ));
+                }
+                let message = candidate
+                    .get("finishMessage")
+                    .and_then(Value::as_str)
+                    .filter(|message| !message.is_empty());
+                let policy_finish = candidate
+                    .get("finishReason")
+                    .and_then(Value::as_str)
+                    .filter(|reason| policy_reason(reason));
+                // 此公开拒绝有时只有 finishMessage，没有 finishReason。
+                let policy_message = message.is_some_and(|message| {
+                    message.contains("The image was filtered out because it violated Google's")
+                        && message.contains("Generative AI Prohibited Use policy")
+                });
+                if policy_finish.is_some() || policy_message {
+                    return Err(common::model_error(
+                        AiErrorKind::ContentFiltered,
+                        message
+                            .or(policy_finish)
+                            .unwrap_or("Antigravity image generation was blocked by policy"),
                     ));
                 }
                 for part in candidate
@@ -164,9 +197,7 @@ impl ImageStream {
                     .filter(|reason| !reason.is_empty())
                 {
                     if reason != "STOP" {
-                        return Err(upstream(
-                            "Antigravity image generation did not finish successfully",
-                        ));
+                        return Err(upstream(message.unwrap_or(reason)));
                     }
                     self.terminal = true;
                 }
@@ -206,6 +237,20 @@ impl ImageStream {
             usage: self.usage,
         })
     }
+}
+
+fn policy_reason(reason: &str) -> bool {
+    matches!(
+        reason,
+        "SAFETY"
+            | "RECITATION"
+            | "BLOCKLIST"
+            | "PROHIBITED_CONTENT"
+            | "SPII"
+            | "IMAGE_SAFETY"
+            | "IMAGE_PROHIBITED_CONTENT"
+            | "IMAGE_RECITATION"
+    )
 }
 
 fn decode_image(inline: &Value) -> Result<MediaArtifact, PluginError> {

@@ -5,9 +5,11 @@ mod browser;
 pub mod fetch;
 pub mod http_client;
 pub mod local;
+mod mcp_http;
 mod outbound;
 pub mod remote;
 pub mod search;
+mod wire;
 
 pub use browser::{resolve_browser_executable, validate_browser_executable};
 pub use outbound::parse_cli_proxy;

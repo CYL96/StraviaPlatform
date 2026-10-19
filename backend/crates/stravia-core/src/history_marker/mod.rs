@@ -13,17 +13,17 @@ use stravia_runtime_contract::protocol::ir::ToolCall;
 
 pub(crate) use rejections::{ReasoningRejections, RejectedReasoning, protected_payload_digest};
 pub use sql::SqlHistoryMarkerStore;
-#[cfg(test)]
-pub(crate) use syntax::render_text_projection_span;
 pub use syntax::{
     HISTORY_MARKER_PREFIX, MarkerResolution, PROJECTION_DELIMITER_PREFIX,
     history_marker_references, render_history_marker, resolve_request_markers,
 };
 pub(crate) use syntax::{
-    new_reference, render_history_marker_reference, render_preview_projection_end,
-    render_preview_projection_span, render_preview_projection_start,
+    client_shaped_request, mark_current_run_projected, new_reference,
+    render_preview_projection_end, render_preview_projection_span, render_preview_projection_start,
     request_needs_marker_resolution, valid_reference,
 };
+#[cfg(test)]
+pub(crate) use syntax::{render_history_marker_reference, render_text_projection_span};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

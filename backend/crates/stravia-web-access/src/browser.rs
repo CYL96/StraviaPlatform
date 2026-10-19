@@ -7,6 +7,7 @@ mod cdp;
 mod egress;
 mod process;
 mod stealth;
+mod wire;
 
 use cdp::Cdp;
 pub use process::{resolve_browser_executable, validate_browser_executable};
@@ -39,6 +40,7 @@ struct Chrome {
 struct Targets {
     sessions: parking_lot::Mutex<HashMap<String, Result<String, String>>>,
     documents: parking_lot::Mutex<HashMap<(String, String), Document>>,
+    wire: wire::Wire,
     changed: Notify,
 }
 
@@ -192,6 +194,9 @@ impl Chrome {
                         let Some(event) = event else { break };
                         match event["method"].as_str().unwrap_or_default() {
                             "Target.attachedToTarget" => {
+                                if let (Some(parent), Some(child)) = (event["sessionId"].as_str(), event["params"]["sessionId"].as_str()) {
+                                    event_targets.wire.inherit(parent, child);
+                                }
                                 let cdp = event_cdp.clone();
                                 let targets = event_targets.clone();
                                 let ua = ua.clone();
@@ -212,6 +217,7 @@ impl Chrome {
                             }
                             "Target.detachedFromTarget" => {
                                 if let Some(session) = event["params"]["sessionId"].as_str() {
+                                    event_targets.wire.detach(session);
                                     event_targets.sessions.lock().retain(|_, value| value.as_ref().is_ok_and(|id| id != session));
                                     event_targets.documents.lock().retain(|(id, _), _| id != session);
                                     event_targets.changed.notify_waiters();
@@ -253,6 +259,16 @@ impl Chrome {
                                     }
                                 });
                             }
+                            "Network.loadingFinished" => {
+                                if let Some(body) = event_targets.wire.finish(&event) {
+                                    let cdp = event_cdp.clone();
+                                    handlers.spawn(async move { body.read(cdp).await; });
+                                }
+                            }
+                            "Network.requestWillBeSent" | "Network.responseReceived" | "Network.loadingFailed" |
+                            "Network.requestWillBeSentExtraInfo" | "Network.responseReceivedExtraInfo" => {
+                                event_targets.wire.event(&event);
+                            }
                             _ => {}
                         }
                     }
@@ -275,6 +291,7 @@ impl Chrome {
     }
 
     async fn page(&self) -> anyhow::Result<Page> {
+        let capture = stravia_runtime_contract::wire_debug::current();
         let cdp = self.cdp.clone();
         let context = self.context.clone();
         let targets = self.targets.clone();
@@ -305,6 +322,9 @@ impl Chrome {
                     let result = targets.sessions.lock().get(&page.target).cloned();
                     if let Some(result) = result {
                         page.session = result.map_err(anyhow::Error::msg)?;
+                        if let Some(capture) = capture {
+                            targets.wire.own(&page.session, capture);
+                        }
                         return Ok::<_, anyhow::Error>(page);
                     }
                     tokio::select! {
@@ -757,6 +777,18 @@ mod tests {
                                 let request = String::from_utf8_lossy(&request);
                                 let raw_url = request.split_whitespace().nth(1).unwrap_or_default();
                                 let Ok(url) = url::Url::parse(raw_url) else { return };
+                                if url.path() == "/wire-echo" {
+                                    let length = request.lines().find_map(|line| {
+                                        let (name, value) = line.split_once(':')?;
+                                        name.eq_ignore_ascii_case("content-length").then(|| value.trim().parse::<usize>().ok()).flatten()
+                                    }).unwrap_or_default();
+                                    let mut body = vec![0; length];
+                                    if stream.read_exact(&mut body).await.is_err() { return; }
+                                    let headers = format!("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+                                    let _ = stream.write_all(headers.as_bytes()).await;
+                                    let _ = stream.write_all(&body).await;
+                                    return;
+                                }
                                 if url.path() == "/pending.js" {
                                     std::future::pending::<()>().await;
                                 }
@@ -818,6 +850,70 @@ mod tests {
             failure_expression: None,
             timeout: Duration::from_secs(20),
             request_guard: None,
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct WireRecords {
+        events: Arc<parking_lot::Mutex<Vec<stravia_runtime_contract::wire_debug::WireEvent>>>,
+        changed: Arc<Notify>,
+    }
+
+    impl stravia_runtime_contract::wire_debug::WireSink for WireRecords {
+        fn record(&self, event: stravia_runtime_contract::wire_debug::WireEvent) {
+            self.events.lock().push(event);
+            self.changed.notify_waiters();
+        }
+        fn gap(&self, _: &'static str) {}
+    }
+
+    #[tokio::test]
+    #[ignore = "requires installed Chrome/Chromium; set STRAVIA_CHROME_PATH when not on a standard path"]
+    async fn chrome_wire_bytes_are_owned_by_concurrent_pages() {
+        use stravia_runtime_contract::wire_debug::{scope, Capture};
+        let private = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fixture = Fixture::start(private.local_addr().unwrap()).await;
+        let runtime = BrowserRuntime::new(fixture.config.clone());
+        let browser = runtime.browser().await.unwrap();
+        let first = WireRecords::default();
+        let second = WireRecords::default();
+        let exercise = |sink: WireRecords, marker: u8| {
+            let browser = browser.clone();
+            async move {
+                scope(Some(Capture::new(sink.clone())), async {
+                    let page = browser.page().await.unwrap();
+                    page.navigate_and_render("http://93.184.216.34/wire-page", "body", None).await.unwrap();
+                    let script = format!("fetch('/wire-echo',{{method:'POST',body:new Uint8Array([0,255,{marker}])}}).then(r=>r.arrayBuffer())");
+                    page.cdp.call(Some(&page.session), "Runtime.evaluate", json!({
+                        "expression": script, "awaitPromise": true, "returnByValue": true
+                    })).await.unwrap();
+                    tokio::time::timeout(Duration::from_secs(5), async {
+                        loop {
+                            let changed = sink.changed.notified();
+                            tokio::pin!(changed);
+                            changed.as_mut().enable();
+                            if sink.events.lock().iter().any(|event| event.url.ends_with("/wire-echo") && event.message_type == "body_chunk" && event.payload.as_ref() == [0, 255, marker]) { break; }
+                            changed.await;
+                        }
+                    }).await.unwrap();
+                    page.close().await.unwrap();
+                }).await;
+            }
+        };
+        tokio::join!(exercise(first.clone(), 17), exercise(second.clone(), 29));
+        for (sink, marker, other) in [(first, 17, 29), (second, 29, 17)] {
+            let records = sink.events.lock();
+            assert!(records.iter().any(|event| event.message_type == "request"
+                && event.url.ends_with("/wire-echo")
+                && event.payload.as_ref() == [0, 255, marker]));
+            assert!(!records
+                .iter()
+                .any(|event| event.payload.as_ref() == [0, 255, other]));
+            assert!(records
+                .iter()
+                .any(|event| event.message_type == "body_chunk"
+                    && event.url.ends_with("/wire-page")
+                    && event.payload.as_ref() == b"<html><body>waiting forever</body></html>"));
         }
     }
 

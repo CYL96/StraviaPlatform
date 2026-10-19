@@ -14,6 +14,7 @@ import { formatLogTime, formatNumber } from '#lib/format.js'
 import * as m from '#lib/paraglide/messages.js'
 import ConsoleChatActions from '#lib/components/console-chat-actions.svelte'
 import ConsoleChatComposer from '#lib/components/console-chat-composer.svelte'
+import ConsoleResponseProgress from '#lib/components/console-response-progress.svelte'
 import ConversationMessage from '#lib/components/conversation-message.svelte'
 import ObservationActivity from '#lib/components/observation-activity.svelte'
 import DesktopPortNotice from '#lib/components/desktop-port-notice.svelte'
@@ -308,9 +309,15 @@ async function submitEdit(id: string) {
                       if (event.key === 'Escape') {
                         event.preventDefault()
                         editingId = null
-                      } else if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
+                      } else if (event.key === 'Enter') {
                         event.preventDefault()
-                        void submitEdit(message.id)
+                        if (event.ctrlKey || event.metaKey || event.shiftKey) {
+                          const input = event.currentTarget as HTMLTextAreaElement
+                          input.setRangeText('\n', input.selectionStart, input.selectionEnd, 'end')
+                          input.dispatchEvent(new Event('input', { bubbles: true }))
+                        } else if (!event.repeat) {
+                          void submitEdit(message.id)
+                        }
                       }
                     }} />
 
@@ -357,6 +364,9 @@ async function submitEdit(id: string) {
             {@const live = generation && message === lastMessage}
             {@const blocks = live ? (generation.blocks ?? []) : consoleAssistantBlocks(message)}
             <ConversationMessage label={m.console_chat_assistant_response()}>
+              {#if live || message.elapsedMs !== undefined}
+                <ConsoleResponseProgress {message} active={Boolean(live)} />
+              {/if}
               {#each blocks as block (block.id)}
                 {#if block.kind === 'thinking'}
                   <ObservationActivity
@@ -433,10 +443,12 @@ async function submitEdit(id: string) {
                     {#if usage?.cacheWriteTokens !== undefined}<span
                         >{m.console_chat_cache_write_tokens({ count: formatNumber(usage.cacheWriteTokens) })}</span
                       >{/if}
-                    {#if message.status === 'stopped'}<span role="status">{m.console_chat_stopped()}</span
-                      >{:else if message.status === 'incomplete'}<span role="status">{m.console_chat_incomplete()}</span
-                      >{:else if message.status === 'completed'}<span role="status">{m.console_chat_completed()}</span
-                      >{/if}
+                    {#if message.elapsedMs === undefined}
+                      {#if message.status === 'stopped'}<span role="status">{m.console_chat_stopped()}</span
+                        >{:else if message.status === 'incomplete'}<span role="status"
+                          >{m.console_chat_incomplete()}</span
+                        >{/if}
+                    {/if}
                   </div>
                 </div>{/if}
             </ConversationMessage>

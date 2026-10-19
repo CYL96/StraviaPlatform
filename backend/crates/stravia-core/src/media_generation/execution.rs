@@ -129,29 +129,6 @@ pub(crate) async fn generate(
         input.input.prompt.clone(),
         references,
     );
-    normalize_references(
-        gateway,
-        &principal,
-        &mut observation_request,
-        &cancellation,
-        deadline,
-    )
-    .await?;
-    let references = materialize_references(
-        gateway,
-        &principal,
-        &observation_request,
-        &cancellation,
-        deadline,
-    )
-    .await?;
-    let request = MediaImageRequest {
-        prompt: input.input.prompt,
-        references,
-        aspect_ratio: input.input.aspect_ratio,
-        resolution: input.input.resolution,
-    };
-
     let inherited = crate::interaction_observation::scope::current();
     let standalone = inherited.is_none();
     let observer = inherited.unwrap_or_else(|| {
@@ -176,7 +153,7 @@ pub(crate) async fn generate(
                     ingress_protocol: "mcp".into(),
                 },
                 AdmissionFacts {
-                    client_request: Arc::new(observation_request),
+                    client_request: Arc::new(observation_request.clone()),
                     has_new_user: true,
                     has_matching_pending_tool_result: false,
                     generation_root_id: None,
@@ -184,20 +161,45 @@ pub(crate) async fn generate(
                 },
             )
     });
-    let mut context = VendorCallContext::new(
-        cancellation,
-        stravia_runtime_contract::Deadline::fixed(deadline),
-    );
-    context.observer = Some(observer.clone());
-    let result = generate_image(
-        gateway,
-        &route,
-        request,
-        principal,
-        deadline,
-        context,
-        &download_settings,
-    )
+    let result = crate::interaction_observation::scope::scope(Some(observer.clone()), async {
+        normalize_references(
+            gateway,
+            &principal,
+            &mut observation_request,
+            &cancellation,
+            deadline,
+        )
+        .await?;
+        let references = materialize_references(
+            gateway,
+            &principal,
+            &observation_request,
+            &cancellation,
+            deadline,
+        )
+        .await?;
+        let request = MediaImageRequest {
+            prompt: input.input.prompt,
+            references,
+            aspect_ratio: input.input.aspect_ratio,
+            resolution: input.input.resolution,
+        };
+        let mut context = VendorCallContext::new(
+            cancellation,
+            stravia_runtime_contract::Deadline::fixed(deadline),
+        );
+        context.observer = Some(observer.clone());
+        generate_image(
+            gateway,
+            &route,
+            request,
+            principal,
+            deadline,
+            context,
+            &download_settings,
+        )
+        .await
+    })
     .await;
     if standalone {
         observer.finish(crate::interaction_observation::RunOutcome {
@@ -228,6 +230,10 @@ async fn generate_image(
     download_settings: &stravia_runtime_contract::artifact::ArtifactSettings,
 ) -> Result<(Value, tokio::sync::OwnedRwLockReadGuard<()>), GenerationError> {
     let cancellation = context.cancellation.clone();
+    let secrets = context
+        .observer
+        .as_ref()
+        .map(crate::interaction_observation::RunObserver::protected_secrets);
     let execution = gateway
         .execute_vendor_route(
             &principal,
@@ -236,7 +242,7 @@ async fn generate_image(
             context,
         )
         .await
-        .map_err(|error| vendor_route_error(error, &cancellation, deadline))?;
+        .map_err(|error| vendor_route_error(error, &cancellation, deadline, secrets.as_ref()))?;
     let response = match execution.output {
         OperationOutput::MediaImage(response) => response,
         _ => {
@@ -558,6 +564,7 @@ fn vendor_route_error(
     error: anyhow::Error,
     cancellation: &CancellationToken,
     deadline: Instant,
+    secrets: Option<&crate::interaction_observation::ProtectedSecrets>,
 ) -> GenerationError {
     match error.downcast_ref::<stravia_vendor_runtime::RuntimeError>() {
         Some(stravia_vendor_runtime::RuntimeError::Cancelled)
@@ -571,6 +578,27 @@ fn vendor_route_error(
             ..
         }) => deadline_error(),
         _ if cancellation.is_cancelled() || Instant::now() >= deadline => interruption(deadline),
+        Some(stravia_vendor_runtime::RuntimeError::Plugin {
+            kind: kind @ stravia_vendor_sdk::ErrorKind::Upstream(_),
+            diagnostic_message,
+            upstream_status,
+            ..
+        }) if !matches!(upstream_status, Some(401 | 403))
+            && !matches!(
+                kind.model_error_kind(),
+                Some(
+                    stravia_runtime_contract::protocol::ir::AiErrorKind::AuthenticationError
+                        | stravia_runtime_contract::protocol::ir::AiErrorKind::AuthorizationError
+                )
+            )
+            && !diagnostic_message.trim().is_empty() =>
+        {
+            let mut message = crate::interaction_observation::redact_text(diagnostic_message);
+            if let Some(secrets) = secrets {
+                secrets.text(&mut message);
+            }
+            GenerationError::new("upstream_generation_failed", message)
+        }
         _ => GenerationError::new(
             "upstream_generation_failed",
             "Upstream image generation failed",

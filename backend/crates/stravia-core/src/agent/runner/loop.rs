@@ -138,20 +138,23 @@ impl AgentRunner {
         use tracing::Instrument as _;
         let parent = tracing::Span::current();
         let driver = stream::once(
-            crate::rpm::scope_root_request(root_request, async move {
-                let terminal = match runner
-                    .execute(input, commit_policy, resolved, &events, observation)
-                    .await
-                {
-                    Ok(result) if result.completion == AgentCompletion::Completed => {
-                        AgentEvent::Completed(result)
-                    }
-                    Ok(result) => AgentEvent::Partial(result),
-                    Err(error) => AgentEvent::Failed { error },
-                };
-                let _ = events.send(terminal).await;
-                None::<AgentEvent>
-            })
+            crate::rpm::scope_root_request(
+                root_request,
+                crate::interaction_observation::scope::scope(observation.clone(), async move {
+                    let terminal = match runner
+                        .execute(input, commit_policy, resolved, &events, observation)
+                        .await
+                    {
+                        Ok(result) if result.completion == AgentCompletion::Completed => {
+                            AgentEvent::Completed(result)
+                        }
+                        Ok(result) => AgentEvent::Partial(result),
+                        Err(error) => AgentEvent::Failed { error },
+                    };
+                    let _ = events.send(terminal).await;
+                    None::<AgentEvent>
+                }),
+            )
             .instrument(parent),
         )
         .filter_map(futures::future::ready);

@@ -410,6 +410,249 @@ async fn enabled_registry() -> AgentDefinitionRegistry {
     registry
 }
 
+#[tokio::test]
+async fn deferred_concurrent_agents_export_tool_wire_in_their_parent_debug_bundles()
+-> anyhow::Result<()> {
+    use crate::interaction_observation::{
+        AdmissionFacts, BundleRequest, BundleResourceKind, ForestQuery, IngressStart,
+        InteractionObservation, RunOutcome, RunStart,
+    };
+    use std::io::Read;
+    use stravia_runtime_contract::hook::{PlatformTool, PlatformToolError, ToolExecutionContext};
+
+    struct RemoteTool(Arc<stravia_web_access::LocalWeb>);
+
+    #[async_trait]
+    impl PlatformTool for RemoteTool {
+        fn id(&self) -> ToolId {
+            ToolId::new("echo")
+        }
+
+        fn external_name(&self) -> &str {
+            "echo"
+        }
+
+        fn parameters(&self) -> Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        fn parallel_safe(&self) -> bool {
+            true
+        }
+
+        async fn execute(
+            &self,
+            arguments: Value,
+            _context: ToolExecutionContext,
+        ) -> Result<Value, PlatformToolError> {
+            let request = axum::http::Request::builder()
+                .method("POST")
+                .uri(arguments["url"].as_str().unwrap())
+                .body(arguments["marker"].as_str().unwrap().as_bytes().to_vec())
+                .map_err(|error| PlatformToolError::new(error.to_string()))?;
+            let (_, body) = self
+                .0
+                .http_client()
+                .fetch(request.into())
+                .await
+                .map_err(|error| PlatformToolError::new(error.to_string()))?;
+            Ok(Value::String(String::from_utf8(body).unwrap()))
+        }
+    }
+
+    let directory = tempfile::tempdir()?;
+    let pool = crate::test_support::migrated_sqlite_pool().await?;
+    let observation = InteractionObservation::new(
+        Some(pool.clone()),
+        None,
+        directory.path().to_path_buf(),
+        1,
+        true,
+        crate::generation_chain::test_chain().await,
+        Some(Arc::new(tokio::sync::Mutex::new(()))),
+    )
+    .await;
+    observation.set_debug_enabled(true);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let url = format!("http://{}/tool", listener.local_addr()?);
+    let barrier = Arc::new(tokio::sync::Barrier::new(4));
+    let app = axum::Router::new().route(
+        "/tool",
+        axum::routing::post(move |body: axum::body::Bytes| {
+            let barrier = barrier.clone();
+            async move {
+                barrier.wait().await;
+                format!("remote:{}", std::str::from_utf8(&body).unwrap())
+            }
+        }),
+    );
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let web = Arc::new(stravia_web_access::LocalWeb::new(
+        stravia_web_access::OutboundProxyMode::Direct,
+    )?);
+    let mut drivers = Vec::new();
+    let mut observers = Vec::new();
+    for owner in ["agent-a", "agent-b"] {
+        let observer = observation
+            .observe_ingress(IngressStart {
+                id: owner.into(),
+                method: "POST".into(),
+                path: "/v1/responses".into(),
+                protocol: "responses".into(),
+            })
+            .admit(
+                RunStart {
+                    id: owner.into(),
+                    principal: "owner".into(),
+                    api_key_id: None,
+                    api_key_name: None,
+                    route_id: "agent".into(),
+                    model_display_name: None,
+                    ingress_protocol: "responses".into(),
+                },
+                AdmissionFacts {
+                    client_request: AiRequest::new("agent", Vec::new()).into(),
+                    has_new_user: true,
+                    has_matching_pending_tool_result: false,
+                    generation_root_id: None,
+                    generation_parent_id: None,
+                },
+            );
+        let mut tool_response = AiResponse::new("tools", "model-1");
+        tool_response.extend_tool_calls((0..2).map(|index| {
+            ToolCall {
+                id: format!("call-{index}").into(),
+                name: "echo".into(),
+                arguments: serde_json::json!({
+                    "url": url,
+                    "marker": format!("{owner}-{index}"),
+                })
+                .to_string(),
+            }
+        }));
+        tool_response.stop_reason = Some("tool_calls".into());
+        let mut final_response = AiResponse::new("done", "model-1");
+        final_response.push_output_text(r#"{"answer":"done"}"#);
+        let runner = AgentRunner::new(
+            enabled_registry().await,
+            Arc::new(crate::agent::InMemoryModelTurnExecutor::scripted([
+                tool_response,
+                final_response,
+            ])),
+            vec![Arc::new(crate::agent::PlatformToolAgentAdapter::new(
+                Arc::new(RemoteTool(web.clone())),
+                1,
+            ))],
+            Arc::new(crate::turn_chain::test_store().await),
+        )?;
+        // 请求接收与后台驱动位于不同任务，不能依赖消费者恰好还在原 task-local 中。
+        let events = crate::interaction_observation::scope::scope(Some(observer.clone()), async {
+            runner.run(AgentInput {
+                principal: Principal::new("owner"),
+                definition_id: AgentDefinitionId::new("research"),
+                parent_turn_id: None,
+                prompt: owner.into(),
+                artifacts: Vec::new(),
+                cancellation: CancellationToken::new(),
+            })
+        })
+        .await;
+        drivers.push(events);
+        observers.push(observer);
+    }
+    for observer in &observers {
+        observer.finish(RunOutcome {
+            client_output_committed: true,
+            delivery: None,
+            delivery_completed_at: None,
+            status: "completed".into(),
+            terminal_reason: None,
+            generation_node_id: None,
+            generation_root_id: None,
+        });
+    }
+    // 父请求已结束；后台消费不能把后续远程字节丢掉或转到新的 Trace。
+    let drivers = drivers
+        .into_iter()
+        .map(|events| tokio::spawn(async move { events.collect::<Vec<_>>().await }))
+        .collect::<Vec<_>>();
+    for driver in drivers {
+        let events = tokio::time::timeout(Duration::from_secs(10), driver).await??;
+        assert!(
+            matches!(events.last(), Some(AgentEvent::Completed(_))),
+            "{events:?}"
+        );
+    }
+    observation.flush().await?;
+    let forest = observation.query_forest(ForestQuery::default()).await?;
+    assert_eq!(
+        forest.roots.len(),
+        2,
+        "tools must not create separate roots"
+    );
+    let mut captured_owners = std::collections::BTreeSet::new();
+    for root in forest.roots {
+        let interaction = &root.interactions[0];
+        let ticket = observation
+            .issue_bundle_ticket(BundleRequest {
+                kind: BundleResourceKind::Interaction,
+                resource_id: interaction.id.clone(),
+                through_sequence: Some(forest.snapshot_sequence),
+            })
+            .await?;
+        let token = ticket.download_url.rsplit('/').next().unwrap();
+        let mut stream = observation.consume_bundle_ticket(token).await?;
+        let mut bytes = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            bytes.extend_from_slice(&chunk?);
+        }
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes))?;
+        let mut records = Vec::<Value>::new();
+        for index in 0..zip.len() {
+            let mut entry = zip.by_index(index)?;
+            if entry.name()?.ends_with("events.jsonl") {
+                let mut text = String::new();
+                entry.read_to_string(&mut text)?;
+                records.extend(
+                    text.lines()
+                        .map(serde_json::from_str::<Value>)
+                        .collect::<Result<Vec<_>, _>>()?,
+                );
+            }
+        }
+        let owner = records.first().expect("remote wire in parent bundle")["run_id"]
+            .as_str()
+            .unwrap();
+        assert!(captured_owners.insert(owner.to_owned()));
+        assert!(records.iter().all(|record| record["run_id"] == owner));
+        for index in 0..2 {
+            let request = format!("{owner}-{index}");
+            let response = format!("remote:{request}");
+            assert!(records.iter().any(|record| {
+                record["direction"] == "upstream_request" && record["payload"] == request
+            }));
+            assert!(records.iter().any(|record| {
+                record["direction"] == "upstream_response" && record["payload"] == response
+            }));
+        }
+        let other = if owner == "agent-a" {
+            "agent-b"
+        } else {
+            "agent-a"
+        };
+        assert!(!records.iter().any(|record| {
+            record["payload"]
+                .as_str()
+                .is_some_and(|payload| payload.contains(other))
+        }));
+    }
+    assert_eq!(captured_owners, ["agent-a".into(), "agent-b".into()].into());
+    server.abort();
+    observation.shutdown().await;
+    pool.close().await;
+    Ok(())
+}
+
 fn request_session_fingerprint(request: &AiRequest) -> String {
     crate::generation_chain::generation_session_fingerprint(request)
         .expect("Agent Model Turn must carry a generation session")

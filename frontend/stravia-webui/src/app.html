@@ -1,9 +1,34 @@
 <!doctype html>
-<html lang="en-US">
+<html lang="en-US" translate="no">
   <head>
     <meta charset="utf-8" />
+    <script>
+      // 在应用模块加载前声明界面语言，避免浏览器先按英文启动自动翻译。
+      {
+        const saved = localStorage.getItem('stravia-locale')
+        let language = 'en-US'
+        if (saved === 'en-US' || saved === 'zh-CN') {
+          language = saved
+        } else {
+          const languages = navigator.languages.length > 0 ? navigator.languages : [navigator.language]
+          for (const preference of languages) {
+            try {
+              const locale = new Intl.Locale(preference).maximize()
+              if (locale.language === 'zh' && locale.script === 'Hans') {
+                language = 'zh-CN'
+                break
+              }
+            } catch {
+              // 忽略非法语言标签，继续读取下一项偏好。
+            }
+          }
+        }
+        document.documentElement.lang = language
+      }
+    </script>
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="application-name" content="Stravia" />
+    <meta name="google" content="notranslate" />
     <meta name="theme-color" content="#426581" />
     <link rel="icon" href="%sveltekit.assets%/stravia-favicon.svg" type="image/svg+xml" sizes="any" />
     %sveltekit.head%
