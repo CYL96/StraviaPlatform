@@ -1,0 +1,11 @@
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -27,7 +27,7 @@
+ pub fn convert_lockfile_to_nix_expression(contents: String, options: Options) -> Result<String> {
+     let lockfile = contents.parse::<Lockfile>()?;
+ 
+-    if lockfile.lockfile_version != 1 {
++    if !matches!(lockfile.lockfile_version, 1 | 2) {
+         return Err(Error::UnsupportedLockfileVersion(lockfile.lockfile_version));
+     };
+ 

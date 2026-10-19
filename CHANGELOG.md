@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Added
+
+- Added a source-built Linux Server flake with embedded production WebUI and base Wasm vendor, locked offline build dependencies, and a `services.stravia` NixOS module. The service owns deployment flags and persistent directory permissions while the application retains its writable database/cache configuration and existing setup flow. Chromium remains optional; the existing devenv workflow is unchanged.
+
 ### Fixed
 
 - Console Chat, image attachments, and Mermaid diagrams prefer native `crypto.randomUUID`, falling back to `crypto.getRandomValues` only when that API is unavailable. Local identifiers remain cryptographically random UUID v4 values when the management UI is accessed over HTTP.
