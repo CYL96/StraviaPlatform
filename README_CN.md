@@ -74,6 +74,8 @@ docker run --rm \
 
 也可从 Releases 下载对应平台压缩包（请先对照 `SHA256SUMS` 校验）。
 
+**Nix / NixOS（仅 Linux Server）：** 在仓库根目录运行 `nix build .#stravia-server`，或导入 `nixosModules.default` 并启用 `services.stravia`。见 [Nix 部署说明](docs/design/architecture.md#nix-server-与-nixos-服务)。
+
 **已有实例升级：** 先停机并备份完整数据目录及外部数据库。路由输出用途迁移会使 **全部历史 Route 在逐条重新配置前不可执行**，SQLite 与 PostgreSQL 相同。见[升级与恢复说明](docs/design/media-generation.md#4-route-与-codex-接入)；回退须恢复备份。
 
 **首次启动（两种形态相同）：**

@@ -234,6 +234,48 @@ PostgreSQL 16 通过 `devenv up postgres` 启动，只监听本地 Unix socket�
 
 进入 shell 不自动安装工作区依赖或启动服务；环境只提供 Docker 客户端，Docker daemon、测试浏览器和桌面图形会话仍需单独准备。
 
+### Nix Server 与 NixOS 服务
+
+根 `flake.nix` 只打包 Linux Server，提供 `x86_64-linux`、`aarch64-linux` 的 `packages.<system>.stravia-server` 和同一包的 `default`。生产 WebUI、i18n 和基础 Wasm Vendor 均从同次源码生成并嵌入，不读取工作区已有的 `dist`、`node_modules` 或 `target`。不提供 Desktop、开发 shell、Home Manager 或 overlay；上面的 devenv 工作流保持独立。
+
+需启用 Nix 的 `nix-command` 与 `flakes` 特性，无需安装 devenv。从 Git checkout 的仓库根目录运行：
+
+```bash
+nix build .#stravia-server
+nix run . -- --help
+nix run . -- --data-dir "$HOME/.local/share/stravia-server"
+```
+
+`nix run` 保留 Server 原有 CLI、默认 loopback 监听和首次设置流程；不是自动创建管理员的安装器。首次构建会下载固定来源的工具链与依赖，后续编译在 sandbox 内离线执行。`flake.lock` 与 `devenv.lock` 分别锁定发行包和开发环境，不会自动同步。不通过 `path:.` 将开发数据和凭据纳入 flake。
+
+NixOS 系统 flake 在现有 `inputs` 中加入 `stravia.url = "github:Stravia-AI/StraviaPlatform";`，并将 `stravia.nixosModules.default` 加入系统的 `modules` 列表。最小服务配置为：
+
+```nix
+services.stravia.enable = true;
+```
+
+仅导入模块不启动服务。默认 unit 为 `stravia.service`，使用静态非 root `stravia` 用户/组，监听 `127.0.0.1:23471`，不开放防火墙。`/var/lib/stravia` 是 `0700` 的持久根；首次设置写入的 `server.toml` 为 `0600`。`/run/stravia` 仅为临时工作目录，避免误读调用者仓库的 `.env`；`HOME` 指向持久根。
+
+首次部署运行 `journalctl -u stravia.service -b`，安全取得一次性 setup token，再打开现有 `/setup` 完成设置。journal 的读取权限属于敏感运维边界，不应分享包含 token 的日志。`systemctl` 显示服务已启动不等于应用完成初始化；存活与就绪分别使用 `/healthz`、`/readyz`。
+
+完整字段、类型、默认值及反向代理示例见 [Server flake 字段设计](../research/server-flake-design.md#8-nixos-service-字段设计)。关键边界：
+
+- `host` 与 `openFirewall` 独立；后者只允许对应 TCP 端口，不改变监听地址，也不生成 TLS 或反向代理。公开部署须单独配置 HTTPS、精确的 `adminOrigins` 与实际 `trustedProxies`；默认不信任 loopback 代理。
+- `dataDir` 默认使用 `StateDirectory`，自定义路径通过系统 tmpfiles 创建并设置根目录的归属和权限，应用 unit 不执行提权的目录初始化命令；自定义用户/组须由调用者声明。修改身份或路径不会迁移已有数据，升级前仍须停止并备份实例。
+- 模块持有进程参数，应用持有可写 `server.toml`；不提供声明式数据库、Redis 或管理员凭据字段。`configFile` 为绝对运行时路径字符串，文件和父目录必须支持应用的原子替换，不可指向 store 或只读 secret。数据库/缓存契约见[统一派生缓存与 Server 配置](#统一派生缓存与-server-配置)。
+- `environment` 只放非秘密值；与具名部署参数、`HOME` 或已配置的 `browserPackage` 冲突时求值失败。`environmentFile` 也是绝对运行时路径字符串，指定文件缺失时启动失败；文件内容不进入 store，但环境变量不是安全凭据接口。保留的 `STRAVIA_*` 部署变量在载入文件后移除，`HOME`/浏览器冲突使启动失败。
+- 需要本机浏览器能力时设置 `services.stravia.browserPackage = pkgs.chromium;`，由其主程序设置 `STRAVIA_CHROME_PATH`。基础 Server 包不依赖 Chromium，也不关闭 Chromium sandbox、Wasm JIT、TLS 或 SSRF 检查。其他 unit/PATH 调整使用原生 `systemd.services.stravia`，不另设 `extraArgs` 覆盖具名字段。
+
+更新 `bun.lock` 或 workspace patch 后，在仓库根目录执行以下维护与检查命令；生成的 `nix/bun.nix` 不手工编辑：
+
+```bash
+nix run .#update-bun-deps
+nix build .#checks.x86_64-linux.bun-lock
+nix build .#checks.x86_64-linux.service
+```
+
+锁定的 bun2nix 使用局部补丁接受格式兼容的 Bun lockfile v2，仍拒绝 v3；不降级或重写 `bun.lock` 的版本标记。`bun-lock` 检查重新生成依赖表达式并比较；`service` 检查在隔离 NixOS VM 中启动真实包，要求 builder 具备 VM/KVM 支持。`nix flake check --all-systems --no-build` 只证明各架构可求值，不能代替相应平台的构建与运行验证。
+
 ### 共享出站代理配置与独立选择
 
 设置页维护共享代理地址及绕过规则，不再提供全局启用开关。`outbound_proxy` 是 settings 中一行 JSON（`url`、`bypass`、`force_http1`）：一次 PUT 提交完整配置，一次读取取得完整快照，验证或持久化失败保留原配置。URL 为空表示尚未配置；非空仅接受可用的 `http`、`https`、`socks5`、`socks5h` 代理地址。保存和使用边界均拒绝未知 scheme，不静默改为直连；错误不回显可能含凭据的 URL，保存并不检查代理在线或认证成功。Core reqwest 的 `socks5` 在本机解析目标，`socks5h` 将目标域名交给代理解析；LocalWeb 保留 ADR-0026 的既有代理侧 DNS 策略（其 `socks5` 规范化为 `socks5h`），不据此推断 Core 的 DNS 行为。读取迁移留下的非法旧 URL 不阻断管理编辑，使用时仍须校验并失败关闭。

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Added
+
+- Added a source-built Linux Server flake with embedded production WebUI and base Wasm vendor, locked offline build dependencies, and a `services.stravia` NixOS module. The service owns deployment flags and persistent directory permissions while the application retains its writable database/cache configuration and existing setup flow. Chromium remains optional; the existing devenv workflow is unchanged.
+
 ## [0.5.2] - 2026-10-18
 
 ### Added
