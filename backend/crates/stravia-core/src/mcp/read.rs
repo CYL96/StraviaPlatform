@@ -940,6 +940,21 @@ impl PlatformTool for ReadTool {
     fn execution_limit(&self) -> Option<Duration> {
         Some(Duration::from_secs(15 * 60))
     }
+    fn execution_policy(
+        &self,
+        arguments: &Value,
+    ) -> stravia_runtime_contract::hook::PlatformExecutionPolicy {
+        use stravia_runtime_contract::hook::PlatformExecutionPolicy;
+        if self.internal {
+            PlatformExecutionPolicy::Synchronous
+        } else {
+            match is_execution_query(arguments) {
+                Ok(true) => PlatformExecutionPolicy::Query,
+                Ok(false) => PlatformExecutionPolicy::Bounded,
+                Err(_) => PlatformExecutionPolicy::Synchronous,
+            }
+        }
+    }
     async fn execute(
         &self,
         arguments: Value,
@@ -954,20 +969,11 @@ impl PlatformTool for ReadTool {
         arguments: Value,
         context: ToolExecutionContext,
     ) -> Result<PlatformToolOutput, PlatformToolError> {
-        if self.internal || is_execution_query(&arguments)? {
-            return self.read(arguments, context).await;
+        if self.internal {
+            self.read(arguments, context).await
+        } else {
+            self.read_standalone(arguments, context).await
         }
-        let source = crate::tool_execution::ExecutionSource::InferenceRun(context.run_id.clone());
-        let tool = self.clone();
-        self.gateway
-            .execute_public_tool(
-                self,
-                arguments,
-                context,
-                source,
-                move |arguments, context| async move { tool.read(arguments, context).await },
-            )
-            .await
     }
 }
 
@@ -1022,7 +1028,7 @@ impl McpTool for ReadTool {
         arguments: Value,
         context: &McpContext,
     ) -> Result<McpToolOutput, McpToolError> {
-        let (cancellation, _) = context.execution().unwrap_or_else(|| {
+        let (cancellation, deadline) = context.execution().unwrap_or_else(|| {
             (
                 CancellationToken::new(),
                 Instant::now() + Duration::from_secs(900),
@@ -1037,26 +1043,19 @@ impl McpTool for ReadTool {
             cancellation,
             progress: None,
         };
-        let result = match is_execution_query(&arguments) {
-            Err(error) => Err(error),
-            Ok(true) => self.read(arguments, context).await,
-            Ok(false) => {
-                let tool = self.clone();
-                self.gateway
-                    .execute_public_tool(
-                        self,
-                        arguments,
-                        context,
-                        crate::tool_execution::ExecutionSource::Mcp,
-                        move |arguments, context| async move {
-                            tool.read_standalone(arguments, context).await
-                        },
-                    )
-                    .await
-            }
-        };
+        let result = crate::tool_execution::scope_request(
+            deadline,
+            self.gateway.dispatch_platform_tool(
+                Arc::new(self.clone()),
+                arguments,
+                context,
+                crate::tool_execution::ExecutionSource::Mcp,
+            ),
+        )
+        .await;
         match result {
-            Ok(result) => {
+            Ok(delivery) => {
+                let result = delivery.output;
                 let (value, _) =
                     crate::hook::tool::blocks_to_value(result.content).map_err(|error| {
                         McpToolError::new("result_encoding_failed", error.to_string())

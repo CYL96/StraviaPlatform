@@ -622,15 +622,21 @@ Request Hook 完成后、首次 Target 选择前，`CacheAffinity` 先按 Princi
 
 `StreamTransformer` 只接收 canonical 语义 delta，支持 `Pass`、`Emit`、`Hold`、`Replace`、`Drop`，并可在 `flush/close` 返回语义事件。核心维护 message/response lifecycle、usage、Done、StreamError 和 PlatformTool owner/ID；transformer 不能伪造或改写这些结构事件。核心统计每个 session 的 buffered bytes 和 delayed events，超过 descriptor 上限即失败。
 
-每个客户端 response leg 独立打开并关闭 transformer。结束、取消、错误均 flush/close；首字节前失败返回错误，首字节后仅终止当前流。纯平台 tool hidden rounds 仍复用同一客户端 SSE，最终只编码一个合法终止序列；不同 provider round 的 usage 在最终响应中聚合。混合 tool 在返回客户端后挂起 run，不能把已结束 leg 的未 flush 缓冲带入下一 HTTP 响应。
+每个客户端 response leg 独立打开并关闭 transformer。结束、取消、错误均 flush/close；首字节前失败返回错误，首字节后仅终止当前流。纯平台 tool hidden rounds 仍复用同一客户端 SSE，最终只编码一个合法终止序列；不同 provider round 的 usage 在最终响应中聚合。混合 tool 交付后结束当前客户端 leg；后续请求以新的 Inference Run 恢复 Marker，不能把已结束 leg 的未 flush 缓冲带入下一 HTTP 响应。
 
-### 4.7 PlatformTool 与 continuation
+### 4.7 Platform Tool Execution 与隐藏历史
 
 `PlatformToolRegistry` 保存稳定内部 `ToolId`、provider-safe 显示名称/schema 和 executor。Request hook 只能以 `ExposeTool(ToolId)` 暴露已注册工具，不能删除客户端工具、注入临时闭包或按显示名取得所有权。provider 返回 tool calls 后核心先分类 platform/client owner；platform call/result 永不进入 `ClientOutput`，但模型最终自然语言可以引用结果。
 
-仅 Platform Tool 的参数在实际执行边界解析为合法 JSON 后按响应顺序串行执行。客户端工具参数作为不透明字符串交付，响应 Hook 的只读字段校验不得因其空串或非法 JSON 拒绝整轮响应；解析与执行责任属于客户端。既有凭据保护与 Hook 主动修改参数的校验仍生效。
+`tool_execution` module 提供统一调用与查询 interface，并为 History Marker 提供不可复制的准备／交付阶段句柄。它复用已注册工具声明的执行策略，集中拥有原子 claim、持久 owner／lease、原始绝对 deadline、并行安全执行门、取消与持久交接仲裁、终态写入及查询唤醒。领域工具只做实际工作，不在实现内包裹公开执行，不按 ToolId 规避嵌套取门。内部 Agent 基础工具保持原有同步内容契约。
 
-领域错误、参数错误、panic 和执行失败都变成 `is_error` 的 canonical `PlatformToolResult` 并送回 provider，客户端取消会停止工具和续跑。当前 run 只缓存成功的 `(ToolId, call ID, arguments)` 结果，失败不缓存。纯平台 turn 在当前请求内隐式续跑；混合 turn 只向客户端返回 client calls 与可见内容，并保存内存 continuation。恢复请求必须一次提交全部预期 client tool results；缺失、重复、额外或上下文不匹配 fail-closed，单一 continuation 同时只能被一个请求 claim。默认 TTL 一小时，可由 builder 覆盖；状态不写数据库，进程退出/重启后丢失。
+Platform Tool 参数在实际执行边界解析为合法 JSON；客户端工具参数仍作为不透明字符串交付，由客户端解析与执行。执行门允许并行安全工具共享读门，非并行安全工具独占写门；查询原执行不嵌套取得执行门，也不创建后台查询任务。领域错误、参数错误、panic 和执行失败形成 `is_error` 的 canonical `PlatformToolResult`。
+
+`generate` 与外部 `StraviaRead` 使用工具声明的同步等待窗口，缺省 60 秒，涵盖排队与输入准备。窗口内保留原结果或错误；窗口耗尽后，只有持久交接提交成功才返回稳定执行引用。创建、排队、交接和查询沿用原始 deadline。Marker 已发布不代表后台接管：交接提交前原请求断开且取消获胜时，保存明确取消结果；提交后即使引用未送达，执行也独立继续。本地取消不保证上游停止或停止计费。
+
+Client Projection／Delivery 保持 Marker 持久化、实际交付、Sent 确认与 publish 顺序，具备必要交付事实后才启动领域工作。纯平台轮次在当前请求内隐式续跑；混合轮次向客户端返回公开调用，隐藏调用由一对一 Marker 恢复。ToolResult Hook 只处理所属 Inference Run 的本次交付；Marker 固定保存 Hook 处理后的结果或系统确定的取消结果，不被后台最终结果覆盖。其他无法完成的交付处理明确失败，不回退为未经 Hook 处理的成功；后台完成不持有或重建旧 Hook 会话。
+
+公开执行结果独立于来源诊断和 Marker 交付结果；清理 Observation 不取消已交接执行、不使有效引用失效。终态按既有历史保留时长独立保留，查询不续期，Artifact 仍按自身生命周期管理。进程中断形成明确中断结果，不自动接管或重放。具体契约见 [ADR-0082](../adr/0082-expose-queryable-tool-executions-after-bounded-wait.md) 与[媒体生成](media-generation.md#公开工具的等待与执行引用)。
 
 ### 4.8 Generation Chain 与 Responses response-chain
 
@@ -1154,6 +1160,8 @@ SQLite 与 PostgreSQL 以冻结的 `0001_baseline.sql` 为受支持起点，后�
 Core 的 `build.rs` 显式跟踪整个 `migrations/` 目录，使新增迁移也能触发增量构建重新嵌入；仅依赖 `sqlx::migrate!` 对已有文件的跟踪不能发现新增文件。`0015_history_retention_indexes` 在两后端将父边索引扩展为 `(parent_id, principal, kind)`，并增加内容引用的 `(node_id, principal)` 索引，使外键删除检查按完整关系定位，避免清理每个节点时反复扫描同一 Principal 的全部历史并长时间占用 SQLite 写锁。迁移只调整索引，不改变历史、保留期、身份或会话契约。
 
 `0020_observation_retention_indexes` 在两后端补齐 Interaction/Run 自引用父边、待完成工具、尾部来源与 Target attempt 的清理外键索引，并将两类观测到期索引扩展为 `(expires_at, id)`。周期清理每批独立提交最多 100 条 Rejected Request 与 100 条非运行中过期 Interaction，SQLite 写协调器随批次释放；writer 逐批失效已删除的归属与实时状态。后批失败保留已提交进度并显式报错，不增加锁超时或自动重试；手动清除及用量持久化屏障保持原有边界。详见 [保留与清理](interaction-observation.md#64-保留与清理)。
+
+`0024_independent_tool_execution_retention` 在两个后端解除公开执行对来源 Observation 的生命周期依赖，删除来源清理触发器、fence、移除队列及 lifetime view。`terminal_at` 记录实际判定终态的时刻，`retention_started_at` 记录结果保留起点，`expires_at` 只约束终态结果；运行中仍由原 deadline 与 owner／lease 保护。升级仅保留旧规则下仍可查询的引用及结果，从迁移时刻给予完整历史保留窗口；旧终态的 `terminal_at` 保持 NULL，不把迁移起点或后来 publish 的时间伪造成完成时间。已失效或已删除的结果不复活。
 
 迁移仍由单一数据库连接持有互斥锁并按阶段执行 SQL，不并发 schema 变更或 SQLite 写事务。历史每批最多 100 个节点，按节点 ID 游标推进并集中读取旧引用；JSON 还原、摘要、envelope 编码和批次唯一内容压缩交给有界 blocking worker。观测每批最多 200 条，旧表在转换期间建立 `(run_id, sequence)` 索引，生命周期合并只查询对应事件种类；批量解码与 manifest 导出使用同样的有界并发，worker 数随可用处理器确定，最多 8 个。事件合并按 sequence 串行执行，同批中被合并修改的旧行必须重读，不能把过期快照写回。每批数据库改动原子提交，失败只回滚当前批次，重启继续未完成数据；所有转换成功后才清理旧结构。日志记录迁移阶段、累计完成条数与总耗时，不记录历史正文、身份或诊断路径。
 

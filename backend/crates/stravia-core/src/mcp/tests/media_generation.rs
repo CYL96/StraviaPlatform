@@ -1307,6 +1307,7 @@ async fn cancellation_stops_an_accepted_generation_without_retry() {
         .unwrap();
     assert!(output.is_error);
     assert_eq!(output.structured_content["error"]["code"], "cancelled");
+
     assert_eq!(fixture.requests.lock().len(), 1);
 }
 

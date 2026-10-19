@@ -465,7 +465,9 @@ writer 在每批提交后立即失效对应的实时状态和归属索引；后�
 
 “清除历史记录”只删除非活动 Interaction 与 Rejected Request；`running` 和 `waiting_client` 保留，并在结果中报告跳过数量。清理不取消 Inference Run。
 
-公开 Tool Execution 是此诊断隔离规则的局部例外：非 MCP 执行以来源 Inference Run 身份关联保留，不要求普通诊断行成功写入。实际删除来源 Run 的同一事务写入不可撤销的来源清理 fence、隔离 backing History Marker 的迟到完成并删除公开引用；提交后取消所属本地执行并唤醒查询等待者。周期到期与手动清理使用相同数据库触发器，不因后台工具尚在运行而额外保护来源。普通诊断缺失或写入失败不是清理，不能取消执行；清理不删除独立 Artifact 或仍合法保留的隐藏历史。MCP 不关联伪造的来源 Run，公开引用沿用历史保留期；查询不续期。
+公开 Tool Execution 与其他执行事实一样独立于诊断生命周期。来源 Inference Run 关联只用于诊断；周期到期或手动清理 Observation 不取消已交接执行、不删除仍有效的执行引用或结果，也不因后台工作而保护来源诊断。普通诊断缺失或写入失败只造成诊断缺口，不是执行取消证据。SQLite／PostgreSQL 配对迁移 `0024_independent_tool_execution_retention` 删除旧来源清理触发器及 fence；执行仍保留 owner／lease、原始 deadline 和终态不可覆盖保护。
+
+执行完成、失败或被判定中断时，从该终态时刻按 `log_retention_days` 独立保留结果；查询不续期，来源诊断剩余寿命不缩短结果寿命。Marker 的本次交付结果、Generation Chain 与独立 Artifact 各自保留，不随执行记录回收而级联删除。升级前仍可查询的旧终态结果以迁移时刻另起完整保留窗口，不伪造未知的实际完成时间，也不恢复已失效或已删除事实。取消与交接分界见 [ADR-0082](../adr/0082-expose-queryable-tool-executions-after-bounded-wait.md)。
 
 “清除 Debug 数据”关闭活动 writer 后删除全部受管目录并清空进程内索引。活动 Run 的 Trace 停止并标记 `debug_data_cleared` partial；请求记录、Rejected Request 与 Debug 开关状态不变，后续准入的 Run 继续正常捕获。
 

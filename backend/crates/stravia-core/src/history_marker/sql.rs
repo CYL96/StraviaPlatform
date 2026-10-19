@@ -118,17 +118,16 @@ impl SqlHistoryMarkerStore {
 
     async fn row(
         &self,
-        principal: &Principal,
+        principal: &str,
         reference: &str,
     ) -> Result<Option<MarkerRow>, HistoryMarkerError> {
-        let principal = principal.continuation_key();
         let result = match self {
             Self::Sqlite(pool) => sqlx::query_as::<_, MarkerRow>(
                 "SELECT reference, kind, activity, call_payload, segment_payload, execution_state, \
          execution_owner, lease_expires_at, execution_deadline, published_at, expires_at \
          FROM history_markers WHERE principal = ? AND reference = ? AND (expires_at > ? OR EXISTS \
-         (SELECT 1 FROM public_tool_execution_lifetimes p WHERE p.marker_reference = history_markers.reference AND p.source_kind = 'inference_run' AND p.retained_until > ?)) \
-         AND NOT EXISTS (SELECT 1 FROM public_tool_execution_lifetimes p WHERE p.marker_reference = history_markers.reference AND p.retained_until <= ?)",
+         (SELECT 1 FROM public_tool_executions p WHERE p.marker_reference = history_markers.reference AND (p.expires_at IS NULL OR p.expires_at > ?))) \
+         AND NOT EXISTS (SELECT 1 FROM public_tool_executions p WHERE p.marker_reference = history_markers.reference AND p.expires_at <= ?)",
             )
             .bind(principal)
             .bind(reference)
@@ -141,8 +140,8 @@ impl SqlHistoryMarkerStore {
                 "SELECT reference, kind, activity, call_payload, segment_payload, execution_state, \
          execution_owner, lease_expires_at, execution_deadline, published_at, expires_at \
          FROM history_markers WHERE principal = $1 AND reference = $2 AND (expires_at > $3 OR EXISTS \
-         (SELECT 1 FROM public_tool_execution_lifetimes p WHERE p.marker_reference = history_markers.reference AND p.source_kind = 'inference_run' AND p.retained_until > $3)) \
-         AND NOT EXISTS (SELECT 1 FROM public_tool_execution_lifetimes p WHERE p.marker_reference = history_markers.reference AND p.retained_until <= $3)",
+         (SELECT 1 FROM public_tool_executions p WHERE p.marker_reference = history_markers.reference AND (p.expires_at IS NULL OR p.expires_at > $3))) \
+         AND NOT EXISTS (SELECT 1 FROM public_tool_executions p WHERE p.marker_reference = history_markers.reference AND p.expires_at <= $3)",
             )
             .bind(principal)
             .bind(reference)
@@ -175,7 +174,7 @@ impl SqlHistoryMarkerStore {
                     separated.push_bind(reference);
                 }
                 separated.push_unseparated(") AND (expires_at > ");
-                query.push_bind(now).push(" OR EXISTS (SELECT 1 FROM public_tool_execution_lifetimes p WHERE p.marker_reference = history_markers.reference AND p.source_kind = 'inference_run' AND p.retained_until > ").push_bind(now).push(")) AND NOT EXISTS (SELECT 1 FROM public_tool_execution_lifetimes p WHERE p.marker_reference = history_markers.reference AND p.retained_until <= ").push_bind(now).push(")");
+                query.push_bind(now).push(" OR EXISTS (SELECT 1 FROM public_tool_executions p WHERE p.marker_reference = history_markers.reference AND (p.expires_at IS NULL OR p.expires_at > ").push_bind(now).push("))) AND NOT EXISTS (SELECT 1 FROM public_tool_executions p WHERE p.marker_reference = history_markers.reference AND p.expires_at <= ").push_bind(now).push(")");
                 query.build_query_as::<MarkerRow>().fetch_all(pool).await
             }
             Self::Postgres(pool) => {
@@ -186,7 +185,7 @@ impl SqlHistoryMarkerStore {
                     separated.push_bind(reference);
                 }
                 separated.push_unseparated(") AND (expires_at > ");
-                query.push_bind(now).push(" OR EXISTS (SELECT 1 FROM public_tool_execution_lifetimes p WHERE p.marker_reference = history_markers.reference AND p.source_kind = 'inference_run' AND p.retained_until > ").push_bind(now).push(")) AND NOT EXISTS (SELECT 1 FROM public_tool_execution_lifetimes p WHERE p.marker_reference = history_markers.reference AND p.retained_until <= ").push_bind(now).push(")");
+                query.push_bind(now).push(" OR EXISTS (SELECT 1 FROM public_tool_executions p WHERE p.marker_reference = history_markers.reference AND (p.expires_at IS NULL OR p.expires_at > ").push_bind(now).push("))) AND NOT EXISTS (SELECT 1 FROM public_tool_executions p WHERE p.marker_reference = history_markers.reference AND p.expires_at <= ").push_bind(now).push(")");
                 query.build_query_as::<MarkerRow>().fetch_all(pool).await
             }
         };
@@ -217,7 +216,7 @@ impl SqlHistoryMarkerStore {
 
     async fn interrupt_if_stale(
         &self,
-        principal: &Principal,
+        principal: &str,
         reference: &str,
     ) -> Result<(), HistoryMarkerError> {
         let Some(row) = self.row(principal, reference).await? else {
@@ -269,7 +268,6 @@ impl SqlHistoryMarkerStore {
         };
         let payload = serde_json::to_string(&segment)
             .map_err(|error| HistoryMarkerError::Storage(error.to_string()))?;
-        let principal = principal.continuation_key();
         match self {
             Self::Sqlite(pool) => {
                 sqlx::query(
@@ -412,34 +410,13 @@ impl HistoryMarkerStore for SqlHistoryMarkerStore {
         let id = stravia_runtime_contract::identifier::new_id();
         let principal = principal.continuation_key();
         let now = Self::now();
-        let expires = Self::after(now, input.retention);
+        let retention_ms = i64::try_from(input.retention.as_millis()).unwrap_or(i64::MAX);
         if input.deadline_unix_ms <= now {
             return Err(HistoryMarkerError::TerminalConflict);
         }
         backend!(self, pool, {
             let mut tx = pool.begin().await.map_err(storage)?;
-            if let Some(source) = &input.source_run_id {
-                // This row serializes creation with actual source deletion, even
-                // when the ordinary diagnostic write was missing or failed.
-                let removed: i32 = sqlx::query_scalar(
-                    "INSERT INTO tool_execution_sources(source_run_id, removed, expires_at) VALUES ($1, 0, $2) \
-                     ON CONFLICT(source_run_id) DO UPDATE SET removed = tool_execution_sources.removed \
-                     RETURNING CASE WHEN removed <> 0 OR (expires_at <= $3 AND NOT EXISTS \
-                     (SELECT 1 FROM inference_run_observations WHERE id = $1)) THEN 1 ELSE 0 END",
-                )
-                .bind(source)
-                .bind(expires)
-                .bind(now)
-                .fetch_one(&mut *tx)
-                .await
-                .map_err(storage)?;
-                if removed != 0 {
-                    return Err(HistoryMarkerError::TerminalConflict);
-                }
-            }
-            // Lock source before marker, matching the deletion trigger. Marker
-            // creation may have waited after acceptance; never extend that
-            // original execution deadline by the time storage took.
+            // Preserve the original absolute acceptance deadline.
             sqlx::query(
                 "UPDATE history_markers SET execution_deadline = CASE WHEN execution_deadline < $1 \
                  THEN execution_deadline ELSE $1 END WHERE reference = $2 AND principal = $3 AND kind = 'platform'",
@@ -452,15 +429,15 @@ impl HistoryMarkerStore for SqlHistoryMarkerStore {
             .map_err(storage)?;
             let updated = sqlx::query(
                 "INSERT INTO public_tool_executions \
-                 (id, marker_reference, principal, source_kind, source_run_id, process_id, expires_at) \
+                 (id, marker_reference, principal, source_kind, source_run_id, process_id, retention_ms) \
                  SELECT $1, reference, principal, $2, $3, $4, $5 FROM history_markers \
-                 WHERE reference = $6 AND principal = $7 AND kind = 'platform' AND expires_at > $8 AND execution_deadline > $8 AND execution_fenced = 0",
+                 WHERE reference = $6 AND principal = $7 AND kind = 'platform' AND execution_state IN ('pending', 'running') AND expires_at > $8 AND execution_deadline > $8",
             )
             .bind(&id)
             .bind(if input.source_run_id.is_some() { "inference_run" } else { "mcp" })
             .bind(&input.source_run_id)
             .bind(process_id())
-            .bind(expires)
+            .bind(retention_ms)
             .bind(marker_reference)
             .bind(&principal)
             .bind(Self::now())
@@ -471,18 +448,6 @@ impl HistoryMarkerStore for SqlHistoryMarkerStore {
             if updated != 1 {
                 return Err(HistoryMarkerError::TerminalConflict);
             }
-            // MCP uses history retention; source-owned markers are protected
-            // from history expiry only while their public association exists.
-            sqlx::query(
-                "UPDATE history_markers SET expires_at = CASE WHEN expires_at > $1 THEN expires_at ELSE $1 END \
-                 WHERE reference = $2 AND principal = $3",
-            )
-            .bind(if input.source_run_id.is_some() { now } else { expires })
-            .bind(marker_reference)
-            .bind(&principal)
-            .execute(&mut *tx)
-            .await
-            .map_err(storage)?;
             tx.commit().await.map_err(storage)?;
         });
         Ok(id)
@@ -496,8 +461,8 @@ impl HistoryMarkerStore for SqlHistoryMarkerStore {
         let key = principal.continuation_key();
         let reference: Option<String> = backend!(self, pool, {
             sqlx::query_scalar(
-                "SELECT marker_reference FROM public_tool_execution_lifetimes WHERE id = $1 AND principal = $2 \
-                 AND retained_until > $3",
+                "SELECT marker_reference FROM public_tool_executions WHERE id = $1 AND principal = $2 \
+                 AND (expires_at IS NULL OR expires_at > $3)",
             )
             .bind(id)
             .bind(&key)
@@ -512,12 +477,11 @@ impl HistoryMarkerStore for SqlHistoryMarkerStore {
         let Some(marker) = self.resolve(principal, &reference).await? else {
             return Ok(None);
         };
-        // Recheck after resolving: cleanup may have fenced the marker while
-        // stale-state resolution was in flight.
+        // Recheck expiry after resolving a stale owner into a terminal result.
         let exists: i64 = backend!(self, pool, {
             sqlx::query_scalar(
-                "SELECT COUNT(*) FROM public_tool_execution_lifetimes WHERE id = $1 AND principal = $2 \
-                 AND retained_until > $3",
+                "SELECT COUNT(*) FROM public_tool_executions WHERE id = $1 AND principal = $2 \
+                 AND (expires_at IS NULL OR expires_at > $3)",
             )
             .bind(id)
             .bind(&key)
@@ -554,7 +518,7 @@ impl HistoryMarkerStore for SqlHistoryMarkerStore {
             let updated = sqlx::query(
                 "UPDATE public_tool_executions SET handed_off_at = COALESCE(handed_off_at, $1) \
                  WHERE id = $2 AND principal = $3 AND id IN \
-                 (SELECT id FROM public_tool_execution_lifetimes WHERE retained_until > $1)",
+                 (SELECT id FROM public_tool_executions WHERE expires_at IS NULL OR expires_at > $1)",
             )
             .bind(Self::now())
             .bind(id)
@@ -593,19 +557,23 @@ impl HistoryMarkerStore for SqlHistoryMarkerStore {
     }
 
     async fn recover_public_executions(&self) -> Result<(), HistoryMarkerError> {
-        backend!(self, pool, {
+        let interrupted: Vec<(String, String)> = backend!(self, pool, {
             // Reuse the existing stale-owner transition and payload construction.
             // No owner from another process may finish or reclaim these markers.
-            sqlx::query(
+            sqlx::query_as(
                 "UPDATE history_markers SET execution_state = 'running', lease_expires_at = 0, \
                  execution_owner = NULL WHERE execution_state IN ('pending', 'running') \
-                 AND reference IN (SELECT marker_reference FROM public_tool_executions WHERE process_id <> $1)",
+                 AND reference IN (SELECT marker_reference FROM public_tool_executions WHERE process_id <> $1) \
+                 RETURNING principal, reference",
             )
             .bind(process_id())
-            .execute(pool)
+            .fetch_all(pool)
             .await
-            .map_err(storage)?;
+            .map_err(storage)?
         });
+        for (principal, reference) in interrupted {
+            self.interrupt_if_stale(&principal, &reference).await?;
+        }
         Ok(())
     }
 
@@ -702,8 +670,9 @@ impl HistoryMarkerStore for SqlHistoryMarkerStore {
         principal: &Principal,
         reference: &str,
     ) -> Result<Option<ResolvedHistoryMarker>, HistoryMarkerError> {
-        self.interrupt_if_stale(principal, reference).await?;
-        let Some(row) = self.row(principal, reference).await? else {
+        self.interrupt_if_stale(&principal.continuation_key(), reference)
+            .await?;
+        let Some(row) = self.row(&principal.continuation_key(), reference).await? else {
             return Ok(None);
         };
         Self::decode_resolved(&row).map(Some)
@@ -746,7 +715,8 @@ impl HistoryMarkerStore for SqlHistoryMarkerStore {
         if owner_id.trim().is_empty() || lease.is_zero() {
             return Err(HistoryMarkerError::InvalidPayload);
         }
-        self.interrupt_if_stale(principal, reference).await?;
+        self.interrupt_if_stale(&principal.continuation_key(), reference)
+            .await?;
         let now = Self::now();
         let lease_expires_at = Self::after(now, lease);
         let principal_key = principal.continuation_key();
@@ -755,8 +725,8 @@ impl HistoryMarkerStore for SqlHistoryMarkerStore {
                 "UPDATE history_markers SET execution_state = 'running', execution_owner = ?, \
      lease_expires_at = ?, updated_at = ? WHERE principal = ? AND reference = ? \
      AND kind = 'platform' AND execution_state = 'pending' AND execution_deadline > ? \
-     AND (expires_at > ? OR EXISTS (SELECT 1 FROM public_tool_execution_lifetimes p WHERE p.marker_reference = history_markers.reference AND p.source_kind = 'inference_run' AND p.retained_until > ?)) AND execution_fenced = 0 \
-     AND NOT EXISTS (SELECT 1 FROM public_tool_execution_lifetimes p WHERE p.marker_reference = history_markers.reference AND p.retained_until <= ?)",
+     AND (expires_at > ? OR EXISTS (SELECT 1 FROM public_tool_executions p WHERE p.marker_reference = history_markers.reference AND (p.expires_at IS NULL OR p.expires_at > ?))) \
+     AND NOT EXISTS (SELECT 1 FROM public_tool_executions p WHERE p.marker_reference = history_markers.reference AND p.expires_at <= ?)",
             )
             .bind(owner_id)
             .bind(lease_expires_at)
@@ -775,8 +745,8 @@ impl HistoryMarkerStore for SqlHistoryMarkerStore {
                 "UPDATE history_markers SET execution_state = 'running', execution_owner = $1, \
      lease_expires_at = $2, updated_at = $3 WHERE principal = $4 AND reference = $5 \
      AND kind = 'platform' AND execution_state = 'pending' AND execution_deadline > $3 \
-     AND (expires_at > $3 OR EXISTS (SELECT 1 FROM public_tool_execution_lifetimes p WHERE p.marker_reference = history_markers.reference AND p.source_kind = 'inference_run' AND p.retained_until > $3)) AND execution_fenced = 0 \
-     AND NOT EXISTS (SELECT 1 FROM public_tool_execution_lifetimes p WHERE p.marker_reference = history_markers.reference AND p.retained_until <= $3)",
+     AND (expires_at > $3 OR EXISTS (SELECT 1 FROM public_tool_executions p WHERE p.marker_reference = history_markers.reference AND (p.expires_at IS NULL OR p.expires_at > $3))) \
+     AND NOT EXISTS (SELECT 1 FROM public_tool_executions p WHERE p.marker_reference = history_markers.reference AND p.expires_at <= $3)",
             )
             .bind(owner_id)
             .bind(lease_expires_at)
@@ -818,7 +788,7 @@ impl HistoryMarkerStore for SqlHistoryMarkerStore {
         ) {
             return Err(HistoryMarkerError::InvalidPayload);
         }
-        let Some(row) = self.row(principal, reference).await? else {
+        let Some(row) = self.row(&principal.continuation_key(), reference).await? else {
             return Err(HistoryMarkerError::TerminalConflict);
         };
         let call_payload = row
@@ -838,7 +808,8 @@ impl HistoryMarkerStore for SqlHistoryMarkerStore {
         if result_is_error != (state != PlatformExecutionState::Completed) {
             return Err(HistoryMarkerError::InvalidPayload);
         }
-        self.interrupt_if_stale(principal, reference).await?;
+        self.interrupt_if_stale(&principal.continuation_key(), reference)
+            .await?;
         let payload = serde_json::to_string(&segment)
             .map_err(|error| HistoryMarkerError::Storage(error.to_string()))?;
         let now = Self::now();
@@ -848,8 +819,8 @@ impl HistoryMarkerStore for SqlHistoryMarkerStore {
                 "UPDATE history_markers SET execution_state = ?, segment_payload = ?, \
          execution_owner = NULL, lease_expires_at = NULL, updated_at = ? \
          WHERE principal = ? AND reference = ? AND execution_state = 'running' \
-         AND execution_owner = ? AND execution_deadline > ? AND lease_expires_at > ? AND execution_fenced = 0 \
-         AND NOT EXISTS (SELECT 1 FROM public_tool_execution_lifetimes p WHERE p.marker_reference = history_markers.reference AND p.retained_until <= ?)",
+         AND execution_owner = ? AND execution_deadline > ? AND lease_expires_at > ? \
+         AND NOT EXISTS (SELECT 1 FROM public_tool_executions p WHERE p.marker_reference = history_markers.reference AND p.expires_at <= ?)",
             )
             .bind(state_to_db(state))
             .bind(&payload)
@@ -869,8 +840,8 @@ impl HistoryMarkerStore for SqlHistoryMarkerStore {
          execution_owner = NULL, lease_expires_at = NULL, updated_at = $3 \
          WHERE principal = $4 AND reference = $5 AND execution_state = 'running' \
          AND execution_owner = $6 AND execution_deadline > $3 \
-         AND lease_expires_at > $3 AND execution_fenced = 0 \
-         AND NOT EXISTS (SELECT 1 FROM public_tool_execution_lifetimes p WHERE p.marker_reference = history_markers.reference AND p.retained_until <= $3)",
+         AND lease_expires_at > $3 \
+         AND NOT EXISTS (SELECT 1 FROM public_tool_executions p WHERE p.marker_reference = history_markers.reference AND p.expires_at <= $3)",
             )
             .bind(state_to_db(state))
             .bind(&payload)
@@ -886,10 +857,10 @@ impl HistoryMarkerStore for SqlHistoryMarkerStore {
         if updated == 1 {
             return Ok(());
         }
-        let fenced: Option<i32> = backend!(self, pool, {
+        let exists: Option<i32> = backend!(self, pool, {
             sqlx::query_scalar(
-                "SELECT execution_fenced FROM history_markers WHERE reference = $1 AND principal = $2 \
-                 AND NOT EXISTS (SELECT 1 FROM public_tool_execution_lifetimes p WHERE p.marker_reference = history_markers.reference AND p.retained_until <= $3)",
+                "SELECT 0 FROM history_markers WHERE reference = $1 AND principal = $2 \
+                 AND NOT EXISTS (SELECT 1 FROM public_tool_executions p WHERE p.marker_reference = history_markers.reference AND p.expires_at <= $3)",
             )
             .bind(reference)
             .bind(principal.continuation_key())
@@ -898,7 +869,7 @@ impl HistoryMarkerStore for SqlHistoryMarkerStore {
             .await
             .map_err(storage)?
         });
-        if fenced != Some(0) {
+        if exists != Some(0) {
             return Err(HistoryMarkerError::TerminalConflict);
         }
         let resolved = self.resolve(principal, reference).await?;
@@ -1105,67 +1076,15 @@ impl HistoryMarkerStore for SqlHistoryMarkerStore {
         let now = Self::now();
         backend!(self, pool, {
             let mut tx = pool.begin().await.map_err(storage)?;
-            sqlx::query(
-                "UPDATE tool_execution_sources SET removed = 1, fence_until = \
-                 CASE WHEN COALESCE((SELECT MAX(CASE WHEN h.execution_deadline > COALESCE(h.lease_expires_at, 0) \
-                 THEN h.execution_deadline ELSE COALESCE(h.lease_expires_at, 0) END) \
-                 FROM history_markers h JOIN public_tool_executions p ON p.marker_reference = h.reference \
-                 WHERE p.source_run_id = tool_execution_sources.source_run_id), 0) > $1 + 901000 \
-                 THEN (SELECT MAX(CASE WHEN h.execution_deadline > COALESCE(h.lease_expires_at, 0) \
-                 THEN h.execution_deadline ELSE COALESCE(h.lease_expires_at, 0) END) \
-                 FROM history_markers h JOIN public_tool_executions p ON p.marker_reference = h.reference \
-                 WHERE p.source_run_id = tool_execution_sources.source_run_id) ELSE $1 + 901000 END \
-                 WHERE removed = 0 AND source_run_id IN \
-                 (SELECT source_run_id FROM public_tool_execution_lifetimes WHERE retained_until <= $1)",
-            )
-            .bind(now)
-            .execute(&mut *tx)
-            .await
-            .map_err(storage)?;
-            sqlx::query(
-                "UPDATE history_markers SET execution_fenced = 1, execution_owner = NULL, lease_expires_at = 0, \
-                 execution_state = CASE WHEN execution_state = 'pending' THEN 'running' ELSE execution_state END \
-                 WHERE reference IN (SELECT marker_reference FROM public_tool_execution_lifetimes WHERE retained_until <= $1)",
-            )
-            .bind(now)
-            .execute(&mut *tx)
-            .await
-            .map_err(storage)?;
-            let removed: Vec<String> = sqlx::query_scalar(
-                "DELETE FROM public_tool_executions WHERE id IN (SELECT id FROM public_tool_execution_lifetimes WHERE retained_until <= $1) RETURNING id",
-            )
-            .bind(now)
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(storage)?;
-            // A deleted source needs no permanent ledger: after the maximum
-            // original public execution deadline, expired admission is rejected
-            // independently of source diagnostics or this short-lived fence.
-            sqlx::query(
-                "DELETE FROM tool_execution_sources WHERE removed <> 0 AND fence_until <= $1",
-            )
-            .bind(now)
-            .execute(&mut *tx)
-            .await
-            .map_err(storage)?;
-            tx.commit().await.map_err(storage)?;
-            crate::tool_execution::cancel_removed(&removed);
-        });
-        match self {
-            Self::Sqlite(pool) => sqlx::query("DELETE FROM history_markers WHERE expires_at <= ? AND NOT EXISTS (SELECT 1 FROM public_tool_executions p WHERE p.marker_reference = history_markers.reference AND p.source_kind = 'inference_run')")
+            sqlx::query("DELETE FROM public_tool_executions WHERE expires_at <= $1")
                 .bind(now)
-                .execute(pool)
+                .execute(&mut *tx)
                 .await
-                .map(|result| result.rows_affected())
-                .map_err(storage),
-            Self::Postgres(pool) => {
-                sqlx::query("DELETE FROM history_markers WHERE expires_at <= $1 AND NOT EXISTS (SELECT 1 FROM public_tool_executions p WHERE p.marker_reference = history_markers.reference AND p.source_kind = 'inference_run')")
-                    .bind(now)
-                    .execute(pool)
-                    .await
-                    .map(|result| result.rows_affected())
-                    .map_err(storage)
-            }
-        }
+                .map_err(storage)?;
+            let removed = sqlx::query("DELETE FROM history_markers WHERE expires_at <= $1 AND NOT EXISTS (SELECT 1 FROM public_tool_executions p WHERE p.marker_reference = history_markers.reference)")
+                    .bind(now).execute(&mut *tx).await.map_err(storage)?.rows_affected();
+            tx.commit().await.map_err(storage)?;
+            Ok(removed)
+        })
     }
 }

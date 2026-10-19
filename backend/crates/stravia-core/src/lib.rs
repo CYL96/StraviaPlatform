@@ -46,4 +46,4 @@ pub(crate) mod web_access;
 pub(crate) mod web_search;
 
 pub use gateway::{Gateway, GatewayBuilder, RuntimeStorageKind};
-pub(crate) use gateway::{HistoryMarkerExecutionJob, StartedHistoryMarkerExecution};
+pub(crate) use tool_execution::{PreparedMarkerExecution, StartedMarkerDelivery};

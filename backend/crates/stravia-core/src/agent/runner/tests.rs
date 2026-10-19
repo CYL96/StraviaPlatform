@@ -77,10 +77,18 @@ impl stravia_runtime_contract::hook::PlatformTool for BlockOutputTool {
 }
 
 async fn platform_output_roundtrip(blocks: Vec<ContentBlock>) -> (AiRequest, PlatformToolResult) {
+    let directory = tempfile::tempdir().unwrap();
+    let gateway = crate::Gateway::new(crate::config::GatewayConfig {
+        data_dir: directory.path().to_owned(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
     let tool = Arc::new(BlockOutputTool(blocks));
     let registry = crate::hook::PlatformToolRegistry::new(vec![tool.clone()]).unwrap();
     let ordinary = registry
         .execute(
+            &gateway,
             &ToolId::new("echo"),
             "call-1".into(),
             serde_json::json!({}),
@@ -92,8 +100,10 @@ async fn platform_output_roundtrip(blocks: Vec<ContentBlock>) -> (AiRequest, Pla
                 cancellation: CancellationToken::new(),
                 progress: None,
             },
+            crate::tool_execution::ExecutionSource::Mcp,
         )
-        .await;
+        .await
+        .result;
     let mut tool_response = AiResponse::new("response-1", "model-1");
     tool_response.extend_tool_calls(vec![ToolCall {
         id: "call-1".into(),

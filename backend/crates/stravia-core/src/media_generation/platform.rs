@@ -143,6 +143,12 @@ impl PlatformTool for GenerateTool {
     fn execution_limit(&self) -> Option<Duration> {
         Some(LIMIT)
     }
+    fn execution_policy(
+        &self,
+        _arguments: &Value,
+    ) -> stravia_runtime_contract::hook::PlatformExecutionPolicy {
+        stravia_runtime_contract::hook::PlatformExecutionPolicy::Bounded
+    }
     fn parameters(&self) -> Value {
         input_schema()
     }
@@ -172,21 +178,9 @@ impl PlatformTool for GenerateTool {
         if let Err(error) = execution::validate_input(&arguments) {
             return Ok(error_output(error));
         }
-        let source = crate::tool_execution::ExecutionSource::InferenceRun(context.run_id.clone());
-        let tool = self.clone();
-        self.gateway
-            .execute_public_tool(
-                self,
-                arguments,
-                context,
-                source,
-                move |arguments, context| async move {
-                    let deadline = crate::tool_execution::current_deadline()
-                        .unwrap_or_else(|| Instant::now() + LIMIT);
-                    tool.run_result(arguments, context, deadline).await
-                },
-            )
-            .await
+        let deadline =
+            crate::tool_execution::current_deadline().unwrap_or_else(|| Instant::now() + LIMIT);
+        self.run_result(arguments, context, deadline).await
     }
 }
 
@@ -242,21 +236,19 @@ impl McpTool for GenerateTool {
             cancellation,
             progress: None,
         };
-        let tool = self.clone();
-        let result = self
-            .gateway
-            .execute_public_tool(
-                self,
+        let result = crate::tool_execution::scope_request(
+            deadline,
+            self.gateway.dispatch_platform_tool(
+                Arc::new(self.clone()),
                 arguments,
                 execution_context,
                 crate::tool_execution::ExecutionSource::Mcp,
-                move |arguments, context| async move {
-                    tool.run_result(arguments, context, deadline).await
-                },
-            )
-            .await;
+            ),
+        )
+        .await;
         match result {
-            Ok(result) => {
+            Ok(delivery) => {
+                let result = delivery.output;
                 let (value, _) =
                     crate::hook::tool::blocks_to_value(result.content).map_err(|error| {
                         McpToolError::new("result_encoding_failed", error.to_string())

@@ -1,4 +1,5 @@
 use super::*;
+use crate::tool_execution::DetachedPlatformExecution;
 
 impl HookRuntime {
     pub fn new(hooks: Vec<Arc<dyn Hook>>) -> Self {
@@ -103,74 +104,38 @@ pub(crate) struct InferenceRun {
     stream_leg_open: bool,
 }
 
-#[derive(Clone)]
-pub(crate) struct DetachedPlatformExecution {
-    tools: PlatformToolRegistry,
-    call: PlatformToolCall,
-    context: ToolExecutionContext,
-    limit: std::time::Duration,
-    accepted_at: tokio::time::Instant,
-}
-
-impl DetachedPlatformExecution {
-    pub(crate) fn activity(&self) -> &str {
-        self.tools
-            .activity_label(&self.call.tool_id)
-            .unwrap_or("Running a platform tool")
-    }
-
-    pub(crate) fn limit(&self) -> std::time::Duration {
-        self.limit
-    }
-
-    pub(crate) fn parallel_safe(&self) -> bool {
-        self.tools.parallel_safe(&self.call.tool_id)
-    }
-
-    pub(crate) fn public_execution(&self) -> bool {
-        matches!(
-            self.call.tool_id.as_str(),
-            "media-generation" | "stravia-read"
-        )
-    }
-
-    pub(crate) fn accepted_at(&self) -> tokio::time::Instant {
-        self.accepted_at
-    }
-
-    pub(crate) fn call(&self) -> &PlatformToolCall {
-        &self.call
-    }
-
-    pub(crate) async fn execute(self) -> PlatformToolResult {
-        let Self {
-            tools,
-            call,
-            context,
-            ..
-        } = self;
-        // 参数解析失败交回模型修正（is_error 工具结果），绝不把原始字节塞进 executor。
-        let arguments = match serde_json::from_str(&call.call.arguments) {
-            Ok(arguments) => arguments,
-            Err(error) => {
-                return PlatformToolResult {
-                    tool_id: call.tool_id,
-                    call_id: call.call.id.to_string(),
-                    content: serde_json::Value::String(format!("invalid tool arguments: {error}")),
-                    content_kind:
-                        stravia_runtime_contract::protocol::ir::ToolResultContentKind::Json,
-                    is_error: true,
-                    metadata: serde_json::Map::new(),
-                };
-            }
-        };
-        tools
-            .execute(&call.tool_id, call.call.id.to_string(), arguments, context)
-            .await
-    }
-}
-
 impl InferenceRun {
+    pub(crate) async fn finish_marker_deliveries(
+        &mut self,
+        executions: Vec<crate::StartedMarkerDelivery>,
+    ) -> Result<(), crate::history_marker::HistoryMarkerError> {
+        for mut execution in executions {
+            let Some(mut result) = execution.result().await? else {
+                execution.finish(None).await?;
+                continue;
+            };
+            let hook_failure = if self.cancellation.is_cancelled() {
+                Some("owning Inference Run disappeared before delivery processing".to_owned())
+            } else {
+                match self.on_tool_result(&mut result).await {
+                    Ok(HookControl::Continue) => None,
+                    Ok(
+                        HookControl::Respond(_)
+                        | HookControl::Reject(_)
+                        | HookControl::StreamAbort { .. },
+                    ) => Some("ToolResult Hook attempted response control".to_owned()),
+                    Err(error) => Some(error.to_string()),
+                }
+            };
+            if let Some(error) = hook_failure {
+                tracing::error!(error, "ToolResult Hook failed for Platform Tool delivery");
+                crate::tool_execution::delivery_processing_error(&mut result);
+            }
+            execution.finish(Some(result)).await?;
+        }
+        Ok(())
+    }
+
     pub fn set_route(&mut self, route: RouteContext) {
         self.route = Some(route);
     }
@@ -196,26 +161,19 @@ impl InferenceRun {
         call: PlatformToolCall,
         cancellation: stravia_runtime_contract::CancellationToken,
     ) -> DetachedPlatformExecution {
-        let limit = self.tools.execution_limit(&call.tool_id);
-        let cancellation = if matches!(call.tool_id.as_str(), "media-generation" | "stravia-read") {
-            self.cancellation.clone()
-        } else {
-            cancellation
-        };
-        DetachedPlatformExecution {
-            tools: self.tools.clone(),
+        DetachedPlatformExecution::new(
+            self.tools.clone(),
             call,
-            context: ToolExecutionContext {
+            ToolExecutionContext {
                 request_id: self.context.request_id.clone(),
                 run_id: self.context.run_id.clone(),
                 principal: self.context.principal.clone(),
                 read_scope: self.read_scope,
-                cancellation,
+                cancellation: self.cancellation.clone(),
                 progress: None,
             },
-            limit,
-            accepted_at: tokio::time::Instant::now(),
-        }
+            cancellation,
+        )
     }
     pub async fn on_request(&mut self, request: &mut AiRequest) -> Result<HookControl, HookError> {
         for index in 0..self.sessions.len() {

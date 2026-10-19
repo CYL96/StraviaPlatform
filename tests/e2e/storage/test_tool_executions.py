@@ -3,6 +3,8 @@ from __future__ import annotations
 import base64
 import http.client
 import json
+import re
+import socket
 import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -59,7 +61,7 @@ class ToolHandler(BaseHTTPRequestHandler):
         try:
             self.wfile.write(data)
         except (BrokenPipeError, ConnectionResetError):
-            # 进程强杀或清理取消后，上游仍可能完成；这不代表宿主接受了结果。
+            # 本地取消或进程中断后，上游仍可能完成；这不代表宿主接受了结果。
             pass
 
     def do_GET(self) -> None:
@@ -194,7 +196,7 @@ def test_public_tool_execution_cleanup_and_restart(
         first = pool.submit(call, key, "generate", {"type": "image", "input": {"prompt": "durable square"}})
         release_first = upstream.images.get(timeout=30)
 
-        def inference() -> dict[str, Any]:
+        def inference() -> tuple[dict[str, Any], dict[str, Any]]:
             status, body = http_request("POST", origin + "/v1/chat/completions", {
                 "model": routes["text"]["model_id"], "messages": [{"role": "user", "content": "Generate a square"}],
                 "tools": [{"type": "function", "function": {"name": "generate", "parameters": {"type": "object"}}}],
@@ -203,11 +205,12 @@ def test_public_tool_execution_cleanup_and_restart(
             assert status == 200, (status, body)
             message = body["choices"][0]["message"]
             assert not message.get("tool_calls"), message
-            return json.loads(message["content"])
+            return json.loads(message["content"]), message
 
         source = pool.submit(inference)
         first_path = first.result(timeout=90)["structuredContent"]["path"]
-        source_path = source.result(timeout=90)["path"]
+        source_delivery, source_message = source.result(timeout=90)
+        source_path = source_delivery["path"]
         # 来源任务已排队并交接后才提交下一项，明确 gate 顺序，不依赖线程调度。
         pending = pool.submit(call, key, "generate", {"type": "image", "input": {"prompt": "interrupted square"}})
         pending_path = pending.result(timeout=90)["structuredContent"]["path"]
@@ -227,11 +230,25 @@ def test_public_tool_execution_cleanup_and_restart(
         assert read(key, source_path)["structuredContent"]["status"] == "running"
         cleared = admin(session, "DELETE", "/api/v1/observations/history")
         assert cleared["deleted_interactions"] > 0 and cleared["skipped_active"] == 0, cleared
-        assert read(key, source_path)["isError"]
-        # 清理必须释放本地执行 gate；上游的迟到完成不能恢复已删除引用。
-        release_pending = upstream.images.get(timeout=30)
+        assert read(key, source_path)["structuredContent"]["status"] == "running"
+        assert read(key, pending_path)["structuredContent"]["status"] == "pending"
+        # 诊断清理不释放执行门、不取消已交接的领域工作。
         release_source.set()
-        assert read(key, source_path)["isError"]
+        source_completed = read(key, source_path + "?wait=120")["structuredContent"]
+        assert source_completed["status"] == "completed", source_completed
+        assert source_completed["result"]["media"] == {"width": 1, "height": 1}
+        release_pending = upstream.images.get(timeout=30)
+        status, replayed = http_request("POST", origin + "/v1/chat/completions", {
+            "model": routes["text"]["model_id"],
+            "messages": [
+                {"role": "user", "content": "Generate a square"},
+                source_message,
+                {"role": "user", "content": "Read the previously delivered tool outcome"},
+            ],
+            "stream": False,
+        }, headers={"authorization": "Bearer " + key}, timeout=30)
+        assert status == 200, replayed
+        assert json.loads(replayed["choices"][0]["message"]["content"]) == source_delivery
         assert process is not None
         process.kill()
         process.wait(timeout=15)
@@ -240,7 +257,7 @@ def test_public_tool_execution_cleanup_and_restart(
         assert not interrupted["isError"]
         assert interrupted["structuredContent"]["status"] == "interrupted"
         assert interrupted["structuredContent"]["error"]
-        assert read(key, source_path)["isError"]
+        assert read(key, source_path)["structuredContent"] == source_completed
         assert read(key, first_path)["structuredContent"] == completed
         grant = read(key, completed["result"]["path"] + "?download=1")["structuredContent"]
         status, _, image = http_bytes("GET", grant["download_url"])
@@ -297,6 +314,63 @@ def test_public_tool_execution_cleanup_and_restart(
             assert [request["prompt"] for request in upstream.image_requests][3:] == [
                 "disconnected square", "after disconnect",
             ]
+
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
+        response = None
+        try:
+            connection.request("POST", "/v1/chat/completions", json.dumps({
+                "model": routes["text"]["model_id"],
+                "messages": [{"role": "user", "content": "Generate a cancellable square"}],
+                "tools": [{"type": "function", "function": {
+                    "name": "generate", "parameters": {"type": "object"},
+                }}],
+                "stream": True,
+            }), headers={"content-type": "application/json", "authorization": "Bearer " + key})
+            response = connection.getresponse()
+            assert response.status == 200
+            projected = ""
+            marker = None
+            while marker is None:
+                line = response.readline()
+                assert line, "stream ended before publishing the hidden tool Marker"
+                if not line.startswith(b"data: "):
+                    continue
+                event = json.loads(line[6:])
+                delta = event["choices"][0]["delta"] if event.get("choices") else {}
+                projected += delta.get("reasoning_content") or ""
+                projected += delta.get("content") or ""
+                marker = re.search(r"<!--sh:[a-z]{28}-->", projected)
+            cancelled_marker = marker.group()
+            release_cancelled = upstream.images.get(timeout=30)
+            if connection.sock is not None:
+                connection.sock.shutdown(socket.SHUT_RDWR)
+        finally:
+            if response is not None:
+                response.close()
+            connection.close()
+
+        following = pool.submit(call, key, "generate", {
+            "type": "image", "input": {"prompt": "after marker disconnect"},
+        })
+        # 后续调用被供应商受理，证明断连已释放本地执行门；不要求上游撤销旧请求。
+        release_following = upstream.images.get(timeout=30)
+        release_cancelled.set()
+        release_following.set()
+        assert not following.result(timeout=30)["isError"]
+        requests_before_restore = len(upstream.image_requests)
+        status, restored = http_request("POST", origin + "/v1/chat/completions", {
+            "model": routes["text"]["model_id"],
+            "messages": [
+                {"role": "user", "content": "Generate a cancellable square"},
+                {"role": "assistant", "content": None, "reasoning_content": cancelled_marker},
+                {"role": "user", "content": "Read the previous tool outcome"},
+            ],
+            "stream": False,
+        }, headers={"authorization": "Bearer " + key}, timeout=30)
+        assert status == 200, restored
+        cancelled = json.loads(restored["choices"][0]["message"]["content"])
+        assert cancelled["error"]["code"] == "cancelled", cancelled
+        assert len(upstream.image_requests) == requests_before_restore, "Marker recovery must not replay generation"
     finally:
         for release in upstream.releases:
             release.set()

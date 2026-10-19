@@ -22,30 +22,22 @@ SET client_min_messages = warning;
 SET row_security = off;
 
 --
--- Name: remove_source_tool_executions(); Type: FUNCTION; Schema: public; Owner: -
+-- Name: retain_terminal_tool_execution(); Type: FUNCTION; Schema: public; Owner: -
 --
 
-CREATE FUNCTION public.remove_source_tool_executions() RETURNS trigger
+CREATE FUNCTION public.retain_terminal_tool_execution() RETURNS trigger
     LANGUAGE plpgsql
     AS $$
 BEGIN
-    -- Both public tools have a 900s absolute acceptance deadline. Keep even an
-    -- as-yet unassociated source fenced until every pre-delete admission must
-    -- have expired. Admission checks that original deadline, not a fresh TTL.
-    -- Changing public execution_limit requires updating this safety boundary.
-    -- Match SQLite's conservative second-resolution clock allowance.
-    INSERT INTO tool_execution_sources(source_run_id, removed, fence_until)
-        VALUES (OLD.id, 1, GREATEST((EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT + 901000,
-            COALESCE((SELECT MAX(GREATEST(h.execution_deadline, COALESCE(h.lease_expires_at, 0)))
-                FROM history_markers h JOIN public_tool_executions p ON p.marker_reference = h.reference
-                WHERE p.source_run_id = OLD.id), 0)))
-        ON CONFLICT(source_run_id) DO UPDATE SET removed = 1, fence_until = excluded.fence_until;
-    INSERT INTO removed_tool_executions(id) SELECT id FROM public_tool_executions WHERE source_run_id = OLD.id ON CONFLICT DO NOTHING;
-    UPDATE history_markers SET execution_fenced = 1, execution_owner = NULL, lease_expires_at = 0,
-        execution_state = CASE WHEN execution_state = 'pending' THEN 'running' ELSE execution_state END
-        WHERE reference IN (SELECT marker_reference FROM public_tool_executions WHERE source_run_id = OLD.id);
-    DELETE FROM public_tool_executions WHERE source_run_id = OLD.id;
-    RETURN OLD;
+    IF OLD.execution_state IN ('pending','running') AND NEW.execution_state IN ('completed','failed','interrupted') THEN
+        UPDATE public_tool_executions
+        SET terminal_at = NEW.updated_at,
+            retention_started_at = NEW.updated_at,
+            retention_ms = COALESCE((SELECT value::BIGINT * 86400000 FROM settings WHERE name = 'log_retention_days'), retention_ms),
+            expires_at = NEW.updated_at + COALESCE((SELECT value::BIGINT * 86400000 FROM settings WHERE name = 'log_retention_days'), retention_ms)
+        WHERE marker_reference = NEW.reference AND retention_started_at IS NULL;
+    END IF;
+    RETURN NEW;
 END;
 $$;
 
@@ -1029,7 +1021,6 @@ CREATE TABLE public.history_markers (
     created_at bigint NOT NULL,
     updated_at bigint NOT NULL,
     expires_at bigint NOT NULL,
-    execution_fenced integer DEFAULT 0 NOT NULL,
     CONSTRAINT history_markers_check CHECK ((((kind = 'thinking'::text) AND (tool_id IS NULL) AND (call_payload IS NULL) AND (execution_state IS NULL) AND (segment_payload IS NOT NULL)) OR ((kind = 'platform'::text) AND (tool_id IS NOT NULL) AND (call_payload IS NOT NULL) AND (execution_state IS NOT NULL) AND (execution_deadline IS NOT NULL)))),
     CONSTRAINT history_markers_execution_state_check CHECK (((execution_state IS NULL) OR (execution_state = ANY (ARRAY['pending'::text, 'running'::text, 'completed'::text, 'failed'::text, 'interrupted'::text])))),
     CONSTRAINT history_markers_kind_check CHECK ((kind = ANY (ARRAY['platform'::text, 'thinking'::text])))
@@ -1510,46 +1501,13 @@ CREATE TABLE public.public_tool_executions (
     source_run_id text,
     process_id text NOT NULL,
     handed_off_at bigint,
-    expires_at bigint NOT NULL,
+    expires_at bigint,
+    retention_ms bigint NOT NULL,
+    terminal_at bigint,
+    retention_started_at bigint,
     CONSTRAINT public_tool_executions_check CHECK ((((source_kind = 'mcp'::text) AND (source_run_id IS NULL)) OR ((source_kind = 'inference_run'::text) AND (source_run_id IS NOT NULL)))),
     CONSTRAINT public_tool_executions_source_kind_check CHECK ((source_kind = ANY (ARRAY['mcp'::text, 'inference_run'::text])))
 );
-
-
---
--- Name: tool_execution_sources; Type: TABLE; Schema: public; Owner: -
---
-
-CREATE TABLE public.tool_execution_sources (
-    source_run_id text NOT NULL,
-    removed integer DEFAULT 0 NOT NULL,
-    expires_at bigint DEFAULT 0 NOT NULL,
-    fence_until bigint DEFAULT 0 NOT NULL
-);
-
-
---
--- Name: public_tool_execution_lifetimes; Type: VIEW; Schema: public; Owner: -
---
-
-CREATE VIEW public.public_tool_execution_lifetimes AS
- SELECT p.id,
-    p.marker_reference,
-    p.principal,
-    p.source_kind,
-    p.source_run_id,
-    p.process_id,
-    p.handed_off_at,
-    p.expires_at,
-        CASE
-            WHEN (p.source_kind = 'mcp'::text) THEN p.expires_at
-            WHEN (EXISTS ( SELECT 1
-               FROM public.inference_run_observations r
-              WHERE (r.id = p.source_run_id))) THEN '9223372036854775807'::bigint
-            ELSE s.expires_at
-        END AS retained_until
-   FROM (public.public_tool_executions p
-     LEFT JOIN public.tool_execution_sources s ON ((s.source_run_id = p.source_run_id)));
 
 
 --
@@ -1574,15 +1532,6 @@ CREATE TABLE public.rejected_request_observations (
     api_key_name text,
     started_at bigint,
     duration_ms bigint
-);
-
-
---
--- Name: removed_tool_executions; Type: TABLE; Schema: public; Owner: -
---
-
-CREATE TABLE public.removed_tool_executions (
-    id text NOT NULL
 );
 
 
@@ -2763,14 +2712,6 @@ ALTER TABLE ONLY public.rejected_request_observations
 
 
 --
--- Name: removed_tool_executions removed_tool_executions_pkey; Type: CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.removed_tool_executions
-    ADD CONSTRAINT removed_tool_executions_pkey PRIMARY KEY (id);
-
-
---
 -- Name: reversible_redaction_mappings reversible_redaction_mappings_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -2808,14 +2749,6 @@ ALTER TABLE ONLY public.stats_usage_checkpoints
 
 ALTER TABLE ONLY public.target_attempt_observations
     ADD CONSTRAINT target_attempt_observations_pkey PRIMARY KEY (id);
-
-
---
--- Name: tool_execution_sources tool_execution_sources_pkey; Type: CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.tool_execution_sources
-    ADD CONSTRAINT tool_execution_sources_pkey PRIMARY KEY (source_run_id);
 
 
 --
@@ -3355,6 +3288,13 @@ CREATE INDEX observation_tail_sources_interaction_idx ON public.observation_tail
 
 
 --
+-- Name: public_tool_executions_expiry; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX public_tool_executions_expiry ON public.public_tool_executions USING btree (expires_at);
+
+
+--
 -- Name: public_tool_executions_source; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -3418,10 +3358,10 @@ CREATE INDEX target_attempts_turn_idx ON public.target_attempt_observations USIN
 
 
 --
--- Name: inference_run_observations remove_source_tool_executions; Type: TRIGGER; Schema: public; Owner: -
+-- Name: history_markers retain_terminal_tool_execution; Type: TRIGGER; Schema: public; Owner: -
 --
 
-CREATE TRIGGER remove_source_tool_executions BEFORE DELETE ON public.inference_run_observations FOR EACH ROW EXECUTE FUNCTION public.remove_source_tool_executions();
+CREATE TRIGGER retain_terminal_tool_execution AFTER UPDATE OF execution_state ON public.history_markers FOR EACH ROW EXECUTE FUNCTION public.retain_terminal_tool_execution();
 
 
 --

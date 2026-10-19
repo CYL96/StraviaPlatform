@@ -1,12 +1,11 @@
 use crate::{
-    admin, admission, agent, config, db, generation_chain, history_marker, hook,
-    interaction_observation, media, migrations, model_turn, provider_catalog, proxy, router,
-    storage, turn_chain, web_access, web_search,
+    admin, admission, agent, config, db, generation_chain, history_marker, interaction_observation,
+    media, migrations, model_turn, provider_catalog, proxy, router, storage, turn_chain,
+    web_access, web_search,
 };
 
 mod builder;
 mod extensions;
-mod history_marker_executions;
 mod icon;
 mod lifecycle;
 mod provider_model_sync;
@@ -16,9 +15,6 @@ mod vendor_auxiliary_tests;
 
 pub use builder::GatewayBuilder;
 use extensions::configure_gateway_extensions;
-pub(crate) use history_marker_executions::{
-    HistoryMarkerExecutionJob, StartedHistoryMarkerExecution,
-};
 use lifecycle::GatewayLifecycle;
 
 use std::collections::HashMap;

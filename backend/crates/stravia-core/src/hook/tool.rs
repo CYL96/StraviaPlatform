@@ -106,26 +106,36 @@ impl PlatformToolRegistry {
         })
     }
 
-    pub async fn execute(
+    pub(crate) async fn execute(
         &self,
+        gateway: &crate::Gateway,
         id: &ToolId,
         call_id: String,
         arguments: Value,
         context: ToolExecutionContext,
-    ) -> PlatformToolResult {
+        source: crate::tool_execution::ExecutionSource,
+    ) -> crate::tool_execution::ToolDelivery {
         let Some(tool) = self.tools.get(id) else {
-            return PlatformToolResult {
-                tool_id: id.clone(),
-                call_id,
-                content: Value::String(format!("platform tool not found: {id}")),
-                content_kind: ToolResultContentKind::Json,
-                is_error: true,
-                metadata: serde_json::Map::new(),
+            return crate::tool_execution::ToolDelivery {
+                system_cancelled: false,
+                result: PlatformToolResult {
+                    tool_id: id.clone(),
+                    call_id,
+                    content: Value::String(format!("platform tool not found: {id}")),
+                    content_kind: ToolResultContentKind::Json,
+                    is_error: true,
+                    metadata: serde_json::Map::new(),
+                },
             };
         };
-        match std::panic::AssertUnwindSafe(async {
-            let output = tool.execute_result(arguments, context).await?;
+        let mut system_cancelled = false;
+        let result = match std::panic::AssertUnwindSafe(async {
+            let delivery = gateway
+                .dispatch_platform_tool(Arc::clone(tool), arguments, context, source)
+                .await?;
+            let output = delivery.output;
             let (content, content_kind) = blocks_to_value(output.content)?;
+            system_cancelled = delivery.system_cancelled;
             Ok::<_, PlatformToolError>((content, content_kind, output.is_error, output.metadata))
         })
         .catch_unwind()
@@ -155,6 +165,10 @@ impl PlatformToolRegistry {
                 is_error: true,
                 metadata: serde_json::Map::new(),
             },
+        };
+        crate::tool_execution::ToolDelivery {
+            result,
+            system_cancelled,
         }
     }
 }
@@ -295,10 +309,18 @@ mod tests {
 
     #[tokio::test]
     async fn executor_panic_becomes_a_tool_error_result() {
+        let directory = tempfile::tempdir().unwrap();
+        let gateway = crate::Gateway::new(crate::config::GatewayConfig {
+            data_dir: directory.path().to_owned(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
         let registry = PlatformToolRegistry::new(vec![Arc::new(PanicTool)]).unwrap();
 
         let result = registry
             .execute(
+                &gateway,
                 &ToolId::new("panic"),
                 "call-1".into(),
                 Value::Null,
@@ -310,8 +332,10 @@ mod tests {
                     cancellation: stravia_runtime_contract::CancellationToken::new(),
                     progress: None,
                 },
+                crate::tool_execution::ExecutionSource::Mcp,
             )
-            .await;
+            .await
+            .result;
 
         assert!(result.is_error);
         assert_eq!(

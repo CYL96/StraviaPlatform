@@ -8,6 +8,13 @@ use std::time::Duration;
 
 pub const DEFAULT_PLATFORM_TOOL_EXECUTION_LIMIT: Duration = Duration::from_secs(120);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlatformExecutionPolicy {
+    Synchronous,
+    Bounded,
+    Query,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ToolId(String);
 
@@ -149,6 +156,9 @@ pub trait PlatformTool: Send + Sync + 'static {
     /// 公开调用的同步等待窗口；未声明时为 60 秒，与实际执行期限无关。
     fn synchronous_wait(&self) -> Option<Duration> {
         None
+    }
+    fn execution_policy(&self, _arguments: &Value) -> PlatformExecutionPolicy {
+        PlatformExecutionPolicy::Synchronous
     }
     fn parallel_safe(&self) -> bool {
         false

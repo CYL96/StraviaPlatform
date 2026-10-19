@@ -1052,7 +1052,7 @@ struct RunObserverInner {
     protected: redaction::ProtectedSecrets,
 }
 impl RunObserver {
-    /// 公开执行的清理归属由来源请求决定，内部 Model Turn 不额外保护来源记录。
+    /// 后台执行独立保留；其内部 Model Turn 不额外保护来源诊断记录。
     pub(crate) fn for_public_execution(&self) -> Self {
         Self {
             inner: self.inner.clone(),

@@ -1,9 +1,7 @@
 use crate::Gateway;
-use crate::history_marker::{
-    ClaimOutcome, HiddenHistorySegment, HistoryMarker, HistoryMarkerError, PlatformMarkerInput,
-};
-use crate::hook::DetachedPlatformExecution;
+use crate::history_marker::{HiddenHistorySegment, HistoryMarker, HistoryMarkerError};
 use crate::model_turn::TargetIdentity;
+use crate::tool_execution::DetachedPlatformExecution;
 use stravia_runtime_contract::Principal;
 use stravia_runtime_contract::protocol::ids::OPEN_RESPONSES_2026_04_24;
 use stravia_runtime_contract::protocol::ir::AiItem;
@@ -232,8 +230,8 @@ pub(super) struct PlatformOnlyContinuation {
     projected_response: AiResponse,
     canonical_response: AiResponse,
     markers: Vec<PreparedPlatformMarker>,
-    jobs: Vec<crate::HistoryMarkerExecutionJob>,
-    started_executions: Vec<crate::StartedHistoryMarkerExecution>,
+    jobs: Vec<crate::PreparedMarkerExecution>,
+    started_executions: Vec<crate::StartedMarkerDelivery>,
     commit: ClientOutputCommit,
 }
 
@@ -247,14 +245,13 @@ impl PlatformOnlyContinuation {
         phase: &mut PhaseTracker,
     ) -> Result<(), CompletionFailure> {
         ledger.record_hidden_round(&self.projected_response);
-        context
+        let mut executions = context
             .gateway
-            .run_history_marker_executions(context.principal.clone(), self.jobs, run)
-            .await;
-        context
-            .gateway
-            .run_started_history_marker_executions(self.started_executions, run)
-            .await;
+            .start_history_marker_executions(context.principal.clone(), self.jobs);
+        executions.extend(self.started_executions);
+        run.finish_marker_deliveries(executions)
+            .await
+            .map_err(|error| CompletionFailure::hook(error, self.commit))?;
         let terminal = wait_platform_markers(context, &self.markers)
             .await
             .map_err(|error| CompletionFailure::hook(error, self.commit))?;
@@ -294,8 +291,8 @@ pub(super) struct CompletionLease {
     response: Box<AiResponse>,
     staged_delivery: ProjectedDeltaBatch,
     pending_generation_chain: Option<Box<super::PendingGenerationChainWrite>>,
-    background_executions: Vec<crate::HistoryMarkerExecutionJob>,
-    started_executions: Vec<crate::StartedHistoryMarkerExecution>,
+    background_executions: Vec<crate::PreparedMarkerExecution>,
+    started_executions: Vec<crate::StartedMarkerDelivery>,
     commit: ClientOutputCommit,
 }
 
@@ -303,8 +300,8 @@ pub(super) struct PreparedDelivery {
     pub(super) response: AiResponse,
     pub(super) staged_delivery: ProjectedDeltaBatch,
     pub(super) pending_generation_chain: Option<super::PendingGenerationChainWrite>,
-    pub(super) background_executions: Vec<crate::HistoryMarkerExecutionJob>,
-    pub(super) started_executions: Vec<crate::StartedHistoryMarkerExecution>,
+    pub(super) background_executions: Vec<crate::PreparedMarkerExecution>,
+    pub(super) started_executions: Vec<crate::StartedMarkerDelivery>,
 }
 
 impl CompletionLease {
@@ -397,7 +394,7 @@ impl PreparedPlatformMarker {
 
 pub(super) struct EarlyPlatformExecution {
     pub(super) marker: PreparedPlatformMarker,
-    pub(super) execution: crate::StartedHistoryMarkerExecution,
+    pub(super) execution: crate::StartedMarkerDelivery,
 }
 
 pub(super) async fn prepare_platform_markers(
@@ -406,12 +403,10 @@ pub(super) async fn prepare_platform_markers(
 ) -> Result<
     (
         Vec<PreparedPlatformMarker>,
-        Vec<crate::HistoryMarkerExecutionJob>,
+        Vec<crate::PreparedMarkerExecution>,
     ),
     HistoryMarkerError,
 > {
-    const PENDING_RETENTION: std::time::Duration = std::time::Duration::from_secs(60 * 60);
-
     let vendor_publication = context
         .current_vendor_publication()
         .map_err(|error| HistoryMarkerError::Storage(error.to_string()))?;
@@ -424,75 +419,21 @@ pub(super) async fn prepare_platform_markers(
         ),
         None => None,
     };
-    let mut pending =
-        Vec::<(PreparedPlatformMarker, String, DetachedPlatformExecution)>::with_capacity(
-            executions.len(),
-        );
+    let mut prepared = Vec::with_capacity(executions.len());
+    let mut jobs = Vec::with_capacity(executions.len());
     for execution in executions {
-        let marker = context
+        let call_id = execution.call().call.id.clone();
+        let (marker, execution) = context
             .gateway
-            .history_markers
-            .create_platform(
+            .prepare_marker_execution(
                 &context.principal,
-                PlatformMarkerInput {
-                    tool_id: execution.call().tool_id.to_string(),
-                    call: execution.call().call.clone(),
-                    activity: execution.activity().to_owned(),
-                    execution_limit: execution.limit(),
-                    pending_retention: PENDING_RETENTION,
-                },
+                execution,
+                Some(context.observer.clone()),
+                context.model_turn_id.clone(),
             )
             .await?;
-        let owner_id = stravia_runtime_contract::identifier::new_id();
-        pending.push((
-            PreparedPlatformMarker {
-                call_id: execution.call().call.id.clone(),
-                marker,
-            },
-            owner_id,
-            execution,
-        ));
-    }
-    for (prepared, owner_id, execution) in &pending {
-        let claim = context
-            .gateway
-            .history_markers
-            .claim_execution(
-                &context.principal,
-                &prepared.marker.reference,
-                owner_id,
-                execution.limit(),
-            )
-            .await?;
-        if claim != ClaimOutcome::Claimed {
-            return Err(HistoryMarkerError::Storage(
-                "new Platform Tool execution could not be claimed".into(),
-            ));
-        }
-    }
-    let mut prepared = Vec::with_capacity(pending.len());
-    let mut jobs = Vec::with_capacity(pending.len());
-    for (marker, owner_id, execution) in pending {
-        let execution_deadline_unix_ms = context
-            .gateway
-            .history_markers
-            .resolve(&context.principal, &marker.marker.reference)
-            .await?
-            .and_then(|resolved| resolved.execution_deadline_unix_ms)
-            .ok_or_else(|| {
-                HistoryMarkerError::Storage(
-                    "claimed Platform execution is missing its persisted deadline".into(),
-                )
-            })?;
-        jobs.push(crate::HistoryMarkerExecutionJob {
-            marker_reference: marker.marker.reference.clone(),
-            owner_id,
-            execution_deadline_unix_ms,
-            execution,
-            observer: Some(context.observer.clone()),
-            model_turn_id: context.model_turn_id.clone(),
-        });
-        prepared.push(marker);
+        jobs.push(execution);
+        prepared.push(PreparedPlatformMarker { call_id, marker });
     }
     Ok((prepared, jobs))
 }

@@ -15,6 +15,12 @@ use stravia_runtime_contract::{
 };
 use tokio::sync::{Notify, oneshot};
 
+mod marker;
+pub(crate) use marker::delivery_processing_error;
+pub(crate) use marker::{
+    DetachedPlatformExecution, PreparedMarkerExecution, StartedMarkerDelivery,
+};
+
 use crate::{
     Gateway,
     history_marker::{
@@ -49,9 +55,47 @@ pub(crate) async fn scope_execution<F: Future>(
         .await
 }
 
+pub(crate) async fn scope_request<F: Future>(deadline: Instant, work: F) -> F::Output {
+    let accepted = ACCEPTED_AT
+        .try_with(|accepted| *accepted)
+        .unwrap_or_else(|_| tokio::time::Instant::now());
+    let deadline = current_deadline()
+        .map(|current| current.min(deadline))
+        .unwrap_or(deadline);
+    scope_execution(accepted, deadline, work).await
+}
+
 pub(crate) enum ExecutionSource {
     Mcp,
-    InferenceRun(String),
+    InferenceRun {
+        run_id: String,
+        published_cancellation: CancellationToken,
+    },
+}
+
+pub(crate) struct ToolExecutionOutput {
+    pub(crate) output: PlatformToolOutput,
+    pub(crate) system_cancelled: bool,
+}
+
+impl ToolExecutionOutput {
+    fn ordinary(output: PlatformToolOutput) -> Self {
+        Self {
+            output,
+            system_cancelled: false,
+        }
+    }
+    fn cancelled() -> Self {
+        Self {
+            output: cancelled_output(),
+            system_cancelled: true,
+        }
+    }
+}
+
+pub(crate) struct ToolDelivery {
+    pub(crate) result: stravia_runtime_contract::hook::PlatformToolResult,
+    pub(crate) system_cancelled: bool,
 }
 
 struct LiveExecution {
@@ -93,29 +137,21 @@ impl LiveExecution {
     }
 
     fn resolve_handoff(&self, committed: bool) {
-        *self.ownership.lock() = if committed {
-            Ownership::Background
-        } else {
-            Ownership::Cancelled
-        };
-        if !committed {
+        let mut ownership = self.ownership.lock();
+        if committed {
+            *ownership = Ownership::Background;
+        } else if matches!(*ownership, Ownership::Initial | Ownership::Cancelled) {
+            *ownership = Ownership::Cancelled;
             self.cancellation.cancel();
         }
+        // Once COMMIT began, a storage error is not proof of rollback. Leave
+        // ownership unresolved and report the error rather than inventing a
+        // cancellation fact; the original deadline still bounds local work.
     }
 }
 
 // 此表只负责本进程的取消与唤醒；身份、权限和结果始终由持久 Store 决定。
 static LIVE: LazyLock<Mutex<HashMap<String, Arc<LiveExecution>>>> = LazyLock::new(Default::default);
-
-pub(crate) fn cancel_removed(ids: &[String]) {
-    let mut live = LIVE.lock();
-    for id in ids {
-        if let Some(execution) = live.remove(id) {
-            execution.cancellation.cancel();
-            execution.changed.notify_waiters();
-        }
-    }
-}
 
 struct InitialWait<'a> {
     execution: Arc<LiveExecution>,
@@ -151,7 +187,7 @@ fn output(value: Value) -> PlatformToolOutput {
 fn cancelled_output() -> PlatformToolOutput {
     PlatformToolOutput {
         content: vec![ContentBlock::Unknown {
-            raw: json!({"error":{"code":"cancelled","message":"Tool execution cancelled"}}),
+            raw: json!({"error":{"code":"cancelled","message":"Local tool execution cancelled; this does not guarantee upstream work or billing has stopped."}}),
         }],
         is_error: true,
         metadata: Default::default(),
@@ -191,18 +227,54 @@ fn snapshot(execution: PublicExecution) -> Result<Value, PlatformToolError> {
 }
 
 impl Gateway {
-    pub(crate) async fn execute_public_tool<F, Fut>(
+    pub(crate) async fn dispatch_platform_tool(
         &self,
-        tool: &dyn PlatformTool,
+        tool: Arc<dyn PlatformTool>,
         arguments: Value,
         mut context: ToolExecutionContext,
         source: ExecutionSource,
-        work: F,
-    ) -> Result<PlatformToolOutput, PlatformToolError>
-    where
-        F: FnOnce(Value, ToolExecutionContext) -> Fut + Send + 'static,
-        Fut: Future<Output = Result<PlatformToolOutput, PlatformToolError>> + Send + 'static,
-    {
+    ) -> Result<ToolExecutionOutput, PlatformToolError> {
+        use stravia_runtime_contract::hook::PlatformExecutionPolicy;
+        match tool.execution_policy(&arguments) {
+            PlatformExecutionPolicy::Query => tool
+                .execute_result(arguments, context)
+                .await
+                .map(ToolExecutionOutput::ordinary),
+            PlatformExecutionPolicy::Synchronous => {
+                if let ExecutionSource::InferenceRun {
+                    published_cancellation,
+                    ..
+                } = source
+                {
+                    // 未纳入有界执行的工具仍遵循 Marker 发布后的独立执行契约。
+                    context.cancellation = published_cancellation;
+                }
+                if tool.parallel_safe() {
+                    let _permit = self.history_marker_execution_gate.read().await;
+                    tool.execute_result(arguments, context)
+                        .await
+                        .map(ToolExecutionOutput::ordinary)
+                } else {
+                    let _permit = self.history_marker_execution_gate.write().await;
+                    tool.execute_result(arguments, context)
+                        .await
+                        .map(ToolExecutionOutput::ordinary)
+                }
+            }
+            PlatformExecutionPolicy::Bounded => {
+                self.execute_bounded_tool(tool, arguments, context, source)
+                    .await
+            }
+        }
+    }
+
+    async fn execute_bounded_tool(
+        &self,
+        tool: Arc<dyn PlatformTool>,
+        arguments: Value,
+        mut context: ToolExecutionContext,
+        source: ExecutionSource,
+    ) -> Result<ToolExecutionOutput, PlatformToolError> {
         let accepted = ACCEPTED_AT
             .try_with(|instant| *instant)
             .unwrap_or_else(|_| tokio::time::Instant::now());
@@ -218,7 +290,8 @@ impl Gateway {
         let principal = context.principal.clone();
         let caller_cancellation = context.cancellation.clone();
         let cancellation = CancellationToken::new();
-        context.cancellation = cancellation.clone();
+        let domain_cancellation = CancellationToken::new();
+        context.cancellation = domain_cancellation.clone();
         let retention = self
             .storage
             .settings()
@@ -259,11 +332,11 @@ impl Gateway {
                     source_run_id: match source {
                         ExecutionSource::Mcp => None,
                         // Hook session 的 run_id 不是诊断 Run 身份；缺少诊断时才使用会话 fallback。
-                        ExecutionSource::InferenceRun(id) => Some(
+                        ExecutionSource::InferenceRun { run_id, .. } => Some(
                             observer
                                 .as_ref()
                                 .map(|observer| observer.run_id().to_owned())
-                                .unwrap_or(id),
+                                .unwrap_or(run_id),
                         ),
                     },
                     retention,
@@ -289,17 +362,7 @@ impl Gateway {
         if caller_cancellation.is_cancelled() {
             live.cancel_initial();
         }
-        // 清理可能先于本地注册提交；再次读取持久事实，不把已删除记录变成可运行任务。
-        if self
-            .history_markers
-            .resolve_public_execution(&principal, &id)
-            .await
-            .map_err(|error| failure(error.to_string()))?
-            .is_none()
-        {
-            cancel_removed(std::slice::from_ref(&id));
-            return Err(failure("Tool execution is unavailable"));
-        }
+
         let (tx, mut rx) = oneshot::channel();
         let gateway = self.background_clone();
         let task_live = live.clone();
@@ -312,14 +375,14 @@ impl Gateway {
             let mut claimed = false;
             let operation = async {
                 if task_live.cancellation.is_cancelled() {
-                    return Ok(cancelled_output());
+                    return Ok(ToolExecutionOutput::cancelled());
                 }
                 let execute = async {
                     if gateway.history_markers.claim_execution(&task_principal, &marker.reference, &owner, remaining).await.map_err(|error| failure(error.to_string()))? != ClaimOutcome::Claimed {
                         return Err(failure("Tool execution could not be claimed"));
                     }
                     claimed = true;
-                    work(arguments, context).await
+                    tool.execute_result(arguments, context).await.map(ToolExecutionOutput::ordinary)
                 };
                 if parallel_safe {
                     let _permit = gateway.history_marker_execution_gate.read().await;
@@ -332,9 +395,18 @@ impl Gateway {
             let result = tokio::select! {
                 biased;
                 result = std::panic::AssertUnwindSafe(EXECUTION_DEADLINE.scope(deadline, crate::interaction_observation::scope::scope(observer, operation))).catch_unwind() => result.unwrap_or_else(|_| Err(failure("Platform tool panicked"))),
-                _ = task_live.cancellation.cancelled() => Ok(cancelled_output()),
-                _ = tokio::time::sleep_until(deadline.into()) => Err(failure("Platform tool execution reached its registered deadline")),
-                _ = gateway.lifecycle.cancellation.cancelled() => Err(failure("Platform tool execution interrupted by shutdown")),
+                _ = task_live.cancellation.cancelled() => {
+                    domain_cancellation.cancel();
+                    Ok(ToolExecutionOutput::cancelled())
+                },
+                _ = tokio::time::sleep_until(deadline.into()) => {
+                    domain_cancellation.cancel();
+                    Err(failure("Platform tool execution reached its registered deadline"))
+                },
+                _ = gateway.lifecycle.cancellation.cancelled() => {
+                    domain_cancellation.cancel();
+                    Err(failure("Platform tool execution interrupted by shutdown"))
+                },
             };
             let interrupted = gateway.lifecycle.cancellation.is_cancelled();
             let result = if interrupted {
@@ -349,7 +421,7 @@ impl Gateway {
                 }
             }
             let encoded = match &result {
-                Ok(output) => crate::hook::tool::blocks_to_value(output.content.clone()).map(|(content, kind)| (content, kind, output.is_error)),
+                Ok(delivery) => crate::hook::tool::blocks_to_value(delivery.output.content.clone()).map(|(content, kind)| (content, kind, delivery.output.is_error)),
                 Err(error) => Ok((Value::String(error.to_string()), stravia_runtime_contract::protocol::ir::ToolResultContentKind::Json, true)),
             };
             let mut authoritative_terminal = false;
@@ -444,7 +516,7 @@ impl Gateway {
                 let execution = self.history_markers.resolve_public_execution(&principal, &id).await.map_err(|error| failure(error.to_string()))?.ok_or_else(|| failure("Tool execution is unavailable"))?;
                 // 到期与完成竞争时仍交付原快速结果，不丢弃已完成的领域输出。
                 if let Ok(result) = rx.try_recv() { return result; }
-                Ok(output(snapshot(execution)?))
+                Ok(ToolExecutionOutput::ordinary(output(snapshot(execution)?)))
             }
         }
     }

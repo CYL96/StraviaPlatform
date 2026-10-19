@@ -68,9 +68,9 @@ pub(super) struct Settlement {
     /// Marker batch staged for the Sent response, published after observation.
     pub staged_delivery: Option<ProjectedDeltaBatch>,
     /// Platform executions whose jobs start once their Markers are published.
-    pub background_executions: Vec<crate::HistoryMarkerExecutionJob>,
+    pub background_executions: Vec<crate::PreparedMarkerExecution>,
     /// Platform executions already started, spawned once delivery is confirmed.
-    pub started_executions: Vec<crate::StartedHistoryMarkerExecution>,
+    pub started_executions: Vec<crate::StartedMarkerDelivery>,
     /// The live Hook session executions finish under. Required whenever
     /// `started_executions` is non-empty; its absence is itself a failure.
     pub run: Option<crate::hook::InferenceRun>,
@@ -90,6 +90,8 @@ pub(super) struct Settlement {
 pub(super) enum SettlementFailure {
     /// Delivered Markers could not be published.
     MarkerPublish(crate::history_marker::HistoryMarkerError),
+    /// The current Platform delivery result could not be persisted.
+    MarkerResult(crate::history_marker::HistoryMarkerError),
     /// Confirmed executions had no live Inference Run to finish under.
     ExecutionsWithoutRun { count: usize },
     /// The Vendor generation became stale before its final history write.
@@ -102,6 +104,7 @@ impl std::fmt::Display for SettlementFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::MarkerPublish(error) => write!(f, "settlement_marker_publish: {error}"),
+            Self::MarkerResult(error) => write!(f, "settlement_marker_result: {error}"),
             Self::ExecutionsWithoutRun { count } => {
                 write!(f, "settlement_executions_without_run: {count}")
             }
@@ -246,7 +249,15 @@ pub(super) async fn settle(
     }
     if !started_executions.is_empty() {
         match run {
-            Some(run) => gateway.spawn_started_history_marker_executions(started_executions, run),
+            Some(mut run) => {
+                if let Err(error) = run.finish_marker_deliveries(started_executions).await {
+                    let failure = SettlementFailure::MarkerResult(error);
+                    observer.record(RunEvent::ObservationGap {
+                        reason: failure.to_string(),
+                    });
+                    outcome.failures.push(failure);
+                }
+            }
             None => {
                 let count = started_executions.len();
                 tracing::error!(

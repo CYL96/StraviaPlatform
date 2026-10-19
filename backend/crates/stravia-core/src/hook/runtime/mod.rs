@@ -15,7 +15,7 @@ mod apply;
 mod inference;
 
 use apply::*;
-pub(crate) use inference::{DetachedPlatformExecution, InferenceRun};
+pub(crate) use inference::InferenceRun;
 #[cfg(test)]
 use inference::{preserve_stream_coordinates, semantic_variant};
 

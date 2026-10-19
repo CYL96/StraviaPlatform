@@ -1,9 +1,10 @@
 use async_trait::async_trait;
+use serde_json::Value;
 use stravia_runtime_contract::Principal;
 use tokio::sync::Mutex;
 
 use super::*;
-use stravia_runtime_contract::protocol::ir::AiItem;
+use stravia_runtime_contract::protocol::ir::{AiItem, ContentBlock};
 
 struct TestHook {
     descriptor: HookDescriptor,
@@ -72,6 +73,420 @@ fn session_context(kind: RequestKind) -> SessionContext {
         response_id: None,
         previous_response_id: None,
     }
+}
+
+struct ControlledDeliveryTool {
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait]
+impl PlatformTool for ControlledDeliveryTool {
+    fn id(&self) -> ToolId {
+        ToolId::new("controlled-delivery")
+    }
+    fn external_name(&self) -> &str {
+        "controlled_delivery"
+    }
+    fn parameters(&self) -> Value {
+        serde_json::json!({"type":"object"})
+    }
+    fn execution_policy(&self, _arguments: &Value) -> PlatformExecutionPolicy {
+        PlatformExecutionPolicy::Bounded
+    }
+    async fn execute(
+        &self,
+        _arguments: Value,
+        _context: ToolExecutionContext,
+    ) -> Result<Value, PlatformToolError> {
+        self.entered.notify_one();
+        self.release.notified().await;
+        Ok(serde_json::json!({"unprocessed_success":true}))
+    }
+}
+
+#[tokio::test]
+async fn abandoned_inference_delivery_never_restores_unprocessed_success() {
+    assert_abandoned_inference_delivery(false).await;
+}
+
+#[tokio::test]
+async fn published_marker_cancellation_restores_concrete_cancelled_output_without_hook() {
+    assert_abandoned_inference_delivery(true).await;
+}
+
+async fn assert_abandoned_inference_delivery(cancel: bool) {
+    let directory = tempfile::tempdir().unwrap();
+    let gateway = crate::Gateway::new(crate::config::GatewayConfig {
+        data_dir: directory.path().to_owned(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let runtime = HookRuntime::with_tools(
+        Vec::new(),
+        PlatformToolRegistry::new(vec![Arc::new(ControlledDeliveryTool {
+            entered: entered.clone(),
+            release: release.clone(),
+        })])
+        .unwrap(),
+    );
+    let context = session_context(RequestKind::Generation);
+    let principal = context.principal.clone();
+    let cancellation = context.cancellation.clone();
+    let run = runtime
+        .begin(
+            context,
+            &AiRequest::new("model", Vec::new()),
+            ContextCompleteness::Full,
+        )
+        .unwrap();
+    let execution = run.detached_platform_execution(
+        PlatformToolCall {
+            tool_id: ToolId::new("controlled-delivery"),
+            call: stravia_runtime_contract::protocol::ir::ToolCall {
+                id: "controlled-call".into(),
+                name: "controlled_delivery".into(),
+                arguments: "{}".into(),
+            },
+        },
+        stravia_runtime_contract::CancellationToken::new(),
+    );
+    let (marker, execution) = gateway
+        .prepare_marker_execution(&principal, execution, None, "turn".into())
+        .await
+        .unwrap();
+    gateway
+        .history_markers
+        .publish(
+            &principal,
+            std::slice::from_ref(&marker.reference),
+            std::time::Duration::from_secs(3600),
+        )
+        .await
+        .unwrap();
+    let delivery = gateway.start_history_marker_executions(principal.clone(), vec![execution]);
+    entered.notified().await;
+    if cancel {
+        cancellation.cancel();
+    }
+    drop(delivery);
+    drop(run);
+    if !cancel {
+        release.notify_one();
+    }
+    let restored = gateway
+        .history_markers
+        .wait_terminal(&principal, &marker.reference)
+        .await
+        .unwrap()
+        .unwrap();
+    let Some(crate::history_marker::HiddenHistorySegment::Platform {
+        call,
+        result: ContentBlock::ToolResult {
+            content, is_error, ..
+        },
+    }) = restored.segment
+    else {
+        panic!("published Marker must restore its call and delivery result");
+    };
+    assert_eq!(call.id.to_string(), "controlled-call");
+    assert_eq!(is_error, Some(true));
+    assert_eq!(
+        content["error"]["code"],
+        if cancel {
+            "cancelled"
+        } else {
+            "delivery_processing_failed"
+        }
+    );
+    assert!(content.get("unprocessed_success").is_none());
+}
+
+struct DeliveryResultSession(Arc<std::sync::atomic::AtomicUsize>);
+
+#[async_trait]
+impl HookSession for DeliveryResultSession {
+    async fn handle(&mut self, event: HookEvent<'_>) -> Result<ActionBatch, String> {
+        let HookEvent::ToolResult { result, .. } = event else {
+            return Ok(ActionBatch::default());
+        };
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut content = result.content.clone();
+        content["delivery_hook"] = serde_json::json!(true);
+        Ok(ActionBatch::one(HookAction::PatchToolResult(
+            ToolResultPatch::SetContent(content),
+        )))
+    }
+}
+
+#[tokio::test]
+async fn marker_delivery_persistence_failure_returns_to_owning_inference_run() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut gateway = crate::Gateway::new(crate::config::GatewayConfig {
+        data_dir: directory.path().to_owned(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let pool = crate::test_support::migrated_sqlite_pool().await.unwrap();
+    gateway.history_markers = Arc::new(crate::history_marker::SqlHistoryMarkerStore::sqlite(
+        pool.clone(),
+    ));
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let runtime = HookRuntime::with_tools(
+        Vec::new(),
+        PlatformToolRegistry::new(vec![Arc::new(ControlledDeliveryTool {
+            entered: entered.clone(),
+            release: release.clone(),
+        })])
+        .unwrap(),
+    );
+    let context = session_context(RequestKind::Generation);
+    let principal = context.principal.clone();
+    let mut run = runtime
+        .begin(
+            context,
+            &AiRequest::new("model", Vec::new()),
+            ContextCompleteness::Full,
+        )
+        .unwrap();
+    run.set_route(route_context());
+    let execution = run.detached_platform_execution(
+        PlatformToolCall {
+            tool_id: ToolId::new("controlled-delivery"),
+            call: stravia_runtime_contract::protocol::ir::ToolCall {
+                id: "failed-delivery-write".into(),
+                name: "controlled_delivery".into(),
+                arguments: "{}".into(),
+            },
+        },
+        stravia_runtime_contract::CancellationToken::new(),
+    );
+    let (marker, execution) = gateway
+        .prepare_marker_execution(&principal, execution, None, "turn".into())
+        .await
+        .unwrap();
+    gateway
+        .history_markers
+        .publish(
+            &principal,
+            std::slice::from_ref(&marker.reference),
+            std::time::Duration::from_secs(3600),
+        )
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER fail_delivery_result BEFORE UPDATE OF segment_payload ON history_markers \
+         WHEN NOT EXISTS (SELECT 1 FROM public_tool_executions WHERE marker_reference = OLD.reference) \
+         BEGIN SELECT RAISE(ABORT, 'controlled delivery persistence failure'); END",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let delivery = gateway.start_history_marker_executions(principal, vec![execution]);
+    entered.notified().await;
+    release.notify_one();
+    let error = run.finish_marker_deliveries(delivery).await.unwrap_err();
+    assert!(matches!(
+        error,
+        crate::history_marker::HistoryMarkerError::Storage(_)
+    ));
+}
+
+#[tokio::test]
+async fn marker_reference_delivery_is_fixed_after_background_completion_and_hook_runs_once() {
+    let directory = tempfile::tempdir().unwrap();
+    let gateway = crate::Gateway::new(crate::config::GatewayConfig {
+        data_dir: directory.path().to_owned(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let hooks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let hook_count = hooks.clone();
+    let runtime = HookRuntime::with_tools(
+        vec![Arc::new(TestHook {
+            descriptor: HookDescriptor {
+                event_kinds: vec![EventKind::ToolResult],
+                ..HookDescriptor::all("delivery-result")
+            },
+            make: Arc::new(move || Box::new(DeliveryResultSession(hook_count.clone()))),
+        })],
+        PlatformToolRegistry::new(vec![
+            Arc::new(ControlledDeliveryTool {
+                entered: entered.clone(),
+                release: release.clone(),
+            }),
+            Arc::new(crate::mcp::read::ReadTool::new(&gateway, &mut Vec::new()).unwrap()),
+        ])
+        .unwrap(),
+    );
+    let key = gateway
+        .admin()
+        .create_api_key(crate::db::models::CreateApiKey {
+            key: None,
+            name: "marker query owner".into(),
+            rpm_limit: None,
+            expires_at: None,
+            mcp_access_enabled: true,
+            transparent_injection_enabled: false,
+            inject_web_search: false,
+            inject_media_generation: false,
+            model_ids: vec![],
+            inject_media_understanding: false,
+        })
+        .await
+        .unwrap();
+    let mut context = session_context(RequestKind::Generation);
+    context.principal = Principal::new(key.id);
+    let principal = context.principal.clone();
+    let mut run = runtime
+        .begin(
+            context,
+            &AiRequest::new("model", Vec::new()),
+            ContextCompleteness::Full,
+        )
+        .unwrap();
+    run.set_route(route_context());
+    let execution = run.detached_platform_execution(
+        PlatformToolCall {
+            tool_id: ToolId::new("controlled-delivery"),
+            call: stravia_runtime_contract::protocol::ir::ToolCall {
+                id: "fixed-reference-call".into(),
+                name: "controlled_delivery".into(),
+                arguments: "{}".into(),
+            },
+        },
+        stravia_runtime_contract::CancellationToken::new(),
+    );
+    let (marker, execution) = gateway
+        .prepare_marker_execution(&principal, execution, None, "turn".into())
+        .await
+        .unwrap();
+    gateway
+        .history_markers
+        .publish(
+            &principal,
+            std::slice::from_ref(&marker.reference),
+            std::time::Duration::from_secs(3600),
+        )
+        .await
+        .unwrap();
+    let delivery = gateway.start_history_marker_executions(principal.clone(), vec![execution]);
+    entered.notified().await;
+    tokio::time::pause();
+    tokio::time::advance(std::time::Duration::from_secs(60)).await;
+    tokio::time::resume();
+    run.finish_marker_deliveries(delivery).await.unwrap();
+    let delivered = gateway
+        .history_markers
+        .wait_terminal(&principal, &marker.reference)
+        .await
+        .unwrap()
+        .unwrap()
+        .segment
+        .unwrap();
+    let crate::history_marker::HiddenHistorySegment::Platform {
+        result: ContentBlock::ToolResult { ref content, .. },
+        ..
+    } = delivered
+    else {
+        panic!("Marker must contain the current delivery");
+    };
+    let path = content["path"]
+        .as_str()
+        .expect("bounded delivery contains its execution reference");
+    assert_eq!(content["delivery_hook"], true);
+    let id = path.strip_prefix("stravia://tool-executions/").unwrap();
+    let mut query_context = session_context(RequestKind::Generation);
+    query_context.principal = principal.clone();
+    let query_cancellation = query_context.cancellation.clone();
+    let query_run = runtime
+        .begin(
+            query_context,
+            &AiRequest::new("model", Vec::new()),
+            ContextCompleteness::Full,
+        )
+        .unwrap();
+    let query = query_run.detached_platform_execution(
+        PlatformToolCall {
+            tool_id: ToolId::new("stravia-read"),
+            call: stravia_runtime_contract::protocol::ir::ToolCall {
+                id: "independent-query-call".into(),
+                name: "StraviaRead".into(),
+                arguments: serde_json::json!({"path":format!("{path}?wait=120")}).to_string(),
+            },
+        },
+        stravia_runtime_contract::CancellationToken::new(),
+    );
+    let waiting = Arc::new(tokio::sync::Notify::new());
+    let registered = waiting.clone();
+    let query_gateway = gateway.clone();
+    let mut query = tokio::spawn(async move {
+        crate::tool_execution::QUERY_WAITING
+            .scope(registered, query.execute(&query_gateway))
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        tokio::select! {
+            _ = waiting.notified() => {},
+            result = &mut query => panic!("query returned before waiting: {}", result.unwrap().result.content),
+        }
+    })
+    .await
+    .expect("query must register its waiter");
+    query_cancellation.cancel();
+    let cancelled_query = tokio::time::timeout(std::time::Duration::from_secs(10), query)
+        .await
+        .expect("disconnecting the query must remove its waiter")
+        .unwrap();
+    assert!(cancelled_query.result.is_error);
+    assert_eq!(
+        gateway
+            .query_tool_execution(
+                &principal,
+                id,
+                std::time::Duration::ZERO,
+                &stravia_runtime_contract::CancellationToken::new(),
+            )
+            .await
+            .unwrap()["status"],
+        "running",
+    );
+    release.notify_one();
+    let completed = gateway
+        .query_tool_execution(
+            &principal,
+            id,
+            std::time::Duration::from_secs(60),
+            &stravia_runtime_contract::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(completed["status"], "completed");
+    assert_eq!(
+        completed["result"],
+        serde_json::json!({"unprocessed_success":true})
+    );
+    let restored = gateway
+        .history_markers
+        .wait_terminal(&principal, &marker.reference)
+        .await
+        .unwrap()
+        .unwrap()
+        .segment
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(restored).unwrap(),
+        serde_json::to_value(delivered).unwrap()
+    );
+    assert_eq!(hooks.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -1065,6 +1480,13 @@ async fn valid_platform_call_does_not_block_malformed_client_arguments() {
 
 #[tokio::test]
 async fn platform_tool_malformed_arguments_are_refused_at_execution() {
+    let directory = tempfile::tempdir().unwrap();
+    let gateway = crate::Gateway::new(crate::config::GatewayConfig {
+        data_dir: directory.path().to_owned(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
     let registry = crate::hook::PlatformToolRegistry::new(vec![Arc::new(RuntimeEchoTool)]).unwrap();
     let runtime = HookRuntime::with_tools(
         vec![Arc::new(TestHook {
@@ -1114,8 +1536,9 @@ async fn platform_tool_malformed_arguments_are_refused_at_execution() {
                 .expect("platform call"),
             stravia_runtime_contract::CancellationToken::new(),
         )
-        .execute()
-        .await;
+        .execute(&gateway)
+        .await
+        .result;
 
     assert!(result.is_error, "malformed arguments must refuse execution");
     assert_eq!(result.call_id, "platform-call");

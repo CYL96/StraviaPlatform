@@ -296,7 +296,7 @@ _避免使用_：Thinking Text、Authoritative Thinking
 
 ## History Marker
 
-History Marker 是 Client Projection 中、归属于 Principal 的 opaque 历史引用，用于在原位置等待并恢复一个 Hidden History Segment。一个 Marker 只能引用一个 Platform Tool Execution（其 call 与 terminal result）或一个 authoritative Thinking block，禁止聚合多个工具执行或多个 block。新 Marker 默认以无签名 Thinking block 中仅供机器读取的 HTML comment 呈现；OpenAI-compatible 客户端收到首个 Text 后，所有 Thinking 与 Platform Marker 均改用 Text carrier，以保留它们与后续内容的顺序。Markdown renderer 通常隐藏该 comment，纯文本客户端可能直接显示它，这是 Text carrier 的显式协议行为；周边客户端历史可以独立修改，同一 Marker 在保留期内可以被重试和并发分支重复使用。
+History Marker 是 Client Projection 中、归属于 Principal 的 opaque 历史引用，用于在原位置等待并恢复一个 Hidden History Segment。一个 Marker 只能引用一次 Platform Tool 调用的 call 与实际交付结果，或一个 authoritative Thinking block，禁止聚合多个工具调用或多个 block。工具返回 Tool Execution Reference 时，Marker 恢复该次实际交付的工具结果，不随后台执行完成而替换为其最终结果。新 Marker 默认以无签名 Thinking block 中仅供机器读取的 HTML comment 呈现；OpenAI-compatible 客户端收到首个 Text 后，所有 Thinking 与 Platform Marker 均改用 Text carrier，以保留它们与后续内容的顺序。Markdown renderer 通常隐藏该 comment，纯文本客户端可能直接显示它，这是 Text carrier 的显式协议行为；周边客户端历史可以独立修改，同一 Marker 在保留期内可以被重试和并发分支重复使用。
 其访问隔离边界仅为 Stravia API Key 对应的 Principal；同一 API Key 持有有效 Marker 引用时可跨对话或分支复用，不要求属于原历史或其后代，其他 API Key 不得解析。
 _避免使用_：占位文本、Platform Tool Call、Client History Token
 
@@ -312,7 +312,7 @@ _避免使用_：History Marker、Hidden History Segment、Projection Record
 
 ## Hidden History Segment
 
-Hidden History Segment 是 Client Projection 省略、但属于模型有效上下文的单个受保护单元；它是一个 Thinking block，或一个 Platform Tool Execution 的 call/result 对。恢复只替换对应 History Marker，不覆盖 Marker 之外的客户端历史，也不拥有同一模型轮次中客户端可见的工具调用。一次恢复同时给出模型可见历史，以及仍带 Marker 的 client-shaped 对照；Generation Chain 落盘 effective request 时使用该对照，不自己回锚 Marker。
+Hidden History Segment 是 Client Projection 省略、但属于模型有效上下文的单个受保护单元；它是一个 Thinking block，或一次 Platform Tool 调用的 call 与实际交付结果，不随该结果引用的后台执行完成而改变。恢复只替换对应 History Marker，不覆盖 Marker 之外的客户端历史，也不拥有同一模型轮次中客户端可见的工具调用。一次恢复同时给出模型可见历史，以及仍带 Marker 的 client-shaped 对照；Generation Chain 落盘 effective request 时使用该对照，不自己回锚 Marker。
 _避免使用_：Hidden Client History、完整历史快照
 
 ## Thinking Replay
@@ -322,17 +322,24 @@ _避免使用_：无损跨模型思维链、解密降级、删除原始推理
 
 ## History Marker Store
 
-History Marker Store 是在 Marker 交付前持久化 Principal-scoped 隐藏历史及其 Platform Tool Execution 状态的事实源；执行完成后形成不可变 Hidden History Segment。它独立于只在完整交付后形成节点的 Generation Chain；未被完整交付引用的记录由保留策略清理。
+History Marker Store 是在 Marker 交付前持久化 Principal-scoped 隐藏历史及其交付状态的事实源；本次调用的交付结果封存后形成不可变 Hidden History Segment，与工具独立执行的最终结果分别保留。它独立于只在完整交付后形成节点的 Generation Chain；未被完整交付引用的记录由各自保留策略清理。
 _避免使用_：Marker Cache、Tool Continuation Store
 
 ## Platform Tool Execution
 
-Platform Tool Execution 是由 History Marker Store 跟踪、可与客户端工具并行推进的一次平台工具执行。进程崩溃时未落盘完成的执行转为失败结果并提示模型重新请求工具，Stravia 不自动重放可能已经产生副作用的调用。
+Platform Tool Execution 是一次归属于 Principal、可与客户端工具并行推进的平台工具执行；已交接的后台执行及其可查询结果独立于来源请求的诊断记录，清除诊断不取消该执行或回收其结果。进程崩溃时未落盘完成的执行转为失败结果并提示模型重新请求工具，Stravia 不自动重放可能已经产生副作用的调用。
 _避免使用_：Tool Retry Job、Inference Run
+
+## 工具执行交接（Tool Execution Handoff）
+
+工具执行交接是采用有界同步等待的平台工具调用在等待耗尽后，将执行归属从原调用方转为独立后台执行的持久确认；等待窗口不是执行期限，交接不重置原始执行期限。对于这类调用，History Marker 发布只确认隐藏历史的发布，不转移执行归属：交接提交前原调用方断开会取消本地执行，即使 Marker 已发布；提交后则不因原调用方断开或执行引用未送达而取消。它不表示上游能够被撤销或停止计费。
+
+本地取消实际生效时形成明确的取消工具结果，对应 History Marker 保存并恢复该次调用与取消结果，不因原请求的 Hook 无法继续而改成其他交付错误；已经完成的终态不被后续断线改写。
+_避免使用_：执行超时、客户端已收到引用、重新执行
 
 ## 工具执行引用（Tool Execution Reference）
 
-工具执行引用是供客户端与模型通过 StraviaRead 查询某次平台工具执行状态及结果的稳定、不透明引用，外壳为 `stravia://tool-executions/<id>`。它不是模型生成的 tool-call ID、History Marker 或结果文件的 Artifact Reference，也不授予访问权限；解析仍受所属 Principal 的访问隔离约束。
+工具执行引用是供客户端与模型通过 StraviaRead 查询某次平台工具执行状态及结果的稳定、不透明引用，外壳为 `stravia://tool-executions/<id>`，可查询结果从执行终态起按历史保留时长独立保留，查询不续期。它不是模型生成的 tool-call ID、History Marker 或结果文件的 Artifact Reference，也不授予访问权限；解析仍受所属 Principal 的访问隔离约束。
 _避免使用_：Tool Call ID、工具定义 ID、访问凭据
 
 ## Generation Chain
