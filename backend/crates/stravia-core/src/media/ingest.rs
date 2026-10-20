@@ -2,6 +2,7 @@
 use base64::Engine;
 use bytes::Bytes;
 use serde::Deserialize;
+use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::Duration;
 use stravia_runtime_contract::artifact::{
@@ -586,6 +587,14 @@ pub(crate) async fn materialize_request(
         principal,
         settings: &settings,
         retention: retention(gateway).await?,
+        annotate_references: crate::proxy::security::Security::new(gateway.storage.auth())
+            .transparent_injection_enabled(principal)
+            .await
+            .map_err(|error| {
+                ArtifactError::Storage(format!(
+                    "Failed to resolve transparent tool injection: {error}"
+                ))
+            })?,
     };
     let mut transfers = Vec::new();
     for item in &mut Arc::make_mut(request).items {
@@ -601,16 +610,19 @@ struct ArtifactAccess<'a> {
     principal: &'a Principal,
     settings: &'a ArtifactSettings,
     retention: Duration,
+    annotate_references: bool,
 }
 
 fn materialize_blocks<'a>(
     access: &'a ArtifactAccess<'a>,
-    blocks: &'a mut [ContentBlock],
+    blocks: &'a mut Vec<ContentBlock>,
     protocol: Option<ProtocolId>,
     transfers: &'a mut Vec<(String, ArtifactId)>,
 ) -> futures::future::BoxFuture<'a, Result<(), ArtifactError>> {
     Box::pin(async move {
-        for block in blocks {
+        let mut references = String::new();
+        let mut attachment_index = 0;
+        for block in blocks.iter_mut() {
             let kind = match block {
                 ContentBlock::Image { .. } => "image",
                 ContentBlock::Audio { .. } => "audio",
@@ -623,10 +635,26 @@ fn materialize_blocks<'a>(
                 | ContentBlock::Audio { source }
                 | ContentBlock::File { source, .. }
                 | ContentBlock::Video { source, .. } => {
+                    attachment_index += 1;
+                    if access.annotate_references
+                        && let MediaSource::Url(reference) = source
+                    {
+                        let _ = writeln!(
+                            references,
+                            "Attachment {attachment_index} ({kind}): {reference}"
+                        );
+                    }
                     materialize_source(access, source, protocol, kind, transfers).await?;
                 }
                 ContentBlock::Document { source, .. } => match source {
                     DocumentSource::Url(url) => {
+                        attachment_index += 1;
+                        if access.annotate_references {
+                            let _ = writeln!(
+                                references,
+                                "Attachment {attachment_index} (document): {url}"
+                            );
+                        }
                         let mut media = MediaSource::Url(url.clone());
                         materialize_source(access, &mut media, protocol, "document", transfers)
                             .await?;
@@ -670,6 +698,13 @@ fn materialize_blocks<'a>(
                 }
                 _ => {}
             }
+        }
+        // 传输源会变成 base64 或临时下载地址；稳定引用只补到本次交付副本，不写回历史。
+        if !references.is_empty() {
+            blocks.push(ContentBlock::Text {
+                text: references.into(),
+                cache_control: None,
+            });
         }
         Ok(())
     })

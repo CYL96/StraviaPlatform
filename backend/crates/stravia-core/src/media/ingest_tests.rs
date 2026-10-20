@@ -16,6 +16,37 @@ async fn opaque_media_uses_inline_bytes_and_standard_media_keeps_signed_download
         ToolResultContentKind,
     };
 
+    fn assert_image_bytes(block: &ContentBlock, expected: &[u8]) {
+        let ContentBlock::Image {
+            source: MediaSource::Base64 { media_type, data },
+            ..
+        } = block
+        else {
+            panic!("opaque guest must receive canonical inline image bytes");
+        };
+        assert_eq!(media_type, "image/png");
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(data)
+                .unwrap(),
+            expected
+        );
+    }
+
+    fn assert_reference(blocks: &[ContentBlock], reference: &str) {
+        let occurrences: usize = blocks
+            .iter()
+            .map(|block| match block {
+                ContentBlock::Text { text, .. } => text.matches(reference).count(),
+                _ => 0,
+            })
+            .sum();
+        assert_eq!(
+            occurrences, 1,
+            "attachment reference must remain model-readable"
+        );
+    }
+
     let directory = tempfile::tempdir().unwrap();
     let gateway = crate::Gateway::new(crate::config::GatewayConfig {
         data_dir: directory.path().to_owned(),
@@ -32,7 +63,18 @@ async fn opaque_media_uses_inline_bytes_and_standard_media_keeps_signed_download
         )
         .await
         .unwrap();
-    let owner = Principal::new("opaque-media-owner");
+    let owner = gateway
+        .admin()
+        .create_api_key(
+            serde_json::from_value(serde_json::json!({
+                "name": "opaque-media-owner",
+                "transparent_injection_enabled": true
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let owner = Principal::new(owner.id);
     let bytes = include_bytes!("../../tests/fixtures/media/transparent.png");
     let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
     let image = ContentBlock::Image {
@@ -80,6 +122,23 @@ async fn opaque_media_uses_inline_bytes_and_standard_media_keeps_signed_download
     )
     .await
     .unwrap();
+    let MessageContent::Blocks(normalized_blocks) = &normalized.items[0].content else {
+        panic!("expected normalized media blocks");
+    };
+    let ContentBlock::Image {
+        source: MediaSource::Url(image_reference),
+        ..
+    } = &normalized_blocks[0]
+    else {
+        panic!("expected stored image reference");
+    };
+    let ContentBlock::Document {
+        source: DocumentSource::Url(pdf_reference),
+        ..
+    } = &normalized_blocks[3]
+    else {
+        panic!("expected stored PDF reference");
+    };
     // 与 Target preparation 一样从 guest identity 查找共享 codec；空 hint 也没有 endpoint。
     let identity = ProtocolIdentity::new("opaque-test-plugin/private-api/v7");
     assert!(identity.protocol().is_none());
@@ -95,39 +154,58 @@ async fn opaque_media_uses_inline_bytes_and_standard_media_keeps_signed_download
             transfers.is_empty(),
             "opaque delivery must not issue URL grants"
         );
-        assert_eq!(
-            serde_json::to_value(&request.items).unwrap(),
-            serde_json::to_value(&original.items).unwrap(),
-            "nested images and PDF must retain their bytes"
-        );
         let MessageContent::Blocks(blocks) = &request.items[0].content else {
             panic!("expected media blocks");
         };
-        let ContentBlock::Image {
-            source: MediaSource::Base64 { media_type, data },
+        assert_image_bytes(&blocks[0], bytes);
+        assert_reference(blocks, image_reference);
+        assert_reference(blocks, pdf_reference);
+        let ContentBlock::Document {
+            source: DocumentSource::Blocks { content },
             ..
-        } = &blocks[0]
+        } = &blocks[1]
         else {
-            panic!("opaque guest must receive canonical inline image bytes");
+            panic!("expected nested document");
         };
-        assert_eq!(media_type, "image/png");
+        assert_image_bytes(&content[0], bytes);
+        assert_reference(content, image_reference);
+        let ContentBlock::ToolResult { content, .. } = &blocks[2] else {
+            panic!("expected nested tool result");
+        };
+        let content: Vec<ContentBlock> = serde_json::from_value(content.clone()).unwrap();
+        assert_image_bytes(&content[0], bytes);
+        assert_reference(&content, image_reference);
+        let ContentBlock::Document {
+            source: DocumentSource::Base64Pdf { data },
+            ..
+        } = &blocks[3]
+        else {
+            panic!("opaque guest must receive inline PDF bytes");
+        };
         assert_eq!(
             base64::engine::general_purpose::STANDARD
                 .decode(data)
                 .unwrap(),
-            bytes
+            b"%PDF-1.7\nopaque document\n"
         );
     }
-    let mut unauthorized = normalized.clone();
-    assert!(
-        ingest::materialize_request(
-            &gateway,
-            &Principal::new("other-owner"),
-            &mut unauthorized,
-            None,
+    let other = gateway
+        .admin()
+        .create_api_key(
+            serde_json::from_value(serde_json::json!({
+                "name": "other-owner",
+                "transparent_injection_enabled": true
+            }))
+            .unwrap(),
         )
         .await
-        .is_err(),
+        .unwrap();
+    let other = Principal::new(other.id);
+    let mut unauthorized = normalized.clone();
+    assert!(
+        ingest::materialize_request(&gateway, &other, &mut unauthorized, None)
+            .await
+            .is_err(),
         "inline delivery must retain Artifact ownership enforcement"
     );
 
@@ -155,6 +233,7 @@ async fn opaque_media_uses_inline_bytes_and_standard_media_keeps_signed_download
         panic!("standard image target must still receive a signed URL");
     };
     assert!(url.starts_with("https://downloads.example/v1/artifacts/downloads/"));
+    assert_reference(blocks, image_reference);
     assert_eq!(transfers.len(), 1);
     assert_eq!(transfers[0].0, *url);
     let download = crate::proxy::server::create_router(gateway.clone())
@@ -391,81 +470,6 @@ async fn public_model_input_snapshots_media_without_scanning_text() {
     let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
     let ordinary =
         "Do not fetch http://127.0.0.1/private or sa:not-a-file; YWJjZA== is ordinary text.";
-    let upload_grant = gateway
-        .upload_grants
-        .issue(&Principal::new(key.id.clone()))
-        .unwrap();
-    let body = serde_json::json!({"model":"vision","safety_identifier":upload_grant.key,"tools":[{"type":"function","function":{"name":"client_action","description":"ordinary description","parameters":{"type":"object","properties":{(upload_grant.key.clone()):{"type":"string","description":"ordinary-value"}}}}}],"messages":[{"role":"user","content":[{"type":"text","text":ordinary},{"type":"image_url","image_url":{"url":format!("data:image/png;base64,{encoded}")}}]}]});
-    let response = router
-        .clone()
-        .oneshot(
-            Request::post("/v1/chat/completions")
-                .header("content-type", "application/json")
-                .header("authorization", format!("Bearer {}", key.token))
-                .body(Body::from(body.to_string()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let status = response.status();
-    let response_body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "{}",
-        String::from_utf8_lossy(&response_body)
-    );
-    let wire = received.lock().await;
-    assert_eq!(wire[0]["safety_identifier"], "<stravia-upload-key>");
-    assert_eq!(
-        wire[0]["tools"][0]["function"]["parameters"]["properties"]["<stravia-upload-key>"]["description"],
-        "ordinary-value"
-    );
-    assert!(!wire[0].to_string().contains(&upload_grant.key));
-    let contents = wire[0]["messages"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter_map(|item| item["content"].as_array())
-        .flatten()
-        .collect::<Vec<_>>();
-    assert!(contents.iter().any(|part| part["text"] == ordinary));
-    let sent = contents
-        .iter()
-        .find_map(|part| {
-            part.pointer("/image_url/url")
-                .and_then(serde_json::Value::as_str)
-        })
-        .unwrap();
-    assert_eq!(
-        base64::engine::general_purpose::STANDARD
-            .decode(sent.split_once(',').unwrap().1)
-            .unwrap(),
-        bytes
-    );
-    drop(wire);
-    let bad = serde_json::json!({"model":"vision","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"http://127.0.0.1/private"}}]}]});
-    let rejected = router
-        .oneshot(
-            Request::post("/v1/chat/completions")
-                .header("content-type", "application/json")
-                .header("authorization", format!("Bearer {}", key.token))
-                .body(Body::from(bad.to_string()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert!(rejected.status().is_client_error());
-    assert_eq!(
-        received.lock().await.len(),
-        1,
-        "required attachment failure must precede provider execution"
-    );
-    use futures::StreamExt;
-    use stravia_runtime_contract::agent::{
-        AgentBudgets, AgentDefinitionConfig, AgentDefinitionExposure, AgentDefinitionId,
-        AgentDefinitionSpec, AgentEvent, AgentInput, AgentSlug, ArtifactPolicy,
-    };
     let principal = Principal::new(key.id.clone());
     let artifact = gateway
         .artifact_store
@@ -480,6 +484,105 @@ async fn public_model_input_snapshots_media_without_scanning_text() {
         )
         .await
         .unwrap();
+    let upload_grant = gateway
+        .upload_grants
+        .issue(&Principal::new(key.id.clone()))
+        .unwrap();
+    let body = serde_json::json!({"model":"vision","safety_identifier":upload_grant.key,"tools":[{"type":"function","function":{"name":"client_action","description":"ordinary description","parameters":{"type":"object","properties":{(upload_grant.key.clone()):{"type":"string","description":"ordinary-value"}}}}}],"messages":[{"role":"user","content":[{"type":"text","text":ordinary},{"type":"image_url","image_url":{"url":format!("data:image/png;base64,{encoded}")}}]}]});
+    for (index, enabled) in [false, true, false].into_iter().enumerate() {
+        admin
+            .update_api_key(
+                &key.id,
+                serde_json::from_value(serde_json::json!({
+                    "transparent_injection_enabled": enabled
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let response = router
+            .clone()
+            .oneshot(
+                Request::post("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {}", key.token))
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let response_body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&response_body)
+        );
+        let wire = received.lock().await;
+        assert_eq!(wire[index]["safety_identifier"], "<stravia-upload-key>");
+        let client_tool = wire[index]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["function"]["name"] == "client_action")
+            .unwrap();
+        assert_eq!(
+            client_tool["function"]["parameters"]["properties"]["<stravia-upload-key>"]["description"],
+            "ordinary-value"
+        );
+        assert!(!wire[index].to_string().contains(&upload_grant.key));
+        let contents = wire[index]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|item| item["content"].as_array())
+            .flatten()
+            .collect::<Vec<_>>();
+        assert!(contents.iter().any(|part| part["text"] == ordinary));
+        let sent = contents
+            .iter()
+            .find_map(|part| {
+                part.pointer("/image_url/url")
+                    .and_then(serde_json::Value::as_str)
+            })
+            .unwrap();
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(sent.split_once(',').unwrap().1)
+                .unwrap(),
+            bytes
+        );
+        assert_eq!(
+            contents.iter().any(|part| part["text"]
+                .as_str()
+                .is_some_and(|text| text.contains(&artifact.reference()))),
+            enabled,
+            "attachment references must follow the transparent tool injection switch"
+        );
+    }
+    let bad = serde_json::json!({"model":"vision","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"http://127.0.0.1/private"}}]}]});
+    let rejected = router
+        .oneshot(
+            Request::post("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {}", key.token))
+                .body(Body::from(bad.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(rejected.status().is_client_error());
+    assert_eq!(
+        received.lock().await.len(),
+        3,
+        "required attachment failure must precede provider execution"
+    );
+    use futures::StreamExt;
+    use stravia_runtime_contract::agent::{
+        AgentBudgets, AgentDefinitionConfig, AgentDefinitionExposure, AgentDefinitionId,
+        AgentDefinitionSpec, AgentEvent, AgentInput, AgentSlug, ArtifactPolicy,
+    };
     let definitions = crate::agent::AgentDefinitionRegistry::default();
     let definition_id = AgentDefinitionId::new("artifact_wire_agent");
     definitions
