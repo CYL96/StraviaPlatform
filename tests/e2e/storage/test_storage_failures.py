@@ -388,7 +388,8 @@ def media_background_upstream():
             if body['model'] == 'vision':
                 media_requests.append(body)
                 entered.set()
-                assert release.wait(20), 'background vision provider was not released'
+                # 保持真实上游挂起，跨过公开工具默认的 60 秒同步等待窗口。
+                assert release.wait(150), 'background vision provider was not released'
                 message = {'role': 'assistant', 'content': json.dumps({
                     'answer': f'A blue square from the real media provider. [{self.server.artifact_path}]',
                     'artifacts': [{'path': self.server.artifact_path}], 'limitations': []})}
@@ -442,7 +443,7 @@ def configure_background_media(env, parent_route):
     assert status == 201, body
     status, body = http_request('POST', env['admin'] + '/api/v1/models', {
         'model_id': 'background-vision', 'output_modality': 'text', 'targets': [{'provider_id': provider, 'model': 'vision',
-        'target_retry_budget': 0, 'target_cooldown_ms': 0}]}, env['auth'])
+        'first_token_timeout_ms': 120_000, 'target_retry_budget': 0, 'target_cooldown_ms': 0}]}, env['auth'])
     assert status == 200, body
     vision = body['data']['id']
     status, body = http_request('PUT', env['admin'] + '/api/v1/media-understanding', {
@@ -450,7 +451,8 @@ def configure_background_media(env, parent_route):
     assert status == 200, body
     status, body = http_request('POST', env['admin'] + '/api/v1/api-keys', {
         'name': 'background-media-key', 'model_ids': [parent_route],
-        'transparent_injection_enabled': True, 'inject_media_understanding': True}, env['auth'])
+        'transparent_injection_enabled': True, 'inject_media_understanding': True,
+        'mcp_access_enabled': True}, env['auth'])
     assert status == 200, body
     return body['data']['key']
 
@@ -497,12 +499,13 @@ def test_storage_failure_preserves_published_background_media_task(
             assert status == 201, f'fault upload creation returned HTTP {status}'
             # Public StraviaRead is the path facade. Its PNG artifact branch
             # delegates to the real configured Media Understanding provider.
+            # HTTP 等待必须覆盖真实同步窗口，不能把产品交接期限缩短成测试专用值。
             status, published = http_request('POST', env['proxy'] + '/v1/responses', {
                 'model': 'background-media-parent', 'input': [{'role': 'user', 'content': 'read the owned image'}],
                 'tools': [{'type': 'function', 'name': 'StraviaRead', 'parameters': {
                     'type': 'object', 'properties': {'path': {'type': 'string', 'minLength': 1}},
                     'required': ['path'], 'additionalProperties': False}},
-                    {'type': 'function', 'name': 'local_probe', 'parameters': {'type': 'object'}}]}, auth)
+                    {'type': 'function', 'name': 'local_probe', 'parameters': {'type': 'object'}}]}, auth, timeout=90)
             assert status == 200 and 'background published' in json.dumps(published), published
             client_call = next(item for item in published['output']
                                if item.get('type') == 'function_call' and item.get('name') == 'local_probe')
@@ -520,18 +523,7 @@ def test_storage_failure_preserves_published_background_media_task(
                 trigger.close()
             assert not arm.exists(), 'configured artifact fault was not consumed'
             assert process.poll() is None, 'unrelated upload failure terminated background host'
-            release.set()
-            interaction = _wait_for('published background interaction', lambda: next(iter(
-                _route_interactions(env, route_id)), None))
-            def finished_platform():
-                detail = _detail(env, interaction['id'])
-                return next((event['payload'] for run in detail['runs'] for event in run['events']
-                    if event['kind'] == 'platform_tool_finished' and event['payload']['tool_id'] == 'read-media'), None)
-            completed = _wait_for('background media task public completion', finished_platform)
-            assert completed['status'] == 'completed', completed
-            # Durable observations may deliberately omit full tool content.
-            # The subsequent real provider request proves the retained result.
-            assert len(media_requests) == 1, 'storage failure retried or replayed background media'
+            # Marker 恢复本次实际交付的执行引用，不等后台完成，也不替换成最终报告。
             status, continued = http_request('POST', env['proxy'] + '/v1/responses', {
                 'model': 'background-media-parent', 'previous_response_id': published['id'],
                 'input': [{'type': 'function_call_output', 'call_id': client_call['call_id'], 'output': 'probe done'}]}, auth)
@@ -540,5 +532,25 @@ def test_storage_failure_preserves_published_background_media_task(
             tool_results = [message for message in parent_requests[-1]['messages']
                             if message['role'] == 'tool' and message.get('tool_call_id') == 'read-media']
             assert len(tool_results) == 1
-            assert 'A blue square from the real media provider.' in json.dumps(tool_results[0])
+            delivered = json.loads(tool_results[0]['content'])
+            assert delivered['path'].startswith('stravia://tool-executions/'), delivered
+            assert delivered['status'] == 'running', delivered
+            assert not release.is_set(), 'Marker restoration waited for background completion'
+            release.set()
+            status, queried = http_request('POST', env['proxy'] + '/mcp', {
+                'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call', 'params': {
+                    'name': 'StraviaRead', 'arguments': {'path': delivered['path'] + '?wait=30'},
+                    '_meta': {'io.modelcontextprotocol/protocolVersion': '2026-07-28',
+                              'io.modelcontextprotocol/clientCapabilities': {}}}},
+                {**auth, 'Accept': 'application/json, text/event-stream',
+                 'MCP-Protocol-Version': '2026-07-28', 'Mcp-Method': 'tools/call',
+                 'Mcp-Name': 'StraviaRead'}, timeout=45)
+            assert status == 200, queried
+            assert not queried['result']['isError'], queried
+            completed = queried['result']['structuredContent']
+            assert completed['status'] == 'completed', completed
+            assert completed['result']['report']['answer'] == (
+                f'A blue square from the real media provider. [{upstream.artifact_path}]')
+            assert completed['result']['report']['artifacts'] == [{'path': upstream.artifact_path}]
+            assert len(media_requests) == 1, 'storage failure retried or replayed background media'
             assert process.poll() is None
