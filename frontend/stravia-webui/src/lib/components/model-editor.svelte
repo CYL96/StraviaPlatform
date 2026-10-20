@@ -821,7 +821,7 @@ async function saveModel(): Promise<void> {
             {m.model_editor_set_model_name_request_type_client_apps_use()}
           </p>
         </div>
-        <div data-slot="model-enabled-control" class="flex min-h-10 shrink-0 items-center gap-2">
+        <div data-slot="model-enabled-control" class="flex shrink-0 items-center gap-2">
           <Field.Label for="route-enabled">{m.common_enable_action()}</Field.Label>
           <Switch
             id="route-enabled"
@@ -1256,7 +1256,6 @@ async function saveModel(): Promise<void> {
                       type="button"
                       variant="ghost"
                       size="icon"
-                      class="size-10"
                       aria-label={m.model_editor_remove_destination_value({ index: index + 1 })}
                       onclick={deleteEditedTarget}><Trash2Icon /></Button>
                   {/if}
@@ -1390,7 +1389,7 @@ async function saveModel(): Promise<void> {
                       {@const rowWritable = thinkingRowWritable(target, row)}
                       <div
                         data-slot="thinking-map-row"
-                        class="grid grid-cols-[minmax(0,1fr)_2.5rem] items-center gap-x-3 gap-y-2 py-2 sm:grid-cols-[minmax(8rem,0.8fr)_minmax(0,2.2fr)_2.5rem]">
+                        class="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-x-3 gap-y-2 py-2 sm:grid-cols-[minmax(8rem,0.8fr)_minmax(0,2.2fr)_auto]">
                         <div class="flex min-w-0 items-center gap-2">
                           <span class="font-technical text-sm">{row.level}</span>
                           {#if row.source === 'overridden'}
@@ -1441,7 +1440,7 @@ async function saveModel(): Promise<void> {
                             type="button"
                             variant="ghost"
                             size="icon"
-                            class="col-start-2 row-start-1 size-10 justify-self-end sm:col-auto sm:row-auto"
+                            class="col-start-2 row-start-1 justify-self-end sm:col-auto sm:row-auto"
                             aria-label={`${m.model_editor_thinking_reset_row()}: ${row.level}`}
                             title={m.model_editor_thinking_reset_row()}
                             onclick={() => void resetThinkingRow(target, row.level)}>
@@ -1493,7 +1492,7 @@ async function saveModel(): Promise<void> {
                 data-slot="route-thinking-level"
                 data-level={level}
                 data-supported="false"
-                class="flex min-h-10 w-full cursor-help items-center justify-center rounded-lg px-3 text-muted-foreground outline-none transition-colors hover:bg-background/50 focus-visible:ring-[3px] focus-visible:ring-ring/50">
+                class="flex w-full cursor-help items-center justify-center rounded-lg px-3 py-2 text-muted-foreground outline-none transition-colors hover:bg-background/50 focus-visible:ring-[3px] focus-visible:ring-ring/50">
                 <span class="font-technical">{level}</span>
               </Tooltip.Trigger>
               <Tooltip.Content side="top" sideOffset={8} class="max-w-96 flex-col items-start gap-1.5">
@@ -1510,7 +1509,7 @@ async function saveModel(): Promise<void> {
               data-slot="route-thinking-level"
               data-level={level}
               data-supported="true"
-              class="flex min-h-10 items-center justify-center rounded-lg bg-background px-3 shadow-xs">
+              class="flex items-center justify-center rounded-lg bg-background px-3 py-2 shadow-xs">
               <span class="font-technical">{level}</span>
             </div>
           {/if}

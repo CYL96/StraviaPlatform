@@ -102,7 +102,7 @@ function setText(field: VendorConfigField, value: string): void {
         {#if field.kind.type === 'bool' && !field.secret}
           <Field.Field
             orientation="horizontal"
-            class="min-h-10 justify-between rounded-lg border px-3 py-2 sm:col-span-2"
+            class="justify-between rounded-lg border px-3 py-2 sm:col-span-2"
             data-invalid={invalid || undefined}>
             <div>
               <Field.Label

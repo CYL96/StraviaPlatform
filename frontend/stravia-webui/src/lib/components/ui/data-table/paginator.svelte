@@ -29,7 +29,7 @@ let { table, pagination, resolvedLabels, pageSizeOptions, pageCount }: Props = $
     <Select.Root
       type="single"
       bind:value={() => String(pagination.pageSize), (value) => table.setPageSize(Number(value))}>
-      <Select.Trigger class="h-10 w-20" aria-label={resolvedLabels.rowsPerPage}>{pagination.pageSize}</Select.Trigger>
+      <Select.Trigger class="w-20" aria-label={resolvedLabels.rowsPerPage}>{pagination.pageSize}</Select.Trigger>
       <Select.Content>
         <Select.Group>
           {#each pageSizeOptions as option (option)}
@@ -55,7 +55,6 @@ let { table, pagination, resolvedLabels, pageSizeOptions, pageCount }: Props = $
             type="button"
             variant="outline"
             size="icon"
-            class="size-10"
             aria-label={resolvedLabels.firstPage}
             disabled={!table.getCanPreviousPage()}
             onclick={() => table.firstPage()}>
@@ -91,7 +90,6 @@ let { table, pagination, resolvedLabels, pageSizeOptions, pageCount }: Props = $
             type="button"
             variant="outline"
             size="icon"
-            class="size-10"
             aria-label={resolvedLabels.lastPage}
             disabled={!table.getCanNextPage()}
             onclick={() => table.lastPage()}>

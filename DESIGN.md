@@ -114,7 +114,6 @@ spacing:
   lg: 24px
   xl: 32px
   control-gap: 12px
-  titlebar-height: 40px
   sidebar-compact-width: 48px
   sidebar-width: 256px
   content-max-width: 1800px
@@ -136,32 +135,29 @@ components:
     backgroundColor: "{colors.sidebar-accent}"
     textColor: "{colors.sidebar-accent-foreground}"
     rounded: "{rounded.md}"
-    height: 40px
-    padding: "0 12px"
+    padding: "8px 12px"
   button-primary:
     backgroundColor: "{colors.primary}"
     textColor: "{colors.primary-foreground}"
     rounded: "{rounded.lg}"
-    height: 40px
-    padding: "0 12px"
+    padding: "8px 12px"
   button-large:
     backgroundColor: "{colors.primary}"
     textColor: "{colors.primary-foreground}"
     rounded: "{rounded.lg}"
-    height: 44px
-    padding: "0 16px"
+    padding: "10px 16px"
   icon-button:
     rounded: "{rounded.lg}"
-    size: 40px
+    padding: 8px
   input:
     backgroundColor: "{colors.background}"
     textColor: "{colors.foreground}"
     rounded: "{rounded.lg}"
-    height: 40px
+    padding: "4px 12px"
   field-help-trigger:
     textColor: "{colors.muted-foreground}"
     rounded: "{rounded.md}"
-    size: 40px
+    size: 16px
   field-number:
     width: 7rem
   field-datetime:
@@ -237,7 +233,7 @@ Stravia 是本地运行、可自托管的 Agent infra（智能体基础设施）
 - OAuth 供应商的三点菜单提供「重新授权」，直接复用账号授权流程并绑定回原服务，不要求进入连接编辑器，也不改写已保存的连接配置。授权失败保留恢复操作；完成后刷新凭据状态。
 - 额度页对凭据失效的服务明确说明无法获取额度，并提供连接恢复入口；暂停该服务的自动、单项和全部刷新请求，其他服务不受影响。已有成功数据只作为过期结果保留；继续读取服务状态以发现凭据恢复，再允许获取额度。
 - 额度页的「耗尽时暂停」开关仅在配置保存期间禁用，并通过开关自身的忙碌与禁用状态反馈，不在供应商标题行追加「正在保存暂停设置」片段；服务器确认后立即显示已保存值。随后额度刷新仅在服务行右侧刷新按钮显示转圈，不额外显示刷新状态文字，也不继续锁住守护编辑；后台刷新失败不得表述为保存失败。取消守护的暂停变化立即呈现，新增守护的暂停结果等待成功读取，不用乐观状态代替。
-- 供应商列表、供应商详情页头和额度矩阵的供应商名称旁使用紧凑的「额度暂停」状态入口。暂停开始时间、触发条目和已知重置时间通过 Tooltip 按需显示，支持悬停、键盘聚焦和触摸点击；Escape 关闭，入口不触发整行导航或额度明细展开。额度矩阵中保留入口的 40px 点击区，但不得撑高标题行或改变名称与次行的间距。不在数据行内放置暂停说明块，也不显示路由恢复原理文案。
+- 供应商列表、供应商详情页头和额度矩阵的供应商名称旁使用紧凑的「额度暂停」状态入口。暂停开始时间、触发条目和已知重置时间通过 Tooltip 按需显示，支持悬停、键盘聚焦和触摸点击；Escape 关闭，入口不触发整行导航或额度明细展开。
 - Provider 保存后沿用进入详情并同步 Provider Model 的流程。同步期间可以继续使用页面；失败时分别说明连接配置已保存与模型同步失败，并提供重试。
 - 手动模型同步使用 Sonner toast，只显示实际变更类型与非零数量，包括上游弃用、解除弃用和同步规格更新；有记录时提供可点击、可键盘操作的「查看详情」并定位、展开本次记录，切换页签或页面不使入口失效，也不因完成而强制返回原页。无变化时明确确认检查完成，不列全零计数。失败保留原因和恢复动作，重试始终绑定原服务，不同步或丢弃后来打开服务的草稿；部分成功明确更改已保存，不把后置错误描述为整次回滚。后台同步不弹 toast、不主动打开侧栏。
 - 模型清单显示服务端保存的上次检查摘要，导航和重启不丢失；进行中状态和暂停原因与最近结果分开。摘要与「自动同步」开关位于上游模型列表头部、与「同步模型」同行，单个模型编辑页不显示；开关即时保存独立偏好，不提交连接或模型草稿；从未检查时不显示占位文字；关闭不撤销已开始的操作，手动同步仍可执行。页面只读取后台结果，不通过定时发送同步请求替代后台维护。
@@ -360,7 +356,7 @@ Stravia 是本地运行、可自托管的 Agent infra（智能体基础设施）
 
 整体是固定窗口壳层内的工作台，页面级滚动只有一个主要容器；表格、编辑器和 Sheet 可按任务需要拥有边界明确的局部视口，不能层层嵌套同方向滚动。
 
-- 根壳层使用 `100svh`，不得再以 `100vh` 的最小高度覆盖它；body 的最小高度同样使用 `100svh`，避免移动浏览器工具栏展开时把输入区推到可见区域之外。顶部 titlebar 固定 40px，承载品牌、导航开关、breadcrumb 和桌面窗口控制。
+- 根壳层使用 `100svh`，不得再以 `100vh` 的最小高度覆盖它；body 的最小高度同样使用 `100svh`，避免移动浏览器工具栏展开时把输入区推到可见区域之外。顶部 titlebar 承载品牌、导航开关、breadcrumb 和桌面窗口控制。
 - `md`（768px）及以上显示侧栏。展开宽度 256px，折叠宽度 48px；折叠状态保存在本机，`Ctrl/Cmd+B` 切换。折叠模式仍保留导航图标与 tooltip。
 - 主内容是唯一页面滚动容器：16px 内边距，桌面时右侧与底部保留 8px 壳层沟槽并使用 8px 圆角。内容居中，最大宽度 1800px。
 - 常规 route 使用纵向 flex 与 24px 间距。Page Header 的标题块与动作在桌面两端对齐；小于 768px 时纵向堆叠，动作区域占满宽度。
@@ -453,7 +449,7 @@ Lucide 图标使用 16px 为常规尺寸，跟随文字颜色；图标只辅助�
 ### Buttons 与操作优先级
 
 - 默认按钮是每个局部任务的主动作；outline 是次级动作；ghost 用于行操作、工具栏和低权重动作；destructive 只用于不可逆确认。
-- 默认高度 40px，large 44px。按钮文本使用动词并说明结果，例如“保存代理设置”“添加第一个供应商”。
+- 按钮尺寸由文字、图标与可见内边距决定，按尺寸变体调整内边距，不设统一高度下限。按钮文本使用动词并说明结果，例如“保存代理设置”“添加第一个供应商”。
 - hover 改变背景/前景；全局 focus-visible 提供 2px outline 与 2px offset，Button 再增加 3px 半透明 ring 和 ring 色边框；普通非 popup 按钮的 pressed 使用 `scale(0.96)`。常规过渡为 140ms、`cubic-bezier(0.2, 0, 0, 1)`，不使用弹跳或 overshoot。
 - loading 保留按钮宽度，显示 Spinner 并使用 `aria-busy`；disabled 降低不透明度且不可交互，但不能替代校验错误说明。
 - destructive action 必须在 AlertDialog 中写明对象名称与即时影响；确认按钮使用实心 destructive，不以普通 primary 假装危险动作。
@@ -489,8 +485,8 @@ Lucide 图标使用 16px 为常规尺寸，跟随文字颜色；图标只辅助�
 
 - 采用主流数据表的克制处理，而不是复制 React 等框架的实现。可参考 [shadcn/ui Data Table](https://ui.shadcn.com/docs/components/data-table) 的 ghost 排序按钮；继续使用本项目的 Svelte 组件、字体和语义 token。
 - 表头是辅助扫描层，不是页面标题或厚重工具栏。共享表头字号为 `0.8rem`（默认根字号下约 13px）、字重 500；未排序标题使用 `muted-foreground`，当前排序标题使用 `foreground`。
-- 单行表头的紧凑、默认、宽松密度基准分别为 40、44、48px，不含边线造成的亚像素差异。这是布局基准，不是截断内容的硬上限；分组、筛选行和文本缩放必须自然容纳。
-- 数据行密度独立选择。规则浏览可以使用宽松数据行，同时保持紧凑表头；不得在 40px 按钮外再叠加大量垂直 padding，把表头撑成约 65px 的色块。
+- 表头密度根据文字、图标与实际控件的占位选择；分组、筛选行和文本缩放必须自然容纳，不以固定高度裁切内容。
+- 数据行密度独立选择。规则浏览可以使用宽松数据行，同时保持紧凑表头；不得在按钮外再叠加大量垂直 padding，把表头撑成厚重色块。
 - 表头背景必须不透明，浅色和深色使用同一语义派生方式：当前共享值为 `color-mix(in oklab, var(--muted) 45%, var(--background))`。固定列的表头使用相同背景，滚动时不能透出下方数据；不为页面新增孤立灰色或主题特例。
 - 底部使用单条细分隔线，保留与数据区的边界；不使用渐变、重阴影、双边线或每列一个按钮外框。
 - 可排序与不可排序标题应在同一文本基线上，并与对应单元格内容起点对齐。排序按钮的内边距与外侧补偿共同计算，不能因复用通用按钮而把文字推离列边界。
@@ -511,7 +507,7 @@ Lucide 图标使用 16px 为常规尺寸，跟随文字颜色；图标只辅助�
 
 - 同级工作区默认复用 shadcn-svelte Tabs 的分段样式，左对齐、按内容宽度占位，不拉成充满整页的下划线导航。页签内可用 Badge 显示相关数量，不把数值拼成另一条常驻状态说明。
 - 真正改变 URL 的详情导航保留链接、`aria-current`、浏览器历史与在新标签页打开的能力；复用共享 Tabs 的视觉样式，不为统一外观改成没有链接语义的按钮，也不复制一套选中态样式。
-- List 必须容纳 Trigger 的实际高度与焦点环。允许换行的 List 使用自适应高度，Trigger 保持独立的 40px 高度；不得用百分比高度使多行触发器撑出容器。
+- List 必须容纳 Trigger 的实际高度与焦点环。List 与 Trigger 均随标签、内边距和换行自然增高，不设统一高度下限；不得用百分比高度使多行触发器撑出容器。
 - 在 320px、500px 与桌面宽度下检查中文和英文标签：不得出现页签内部滚动条、裁切文字或重叠命中区；不能通过隐藏溢出来掩盖尺寸错误。
 - 保留 Tabs 原有键盘导航、选中状态和面板关联。切换状态与视觉反馈一致，不为动效延迟内容操作。
 

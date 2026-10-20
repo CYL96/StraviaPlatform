@@ -252,9 +252,7 @@ async function syncModels(id = providerId): Promise<ProviderModelSyncSummary | u
           <div class="divide-y border-y">
             {#each routeReferences as reference (reference.target.id)}
               <div class="grid gap-3 py-3 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto] sm:items-center">
-                <a
-                  class="min-h-10 content-center font-medium hover:underline"
-                  href={resolve('/models/[id]', { id: reference.route.model_id })}>
+                <a class="font-medium hover:underline" href={resolve('/models/[id]', { id: reference.route.model_id })}>
                   {effectiveModelDisplayName(reference.route)}
                   {#if logicalModelSecondaryId(reference.route)}
                     · {reference.route.model_id}{/if}

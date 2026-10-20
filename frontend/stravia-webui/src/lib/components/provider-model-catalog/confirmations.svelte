@@ -65,7 +65,7 @@ let {
       <div class="flex flex-col gap-1 rounded-lg border p-3">
         {#each references as reference (reference.target.id)}
           <a
-            class="flex min-h-10 items-center rounded-md px-2 font-medium hover:bg-muted"
+            class="flex items-center rounded-md px-2 py-1 font-medium hover:bg-muted"
             href={resolve('/models/[id]', { id: reference.route.model_id })}>
             {effectiveModelDisplayName(reference.route)}
             {#if logicalModelSecondaryId(reference.route)}

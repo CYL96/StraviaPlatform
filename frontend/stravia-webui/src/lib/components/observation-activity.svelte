@@ -212,7 +212,7 @@ function formatContent(content: unknown): string {
   display: flex;
   width: 100%;
   min-width: 0;
-  min-height: 2.5rem;
+
   align-items: center;
   gap: 0.5rem;
   padding: 0.25rem;

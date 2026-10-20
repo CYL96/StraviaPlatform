@@ -171,7 +171,6 @@ let {
             <Button
               variant="ghost"
               size="icon"
-              class="size-10"
               aria-label={resolvedLabels.saveRow(rowIndex + 1)}
               onclick={(event: MouseEvent) => {
                 event.stopPropagation()
@@ -182,7 +181,6 @@ let {
             <Button
               variant="ghost"
               size="icon"
-              class="size-10"
               aria-label={resolvedLabels.cancelRowEdit(rowIndex + 1)}
               onclick={(event: MouseEvent) => {
                 event.stopPropagation()
@@ -194,7 +192,6 @@ let {
             <Button
               variant="ghost"
               size="icon"
-              class="size-10"
               aria-label={resolvedLabels.editRow(rowIndex + 1)}
               onclick={(event: MouseEvent) => {
                 event.stopPropagation()

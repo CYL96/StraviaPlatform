@@ -163,7 +163,7 @@ async function pickModel(id: string) {
             <Command.Item
               value={model.id}
               data-checked={model.id === snapshot.selectedModelId}
-              class="min-h-10 rounded-md px-3"
+              class="rounded-md px-3"
               onSelect={() => void pickModel(model.id)}>
               <span class="flex min-w-0 flex-col"
                 ><span class="truncate">{name}</span>

@@ -1130,7 +1130,7 @@ $effect(() => {
     <div class="flex flex-wrap items-center gap-2" data-slot="data-table-toolbar">
       {#if toolbar}{@render toolbar(table)}{/if}
       {#if filterDisplay !== 'none' && hasConfiguredColumnFilters}
-        <Button variant="outline" class="h-10" disabled={activeFilterCount === 0} onclick={clearAllFilters}>
+        <Button variant="outline" disabled={activeFilterCount === 0} onclick={clearAllFilters}>
           <FunnelXIcon data-icon="inline-start" />
           {resolvedLabels.clearFilters}
           {#if activeFilterCount > 0}

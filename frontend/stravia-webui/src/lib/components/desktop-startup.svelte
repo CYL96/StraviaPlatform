@@ -190,7 +190,7 @@ onMount(() => {
         </div>
 
         <details class="rounded-lg border bg-card px-4 py-3">
-          <summary class="min-h-10 cursor-pointer py-2 font-medium">
+          <summary class="cursor-pointer py-2 font-medium">
             {m.desktop_startup_technical_summary()}
           </summary>
           <pre

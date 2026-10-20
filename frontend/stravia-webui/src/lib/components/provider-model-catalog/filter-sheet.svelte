@@ -37,7 +37,7 @@ const options = $derived(catalogFilterOptions())
   <Select.Root
     type="single"
     bind:value={() => availability, (value: string) => onFilterChange('availability', value ?? allCatalogFilterValue)}>
-    <Select.Trigger {id} class="h-10 w-full font-normal" aria-label={m.provider_model_catalog_model_availability()}>
+    <Select.Trigger {id} class="w-full font-normal" aria-label={m.provider_model_catalog_model_availability()}>
       {options.availability.options.find((option) => option.value === availability)?.label ??
         options.availability.allLabel}
     </Select.Trigger>
@@ -56,7 +56,7 @@ const options = $derived(catalogFilterOptions())
   <Select.Root
     type="single"
     bind:value={() => source, (value: string) => onFilterChange('source_kind', value ?? allCatalogFilterValue)}>
-    <Select.Trigger {id} class="h-10 w-full font-normal" aria-label={m.provider_model_catalog_how_models_were_added()}>
+    <Select.Trigger {id} class="w-full font-normal" aria-label={m.provider_model_catalog_how_models_were_added()}>
       {options.source.options.find((option) => option.value === source)?.label ?? options.source.allLabel}
     </Select.Trigger>
     <Select.Content>
@@ -74,7 +74,7 @@ const options = $derived(catalogFilterOptions())
   <Select.Root
     type="single"
     bind:value={() => reference, (value: string) => onFilterChange('usage', value ?? allCatalogFilterValue)}>
-    <Select.Trigger {id} class="h-10 w-full font-normal" aria-label={m.provider_model_catalog_model_usage()}>
+    <Select.Trigger {id} class="w-full font-normal" aria-label={m.provider_model_catalog_model_usage()}>
       {options.reference.options.find((option) => option.value === reference)?.label ?? options.reference.allLabel}
     </Select.Trigger>
     <Select.Content>
@@ -122,7 +122,7 @@ const options = $derived(catalogFilterOptions())
     </div>
     <Sheet.Footer class="route-overlay-footer">
       <Button variant="outline" onclick={onClear}>{m.provider_model_catalog_clear_filters()}</Button>
-      <Sheet.Close class="h-10 rounded-md bg-primary px-3 text-primary-foreground">
+      <Sheet.Close class="rounded-md bg-primary px-3 py-2 text-primary-foreground">
         {m.provider_model_catalog_show_models()}
       </Sheet.Close>
     </Sheet.Footer>

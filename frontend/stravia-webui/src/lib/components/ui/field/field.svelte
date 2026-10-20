@@ -54,7 +54,7 @@ let {
     class={cn(
       'gap-2 flex min-w-0',
       orientation === 'horizontal'
-        ? 'cn-field-orientation-horizontal min-h-10 w-full flex-row items-center has-[>[data-slot=field-content]]:items-start [&>[data-slot=field-label]]:flex-auto has-[>[data-slot=field-content]]:[&>[role=checkbox],[role=radio]]:mt-px'
+        ? 'cn-field-orientation-horizontal w-full flex-row items-center has-[>[data-slot=field-content]]:items-start [&>[data-slot=field-label]]:flex-auto has-[>[data-slot=field-content]]:[&>[role=checkbox],[role=radio]]:mt-px'
         : 'w-full flex-col [&>.sr-only]:w-auto',
       orientation === 'vertical' && 'cn-field-orientation-vertical',
       orientation === 'responsive' && 'cn-field-orientation-responsive',

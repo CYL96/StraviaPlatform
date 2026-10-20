@@ -555,7 +555,7 @@ async function downloadBundle(): Promise<void> {
           <Field.Field>
             <Field.FieldLabel for="observation-min-tokens" hint={m.observation_min_tokens_hint()}
               >{m.observation_min_tokens()}</Field.FieldLabel>
-            <div class="flex min-h-10 items-center gap-3">
+            <div class="flex items-center gap-3">
               <Slider
                 id="observation-min-tokens"
                 bind:value={() => ws.minTokenStop, (value: number) => ws.setMinTokenStop(value)}

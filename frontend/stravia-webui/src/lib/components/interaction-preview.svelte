@@ -153,7 +153,7 @@ async function handleKeydown(event: KeyboardEvent) {
 :global(.preview-trigger) {
   display: block;
   width: 100%;
-  min-height: 40px;
+
   flex: none;
   border: 1px solid var(--border);
   border-radius: 4px;

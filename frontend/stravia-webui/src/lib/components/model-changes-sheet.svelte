@@ -129,7 +129,7 @@ $effect(() => {
   <article class="min-w-0 border-b last:border-b-0">
     <Button
       variant="ghost"
-      class="h-auto min-h-10 w-full items-start justify-start gap-3 rounded-md px-2 py-3 text-left font-normal whitespace-normal"
+      class="w-full items-start justify-start gap-3 rounded-md px-2 py-3 text-left font-normal whitespace-normal"
       aria-expanded={open}
       aria-controls={`batch-${record.id}`}
       onclick={() => (expanded[record.id] = !expanded[record.id])}>

@@ -182,7 +182,7 @@ let {
                   variant="ghost"
                   size="sm"
                   class={cn(
-                    'group/sort -mx-2 min-w-0 gap-1.5 px-2 text-inherit',
+                    'group/sort min-w-0 gap-1.5 px-2 text-inherit',
                     header.column.getIsSorted() && 'text-foreground',
                     header.column.columnDef.meta?.align === 'end' && 'ms-auto',
                   )}

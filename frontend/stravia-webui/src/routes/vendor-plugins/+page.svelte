@@ -607,13 +607,13 @@ function networkPermissionContext(permission: PluginNetworkPermission): string[]
 
           <div
             class="flex shrink-0 items-start justify-between gap-3 border-t pt-3 sm:flex-col sm:items-end sm:justify-start sm:border-t-0 sm:pt-0">
-            <div class="flex items-center max-sm:h-10">
+            <div class="flex items-center">
               <StatusIndicator label={statusLabel(plugin.status)} tone={statusTone(plugin.status, plugin.error)} />
             </div>
             <div class="flex flex-wrap justify-end gap-2">
               {#if plugin.pending_update}
                 {@const pendingUpdate = plugin.pending_update}
-                <Button size="sm" class="max-sm:h-10" onclick={() => showPreview(pendingUpdate)}>
+                <Button size="sm" onclick={() => showPreview(pendingUpdate)}>
                   {m.vendor_plugins_review_update()}
                 </Button>
               {/if}
@@ -621,7 +621,6 @@ function networkPermissionContext(permission: PluginNetworkPermission): string[]
                 <Button
                   variant="outline"
                   size="sm"
-                  class="max-sm:h-10"
                   disabled={restoringVendorId === plugin.vendor_id}
                   aria-busy={restoringVendorId === plugin.vendor_id}
                   onclick={() => restoreBuiltin(plugin.vendor_id)}>
@@ -632,11 +631,11 @@ function networkPermissionContext(permission: PluginNetworkPermission): string[]
                 </Button>
               {/if}
               {#if canUninstall(plugin)}
-                <Button variant="outline" size="sm" class="max-sm:h-10" onclick={() => openUninstall(plugin)}>
+                <Button variant="outline" size="sm" onclick={() => openUninstall(plugin)}>
                   {m.vendor_plugins_uninstall_action()}
                 </Button>
               {/if}
-              <Button variant="ghost" size="sm" class="max-sm:h-10" onclick={() => openDetails(plugin)}>
+              <Button variant="ghost" size="sm" onclick={() => openDetails(plugin)}>
                 {m.vendor_plugins_details()}
               </Button>
             </div>

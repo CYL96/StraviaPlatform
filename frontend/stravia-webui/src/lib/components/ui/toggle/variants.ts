@@ -5,9 +5,9 @@ export const toggleVariants = tv({
   variants: {
     variant: { default: 'bg-transparent', outline: 'border border-input bg-transparent hover:bg-muted' },
     size: {
-      default: 'h-10 min-w-10 px-3 has-data-[icon=inline-end]:pr-2.5 has-data-[icon=inline-start]:pl-2.5',
-      sm: "h-10 min-w-10 rounded-md px-2.5 text-[0.8rem] has-data-[icon=inline-end]:pr-2 has-data-[icon=inline-start]:pl-2 [&_svg:not([class*='size-'])]:size-3.5",
-      lg: 'h-11 min-w-11 px-3 has-data-[icon=inline-end]:pr-2.5 has-data-[icon=inline-start]:pl-2.5',
+      default: 'px-3 py-2 has-data-[icon=inline-end]:pr-2.5 has-data-[icon=inline-start]:pl-2.5',
+      sm: "rounded-md px-2.5 py-1.5 text-[0.8rem] has-data-[icon=inline-end]:pr-2 has-data-[icon=inline-start]:pl-2 [&_svg:not([class*='size-'])]:size-3.5",
+      lg: 'px-3 py-2.5 has-data-[icon=inline-end]:pr-2.5 has-data-[icon=inline-start]:pl-2.5',
     },
   },
   defaultVariants: { variant: 'default', size: 'default' },

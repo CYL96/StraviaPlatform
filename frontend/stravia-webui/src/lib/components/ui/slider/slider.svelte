@@ -90,7 +90,7 @@ const large = $derived(size === 'lg')
           'relative block shrink-0 rounded-full ring-ring/50 transition-[color,box-shadow] select-none focus-visible:outline-hidden disabled:pointer-events-none disabled:opacity-50',
           large
             ? 'size-8 bg-card shadow-sm ring-offset-0 hover:ring-3 focus-visible:ring-3 active:ring-3 dark:bg-foreground'
-            : 'size-3 border border-ring bg-background after:absolute after:-inset-[0.875rem] hover:ring-3 focus-visible:ring-3 active:ring-3',
+            : 'size-3 border border-ring bg-background hover:ring-3 focus-visible:ring-3 active:ring-3',
         )} />
     {/each}
   {/snippet}

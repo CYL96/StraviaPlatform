@@ -311,7 +311,7 @@ async function saveKey(): Promise<void> {
     </Field.Group>
     <Field.Group class="gap-0!">
       <Field.Field orientation="horizontal">
-        <Switch id="api-key-mcp-access" class="-mt-2" bind:checked={form.mcpAccessEnabled} />
+        <Switch id="api-key-mcp-access" bind:checked={form.mcpAccessEnabled} />
         <Field.Content>
           <Field.Label for="api-key-mcp-access" hint={m.api_key_editor_lets_key_call_stravia_tools_mcp()}>
             {m.api_key_editor_allow_mcp_clients()}
@@ -319,7 +319,7 @@ async function saveKey(): Promise<void> {
         </Field.Content>
       </Field.Field>
       <Field.Field orientation="horizontal">
-        <Switch id="api-key-transparent-injection" class="-mt-2" bind:checked={form.transparentInjectionEnabled} />
+        <Switch id="api-key-transparent-injection" bind:checked={form.transparentInjectionEnabled} />
         <Field.Content>
           <Field.Label for="api-key-transparent-injection" hint={m.api_key_editor_transparent_injection_help()}>
             {m.api_key_editor_transparent_injection()}
@@ -335,7 +335,6 @@ async function saveKey(): Promise<void> {
           <Field.Field orientation="horizontal" class="min-w-52 flex-1 basis-52">
             <Switch
               id="api-key-inject-media-understanding"
-              class="-mt-2.5"
               bind:checked={form.injectMediaUnderstanding}
               disabled={!mediaUnderstandingEnabled} />
             <Field.Content>
@@ -353,7 +352,6 @@ async function saveKey(): Promise<void> {
           <Field.Field orientation="horizontal" class="min-w-52 flex-1 basis-52">
             <Switch
               id="api-key-inject-media-generation"
-              class="-mt-2.5"
               bind:checked={form.injectMediaGeneration}
               disabled={mediaGenerationStatus !== 'enabled'}
               aria-busy={mediaGenerationStatus === 'loading'} />
@@ -376,11 +374,7 @@ async function saveKey(): Promise<void> {
             </Field.Content>
           </Field.Field>
           <Field.Field orientation="horizontal" class="min-w-52 flex-1 basis-52">
-            <Switch
-              id="api-key-inject-web-search"
-              class="-mt-2.5"
-              bind:checked={form.injectWebSearch}
-              disabled={!webSearchEnabled} />
+            <Switch id="api-key-inject-web-search" bind:checked={form.injectWebSearch} disabled={!webSearchEnabled} />
             <Field.Content>
               <Field.Label for="api-key-inject-web-search">
                 {m.api_key_editor_web_search()}

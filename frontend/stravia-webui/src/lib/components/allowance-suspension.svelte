@@ -13,7 +13,7 @@ let open = $state(false)
 <Tooltip.Root bind:open delayDuration={0} disableCloseOnTriggerClick>
   <Tooltip.Trigger
     type="button"
-    class="relative inline-flex min-h-10 shrink-0 cursor-help items-center rounded-md text-start"
+    class="relative inline-flex shrink-0 cursor-help items-center rounded-md text-start"
     aria-label={m.allowances_suspended()}
     aria-describedby={hintId}
     onclick={() => (open = true)}

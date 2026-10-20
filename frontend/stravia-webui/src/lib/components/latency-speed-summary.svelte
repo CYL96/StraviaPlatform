@@ -28,7 +28,7 @@ const outputTps = $derived(overview?.avg_output_tps)
   <Tooltip.Root delayDuration={0} disableCloseOnTriggerClick>
     <Tooltip.Trigger
       type="button"
-      class="inline-flex size-10 shrink-0 items-center justify-center rounded-md text-muted-foreground hover:text-foreground"
+      class="inline-flex shrink-0 items-center justify-center rounded-md text-muted-foreground hover:text-foreground"
       aria-label={m.stats_latency_speed_help()}
       aria-describedby={hintId}>
       <CircleHelpIcon class="size-4" />

@@ -70,7 +70,7 @@ const columns = helper.columns([
 
 {#snippet requestTime(request: FailedRequestSummary)}
   <button
-    class="min-h-10 text-start underline-offset-4 hover:underline"
+    class="text-start underline-offset-4 hover:underline"
     onclick={(event) => {
       event.stopPropagation()
       onselect(request)

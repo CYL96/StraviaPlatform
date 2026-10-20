@@ -317,7 +317,6 @@ async function copyProvider(): Promise<void> {
         <Button
           {...props}
           size="icon"
-          class="size-10"
           variant="ghost"
           aria-label={m.providers_more_actions_value({ name: provider.name })}>
           <MoreHorizontalIcon />
@@ -619,7 +618,7 @@ async function copyProvider(): Promise<void> {
       <div class="flex flex-col gap-2 rounded-lg border p-3">
         {#each references as reference (reference.target.id)}
           <a
-            class="flex min-h-10 items-center justify-between gap-3 rounded-md px-2 hover:bg-muted"
+            class="flex items-center justify-between gap-3 rounded-md p-2 hover:bg-muted"
             href={resolve('/models/[id]', { id: reference.route.model_id })}>
             <span class="font-medium">
               {effectiveModelDisplayName(reference.route)}

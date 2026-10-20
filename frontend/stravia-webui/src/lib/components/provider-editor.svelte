@@ -439,7 +439,7 @@ function saveProvider(): void {
                 draft.oauthStateChanged(sessionId, ready)} />
           {/if}
 
-          <Field.Field orientation="horizontal" class="mt-6 min-h-10 justify-between rounded-lg border px-3 py-2">
+          <Field.Field orientation="horizontal" class="mt-6 justify-between rounded-lg border px-3 py-2">
             <Field.Label for="provider-use-proxy" hint={m.common_send_requests_service_proxy_configured_settings()}>
               {m.common_use_proxy()}
             </Field.Label>

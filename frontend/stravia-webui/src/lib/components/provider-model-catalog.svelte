@@ -519,7 +519,7 @@ function clearManualTemplate(): void {
 
 <!-- 自动同步属于服务模型列表级设置：与「同步模型」同处列表头部，单个模型编辑页不显示。 -->
 {#snippet syncStatus()}
-  <div class="flex min-h-10 flex-wrap items-center gap-x-4 gap-y-1 text-sm">
+  <div class="flex flex-wrap items-center gap-x-4 gap-y-1 text-sm">
     {#if syncStateQuery.data}
       <div class="flex items-center gap-3">
         <Switch
@@ -557,7 +557,7 @@ function clearManualTemplate(): void {
 
 {#snippet providerModelIdentityCell(context: DataTableCellContext<ProviderModelSummary>)}
   {@const model = context.row.original}
-  <div class="min-h-10 w-full min-w-0 text-left" aria-label={`${model.name} ${model.id}`}>
+  <div class="w-full min-w-0 text-left" aria-label={`${model.name} ${model.id}`}>
     <span class="block truncate font-medium">{model.name}</span>
     <span class="block truncate font-technical text-xs text-muted-foreground">{model.id}</span>
   </div>
@@ -652,13 +652,13 @@ function clearManualTemplate(): void {
   {@const matchingRoute = routeForModel(model.id)}
   {#if references.length > 0}
     <a
-      class="inline-flex min-h-10 w-fit items-center rounded-md px-2 text-sm font-medium hover:bg-muted"
+      class="inline-flex w-fit items-center rounded-md px-2 py-1 text-sm font-medium hover:bg-muted"
       href={resolve(`providers/${encodeURIComponent(providerId)}?view=routes`)}
       >{m.provider_model_catalog_used_by_models({ count: references.length })}</a>
   {:else if routeReferencesReady}
     <button
       type="button"
-      class="inline-flex min-h-10 w-fit items-center rounded-md px-2 text-sm font-medium text-foreground hover:bg-muted disabled:pointer-events-none disabled:opacity-70"
+      class="inline-flex w-fit items-center rounded-md px-2 py-1 text-sm font-medium text-foreground hover:bg-muted disabled:pointer-events-none disabled:opacity-70"
       aria-label={m.provider_model_catalog_add_model_to_route({ id: model.id })}
       disabled={!model.available || Boolean(addingRouteModelId)}
       onclick={() => void addModelToRoute(model)}>
@@ -751,7 +751,6 @@ function clearManualTemplate(): void {
                 {...props}
                 variant="ghost"
                 size="icon"
-                class="size-10"
                 disabled={modelEditing.busy}
                 aria-label={m.provider_model_catalog_model_actions()}><MoreHorizontalIcon /></Button>
             {/snippet}
@@ -810,13 +809,9 @@ function clearManualTemplate(): void {
           <StatusIndicator tone="warning" label={m.provider_model_editor_unsaved()} class="me-auto" />
         {/if}
         <div class="flex gap-2">
+          <Button variant="outline" onclick={() => editing.close()} disabled={modelEditing.busy || rpmSaving}
+            >{m.common_cancel()}</Button>
           <Button
-            variant="outline"
-            class="min-h-10"
-            onclick={() => editing.close()}
-            disabled={modelEditing.busy || rpmSaving}>{m.common_cancel()}</Button>
-          <Button
-            class="min-h-10"
             onclick={saveModelDetail}
             disabled={modelEditing.busy || rpmSaving}
             aria-busy={modelEditing.busy || rpmSaving}>
@@ -919,7 +914,7 @@ function clearManualTemplate(): void {
           {@const matchingRoute = routeForModel(model.id)}
           <div class="route-mobile-row">
             <a
-              class="col-span-2 min-h-10 min-w-0 text-left"
+              class="col-span-2 min-w-0 text-left"
               href={resolve(`providers/${encodeURIComponent(providerId)}?${modelEditorSearch(model.id)}`)}
               aria-label={`${model.name} ${model.id}`}>
               <span class="block truncate font-medium">{model.name}</span>
@@ -939,13 +934,13 @@ function clearManualTemplate(): void {
 
               {#if references.length > 0}
                 <a
-                  class="inline-flex min-h-10 items-center rounded-md px-2 text-sm font-medium hover:bg-muted"
+                  class="inline-flex items-center rounded-md px-2 py-1 text-sm font-medium hover:bg-muted"
                   href={resolve(`providers/${encodeURIComponent(providerId)}?view=routes`)}
                   >{m.provider_model_catalog_used_by_models({ count: references.length })}</a>
               {:else if routeReferencesReady}
                 <button
                   type="button"
-                  class="inline-flex min-h-10 items-center rounded-md px-2 text-sm font-medium text-foreground hover:bg-muted disabled:pointer-events-none disabled:opacity-70"
+                  class="inline-flex items-center rounded-md px-2 py-1 text-sm font-medium text-foreground hover:bg-muted disabled:pointer-events-none disabled:opacity-70"
                   aria-label={m.provider_model_catalog_add_model_to_route({ id: model.id })}
                   disabled={!model.available || Boolean(addingRouteModelId)}
                   onclick={() => void addModelToRoute(model)}>

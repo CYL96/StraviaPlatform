@@ -351,7 +351,7 @@ onMount(() => {
                 <li>
                   <a
                     class={[
-                      'flex min-h-10 min-w-0 items-center gap-2 rounded-md px-3 text-sm hover:bg-sidebar-accent',
+                      'flex min-w-0 items-center gap-2 rounded-md px-3 py-2 text-sm hover:bg-sidebar-accent',
                       activeConversationId === conversation.id
                         ? 'bg-sidebar-accent text-sidebar-accent-foreground'
                         : '',
@@ -373,7 +373,7 @@ onMount(() => {
                   <a
                     href={resolve('conversations')}
                     class={[
-                      'flex min-h-10 items-center rounded-md px-3 text-sm hover:bg-sidebar-accent',
+                      'flex items-center rounded-md px-3 py-2 text-sm hover:bg-sidebar-accent',
                       allConversationsActive ? 'bg-sidebar-accent text-sidebar-accent-foreground' : '',
                     ]}
                     aria-current={allConversationsActive ? 'page' : undefined}
@@ -456,7 +456,7 @@ onMount(() => {
           bind:ref={navigationTrigger}
           type="button"
           variant="ghost"
-          class="relative me-2 ms-auto size-6 shrink-0 rounded-md text-sidebar-foreground before:absolute before:-inset-2 before:content-[''] hover:bg-sidebar-accent hover:text-sidebar-accent-foreground aria-expanded:bg-transparent aria-expanded:text-sidebar-foreground aria-expanded:hover:bg-sidebar-accent aria-expanded:hover:text-sidebar-accent-foreground"
+          class="relative me-2 ms-auto shrink-0 rounded-md p-1 text-sidebar-foreground hover:bg-sidebar-accent hover:text-sidebar-accent-foreground aria-expanded:bg-transparent aria-expanded:text-sidebar-foreground aria-expanded:hover:bg-sidebar-accent aria-expanded:hover:text-sidebar-accent-foreground"
           size="icon-sm"
           onclick={handleNavigationTrigger}
           aria-expanded={isDesktopNavigation ? !sidebarCollapsed : navigationOpen}
@@ -475,7 +475,7 @@ onMount(() => {
               {#if index > 0}<Breadcrumb.Separator>/</Breadcrumb.Separator>{/if}
               <Breadcrumb.Item class="min-w-0">
                 {#if item.href}
-                  <Breadcrumb.Link class="inline-flex min-h-10 min-w-0 items-center truncate" href={resolve(item.href)}
+                  <Breadcrumb.Link class="inline-flex min-w-0 items-center truncate" href={resolve(item.href)}
                     >{item.label}</Breadcrumb.Link>
                 {:else}
                   <Breadcrumb.Page class="truncate">{item.label}</Breadcrumb.Page>

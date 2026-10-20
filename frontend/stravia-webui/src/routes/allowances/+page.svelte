@@ -610,7 +610,6 @@ function allowanceErrorMessage(category: ProviderAllowanceErrorCategory): string
         void reading.setGuard(snapshot.provider_id, allowance.key, checked)
       }
     }
-    class="-my-1 -ms-1"
     disabled={!provider.canSaveGuards}
     aria-busy={provider.savingGuards}
     aria-label={m.allowances_guard_item({ item: allowanceLabel(allowance) })} />
@@ -635,7 +634,7 @@ function allowanceErrorMessage(category: ProviderAllowanceErrorCategory): string
               <Tooltip.Root delayDuration={0}>
                 <Tooltip.Trigger
                   type="button"
-                  class="relative -m-2.5 inline-flex size-10 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors duration-[140ms] ease-[cubic-bezier(0.2,0,0,1)] hover:text-foreground"
+                  class="inline-flex shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors duration-[140ms] ease-[cubic-bezier(0.2,0,0,1)] hover:text-foreground"
                   aria-label={m.allowances_guard_help_label()}>
                   <CircleHelpIcon class="size-3.5" />
                 </Tooltip.Trigger>
@@ -736,8 +735,7 @@ function allowanceErrorMessage(category: ProviderAllowanceErrorCategory): string
                   tone={conditionStatusTone(providerCondition)} />
               {/if}
               {#if suspension}
-                <!-- 保留 40px 点击区，但不让它撑高标题行；z-10 避开整行展开命中区。 -->
-                <span class="relative z-10 -my-2.5"><AllowanceSuspension {suspension} /></span>
+                <span class="relative z-10 inline-flex"><AllowanceSuspension {suspension} /></span>
               {/if}
               {#if presentation}<Badge variant={presentation.variant}>{presentation.label}</Badge>{/if}
               {#if snapshot?.plan_label}<span class="text-xs text-muted-foreground">{snapshot.plan_label}</span>{/if}
@@ -752,7 +750,7 @@ function allowanceErrorMessage(category: ProviderAllowanceErrorCategory): string
         </div>
         <Button
           size="icon"
-          class="relative z-10 col-start-2 row-start-1 size-10 @3xl:col-start-3"
+          class="relative z-10 col-start-2 row-start-1 @3xl:col-start-3"
           variant="ghost"
           onclick={() => refreshProvider(provider)}
           disabled={!provider.canRefresh}
@@ -774,7 +772,7 @@ function allowanceErrorMessage(category: ProviderAllowanceErrorCategory): string
           {#if snapshot && snapshot.models.length > 0}
             <Collapsible.Root class="mt-1">
               <Collapsible.Trigger
-                class="inline-flex min-h-10 items-center gap-1 text-sm font-medium"
+                class="inline-flex items-center gap-1 text-sm font-medium"
                 aria-label={m.allowances_show_model_allowances({ provider: provider.target.provider_name })}>
                 {m.allowances_model_allowances()}<ChevronDownIcon class="size-3.5" />
               </Collapsible.Trigger>
@@ -1010,7 +1008,7 @@ function allowanceErrorMessage(category: ProviderAllowanceErrorCategory): string
                       aria-hidden="true"></span>
                     <Button
                       variant="ghost"
-                      class="h-auto min-h-10 w-full justify-start px-2 py-2 text-start whitespace-normal"
+                      class="w-full justify-start px-2 py-2 text-start whitespace-normal"
                       aria-controls={id}
                       aria-label={m.allowances_timeline_locate({
                         provider: item.snapshot.provider_name,

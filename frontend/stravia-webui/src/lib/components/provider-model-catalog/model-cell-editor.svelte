@@ -178,7 +178,7 @@ async function save(selection?: ProviderModelSelectionPolicy): Promise<void> {
         {...props}
         type="button"
         variant="ghost"
-        class="h-auto min-h-10 w-full min-w-0 justify-start whitespace-normal text-left"
+        class="w-full min-w-0 justify-start whitespace-normal text-left"
         aria-label={`${label} ${model.id}`}>
         {@render children()}
       </Button>

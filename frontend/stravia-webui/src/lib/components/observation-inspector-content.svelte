@@ -545,7 +545,6 @@ function jumpToRun(runId: string | null) {
   align-self: stretch;
   display: inline-flex;
   align-items: center;
-  min-height: 40px;
   padding: 0 0.6rem;
   border: 0;
   border-inline-start: 1px dashed var(--border);
@@ -575,7 +574,6 @@ button.run-parent:focus-visible {
   position: relative;
   display: flex;
   width: 100%;
-  min-height: 40px;
   align-items: center;
   gap: 0.5rem;
   border-radius: var(--radius-md);

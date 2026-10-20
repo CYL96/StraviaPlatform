@@ -221,7 +221,6 @@ async function deleteModel(): Promise<void> {
         <Button
           {...props}
           size="icon"
-          class="size-10"
           variant="ghost"
           aria-label={m.models_more_actions_value({ name: effectiveModelDisplayName(model) })}>
           <MoreHorizontalIcon />

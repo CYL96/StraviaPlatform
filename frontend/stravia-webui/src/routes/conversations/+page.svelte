@@ -133,7 +133,7 @@ function lastModel(item: ConsoleConversation) {
       {#each conversations as item (item.id)}
         <article class="flex flex-col gap-3 border-b py-4">
           <a
-            class="block min-h-10 font-medium break-words hover:underline"
+            class="block font-medium break-words hover:underline"
             href={resolve(`?conversation=${encodeURIComponent(item.id)}`)}>{item.title}</a>
 
           {#if chat.readOnlyReasonFor(item.id)}

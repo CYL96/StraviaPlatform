@@ -186,7 +186,7 @@ export function submit(): void {
 </script>
 
 {#snippet pricingActions()}
-  <Button type="button" variant="ghost" size="sm" class="min-h-10" onclick={() => removeField('cost')}
+  <Button type="button" variant="ghost" size="sm" onclick={() => removeField('cost')}
     ><Trash2Icon data-icon="inline-start" />{m.common_remove()}</Button>
 {/snippet}
 
@@ -243,7 +243,7 @@ export function submit(): void {
     </Field.Group>
     <div class={alignedActions}>
       {#each stringFields.filter((field) => !hasField(field.key)) as field (field.key)}
-        <Button type="button" variant="outline" size="sm" class="min-h-10" onclick={() => addStringField(field.key)}>
+        <Button type="button" variant="outline" size="sm" onclick={() => addStringField(field.key)}>
           <PlusIcon data-icon="inline-start" />{field.label()}
         </Button>
       {/each}
@@ -286,7 +286,7 @@ export function submit(): void {
     </Field.Group>
     <div class={alignedActions}>
       {#if !hasField('modalities')}
-        <Button type="button" variant="outline" size="sm" class="min-h-10" onclick={addModalities}
+        <Button type="button" variant="outline" size="sm" onclick={addModalities}
           ><PlusIcon data-icon="inline-start" />{m.provider_model_editor_modalities()}</Button>
       {/if}
     </div>
@@ -395,10 +395,10 @@ export function submit(): void {
           </div>
         </div>
       {/each}
-      <Button type="button" variant="outline" size="sm" class="min-h-10 self-start" onclick={addTier}
+      <Button type="button" variant="outline" size="sm" class="self-start" onclick={addTier}
         ><PlusIcon data-icon="inline-start" />{m.provider_model_editor_pricing_tier()}</Button>
     {:else}
-      <Button type="button" variant="outline" size="sm" class="min-h-10 self-start" onclick={addCost}
+      <Button type="button" variant="outline" size="sm" class="self-start" onclick={addCost}
         ><PlusIcon data-icon="inline-start" />{m.provider_model_editor_pricing()}</Button>
     {/if}
   </FormSection>
@@ -407,7 +407,7 @@ export function submit(): void {
     <Collapsible.Root class="border-t pt-2" bind:open={extensionsOpen}>
       <Collapsible.Trigger
         type="button"
-        class="group/extensions -mx-2 flex min-h-10 w-[calc(100%+1rem)] items-center gap-2 rounded-md px-2 text-left text-sm font-medium text-muted-foreground transition-colors duration-[140ms] ease-[cubic-bezier(0.2,0,0,1)] hover:text-foreground"
+        class="group/extensions flex w-full items-center gap-2 rounded-md py-2 text-left text-sm font-medium text-muted-foreground transition-colors duration-[140ms] ease-[cubic-bezier(0.2,0,0,1)] hover:text-foreground"
         ><ChevronRightIcon
           class="size-4 shrink-0 transition-transform duration-[140ms] ease-[cubic-bezier(0.2,0,0,1)] group-data-[state=open]/extensions:rotate-90"
           aria-hidden="true" />{m.provider_model_editor_extension_fields_read_only()} · {extensionEntries.length}</Collapsible.Trigger>

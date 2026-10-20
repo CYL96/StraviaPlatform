@@ -44,7 +44,7 @@ async function copyValue(): Promise<void> {
   <Tooltip.Root>
     <Tooltip.Trigger
       class={cn(
-        'font-technical flex min-h-10 min-w-0 items-center truncate text-left text-xs tabular-nums transition-colors duration-[140ms] ease-[cubic-bezier(0.2,0,0,1)]',
+        'font-technical flex min-w-0 items-center truncate text-left text-xs tabular-nums transition-colors duration-[140ms] ease-[cubic-bezier(0.2,0,0,1)]',
         copied && 'text-signal',
         className,
       )}>{display}</Tooltip.Trigger>

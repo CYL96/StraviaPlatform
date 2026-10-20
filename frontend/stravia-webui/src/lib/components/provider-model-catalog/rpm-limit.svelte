@@ -38,7 +38,7 @@ let open = $state(false)
       <Button
         {...props}
         variant="ghost"
-        class="h-auto min-h-10 max-w-full justify-start px-2 text-left font-normal"
+        class="max-w-full justify-start px-2 text-left font-normal"
         aria-label={m.rpm_edit_label({ model: modelId, value: summary })}
         disabled={query.isPending}>
         {#if query.isPending}<Spinner />{:else if query.error}{m.common_unavailable()}{:else}<span class="truncate"
