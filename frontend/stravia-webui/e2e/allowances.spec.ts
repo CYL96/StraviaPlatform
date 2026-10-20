@@ -355,7 +355,6 @@ for (const locale of ['en-US', 'zh-CN']) {
       await expect(weekly).toBeChecked()
       await expect(weekly).toBeEnabled()
       await expect(weekly).toHaveAttribute('aria-busy', 'false')
-      await expect(provider.getByText(locale === 'en-US' ? 'Refreshing allowance…' : '正在刷新额度…')).toBeVisible()
       const credits = provider
         .getByRole('switch', {
           name:

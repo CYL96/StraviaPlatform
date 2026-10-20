@@ -165,7 +165,6 @@
   "allowances_guard_help": "开启后，此项额度耗尽时，该供应商不再接收新请求，模型会改用其他可用供应商；进行中的请求不受影响。之后读取到额度恢复，才会自动恢复。",
   "allowances_guard_enabled": "耗尽时暂停此供应商",
   "allowances_guard_saving": "正在保存暂停设置…",
-  "allowances_refreshing": "正在刷新额度…",
   "allowances_guard_refresh_failed": "暂停设置已保存，但额度刷新失败。",
   "allowances_missing_guards": "部分设为耗尽时暂停的额度项本次未上报",
   "allowances_remove_guard": "不再因 {key} 暂停",

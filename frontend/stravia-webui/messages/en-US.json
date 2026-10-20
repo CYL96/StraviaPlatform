@@ -165,7 +165,6 @@
   "allowances_guard_help": "When on, this provider stops taking new requests once this allowance is exhausted, and models use other available providers. Requests already running continue. It resumes after a later allowance read shows recovery.",
   "allowances_guard_enabled": "Pauses the provider when exhausted",
   "allowances_guard_saving": "Saving pause settings…",
-  "allowances_refreshing": "Refreshing allowance…",
   "allowances_guard_refresh_failed": "Pause settings saved, but allowance refresh failed.",
   "allowances_missing_guards": "Some items set to pause this provider were not reported",
   "allowances_remove_guard": "Stop pausing on {key}",

@@ -743,8 +743,6 @@ function allowanceErrorMessage(category: ProviderAllowanceErrorCategory): string
               {#if provider.savingGuards}
                 <span class="inline-flex items-center gap-1 text-xs text-muted-foreground" role="status"
                   ><Spinner class="size-3" aria-hidden="true" />{m.allowances_guard_saving()}</span>
-              {:else if refreshingProvider}
-                <span class="text-xs text-muted-foreground" role="status">{m.allowances_refreshing()}</span>
               {/if}
               {#if snapshot?.plan_label}<span class="text-xs text-muted-foreground">{snapshot.plan_label}</span>{/if}
             </div>
