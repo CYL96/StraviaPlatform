@@ -2265,46 +2265,36 @@ async fn drive_vendor_attempt(
                     operation_cancellation.clone(),
                     deadline.clone(),
                 );
-                let mut recovery_interrupted = false;
                 let refreshed = tokio::select! {
                     biased;
                     _ = parent_cancellation.cancelled() => {
                         operation_cancellation.cancel();
-                        recovery_interrupted = true;
-                        Err(())
+                        Err(RuntimeError::Cancelled.into())
                     }
                     () = deadline.wait() => {
                         operation_cancellation.cancel();
-                        recovery_interrupted = true;
-                        Err(())
+                        Err(RuntimeError::DeadlineExceeded.into())
                     }
-                    result = refresh => result.map_err(|_| ()),
+                    result = refresh => result,
                 };
-                if refreshed.is_ok() {
-                    auth_recovered = true;
-                    continue;
-                }
-                // ADR-0073：恢复路径内部已按"恢复耗尽"规则完成失效标记；
-                // 这里只在恢复根本没跑起来（被取消/超时中断）时抑制标记——
-                // 中断不是凭据证据。
+                let error = match refreshed {
+                    Ok(()) => {
+                        auth_recovered = true;
+                        continue;
+                    }
+                    Err(error) => error,
+                };
+                // 刷新服务的网络故障不是凭据撤销证据，保持其真实错误分类。
                 finish_vendor_failure(
                     &mut lifecycle,
                     &policy,
                     &target,
                     &gateway,
-                    AttemptFailure::terminal(
-                        "provider_auth_error",
-                        "Vendor authentication recovery failed",
-                    )
-                    .upstream_origin(),
+                    classify_vendor_error(error),
                     &attempt,
                     terminal_output,
                     failure_observer.as_ref(),
-                    if recovery_interrupted {
-                        None
-                    } else {
-                        prepared.attempt_credential_version
-                    },
+                    prepared.attempt_credential_version,
                 )
                 .await;
                 return;

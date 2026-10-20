@@ -557,6 +557,57 @@ async fn invoke_affinity(
 }
 
 #[tokio::test]
+async fn disabled_saved_provider_explicit_test_validates_and_persists_success_without_enabling()
+-> anyhow::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let gateway = new_gateway(directory.path().to_owned()).await?;
+    let mut upstream = TestUpstream::start().await;
+    // The installed base Vendor validates OpenAI configuration locally, without
+    // consuming an inference request or contacting a real upstream.
+    let provider = gateway
+        .admin()
+        .create_provider(CreateProvider {
+            name: Some("Disabled explicit validation".into()),
+            source: ProviderSourceInput::Custom {
+                vendor: "openai".into(),
+                channel: "default".into(),
+                protocol: Some("openai".into()),
+                base_url: upstream.base_url.clone(),
+                models_source: None,
+                static_models: None,
+            },
+            credential: ProviderCredentialInput::ApiKey {
+                value: "synthetic-validation-key".into(),
+            },
+            vendor_options: Default::default(),
+            use_proxy: false,
+        })
+        .await?;
+    let disabled = gateway
+        .admin()
+        .update_provider(
+            &provider.id,
+            UpdateProvider {
+                is_enabled: Some(false),
+                ..Default::default()
+            },
+        )
+        .await?;
+    assert!(!disabled.is_enabled);
+    assert_eq!(disabled.last_test_success, None);
+
+    let result = gateway.admin().test_provider(&provider.id).await?;
+    assert!(result.success, "{:?}", result.error);
+    assert!(result.error.is_none());
+    let stored = gateway.admin().get_provider(&provider.id).await?;
+    assert_eq!(stored.last_test_success, Some(true));
+    assert!(stored.last_test_at.is_some());
+    assert!(!stored.is_enabled);
+    upstream.assert_no_request();
+    Ok(())
+}
+
+#[tokio::test]
 async fn allowance_guards_hold_failed_and_missing_evidence_and_recover_only_on_fresh_evidence()
 -> anyhow::Result<()> {
     let directory = tempfile::tempdir()?;
@@ -1836,6 +1887,154 @@ async fn compatible_update_keeps_old_management_work_and_routes_new_work_to_v2()
 }
 
 #[tokio::test]
+async fn inference_oauth_refresh_outage_preserves_credentials_and_recovers_on_next_request()
+-> anyhow::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let gateway = new_gateway(directory.path().to_owned()).await?;
+    install(&gateway, "management-v1.wasm", false).await?;
+    let mut upstream = TestUpstream::start().await;
+    let provider = create_oauth_provider(
+        &gateway,
+        &mut upstream,
+        MANAGEMENT_VENDOR,
+        "Retryable OAuth inference provider",
+        "expired-access-token",
+    )
+    .await?;
+    sync_models(&gateway, &mut upstream, &provider.id).await?;
+    // 一次预算由 401 恢复消耗；不让 Route 的后续尝试掩盖本次刷新故障。
+    let route = gateway
+        .admin()
+        .create_model(CreateRoute {
+            output_modality: stravia_core::db::models::RouteOutputModality::Text,
+            model_id: "management-retryable-oauth-inference".into(),
+            display_name: Some("Retryable OAuth inference route".into()),
+            balance: None,
+            targets: vec![stravia_core::db::models::CreateTarget {
+                provider_id: provider.id.clone(),
+                model: MODEL_ID.into(),
+                enabled: true,
+                priority: None,
+                first_token_timeout_ms: None,
+                target_retry_budget: Some(1),
+                target_cooldown_ms: Some(0),
+                thinking_level_map: Vec::new(),
+            }],
+            default_thinking_level: None,
+        })
+        .await?;
+    let token = api_key(&gateway, &route.id).await?;
+    let router = create_router(gateway.clone());
+
+    let mut first_call = tokio::spawn(invoke(
+        router.clone(),
+        token.clone(),
+        route.model_id.to_string(),
+    ));
+    let rejected = tokio::select! {
+        request = upstream.next() => request,
+        result = &mut first_call => panic!("inference ended before upstream request: {result:?}"),
+    };
+    assert_eq!(rejected.operation(), "infer");
+    assert_eq!(
+        rejected.header("authorization"),
+        Some("Bearer expired-access-token")
+    );
+    rejected.reply(UpstreamReply {
+        status: StatusCode::UNAUTHORIZED,
+        body: br#"{"error":{"type":"authentication_error","message":"expired token"}}"#.to_vec(),
+    });
+    let refresh = tokio::select! {
+        request = upstream.next() => request,
+        result = &mut first_call => panic!("inference ended before OAuth refresh: {result:?}"),
+    };
+    assert_eq!(refresh.operation(), "oauth_refresh");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&refresh.body)?["refresh_token"],
+        "fixture-refresh-token"
+    );
+    refresh.reply(UpstreamReply {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        body: br#"{"error":"temporarily_unavailable"}"#.to_vec(),
+    });
+    let failed = tokio::select! {
+        result = &mut first_call => result?,
+        request = upstream.next() => panic!(
+            "temporary refresh failure must end this request, not dispatch {}",
+            request.operation()
+        ),
+    };
+    assert_eq!(failed.0, StatusCode::SERVICE_UNAVAILABLE, "{}", failed.1);
+    assert_eq!(failed.1["error"]["code"], "upstream_error", "{}", failed.1);
+    let retained_provider = gateway.admin().get_provider(&provider.id).await?;
+    assert_eq!(retained_provider.credential_status, "ok");
+    assert!(retained_provider.credential_invalid_at.is_none());
+    let retained = gateway
+        .storage
+        .oauth_credentials()
+        .get(&provider.id)
+        .await?
+        .context("OAuth credential retained after temporary refresh failure")?;
+    assert_eq!(retained.access_token, "expired-access-token");
+    assert_eq!(
+        retained.refresh_token.as_deref(),
+        Some("fixture-refresh-token")
+    );
+    upstream.assert_no_request();
+
+    let mut next_call = tokio::spawn(invoke(router, token, route.model_id.to_string()));
+    let refresh = tokio::select! {
+        request = upstream.next() => request,
+        result = &mut next_call => panic!("next inference ended before retrying refresh: {result:?}"),
+    };
+    // The failed refresh leaves the binding retryable. Freshness recovery happens
+    // before sending another inference with the rejected access token.
+    assert_eq!(refresh.operation(), "oauth_refresh");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&refresh.body)?["refresh_token"],
+        "fixture-refresh-token"
+    );
+    refresh.reply(UpstreamReply::token(
+        "recovered-access-token",
+        "recovered-refresh-token",
+    ));
+    let inference = tokio::select! {
+        request = upstream.next() => request,
+        result = &mut next_call => panic!("next inference ended before recovered dispatch: {result:?}"),
+    };
+    assert_eq!(inference.operation(), "infer");
+    assert_eq!(
+        inference.header("authorization"),
+        Some("Bearer recovered-access-token")
+    );
+    inference.reply(UpstreamReply::inference("Recovered after refresh outage"));
+    let recovered = next_call.await?;
+    assert_eq!(recovered.0, StatusCode::OK, "{}", recovered.1);
+    assert!(
+        recovered
+            .1
+            .to_string()
+            .contains("Recovered after refresh outage")
+    );
+    let recovered_provider = gateway.admin().get_provider(&provider.id).await?;
+    assert_eq!(recovered_provider.credential_status, "ok");
+    assert!(recovered_provider.credential_invalid_at.is_none());
+    let recovered_credential = gateway
+        .storage
+        .oauth_credentials()
+        .get(&provider.id)
+        .await?
+        .context("successfully recovered OAuth credential")?;
+    assert_eq!(recovered_credential.access_token, "recovered-access-token");
+    assert_eq!(
+        recovered_credential.refresh_token.as_deref(),
+        Some("recovered-refresh-token")
+    );
+    upstream.assert_no_request();
+    Ok(())
+}
+
+#[tokio::test]
 async fn compatible_update_keeps_oauth_401_refresh_and_replay_on_the_original_component()
 -> anyhow::Result<()> {
     let directory = tempfile::tempdir()?;
@@ -1921,6 +2120,116 @@ async fn compatible_update_keeps_oauth_401_refresh_and_replay_on_the_original_co
             .1
             .to_string()
             .contains("OAuth recovery stayed pinned")
+    );
+    upstream.assert_no_request();
+    Ok(())
+}
+
+#[tokio::test]
+async fn paginated_model_sync_reuses_recovered_oauth_credentials_without_a_second_refresh()
+-> anyhow::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let gateway = new_gateway(directory.path().to_owned()).await?;
+    install(&gateway, "management-v1.wasm", false).await?;
+    let mut upstream = TestUpstream::start().await;
+    let provider = create_oauth_provider(
+        &gateway,
+        &mut upstream,
+        MANAGEMENT_VENDOR,
+        "Paginated OAuth recovery",
+        "old-page-access-token",
+    )
+    .await?;
+    let gw = gateway.clone();
+    let provider_id = provider.id.clone();
+    let mut sync = tokio::spawn(async move { gw.admin().sync_provider_models(&provider_id).await });
+
+    let rejected = tokio::select! {
+        request = upstream.next() => request,
+        result = &mut sync => panic!("model sync ended before first page: {result:?}"),
+    };
+    assert_eq!(rejected.operation(), "model_discovery");
+    assert_eq!(
+        rejected.header("authorization"),
+        Some("Bearer old-page-access-token")
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&rejected.body)?["cursor"],
+        serde_json::Value::Null
+    );
+    rejected.reply(UpstreamReply {
+        status: StatusCode::UNAUTHORIZED,
+        body: br#"{"error":{"type":"authentication_error","message":"expired token"}}"#.to_vec(),
+    });
+
+    let refresh = tokio::select! {
+        request = upstream.next() => request,
+        result = &mut sync => panic!("model sync ended before OAuth refresh: {result:?}"),
+    };
+    assert_eq!(refresh.operation(), "oauth_refresh");
+    assert_eq!(
+        refresh.header("authorization"),
+        Some("Bearer old-page-access-token")
+    );
+    refresh.reply(UpstreamReply::token(
+        "new-page-access-token",
+        "new-page-refresh-token",
+    ));
+
+    let replay = tokio::select! {
+        request = upstream.next() => request,
+        result = &mut sync => panic!("model sync ended before first page replay: {result:?}"),
+    };
+    assert_eq!(replay.operation(), "model_discovery");
+    assert_eq!(
+        replay.header("authorization"),
+        Some("Bearer new-page-access-token")
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&replay.body)?["cursor"],
+        serde_json::Value::Null
+    );
+    replay.reply(UpstreamReply::model_page(
+        MODEL_ID,
+        "Recovered Page One",
+        Some("recovered-page-2"),
+    ));
+
+    // The strict request sequence admits exactly one refresh. The next page
+    // must use the recovered credential immediately, not incur another 401.
+    let second = tokio::select! {
+        request = upstream.next() => request,
+        result = &mut sync => panic!("model sync ended before second page: {result:?}"),
+    };
+    assert_eq!(second.operation(), "model_discovery");
+    assert_eq!(second.header("x-management-version"), Some("1.0.0"));
+    assert_eq!(
+        second.header("authorization"),
+        Some("Bearer new-page-access-token")
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&second.body)?["cursor"],
+        "recovered-page-2"
+    );
+    second.reply(UpstreamReply::model_page(
+        PAGINATED_MODEL_ID,
+        "Recovered Page Two",
+        None,
+    ));
+    let summary = sync.await??;
+    assert_eq!(summary.added, 2);
+    let mut model_ids = gateway
+        .admin()
+        .list_provider_models(&provider.id)
+        .await?
+        .models
+        .into_iter()
+        .map(|model| model.id)
+        .collect::<Vec<_>>();
+    model_ids.sort();
+    assert_eq!(
+        model_ids,
+        [MODEL_ID.to_owned(), PAGINATED_MODEL_ID.to_owned()]
     );
     upstream.assert_no_request();
     Ok(())

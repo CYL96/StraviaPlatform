@@ -174,46 +174,41 @@ fn token_request(host: &GuestHost, form: String) -> Result<TokenResponse, Plugin
         body: form.into_bytes(),
     })?;
     let status = response.status()?;
+    let headers = response.headers()?;
     let body = stravia_vendor_sdk::read_http_body(&response, MAX_TOKEN_BODY)?;
     if !(200..300).contains(&status) {
-        let parsed: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
-        let detail = parsed
-            .get("error_description")
-            .or_else(|| parsed.get("message"))
-            .or_else(|| parsed.get("error"))
-            .and_then(Value::as_str)
-            .unwrap_or("token endpoint rejected the request");
-        let code = parsed
-            .get("error")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let kind = if matches!(code, "invalid_grant" | "access_denied" | "invalid_client")
-            || matches!(status, 400 | 401 | 403)
-        {
-            ErrorKind::Auth
-        } else {
-            ErrorKind::upstream_unknown()
-        };
-        return Err(PluginError {
-            kind,
-            message: format!("OpenAI OAuth token exchange failed: {detail}"),
-            upstream_status: Some(status),
-        });
+        return Err(stravia_vendor_common::common::oauth_token_error(
+            status, &headers, &body,
+        ));
     }
-    serde_json::from_slice(&body).map_err(|_| auth_error("OpenAI token response is invalid"))
+    serde_json::from_slice(&body).map_err(|_| {
+        stravia_vendor_common::common::plugin_error(
+            ErrorKind::upstream_unknown(),
+            "OpenAI token response is invalid",
+        )
+    })
 }
 
 fn credentials_response(
     token: TokenResponse,
     fallback_refresh_token: Option<&str>,
 ) -> Result<AuthResponse, PluginError> {
-    let raw = serde_json::to_value(&token)
-        .map_err(|_| auth_error("OpenAI token response could not be preserved"))?;
+    let raw = serde_json::to_value(&token).map_err(|_| {
+        stravia_vendor_common::common::plugin_error(
+            ErrorKind::upstream_unknown(),
+            "OpenAI token response could not be preserved",
+        )
+    })?;
     let access_token = token
         .access_token
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| auth_error("OpenAI token response omitted access_token"))?;
+        .ok_or_else(|| {
+            stravia_vendor_common::common::plugin_error(
+                ErrorKind::upstream_unknown(),
+                "OpenAI token response omitted access_token",
+            )
+        })?;
     let mut values = BTreeMap::new();
     if let Some(account_id) = account_id_from_jwt(&access_token) {
         values.insert("account_id".into(), Value::String(account_id));
@@ -375,4 +370,30 @@ fn unix_millis() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refresh_conversion_preserves_credentials_and_rejects_malformed_upstream() {
+        for refresh in [Value::Null, Value::String(" \t".into())] {
+            let token = serde_json::from_value(serde_json::json!({
+                "access_token": "new", "refresh_token": refresh
+            }))
+            .unwrap();
+            let AuthResponse::Credentials { values, .. } =
+                credentials_response(token, Some("old")).unwrap()
+            else {
+                panic!("expected credentials");
+            };
+            assert_eq!(values["refresh_token"], "old");
+        }
+        let token = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(!matches!(
+            credentials_response(token, Some("old")).unwrap_err().kind,
+            ErrorKind::Auth
+        ));
+    }
 }

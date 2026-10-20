@@ -787,6 +787,29 @@ pub fn anthropic_protected_reasoning_message(message: &str) -> bool {
         || (message.contains("redacted_thinking") && message.to_lowercase().contains("invalid"))
 }
 
+/// Token endpoints only prove revoked authorization with an explicit OAuth
+/// rejection or HTTP 401. Transient statuses always retain their upstream facts.
+pub fn oauth_token_error(status: u16, headers: &[(String, String)], body: &[u8]) -> PluginError {
+    let mut error = upstream_error(status, headers, body);
+    let value = serde_json::from_slice::<serde_json::Value>(body).unwrap_or_default();
+    let permanent = (400..500).contains(&status)
+        && !matches!(status, 408 | 425 | 429)
+        && matches!(
+            value.get("error").and_then(serde_json::Value::as_str),
+            Some(
+                "invalid_grant"
+                    | "invalid_client"
+                    | "unauthorized_client"
+                    | "access_denied"
+                    | "invalid_scope"
+            )
+        );
+    if status == 401 || permanent {
+        error.kind = ErrorKind::Auth;
+    }
+    error
+}
+
 pub fn upstream_error(status: u16, headers: &[(String, String)], body: &[u8]) -> PluginError {
     let value = serde_json::from_slice::<serde_json::Value>(body).unwrap_or_default();
     let message = value
@@ -924,6 +947,49 @@ pub fn map_response_transform_error(error: TransformError) -> PluginError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oauth_rejection_requires_permanent_evidence() {
+        for (status, body, auth) in [
+            (400, r#"{"error":"invalid_grant"}"#, true),
+            (400, r#"{"error":"invalid_client"}"#, true),
+            (400, r#"{"error":"unauthorized_client"}"#, true),
+            (400, r#"{"error":"access_denied"}"#, true),
+            (400, r#"{"error":"invalid_scope"}"#, true),
+            (400, r#"{"error":"invalid_request"}"#, false),
+            (400, r#"{"message":"authentication failed"}"#, false),
+            (401, r#"{}"#, true),
+            (403, r#"{"error":"insufficient_permissions"}"#, false),
+            (408, r#"{"error":"invalid_grant"}"#, false),
+            (425, r#"{"error":"invalid_grant"}"#, false),
+            (429, r#"{"error":"invalid_grant"}"#, false),
+            (503, r#"{"error":"invalid_grant"}"#, false),
+            (500, r#"{"error":"invalid_grant"}"#, false),
+        ] {
+            let error = oauth_token_error(status, &[], body.as_bytes());
+            assert_eq!(
+                matches!(error.kind, ErrorKind::Auth),
+                auth,
+                "{status} {body}"
+            );
+            assert_eq!(error.upstream_status, Some(status));
+        }
+        let error = oauth_token_error(
+            429,
+            &[("retry-after".into(), "17".into())],
+            br#"{"error":"invalid_grant"}"#,
+        );
+        assert_eq!(error.kind.retry_after(), Some(Duration::from_secs(17)));
+        assert_eq!(
+            error.kind.model_error_kind(),
+            Some(AiErrorKind::RateLimitError)
+        );
+        let error = oauth_token_error(403, &[], br#"{"error":"insufficient_permissions"}"#);
+        assert_eq!(
+            error.kind.model_error_kind(),
+            Some(AiErrorKind::AuthorizationError)
+        );
+    }
 
     #[test]
     fn endpoint_join_does_not_duplicate_saved_version_segment() {

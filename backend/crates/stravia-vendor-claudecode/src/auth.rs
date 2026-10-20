@@ -262,34 +262,19 @@ fn token_request(
         body,
     })?;
     let status = response.status()?;
+    let headers = response.headers()?;
     let body = read_http_body(&response, MAX_TOKEN_BODY)?;
     if !(200..300).contains(&status) {
-        let parsed: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
-        let detail = parsed
-            .get("error_description")
-            .or_else(|| parsed.pointer("/error/message"))
-            .or_else(|| parsed.get("message"))
-            .or_else(|| parsed.get("error"))
-            .and_then(Value::as_str)
-            .unwrap_or("token endpoint rejected the request");
-        let code = parsed
-            .get("error")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let kind = if matches!(code, "invalid_grant" | "access_denied" | "invalid_client")
-            || matches!(status, 400 | 401 | 403)
-        {
-            ErrorKind::Auth
-        } else {
-            ErrorKind::upstream_unknown()
-        };
-        return Err(PluginError {
-            kind,
-            message: format!("Claude OAuth token request failed: {detail}"),
-            upstream_status: Some(status),
-        });
+        return Err(stravia_vendor_common::common::oauth_token_error(
+            status, &headers, &body,
+        ));
     }
-    serde_json::from_slice(&body).map_err(|_| auth_error("Claude token response is invalid"))
+    serde_json::from_slice(&body).map_err(|_| {
+        stravia_vendor_common::common::plugin_error(
+            ErrorKind::upstream_unknown(),
+            "Claude token response is invalid",
+        )
+    })
 }
 
 fn non_empty(value: Option<String>) -> Option<Value> {
@@ -303,8 +288,12 @@ fn token_values(
     token: TokenResponse,
     fallback_refresh_token: Option<&str>,
 ) -> Result<(BTreeMap<String, Value>, Option<i64>), PluginError> {
-    let access_token = non_empty(token.access_token)
-        .ok_or_else(|| auth_error("Claude token response omitted access_token"))?;
+    let access_token = non_empty(token.access_token).ok_or_else(|| {
+        stravia_vendor_common::common::plugin_error(
+            ErrorKind::upstream_unknown(),
+            "Claude token response omitted access_token",
+        )
+    })?;
     let mut values = BTreeMap::from([("access_token".to_owned(), access_token)]);
     if let Some(refresh_token) = non_empty(token.refresh_token)
         .or_else(|| fallback_refresh_token.map(|value| Value::String(value.to_owned())))
@@ -497,6 +486,23 @@ fn unix_millis() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refresh_conversion_preserves_credentials_and_rejects_malformed_upstream() {
+        for refresh in [Value::Null, Value::String(" \t".into())] {
+            let token = serde_json::from_value(serde_json::json!({
+                "access_token": "new", "refresh_token": refresh
+            }))
+            .unwrap();
+            let (values, _) = token_values(token, Some("old")).unwrap();
+            assert_eq!(values["refresh_token"], "old");
+        }
+        let token = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(!matches!(
+            token_values(token, Some("old")).unwrap_err().kind,
+            ErrorKind::Auth
+        ));
+    }
 
     #[test]
     fn authorize_url_matches_claude_code_parameter_order_and_encoding() {

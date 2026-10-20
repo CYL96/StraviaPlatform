@@ -768,9 +768,10 @@ fn vertex_access_token(
     let token = payload
         .get("access_token")
         .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| {
             common::plugin_error(
-                ErrorKind::Auth,
+                ErrorKind::upstream_unknown(),
                 "Google OAuth response is missing access_token",
             )
         })?
@@ -831,9 +832,10 @@ fn sap_access_token(host: &GuestHost, provider: &ProviderSnapshot) -> Result<Str
     let token = payload
         .get("access_token")
         .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| {
             common::plugin_error(
-                ErrorKind::Auth,
+                ErrorKind::upstream_unknown(),
                 "SAP OAuth response is missing access_token",
             )
         })?
@@ -867,8 +869,12 @@ fn ibm_access_token(host: &GuestHost, provider: &ProviderSnapshot) -> Result<Str
     let token = payload
         .get("access_token")
         .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| {
-            common::plugin_error(ErrorKind::Auth, "IBM IAM response is missing access_token")
+            common::plugin_error(
+                ErrorKind::upstream_unknown(),
+                "IBM IAM response is missing access_token",
+            )
         })?
         .to_string();
     cache_token(
@@ -900,11 +906,17 @@ fn token_post(
         body,
     })?;
     let status = response.status()?;
+    let headers = response.headers()?;
+    let bytes = read_http_body(&response, 1024 * 1024)?;
     if !(200..300).contains(&status) {
-        return Err(http_error(response, status));
+        return Err(common::oauth_token_error(status, &headers, &bytes));
     }
-    serde_json::from_slice(&read_http_body(&response, 1024 * 1024)?)
-        .map_err(|_| common::plugin_error(ErrorKind::Auth, "token endpoint returned invalid JSON"))
+    serde_json::from_slice(&bytes).map_err(|_| {
+        common::plugin_error(
+            ErrorKind::upstream_unknown(),
+            "token endpoint returned invalid JSON",
+        )
+    })
 }
 
 fn refresh_gitlab(
@@ -968,16 +980,17 @@ fn gitlab_direct_access(
     let payload: Value =
         serde_json::from_slice(&read_http_body(&response, 1024 * 1024)?).map_err(|_| {
             common::plugin_error(
-                ErrorKind::Auth,
+                ErrorKind::upstream_unknown(),
                 "GitLab direct-access endpoint returned invalid JSON",
             )
         })?;
     let token = payload
         .get("token")
         .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| {
             common::plugin_error(
-                ErrorKind::Auth,
+                ErrorKind::upstream_unknown(),
                 "GitLab direct-access response is missing token",
             )
         })?

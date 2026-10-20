@@ -57,7 +57,7 @@ impl OAuthCredentialStore for PostgresOAuthCredentialStore {
         expected_version: i32,
     ) -> anyhow::Result<Option<OAuthCredential>> {
         let result = sqlx::query(
-    "UPDATE provider_oauth_credentials SET status='refreshing', status_version=status_version+1, updated_at=CURRENT_TIMESTAMP WHERE provider_id=$1 AND status='connected' AND status_version=$2",
+    "UPDATE provider_oauth_credentials SET status='refreshing', status_version=status_version+1, updated_at=CURRENT_TIMESTAMP WHERE provider_id=$1 AND status IN ('connected', 'error') AND status_version=$2",
             )
             .bind(provider_id)
             .bind(expected_version)
@@ -136,7 +136,7 @@ impl OAuthCredentialStore for PostgresOAuthCredentialStore {
     async fn list_expiring(&self, before: Duration) -> anyhow::Result<Vec<OAuthCredential>> {
         let seconds = before.as_secs() as i64;
         Ok(sqlx::query_as::<_, OAuthCredential>(
-    "SELECT provider_id, connection_id, driver_key, scheme, access_token, refresh_token, to_char(expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS expires_at, resource_url, subject_id, scopes, meta, status, status_version, last_error, to_char(last_refresh_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS last_refresh_at, to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS created_at, to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS updated_at FROM provider_oauth_credentials WHERE status='connected' AND expires_at IS NOT NULL AND expires_at <= CURRENT_TIMESTAMP + ($1 * INTERVAL '1 second')",
+    "SELECT provider_id, connection_id, driver_key, scheme, access_token, refresh_token, to_char(expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS expires_at, resource_url, subject_id, scopes, meta, status, status_version, last_error, to_char(last_refresh_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS last_refresh_at, to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS created_at, to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS updated_at FROM provider_oauth_credentials WHERE status IN ('connected', 'error') AND expires_at IS NOT NULL AND expires_at <= CURRENT_TIMESTAMP + ($1 * INTERVAL '1 second')",
             )
             .bind(seconds)
             .fetch_all(&self.pool)

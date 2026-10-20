@@ -103,6 +103,7 @@ pub struct Gateway {
     pub(crate) history_marker_execution_gate: Arc<tokio::sync::RwLock<()>>,
     pub(crate) lifecycle: Arc<GatewayLifecycle>,
     pub(crate) provider_model_sync: Arc<provider_model_sync::ProviderModelSyncRuntime>,
+    pub(crate) oauth_refresh: Arc<crate::admin::OAuthRefreshRuntime>,
     lifecycle_owner: bool,
 }
 
@@ -160,6 +161,7 @@ impl Gateway {
             history_marker_execution_gate: Arc::clone(&self.history_marker_execution_gate),
             lifecycle: Arc::clone(&self.lifecycle),
             provider_model_sync: Arc::clone(&self.provider_model_sync),
+            oauth_refresh: Arc::clone(&self.oauth_refresh),
             lifecycle_owner,
         }
     }

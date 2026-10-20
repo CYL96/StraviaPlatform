@@ -1215,7 +1215,9 @@ impl OAuthCredentialStore for MemoryOAuthCredentialStore {
         let Some(cred) = map.get_mut(provider_id) else {
             return Ok(None);
         };
-        if cred.status != "connected" || cred.status_version != expected_version {
+        if !matches!(cred.status.as_str(), "connected" | "error")
+            || cred.status_version != expected_version
+        {
             return Ok(None);
         }
         cred.status = "refreshing".to_string();
@@ -1302,7 +1304,7 @@ impl OAuthCredentialStore for MemoryOAuthCredentialStore {
         Ok(map
             .values()
             .filter(|credential| {
-                credential.status == "connected"
+                matches!(credential.status.as_str(), "connected" | "error")
                     && credential
                         .expires_at
                         .as_deref()
@@ -1313,11 +1315,19 @@ impl OAuthCredentialStore for MemoryOAuthCredentialStore {
             .collect())
     }
 
-    async fn recover_stale_refreshing(&self, _timeout: Duration) -> anyhow::Result<u64> {
+    async fn recover_stale_refreshing(&self, timeout: Duration) -> anyhow::Result<u64> {
+        let cutoff = chrono::Utc::now()
+            .checked_sub_signed(chrono::Duration::from_std(timeout)?)
+            .context("refresh lease timeout is outside the supported timestamp range")?;
         let mut map = self.credentials.write().await;
         let mut count = 0u64;
         for cred in map.values_mut() {
             if cred.status == "refreshing" {
+                let updated_at = parse_datetime_utc(&cred.updated_at)
+                    .context("refresh lease has an invalid updated_at timestamp")?;
+                if updated_at >= cutoff {
+                    continue;
+                }
                 cred.status = "connected".to_string();
                 cred.last_error = Some("refresh lease expired; retrying is allowed".to_string());
                 cred.status_version += 1;
@@ -1510,6 +1520,16 @@ mod tests {
                 .map(|target| target.provider_id().as_str()),
             Some("p2")
         );
+    }
+
+    #[tokio::test]
+    async fn oauth_refresh_recovery_storage_contract() -> anyhow::Result<()> {
+        let storage = MemoryStorage::new(vec![provider("oauth-recovery")], vec![], vec![]);
+        crate::storage::traits::verify_oauth_refresh_recovery_storage_contract(
+            storage.oauth_credentials(),
+            "oauth-recovery",
+        )
+        .await
     }
 
     #[tokio::test]

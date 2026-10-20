@@ -112,7 +112,15 @@ struct LoopbackOnlyResolver {
 
 impl reqwest::dns::Resolve for LoopbackOnlyResolver {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
-        if matches!(name.as_str(), DEEPSEEK_HOST | DEVIN_HOST) {
+        if matches!(
+            name.as_str(),
+            DEEPSEEK_HOST
+                | DEVIN_HOST
+                | "oauth2.googleapis.com"
+                | "daily-cloudcode-pa.googleapis.com"
+                | "auth.openai.com"
+                | "chatgpt.com"
+        ) {
             let addresses: reqwest::dns::Addrs = Box::new(std::iter::once(self.address));
             Box::pin(std::future::ready(Ok(addresses)))
         } else {
@@ -136,8 +144,19 @@ async fn local_tls_server(
     request_count: usize,
     response: impl Fn(&ObservedRequest) -> LocalResponse + Send + Sync + 'static,
 ) -> anyhow::Result<LocalTlsServer> {
-    let CertifiedKey { cert, signing_key } =
-        generate_simple_self_signed(vec![DEEPSEEK_HOST.to_string(), DEVIN_HOST.to_string()])?;
+    let CertifiedKey { cert, signing_key } = generate_simple_self_signed(
+        [
+            DEEPSEEK_HOST,
+            DEVIN_HOST,
+            "oauth2.googleapis.com",
+            "daily-cloudcode-pa.googleapis.com",
+            "auth.openai.com",
+            "chatgpt.com",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>(),
+    )?;
     let certificate_der = cert.der().to_vec();
     let private_key = PrivateKeyDer::from(PrivatePkcs8KeyDer::from(signing_key.serialize_der()));
     let mut tls_config = rustls::ServerConfig::builder_with_provider(Arc::new(
@@ -238,17 +257,30 @@ async fn gateway_for(
     server: &LocalTlsServer,
     vendors: &[&str],
 ) -> anyhow::Result<(tempfile::TempDir, Gateway)> {
+    gateway_for_storage(
+        server,
+        vendors,
+        Arc::new(crate::storage::MemoryStorage::new(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )),
+    )
+    .await
+}
+
+async fn gateway_for_storage(
+    server: &LocalTlsServer,
+    vendors: &[&str],
+    storage: crate::storage::traits::DynStorage,
+) -> anyhow::Result<(tempfile::TempDir, Gateway)> {
     let directory = tempfile::tempdir()?;
     let mut gateway = Gateway::from_storage(
         GatewayConfig {
             data_dir: directory.path().to_path_buf(),
             ..Default::default()
         },
-        Arc::new(crate::storage::MemoryStorage::new(
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-        )),
+        storage,
     )
     .await?;
     for vendor in vendors {
@@ -402,6 +434,475 @@ fn devin_oauth_provider(name: &str) -> CreateProvider {
     }
 }
 
+async fn synthetic_oauth_provider(
+    gateway: &Gateway,
+    vendor: &str,
+    expired: bool,
+) -> anyhow::Result<crate::db::models::Provider> {
+    let (channel, protocol, base_url) = match vendor {
+        "antigravity" => (
+            "oauth",
+            "google-gemini",
+            "https://daily-cloudcode-pa.googleapis.com",
+        ),
+        "openai-codex" => (
+            "codex",
+            "open-responses",
+            "https://chatgpt.com/backend-api/codex",
+        ),
+        _ => anyhow::bail!("undeclared synthetic OAuth vendor"),
+    };
+    let session = gateway
+        .admin()
+        .init_oauth_session(
+            AuthSessionCandidate {
+                vendor_id: vendor.into(),
+                channel: channel.into(),
+                provider_id: None,
+                base_url: base_url.into(),
+                protocol: Some(protocol.into()),
+                options: Default::default(),
+                credentials: Default::default(),
+                use_proxy: false,
+            },
+            OAuthSessionStartOptions {
+                callback_mode: OAuthCallbackMode::Manual,
+                redirect_uri: "http://localhost:1457/auth/callback".into(),
+                listener_port: None,
+                fallback_reason: None,
+            },
+        )
+        .await?;
+    let bundle = crate::auth::CredentialBundle {
+        access_token: Some("synthetic-old-access".into()),
+        refresh_token: Some("synthetic-refresh".into()),
+        expires_at: Some("2099-01-01T00:00:00Z".into()),
+        resource_url: Some(base_url.into()),
+        raw: json!({"project_id": "synthetic-project"}),
+        ..Default::default()
+    };
+    let runtime = {
+        let mut sessions = gateway.auth_sessions.write().await;
+        let record = sessions
+            .get_mut(&session.session_id)
+            .context("synthetic session")?;
+        record.status = crate::auth::AuthSessionStatus::Ready.as_str().into();
+        record.result_json = Some(serde_json::to_string(&bundle)?);
+        record.expires_at = bundle.expires_at.clone();
+        record
+            .vendor_runtime
+            .clone()
+            .context("synthetic session runtime")?
+    };
+    let (_, operation, _) = gateway.vendor_plugins.acquire(vendor)?;
+    let publication = operation.publication_fence(
+        runtime.cancellation.clone(),
+        stravia_runtime_contract::Deadline::fixed(
+            std::time::Instant::now() + Duration::from_secs(600),
+        ),
+    );
+    drop(operation);
+    *runtime.publication.lock().await = Some(publication);
+    let provider = gateway
+        .admin()
+        .create_provider_with_oauth_session(
+            &session.session_id,
+            CreateProvider {
+                name: Some(format!("synthetic {vendor}")),
+                source: ProviderSourceInput::Custom {
+                    vendor: vendor.into(),
+                    channel: channel.into(),
+                    protocol: Some(protocol.into()),
+                    base_url: base_url.into(),
+                    models_source: None,
+                    static_models: None,
+                },
+                credential: ProviderCredentialInput::None,
+                vendor_options: Default::default(),
+                use_proxy: false,
+            },
+        )
+        .await?;
+    if expired {
+        let credential = gateway
+            .storage
+            .oauth_credentials()
+            .get(&provider.id)
+            .await?
+            .context("synthetic OAuth credential")?;
+        gateway
+            .storage
+            .oauth_credentials()
+            .upsert(
+                &provider.id,
+                crate::db::models::UpsertOAuthCredential {
+                    driver_key: vendor.into(),
+                    scheme: credential.scheme,
+                    access_token: credential.access_token,
+                    refresh_token: credential.refresh_token,
+                    expires_at: Some("2000-01-01T00:00:00Z".into()),
+                    resource_url: credential.resource_url,
+                    meta: Some(credential.meta),
+                    ..Default::default()
+                },
+            )
+            .await?;
+    }
+    Ok(provider)
+}
+
+async fn antigravity_independent_image_recovery_case(
+    retry_budget: i32,
+    token_status: &'static str,
+    retry_image_failure: bool,
+) -> anyhow::Result<()> {
+    const PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+    let succeeds = retry_budget > 0 && token_status == "200 OK";
+    let request_count = if retry_budget == 0 {
+        1
+    } else if succeeds {
+        3 + usize::from(retry_image_failure)
+    } else {
+        2
+    };
+    let refreshed_image_calls = std::sync::atomic::AtomicUsize::new(0);
+    let server = local_tls_server(request_count, move |request| {
+        if request.path == "/token" {
+            return LocalResponse {
+                status: token_status,
+                ..LocalResponse::json(if token_status == "200 OK" {
+                    json!({"access_token": "synthetic-new-access", "expires_in": 3600})
+                } else {
+                    json!({"error": "temporarily_unavailable"})
+                })
+            };
+        }
+        if request.headers.get("authorization").map(String::as_str)
+            != Some("Bearer synthetic-new-access")
+        {
+            return LocalResponse {
+                status: "401 Unauthorized",
+                ..LocalResponse::json(json!({"error": {
+                    "code": 401, "status": "UNAUTHENTICATED",
+                    "message": "synthetic expired access token"
+                }}))
+            };
+        }
+        if retry_image_failure
+            && refreshed_image_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0
+        {
+            return LocalResponse {
+                status: "503 Service Unavailable",
+                ..LocalResponse::json(json!({"error": {
+                    "code": 503, "status": "UNAVAILABLE",
+                    "message": "synthetic transient image failure"
+                }}))
+            };
+        }
+        let event = json!({"response": {"candidates": [{
+            "content": {"parts": [{"inlineData": {"mimeType": "image/png", "data": PNG}}]},
+            "finishReason": "STOP"
+        }]}});
+        LocalResponse {
+            content_type: "text/event-stream",
+            body: format!("data: {event}\n\n").into_bytes(),
+            ..LocalResponse::json(Value::Null)
+        }
+    })
+    .await?;
+    // The real capability send boundary authorizes an API-key principal.
+    // Unlike the auxiliary-only fixtures, this consumer needs a SQL-backed
+    // API-key store; keep its database isolated from every other fixture.
+    let storage_directory = tempfile::tempdir()?;
+    let pool = crate::db::init_pool(storage_directory.path()).await?;
+    crate::migrations::migrate_sqlite(&pool, None).await?;
+    let storage = Arc::new(crate::storage::SqliteStorage::from_pool(pool));
+    let (_directory, gateway) = gateway_for_storage(&server, &["antigravity"], storage).await?;
+    // Leave time running while SQLx performs real filesystem I/O; the
+    // consumer uses a fresh credential and finishes before background refresh.
+    tokio::task::yield_now().await;
+    let provider =
+        with_real_time_limit(synthetic_oauth_provider(&gateway, "antigravity", false)).await??;
+    let original = gateway
+        .storage
+        .oauth_credentials()
+        .get(&provider.id)
+        .await?
+        .context("original image credential")?;
+    let model = "gemini-3.1-flash-image";
+    gateway
+        .admin()
+        .create_manual_provider_model(
+            &provider.id,
+            model,
+            crate::provider_models::CreateManualProviderModel {
+                metadata: json!({
+                    "id": model, "name": model, "capabilities": ["media_image"],
+                    "modalities": {"input": ["text"], "output": ["image"]}
+                }),
+                template_id: None,
+            },
+        )
+        .await?;
+    let route = gateway
+        .admin()
+        .create_model(crate::db::models::CreateRoute {
+            model_id: "synthetic-oauth-image".into(),
+            display_name: None,
+            output_modality: crate::db::models::RouteOutputModality::Image,
+            balance: Some("latency_preference".into()),
+            targets: vec![crate::db::models::CreateTarget {
+                provider_id: provider.id.clone(),
+                model: model.into(),
+                enabled: true,
+                priority: Some(0),
+                first_token_timeout_ms: None,
+                target_retry_budget: Some(retry_budget),
+                target_cooldown_ms: Some(0),
+                thinking_level_map: Vec::new(),
+            }],
+            default_thinking_level: None,
+        })
+        .await?;
+    let key = gateway
+        .admin()
+        .create_api_key(crate::db::models::CreateApiKey {
+            key: None,
+            name: "synthetic image owner".into(),
+            rpm_limit: None,
+            expires_at: None,
+            mcp_access_enabled: true,
+            transparent_injection_enabled: false,
+            inject_web_search: false,
+            inject_media_generation: false,
+            inject_media_understanding: false,
+            model_ids: Vec::new(),
+        })
+        .await?;
+    // Exercise the real independent-capability consumer and installed Wasm
+    // component, including HTTP Auth refresh, rather than a refresh-function mock.
+    let result = with_real_time_limit(gateway.execute_vendor_route(
+        &stravia_runtime_contract::Principal::new(key.id),
+        &route,
+        crate::plugin::VendorRequest::MediaImage(stravia_vendor_sdk::MediaImageRequest {
+            prompt: "synthetic loopback image".into(),
+            references: Vec::new(),
+            aspect_ratio: None,
+            resolution: None,
+        }),
+        crate::plugin::VendorCallContext::new(
+            stravia_runtime_contract::CancellationToken::new(),
+            stravia_runtime_contract::Deadline::fixed(
+                std::time::Instant::now() + Duration::from_secs(30),
+            ),
+        ),
+    ))
+    .await?;
+    if succeeds {
+        let execution = result?;
+        let stravia_vendor_sdk::OperationOutput::MediaImage(output) = execution.output else {
+            anyhow::bail!("image consumer returned a different capability");
+        };
+        assert_eq!(output.artifacts.len(), 1);
+        assert_eq!(
+            output.artifacts[0].bytes,
+            base64::engine::general_purpose::STANDARD.decode(PNG)?
+        );
+    } else {
+        let error = result.err().context("image request must fail")?;
+        if retry_budget == 0 {
+            assert!(crate::plugin::execution::is_credential_rejection(&error));
+        } else {
+            assert!(!crate::plugin::execution::is_credential_rejection(&error));
+            assert_eq!(
+                error
+                    .downcast_ref::<stravia_vendor_runtime::RuntimeError>()
+                    .and_then(stravia_vendor_runtime::RuntimeError::upstream_status),
+                Some(503),
+            );
+        }
+    }
+    assert_eq!(
+        gateway
+            .admin()
+            .get_provider(&provider.id)
+            .await?
+            .credential_invalid(),
+        retry_budget == 0,
+    );
+    let current = gateway
+        .storage
+        .oauth_credentials()
+        .get(&provider.id)
+        .await?
+        .context("image credential retained")?;
+    assert_eq!(current.connection_id, original.connection_id);
+    assert_eq!(
+        current.access_token,
+        if succeeds {
+            "synthetic-new-access"
+        } else {
+            "synthetic-old-access"
+        },
+    );
+    assert_eq!(current.refresh_token.as_deref(), Some("synthetic-refresh"));
+    let observed = with_real_time_limit(server.task).await???;
+    assert_eq!(observed.len(), request_count);
+    let refreshes: Vec<_> = observed
+        .iter()
+        .filter(|request| request.path == "/token")
+        .collect();
+    assert_eq!(refreshes.len(), usize::from(retry_budget > 0));
+    for request in refreshes {
+        assert_eq!(request.method, "POST");
+        let form: BTreeMap<_, _> = url::form_urlencoded::parse(&request.body)
+            .into_owned()
+            .collect();
+        assert_eq!(
+            form.get("grant_type").map(String::as_str),
+            Some("refresh_token")
+        );
+        assert_eq!(
+            form.get("refresh_token").map(String::as_str),
+            Some("synthetic-refresh")
+        );
+    }
+    let images: Vec<_> = observed
+        .iter()
+        .filter(|request| request.path != "/token")
+        .collect();
+    assert_eq!(
+        images.len(),
+        if succeeds {
+            2 + usize::from(retry_image_failure)
+        } else {
+            1
+        },
+    );
+    for (index, request) in images.iter().enumerate() {
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.path, "/v1internal:streamGenerateContent?alt=sse");
+        assert_eq!(
+            request.headers.get("authorization").map(String::as_str),
+            Some(if index == 0 {
+                "Bearer synthetic-old-access"
+            } else {
+                "Bearer synthetic-new-access"
+            }),
+        );
+        let body: Value = serde_json::from_slice(&request.body)?;
+        assert_eq!(body["model"], model);
+        assert_eq!(body["project"], "synthetic-project");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn antigravity_independent_image_401_refreshes_with_target_budget() -> anyhow::Result<()> {
+    antigravity_independent_image_recovery_case(1, "200 OK", false).await
+}
+
+#[tokio::test]
+async fn antigravity_independent_image_retry_retains_refreshed_credential() -> anyhow::Result<()> {
+    antigravity_independent_image_recovery_case(2, "200 OK", true).await
+}
+
+#[tokio::test]
+async fn antigravity_independent_image_zero_budget_does_not_refresh() -> anyhow::Result<()> {
+    antigravity_independent_image_recovery_case(0, "200 OK", false).await
+}
+
+#[tokio::test]
+async fn antigravity_independent_image_transient_refresh_keeps_provider_valid() -> anyhow::Result<()>
+{
+    antigravity_independent_image_recovery_case(1, "503 Service Unavailable", false).await
+}
+
+#[tokio::test]
+async fn antigravity_background_refresh_recovers_after_transient_token_endpoint_failure()
+-> anyhow::Result<()> {
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let server_calls = calls.clone();
+    let server = local_tls_server(2, move |_| {
+        if server_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            LocalResponse {
+                status: "503 Service Unavailable",
+                ..LocalResponse::json(json!({"error": "temporarily_unavailable"}))
+            }
+        } else {
+            LocalResponse::json(json!({"access_token": "synthetic-new-access", "expires_in": 3600}))
+        }
+    })
+    .await?;
+    let (_directory, gateway) = gateway_for(&server, &["antigravity"]).await?;
+    tokio::time::pause();
+    // Drain the immediate background interval tick before publishing an expired
+    // credential. The paused clock cannot reach the next 120-second tick while
+    // the TLS exchanges are driven by with_real_time_limit.
+    tokio::time::advance(Duration::from_millis(1)).await;
+    tokio::task::yield_now().await;
+    let provider =
+        with_real_time_limit(synthetic_oauth_provider(&gateway, "antigravity", true)).await??;
+    assert_eq!(
+        with_real_time_limit(gateway.admin().refresh_oauth_providers()).await??,
+        0
+    );
+    assert!(
+        !gateway
+            .admin()
+            .get_provider(&provider.id)
+            .await?
+            .credential_invalid()
+    );
+    let retained = gateway
+        .storage
+        .oauth_credentials()
+        .get(&provider.id)
+        .await?
+        .context("retained credential")?;
+    assert_eq!(retained.refresh_token.as_deref(), Some("synthetic-refresh"));
+    assert_eq!(
+        with_real_time_limit(gateway.admin().refresh_oauth_providers()).await??,
+        1
+    );
+    let credential = gateway
+        .storage
+        .oauth_credentials()
+        .get(&provider.id)
+        .await?
+        .context("refreshed credential")?;
+    assert_eq!(credential.access_token, "synthetic-new-access");
+    assert_eq!(
+        credential.refresh_token.as_deref(),
+        Some("synthetic-refresh")
+    );
+    assert!(
+        !gateway
+            .admin()
+            .get_provider(&provider.id)
+            .await?
+            .credential_invalid()
+    );
+    let observed = with_real_time_limit(server.task).await???;
+    assert_eq!(observed.len(), 2);
+    for request in observed {
+        assert_eq!(request.path, "/token");
+        assert_eq!(request.method, "POST");
+        let form: BTreeMap<_, _> = url::form_urlencoded::parse(&request.body)
+            .into_owned()
+            .collect();
+        assert_eq!(
+            form.get("grant_type").map(String::as_str),
+            Some("refresh_token")
+        );
+        assert_eq!(
+            form.get("refresh_token").map(String::as_str),
+            Some("synthetic-refresh")
+        );
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn deepseek_allowance_uses_real_tls_get_and_preserves_multi_currency_unknowns()
 -> anyhow::Result<()> {
@@ -469,6 +970,697 @@ async fn deepseek_allowance_uses_real_tls_get_and_preserves_multi_currency_unkno
     assert!(request.body.is_empty());
     server.task.await??;
     Ok(())
+}
+
+async fn codex_auxiliary_refresh_case(
+    discover: bool,
+    expired: bool,
+    token_status: &'static str,
+    retried_status: &'static str,
+) -> anyhow::Result<()> {
+    let request_count = if expired || token_status != "200 OK" {
+        2
+    } else {
+        3
+    };
+    let server = local_tls_server(request_count, move |request| {
+        if request.path == "/oauth/token" {
+            return LocalResponse {
+                status: token_status,
+                ..LocalResponse::json(if token_status == "200 OK" {
+                    json!({"access_token": "synthetic-new-access",
+                        "refresh_token": "synthetic-rotated-refresh", "expires_in": 3600})
+                } else {
+                    json!({"error": "temporarily_unavailable"})
+                })
+            };
+        }
+        let new_token = request.headers.get("authorization").map(String::as_str)
+            == Some("Bearer synthetic-new-access");
+        if !new_token || retried_status != "200 OK" {
+            return LocalResponse {
+                status: "401 Unauthorized",
+                ..LocalResponse::json(json!({"error": {"message": "synthetic unauthorized"}}))
+            };
+        }
+        LocalResponse::json(if discover {
+            json!({"models": [{"slug": "synthetic-codex-model", "display_name": "Synthetic Codex model"}]})
+        } else {
+            json!({"rate_limit": {"primary_window": {
+                "used_percent": 25, "limit_window_seconds": 18000
+            }}})
+        })
+    }).await?;
+    let (_directory, gateway) = gateway_for(&server, &["openai-codex"]).await?;
+    let provider = synthetic_oauth_provider(&gateway, "openai-codex", expired).await?;
+    let succeeds = token_status == "200 OK" && retried_status == "200 OK";
+    if discover {
+        let result =
+            with_real_time_limit(gateway.admin().get_provider_models(&provider.id)).await?;
+        if succeeds {
+            assert_eq!(result?, vec!["synthetic-codex-model"]);
+        } else {
+            assert!(result.is_err());
+        }
+    } else {
+        let snapshot =
+            with_real_time_limit(gateway.admin().refresh_provider_allowance(&provider.id))
+                .await??
+                .context("Codex allowance snapshot")?;
+        if succeeds {
+            assert_eq!(snapshot.status, ProviderAllowanceStatus::Fresh);
+            assert_eq!(snapshot.allowances.len(), 1);
+        } else {
+            assert_ne!(snapshot.status, ProviderAllowanceStatus::Fresh);
+        }
+    }
+    assert_eq!(
+        gateway
+            .admin()
+            .get_provider(&provider.id)
+            .await?
+            .credential_invalid(),
+        token_status == "200 OK" && retried_status == "401 Unauthorized",
+    );
+    let credential = gateway
+        .storage
+        .oauth_credentials()
+        .get(&provider.id)
+        .await?
+        .context("Codex credential retained")?;
+    assert_eq!(
+        credential.refresh_token.as_deref(),
+        Some(if token_status == "200 OK" {
+            "synthetic-rotated-refresh"
+        } else {
+            "synthetic-refresh"
+        }),
+    );
+    let observed = with_real_time_limit(server.task).await???;
+    let token_requests: Vec<_> = observed
+        .iter()
+        .filter(|request| request.path == "/oauth/token")
+        .collect();
+    assert_eq!(
+        token_requests.len(),
+        1,
+        "one token exchange per auxiliary operation"
+    );
+    let form: BTreeMap<_, _> = url::form_urlencoded::parse(&token_requests[0].body)
+        .into_owned()
+        .collect();
+    assert_eq!(
+        form.get("grant_type").map(String::as_str),
+        Some("refresh_token")
+    );
+    assert_eq!(
+        form.get("refresh_token").map(String::as_str),
+        Some("synthetic-refresh")
+    );
+    if expired {
+        assert_eq!(
+            observed[0].path, "/oauth/token",
+            "refresh precedes the auxiliary HTTP request"
+        );
+    }
+    let auxiliary: Vec<_> = observed
+        .iter()
+        .filter(|request| request.path != "/oauth/token")
+        .collect();
+    for (index, request) in auxiliary.iter().enumerate() {
+        if discover {
+            assert!(
+                request
+                    .path
+                    .starts_with("/backend-api/codex/models?client_version=")
+            );
+        } else {
+            assert_eq!(request.path, "/backend-api/wham/usage");
+        }
+        assert_eq!(
+            request.headers.get("authorization").map(String::as_str),
+            Some(if expired || index > 0 {
+                "Bearer synthetic-new-access"
+            } else {
+                "Bearer synthetic-old-access"
+            }),
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn codex_expired_discovery_refreshes_before_upstream_request() -> anyhow::Result<()> {
+    codex_auxiliary_refresh_case(true, true, "200 OK", "200 OK").await
+}
+
+#[tokio::test]
+async fn antigravity_invalid_grant_pauses_background_refresh_until_explicit_reconnect()
+-> anyhow::Result<()> {
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let server_calls = calls.clone();
+    let server = local_tls_server(2, move |_| {
+        if server_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            LocalResponse {
+                status: "400 Bad Request",
+                ..LocalResponse::json(json!({"error": "invalid_grant"}))
+            }
+        } else {
+            LocalResponse::json(json!({
+                "access_token": "synthetic-reconnected-access",
+                "refresh_token": "synthetic-reconnected-refresh",
+                "expires_in": 3600
+            }))
+        }
+    })
+    .await?;
+    let (_directory, gateway) = gateway_for(&server, &["antigravity"]).await?;
+    tokio::time::pause();
+    with_real_time_limit(async {
+        tokio::time::advance(Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        let provider = synthetic_oauth_provider(&gateway, "antigravity", true).await?;
+        assert!(
+            gateway
+                .admin()
+                .reconnect_provider_oauth(&provider.id)
+                .await
+                .is_err()
+        );
+        assert!(
+            gateway
+                .admin()
+                .get_provider(&provider.id)
+                .await?
+                .credential_invalid()
+        );
+        assert_eq!(gateway.admin().refresh_oauth_providers().await?, 0);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        gateway
+            .admin()
+            .reconnect_provider_oauth(&provider.id)
+            .await?;
+        assert!(
+            !gateway
+                .admin()
+                .get_provider(&provider.id)
+                .await?
+                .credential_invalid()
+        );
+        let credential = gateway
+            .storage
+            .oauth_credentials()
+            .get(&provider.id)
+            .await?
+            .context("explicitly reconnected credential")?;
+        assert_eq!(credential.access_token, "synthetic-reconnected-access");
+        assert_eq!(
+            credential.refresh_token.as_deref(),
+            Some("synthetic-reconnected-refresh")
+        );
+        assert_eq!(server.task.await??.len(), 2);
+        Ok::<_, anyhow::Error>(())
+    })
+    .await?
+}
+
+#[tokio::test]
+async fn codex_expired_allowance_refreshes_before_upstream_request() -> anyhow::Result<()> {
+    codex_auxiliary_refresh_case(false, true, "200 OK", "200 OK").await
+}
+
+#[tokio::test]
+async fn codex_discovery_401_refreshes_once_and_retries_with_new_token() -> anyhow::Result<()> {
+    codex_auxiliary_refresh_case(true, false, "200 OK", "200 OK").await
+}
+
+#[tokio::test]
+async fn codex_allowance_401_refreshes_once_and_retries_with_new_token() -> anyhow::Result<()> {
+    codex_auxiliary_refresh_case(false, false, "200 OK", "200 OK").await
+}
+
+#[tokio::test]
+async fn codex_allowance_repeated_401_marks_provider_invalid() -> anyhow::Result<()> {
+    codex_auxiliary_refresh_case(false, false, "200 OK", "401 Unauthorized").await
+}
+
+#[tokio::test]
+async fn codex_allowance_transient_refresh_failure_keeps_provider_valid() -> anyhow::Result<()> {
+    codex_auxiliary_refresh_case(false, false, "503 Service Unavailable", "200 OK").await
+}
+
+#[tokio::test]
+async fn codex_discovery_transient_refresh_failure_keeps_provider_valid() -> anyhow::Result<()> {
+    codex_auxiliary_refresh_case(true, false, "503 Service Unavailable", "200 OK").await
+}
+
+#[tokio::test]
+async fn codex_reconnect_recovers_after_transient_refresh_failure() -> anyhow::Result<()> {
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let server_calls = calls.clone();
+    let server = local_tls_server(2, move |_| {
+        if server_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            LocalResponse {
+                status: "503 Service Unavailable",
+                ..LocalResponse::json(json!({"error": "temporarily_unavailable"}))
+            }
+        } else {
+            LocalResponse::json(json!({
+                "access_token": "synthetic-new-access",
+                "refresh_token": "synthetic-rotated-refresh", "expires_in": 3600
+            }))
+        }
+    })
+    .await?;
+    let (_directory, gateway) = gateway_for(&server, &["openai-codex"]).await?;
+    let provider = synthetic_oauth_provider(&gateway, "openai-codex", false).await?;
+    assert!(
+        gateway
+            .admin()
+            .reconnect_provider_oauth(&provider.id)
+            .await
+            .is_err()
+    );
+    assert!(
+        !gateway
+            .admin()
+            .get_provider(&provider.id)
+            .await?
+            .credential_invalid()
+    );
+    assert_eq!(
+        gateway
+            .storage
+            .oauth_credentials()
+            .get(&provider.id)
+            .await?
+            .context("retained Codex credential")?
+            .refresh_token
+            .as_deref(),
+        Some("synthetic-refresh"),
+    );
+    gateway
+        .admin()
+        .reconnect_provider_oauth(&provider.id)
+        .await?;
+    let credential = gateway
+        .storage
+        .oauth_credentials()
+        .get(&provider.id)
+        .await?
+        .context("reconnected Codex credential")?;
+    assert_eq!(credential.access_token, "synthetic-new-access");
+    assert_eq!(
+        credential.refresh_token.as_deref(),
+        Some("synthetic-rotated-refresh")
+    );
+    assert!(
+        !gateway
+            .admin()
+            .get_provider(&provider.id)
+            .await?
+            .credential_invalid()
+    );
+    assert_eq!(with_real_time_limit(server.task).await???.len(), 2);
+    Ok(())
+}
+
+// Only the follower uses this transparent adapter. The notification proves that
+// its refresh task observed the peer's active storage lease before release.
+struct PeerRefreshObservedStorage {
+    inner: crate::storage::traits::DynStorage,
+    observed: Arc<Notify>,
+}
+
+impl crate::storage::Storage for PeerRefreshObservedStorage {
+    fn vendor_plugins(&self) -> &crate::plugin::PluginStore {
+        self.inner.vendor_plugins()
+    }
+    fn providers(&self) -> &dyn crate::storage::ProviderStore {
+        self.inner.providers()
+    }
+    fn web_providers(&self) -> Option<&dyn crate::storage::traits::WebProviderStore> {
+        self.inner.web_providers()
+    }
+    fn routes(&self) -> &dyn crate::storage::RouteStore {
+        self.inner.routes()
+    }
+    fn provider_models(&self) -> &dyn crate::storage::ProviderModelStore {
+        self.inner.provider_models()
+    }
+    fn settings(&self) -> &dyn crate::storage::SettingsStore {
+        self.inner.settings()
+    }
+    fn api_keys(&self) -> Option<&dyn crate::storage::ApiKeyStore> {
+        self.inner.api_keys()
+    }
+    fn auth(&self) -> Option<&dyn crate::storage::AuthAccessStore> {
+        self.inner.auth()
+    }
+    fn admin_identity(&self) -> Option<&dyn crate::storage::AdminIdentityStore> {
+        self.inner.admin_identity()
+    }
+    fn usage_stats(&self) -> &dyn crate::storage::UsageStatsStore {
+        self.inner.usage_stats()
+    }
+    fn oauth_credentials(&self) -> &dyn crate::storage::traits::OAuthCredentialStore {
+        self
+    }
+    fn bootstrap(&self) -> &dyn crate::storage::StorageBootstrap {
+        self.inner.bootstrap()
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::storage::traits::OAuthCredentialStore for PeerRefreshObservedStorage {
+    async fn get(&self, id: &str) -> anyhow::Result<Option<crate::db::models::OAuthCredential>> {
+        self.inner.oauth_credentials().get(id).await
+    }
+    async fn upsert(
+        &self,
+        id: &str,
+        input: crate::db::models::UpsertOAuthCredential,
+    ) -> anyhow::Result<crate::db::models::OAuthCredential> {
+        self.inner.oauth_credentials().upsert(id, input).await
+    }
+    async fn delete(&self, id: &str) -> anyhow::Result<()> {
+        self.inner.oauth_credentials().delete(id).await
+    }
+    async fn try_begin_refresh(
+        &self,
+        id: &str,
+        version: i32,
+    ) -> anyhow::Result<Option<crate::db::models::OAuthCredential>> {
+        self.inner
+            .oauth_credentials()
+            .try_begin_refresh(id, version)
+            .await
+    }
+    async fn cancel_refresh(&self, id: &str, version: i32) -> anyhow::Result<bool> {
+        self.inner
+            .oauth_credentials()
+            .cancel_refresh(id, version)
+            .await
+    }
+    async fn complete_refresh(
+        &self,
+        id: &str,
+        version: i32,
+        input: crate::db::models::UpsertOAuthCredential,
+    ) -> anyhow::Result<crate::db::models::OAuthCredential> {
+        self.inner
+            .oauth_credentials()
+            .complete_refresh(id, version, input)
+            .await
+    }
+    async fn fail_refresh(&self, id: &str, version: i32, message: &str) -> anyhow::Result<bool> {
+        self.inner
+            .oauth_credentials()
+            .fail_refresh(id, version, message)
+            .await
+    }
+    async fn list_expiring(
+        &self,
+        before: Duration,
+    ) -> anyhow::Result<Vec<crate::db::models::OAuthCredential>> {
+        self.inner.oauth_credentials().list_expiring(before).await
+    }
+    async fn recover_stale_refreshing(&self, timeout: Duration) -> anyhow::Result<u64> {
+        let recovered = self
+            .inner
+            .oauth_credentials()
+            .recover_stale_refreshing(timeout)
+            .await?;
+        self.observed.notify_one();
+        Ok(recovered)
+    }
+}
+
+#[tokio::test]
+async fn codex_cross_gateway_refresh_failure_preserves_retryable_peer_error_and_reconnects()
+-> anyhow::Result<()> {
+    let release = Arc::new(Notify::new());
+    let response_release = release.clone();
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let server_calls = calls.clone();
+    let mut server = local_tls_server(2, move |_| {
+        if server_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            LocalResponse {
+                status: "503 Service Unavailable",
+                release: Some(response_release.clone()),
+                ..LocalResponse::json(json!({"error": "temporarily_unavailable"}))
+            }
+        } else {
+            LocalResponse::json(json!({
+                "access_token": "synthetic-new-access",
+                "refresh_token": "synthetic-rotated-refresh", "expires_in": 3600
+            }))
+        }
+    })
+    .await?;
+    let storage: crate::storage::traits::DynStorage = Arc::new(crate::storage::MemoryStorage::new(
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    ));
+    let (_leader_directory, leader_gateway) =
+        gateway_for_storage(&server, &["openai-codex"], storage.clone()).await?;
+    let observed = Arc::new(Notify::new());
+    let (_follower_directory, follower_gateway) = gateway_for_storage(
+        &server,
+        &["openai-codex"],
+        Arc::new(PeerRefreshObservedStorage {
+            inner: storage.clone(),
+            observed: observed.clone(),
+        }),
+    )
+    .await?;
+    assert!(!Arc::ptr_eq(
+        &leader_gateway.oauth_refresh,
+        &follower_gateway.oauth_refresh
+    ));
+    let provider = synthetic_oauth_provider(&leader_gateway, "openai-codex", false).await?;
+    let before = storage
+        .oauth_credentials()
+        .get(&provider.id)
+        .await?
+        .context("original credential")?;
+    let provider_id = provider.id.clone();
+    let leader = tokio::spawn(async move {
+        leader_gateway
+            .admin()
+            .reconnect_provider_oauth(&provider_id)
+            .await
+    });
+    let request = with_real_time_limit(server.requests.recv())
+        .await?
+        .context("leader token exchange")?;
+    assert_eq!(request.path, "/oauth/token");
+    let peer_gateway = follower_gateway.clone();
+    let provider_id = provider.id.clone();
+    let follower = tokio::spawn(async move {
+        peer_gateway
+            .admin()
+            .reconnect_provider_oauth(&provider_id)
+            .await
+    });
+    with_real_time_limit(observed.notified()).await?;
+    assert_eq!(
+        storage
+            .oauth_credentials()
+            .get(&provider.id)
+            .await?
+            .context("active peer lease")?
+            .status,
+        "refreshing"
+    );
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    release.notify_one();
+    let (leader, follower) = with_real_time_limit(async { tokio::join!(leader, follower) }).await?;
+    let leader_error = leader?.expect_err("leader must propagate the token endpoint failure");
+    let follower_error = follower?.expect_err("peer waiter must not accept the old credential");
+    for error in [&leader_error, &follower_error] {
+        let runtime = error
+            .downcast_ref::<stravia_vendor_runtime::RuntimeError>()
+            .context("refresh failure must retain its typed runtime classification")?;
+        assert!(
+            runtime.is_upstream_failure(),
+            "transient refresh is not an Auth failure"
+        );
+        assert_eq!(
+            runtime.model_error_kind(),
+            Some(stravia_runtime_contract::protocol::ir::AiErrorKind::ServiceUnavailable)
+        );
+    }
+    let peer_runtime = follower_error
+        .downcast_ref::<stravia_vendor_runtime::RuntimeError>()
+        .unwrap();
+    assert_eq!(
+        peer_runtime.upstream_status(),
+        None,
+        "peer cannot infer the token endpoint HTTP status"
+    );
+    assert_eq!(peer_runtime.retry_after(), None);
+    assert!(
+        !follower_gateway
+            .admin()
+            .get_provider(&provider.id)
+            .await?
+            .credential_invalid()
+    );
+    let retained = storage
+        .oauth_credentials()
+        .get(&provider.id)
+        .await?
+        .context("retained credential")?;
+    assert_eq!(retained.access_token, before.access_token);
+    assert_eq!(retained.refresh_token, before.refresh_token);
+    assert_eq!(retained.expires_at, before.expires_at);
+    assert!(
+        retained
+            .last_error
+            .as_deref()
+            .is_some_and(|error| !error.is_empty())
+    );
+    follower_gateway
+        .admin()
+        .reconnect_provider_oauth(&provider.id)
+        .await?;
+    let credential = storage
+        .oauth_credentials()
+        .get(&provider.id)
+        .await?
+        .context("reconnected credential")?;
+    assert_eq!(credential.access_token, "synthetic-new-access");
+    assert_eq!(
+        credential.refresh_token.as_deref(),
+        Some("synthetic-rotated-refresh")
+    );
+    assert!(
+        !follower_gateway
+            .admin()
+            .get_provider(&provider.id)
+            .await?
+            .credential_invalid()
+    );
+    assert_eq!(with_real_time_limit(server.task).await???.len(), 2);
+    Ok(())
+}
+
+async fn codex_concurrent_reconnect_case(
+    cancel_waiter: bool,
+    timeout_waiter: bool,
+) -> anyhow::Result<()> {
+    let release = Arc::new(Notify::new());
+    let response_release = release.clone();
+    let mut server = local_tls_server(1, move |_| LocalResponse {
+        release: Some(response_release.clone()),
+        ..LocalResponse::json(json!({
+            "access_token": "synthetic-new-access",
+            "refresh_token": "synthetic-rotated-refresh",
+            "expires_in": 3600
+        }))
+    })
+    .await?;
+    let (_directory, gateway) = gateway_for(&server, &["openai-codex"]).await?;
+    let provider = synthetic_oauth_provider(&gateway, "openai-codex", false).await?;
+    let leader_gateway = gateway.clone();
+    let provider_id = provider.id.clone();
+    let leader = tokio::spawn(async move {
+        leader_gateway
+            .admin()
+            .reconnect_provider_oauth(&provider_id)
+            .await
+    });
+    let request = with_real_time_limit(server.requests.recv())
+        .await?
+        .context("leader token exchange observed")?;
+    assert_eq!(request.path, "/oauth/token");
+
+    let admin = gateway.admin();
+    if timeout_waiter {
+        assert!(
+            tokio::time::timeout(Duration::ZERO, admin.reconnect_provider_oauth(&provider.id),)
+                .await
+                .is_err(),
+            "a timed-out waiter must not receive the old credential",
+        );
+    }
+    if cancel_waiter {
+        let mut cancelled = Box::pin(admin.reconnect_provider_oauth(&provider.id));
+        std::future::poll_fn(|cx| {
+            assert!(
+                cancelled.as_mut().poll(cx).is_pending(),
+                "a reconnect waiter must not complete with the old credential"
+            );
+            std::task::Poll::Ready(())
+        })
+        .await;
+        // Dropping a polled, pending request cancels only this waiter, not the
+        // already observed exchange or the remaining reconnect request.
+        drop(cancelled);
+    }
+    let mut survivor = Box::pin(admin.reconnect_provider_oauth(&provider.id));
+    std::future::poll_fn(|cx| {
+        assert!(
+            survivor.as_mut().poll(cx).is_pending(),
+            "concurrent reconnect must wait for the observed exchange"
+        );
+        std::task::Poll::Ready(())
+    })
+    .await;
+    release.notify_one();
+    let (leader_status, survivor_status) =
+        with_real_time_limit(async { tokio::join!(leader, survivor) }).await?;
+    let leader_status = leader_status??;
+    let survivor_status = survivor_status?;
+    let credential = gateway
+        .storage
+        .oauth_credentials()
+        .get(&provider.id)
+        .await?
+        .context("published concurrent refresh")?;
+    assert_eq!(credential.access_token, "synthetic-new-access");
+    assert_eq!(
+        credential.refresh_token.as_deref(),
+        Some("synthetic-rotated-refresh")
+    );
+    assert_ne!(
+        credential.expires_at.as_deref(),
+        Some("2099-01-01T00:00:00Z")
+    );
+    assert_eq!(leader_status.expires_at, credential.expires_at);
+    assert_eq!(survivor_status.expires_at, credential.expires_at);
+    assert_eq!(leader_status.status, AuthBindingStatus::Connected.as_str());
+    assert_eq!(
+        survivor_status.status,
+        AuthBindingStatus::Connected.as_str()
+    );
+    assert!(
+        !gateway
+            .admin()
+            .get_provider(&provider.id)
+            .await?
+            .credential_invalid()
+    );
+    assert_eq!(with_real_time_limit(server.task).await???.len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn codex_concurrent_reconnects_share_one_exchange_and_new_credentials() -> anyhow::Result<()>
+{
+    codex_concurrent_reconnect_case(false, false).await
+}
+
+#[tokio::test]
+async fn cancelling_codex_reconnect_waiter_preserves_shared_refresh() -> anyhow::Result<()> {
+    codex_concurrent_reconnect_case(true, false).await
+}
+
+#[tokio::test]
+async fn timing_out_codex_reconnect_waiter_preserves_shared_refresh() -> anyhow::Result<()> {
+    codex_concurrent_reconnect_case(false, true).await
 }
 
 #[tokio::test]

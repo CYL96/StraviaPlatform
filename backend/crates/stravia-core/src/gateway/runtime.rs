@@ -564,6 +564,7 @@ impl Gateway {
             provider_model_sync: Arc::new(
                 super::provider_model_sync::ProviderModelSyncRuntime::default(),
             ),
+            oauth_refresh: Arc::new(crate::admin::OAuthRefreshRuntime::default()),
             principal_admission: Arc::new(admission::PrincipalAdmission::new()),
             rpm_admission,
             lifecycle_owner: true,

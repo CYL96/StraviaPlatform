@@ -241,30 +241,22 @@ fn token_request(
         body,
     })?;
     let status = response.status()?;
+    let headers = response.headers()?;
     let bytes = read_http_body(&response, MAX_AUTH_BODY)?;
     if !(200..300).contains(&status) {
-        let detail =
-            parse_error(&bytes).unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned());
-        let kind = match status {
-            400 | 401 | 403 => ErrorKind::Auth,
-            408 | 425 | 429 | 500..=599 => ErrorKind::upstream_unknown(),
-            _ => ErrorKind::Invalid,
-        };
-        return Err(PluginError {
-            kind,
-            message: format!("Devin token exchange returned HTTP {status}: {detail}"),
-            upstream_status: Some(status),
-        });
+        return Err(stravia_vendor_common::common::oauth_token_error(
+            status, &headers, &bytes,
+        ));
     }
     let raw: Value = serde_json::from_slice(&bytes).map_err(|err| {
         error(
-            ErrorKind::Invalid,
+            ErrorKind::upstream_unknown(),
             format!("invalid Devin token response: {err}"),
         )
     })?;
     let token: TokenResponse = serde_json::from_value(raw.clone()).map_err(|err| {
         error(
-            ErrorKind::Invalid,
+            ErrorKind::upstream_unknown(),
             format!("invalid Devin token response: {err}"),
         )
     })?;
@@ -279,7 +271,7 @@ fn token_request(
     .find(|value| !value.trim().is_empty())
     .ok_or_else(|| {
         error(
-            ErrorKind::Invalid,
+            ErrorKind::upstream_unknown(),
             "Devin token response is missing a session token",
         )
     })?;
@@ -298,7 +290,7 @@ fn token_request(
         }
         Some(value) => {
             return Err(error(
-                ErrorKind::Invalid,
+                ErrorKind::upstream_unknown(),
                 format!("Devin token response returned undeclared api_server_url `{value}`"),
             ));
         }
@@ -409,14 +401,6 @@ fn manual_token(input: &str) -> Option<String> {
         }
     }
     None
-}
-
-fn parse_error(bytes: &[u8]) -> Option<String> {
-    let value: Value = serde_json::from_slice(bytes).ok()?;
-    ["error_description", "error", "message"]
-        .into_iter()
-        .find_map(|key| value.get(key).and_then(Value::as_str))
-        .map(str::to_string)
 }
 
 fn error(kind: ErrorKind, message: impl Into<String>) -> PluginError {

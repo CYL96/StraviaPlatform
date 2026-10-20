@@ -351,7 +351,14 @@ impl Operation<'_, '_> {
             VendorRequest::Infer(request)
         };
         let compact = prepared.compact;
-        let execution = gateway.execute_prepared_vendor(execution_handle, vendor_request, context);
+        let execution = async move {
+            let result = gateway
+                .execute_prepared_vendor(execution_handle, vendor_request, &context)
+                .await;
+            // 消费方会排空事件流；完成后必须先释放上下文持有的发送端。
+            drop(context);
+            result
+        };
         tokio::pin!(execution);
         let mut operation_result = None;
 
@@ -439,6 +446,7 @@ impl Operation<'_, '_> {
             output: result,
             publication,
             protocol,
+            ..
         } = operation_result
             .expect("operation result")
             .map_err(|error| {

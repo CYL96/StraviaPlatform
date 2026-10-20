@@ -22,7 +22,7 @@ pub enum LoadError {
 /// Execution failures format only host-owned summaries. Guest-provided error
 /// messages and trap text are never used as `safe_summary`. Product-owned error
 /// projections may expose upstream diagnostics only after credential redaction.
-#[derive(thiserror::Error)]
+#[derive(Clone, thiserror::Error)]
 pub enum RuntimeError {
     #[error("{safe_summary}")]
     Plugin {

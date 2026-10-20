@@ -25,6 +25,7 @@ mod media;
 mod media_generation;
 mod model_data;
 mod oauth;
+pub(crate) use oauth::runtime::{OAuthRefreshRuntime, provider_oauth_needs_refresh};
 mod observability;
 pub mod provider_allowance;
 mod provider_connection;

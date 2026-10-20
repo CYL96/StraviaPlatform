@@ -373,6 +373,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn oauth_refresh_recovery_storage_contract() -> anyhow::Result<()> {
+        let store = store().await;
+        let provider = create_provider(&store, "oauth-recovery").await;
+        let oauth = SqliteOAuthCredentialStore {
+            pool: store.pool.clone(),
+        };
+        crate::storage::traits::verify_oauth_refresh_recovery_storage_contract(&oauth, &provider.id)
+            .await
+    }
+
+    #[tokio::test]
     async fn allowance_suspension_storage_contract() -> anyhow::Result<()> {
         let store = store().await;
         let provider = create_provider(&store, "allowance").await;

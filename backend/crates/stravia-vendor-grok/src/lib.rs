@@ -697,7 +697,7 @@ fn xai_auth_refresh(
     match token_request(host, token_endpoint, body, Some(refresh_token))? {
         TokenResult::Ready(response) => Ok(response),
         TokenResult::Pending(_) => Err(common::plugin_error(
-            ErrorKind::Auth,
+            ErrorKind::upstream_unknown(),
             "xAI refresh unexpectedly remained pending",
         )),
     }
@@ -732,15 +732,34 @@ fn token_request(
     let value: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
     if !(200..300).contains(&status) {
         return match value.get("error").and_then(Value::as_str) {
-            Some("authorization_pending") => Ok(TokenResult::Pending(false)),
-            Some("slow_down") => Ok(TokenResult::Pending(true)),
-            _ => Err(common::upstream_error(status, &headers, &bytes)),
+            Some("authorization_pending") if status == 400 => Ok(TokenResult::Pending(false)),
+            Some("slow_down") if status == 400 => Ok(TokenResult::Pending(true)),
+            _ => Err(common::oauth_token_error(status, &headers, &bytes)),
         };
     }
-    let access_token = required_json_string(&value, "access_token")?.to_owned();
+    token_response(value, endpoint, fallback_refresh)
+}
+
+fn token_response(
+    value: Value,
+    endpoint: &str,
+    fallback_refresh: Option<&str>,
+) -> Result<TokenResult, PluginError> {
+    let access_token = value
+        .get("access_token")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            common::plugin_error(
+                ErrorKind::upstream_unknown(),
+                "xAI token response omitted access_token",
+            )
+        })?
+        .to_owned();
     let refresh_token = value
         .get("refresh_token")
         .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
         .or(fallback_refresh)
         .map(str::to_owned);
     let expires = value
@@ -910,6 +929,33 @@ stravia_vendor_sdk::export_vendor!(GrokVendor);
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn token_conversion_preserves_refresh_on_missing_or_blank_rotation() {
+        for refresh in [Value::Null, json!(""), json!(" \t"), json!("rotated")] {
+            let result = token_response(
+                json!({"access_token":"new","refresh_token":refresh}),
+                "https://auth.x.ai/oauth2/token",
+                Some("old"),
+            )
+            .unwrap();
+            let TokenResult::Ready(AuthResponse::Credentials { values, .. }) = result else {
+                panic!("expected credentials");
+            };
+            assert_eq!(
+                values["refresh_token"],
+                if refresh == json!("rotated") {
+                    "rotated"
+                } else {
+                    "old"
+                }
+            );
+        }
+        let error = token_response(json!({}), "https://auth.x.ai/oauth2/token", Some("old"))
+            .err()
+            .expect("missing access token must fail");
+        assert!(!matches!(error.kind, ErrorKind::Auth));
+    }
 
     #[test]
     fn native_session_headers_use_host_affinity_not_client_identity() {

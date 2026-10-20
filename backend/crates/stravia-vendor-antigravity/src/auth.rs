@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
-use stravia_vendor_common::common::{plugin_error, upstream_error};
+use stravia_vendor_common::common::{oauth_token_error, plugin_error};
 use stravia_vendor_sdk::{
     AuthRequest, AuthResponse, AuthStep, ErrorKind, GuestHost, PluginError, ProviderSnapshot,
     read_http_body,
@@ -208,28 +208,14 @@ fn token_request(host: &GuestHost, params: &[(&str, &str)]) -> Result<Value, Plu
     let headers = response.headers()?;
     let body = read_http_body(&response, client::MAX_JSON_BODY)?;
     if !(200..300).contains(&status) {
-        let value: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
-        let permanent = status < 500
-            && matches!(
-                value.get("error").and_then(Value::as_str),
-                Some(
-                    "invalid_grant"
-                        | "invalid_client"
-                        | "unauthorized_client"
-                        | "access_denied"
-                        | "invalid_scope"
-                )
-            );
-        let mut error = upstream_error(status, &headers, &body);
-        if permanent {
-            error.kind = ErrorKind::Auth;
-            error.message =
-                "Google OAuth authorization is no longer valid; authorize this account again"
-                    .into();
-        }
-        return Err(error);
+        return Err(oauth_token_error(status, &headers, &body));
     }
-    serde_json::from_slice(&body).map_err(|_| auth("Google OAuth token response is malformed"))
+    serde_json::from_slice(&body).map_err(|_| {
+        plugin_error(
+            ErrorKind::upstream_unknown(),
+            "Google OAuth token response is malformed",
+        )
+    })
 }
 
 fn token_values(
@@ -243,13 +229,21 @@ fn token_values(
         .filter(|value| {
             !value.trim().is_empty() && !value.bytes().any(|byte| byte.is_ascii_control())
         })
-        .ok_or_else(|| auth("Google OAuth token response omitted valid access_token"))?;
+        .ok_or_else(|| {
+            plugin_error(
+                ErrorKind::upstream_unknown(),
+                "Google OAuth token response omitted valid access_token",
+            )
+        })?;
     if token
         .get("token_type")
         .and_then(Value::as_str)
         .is_some_and(|kind| !kind.eq_ignore_ascii_case("bearer"))
     {
-        return Err(auth("Google OAuth returned an unsupported token type"));
+        return Err(plugin_error(
+            ErrorKind::upstream_unknown(),
+            "Google OAuth returned an unsupported token type",
+        ));
     }
     values.insert("access_token".into(), Value::String(access.into()));
     if let Some(refresh) = token
@@ -260,7 +254,8 @@ fn token_values(
         values.insert("refresh_token".into(), Value::String(refresh.into()));
     }
     if require_refresh && !values.contains_key("refresh_token") {
-        return Err(auth(
+        return Err(plugin_error(
+            ErrorKind::upstream_unknown(),
             "Google OAuth omitted refresh_token; authorize with consent again",
         ));
     }
@@ -291,7 +286,12 @@ fn token_values(
             let seconds = value
                 .as_i64()
                 .filter(|seconds| *seconds > 0)
-                .ok_or_else(|| auth("Google OAuth token expiry is malformed"))?;
+                .ok_or_else(|| {
+                    plugin_error(
+                        ErrorKind::upstream_unknown(),
+                        "Google OAuth token expiry is malformed",
+                    )
+                })?;
             Some(now().saturating_add(seconds.saturating_mul(1000)))
         }
         None => None,
@@ -468,6 +468,17 @@ fn now() -> i64 {
 mod tests {
     use super::*;
     #[test]
+    fn malformed_token_response_is_not_revoked_authorization() {
+        for token in [
+            json!({}),
+            json!({"access_token":"new","expires_in":-1}),
+            json!({"access_token":"new","token_type":"unsupported"}),
+        ] {
+            let error = token_values(&token, BTreeMap::new(), false).unwrap_err();
+            assert!(!matches!(error.kind, ErrorKind::Auth));
+        }
+    }
+    #[test]
     fn rejects_callback_ambiguity_and_wrong_redirect() {
         assert!(callback("https://antigravity.google/oauth-callback?state=a&state=b").is_err());
         assert!(callback("https://other.example/oauth-callback?state=a").is_err());
@@ -496,6 +507,15 @@ mod tests {
         assert_eq!(values["refresh_token"], "old");
         assert_eq!(values["project_id"], "project");
         assert_eq!(values["account_id"], "account");
+        for refresh in [json!(""), json!(" \t"), Value::Null] {
+            let (refreshed, _) = token_values(
+                &json!({"access_token":"next","refresh_token":refresh}),
+                values.clone(),
+                false,
+            )
+            .unwrap();
+            assert_eq!(refreshed["refresh_token"], "old");
+        }
         assert!(
             token_values(
                 &json!({"access_token":"new","expires_in":-1}),
