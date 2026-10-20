@@ -377,7 +377,7 @@ def main() -> None:
                         streams.append(Stream(env, "/api/v1/observations/events?after=" + str(initial["snapshot_sequence"])))
                     stream_results = [stream.close() for stream in streams + scoped]
                     timeline = meter.request("/api/v1/performance/timeline")
-                    with urlopen(Request(base + "/api/v1/performance/metrics", headers=env["auth"])) as response:
+                    with urlopen(Request(base + "/api/v1/performance/snapshot", headers=env["auth"])) as response:
                         metrics = response.read().decode()
                     database = Path(temporary) / "db" / "gateway.db"
                     with closing(sqlite3.connect(f"file:{database.as_posix()}?mode=ro", uri=True)) as connection:
