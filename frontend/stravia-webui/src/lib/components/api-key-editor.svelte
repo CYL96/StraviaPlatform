@@ -436,7 +436,7 @@ async function saveKey(): Promise<void> {
 {/snippet}
 
 {#if presentation === 'page'}
-  <div class="route-page mx-auto min-h-[calc(100svh-5rem)] w-full max-w-[90rem]">
+  <div class="route-page min-h-[calc(100svh-5rem)]">
     <PageHeader
       eyebrow={m.common_setup()}
       title={m.api_key_editor_edit_api_key()}

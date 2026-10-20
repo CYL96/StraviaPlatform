@@ -801,7 +801,7 @@ async function saveModel(): Promise<void> {
   </div>
 {/snippet}
 
-<div class="route-page mx-auto min-h-[calc(100svh-5rem)] w-full max-w-[90rem]">
+<div class="route-page min-h-[calc(100svh-5rem)]">
   <PageHeader
     eyebrow={m.common_setup()}
     title={initialModel ? m.model_editor_edit_model() : m.common_add_model()}

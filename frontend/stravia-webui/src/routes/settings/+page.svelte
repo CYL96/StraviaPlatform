@@ -337,7 +337,7 @@ async function downloadPerformance(kind: 'metrics' | 'timeline'): Promise<void> 
 
 <svelte:head><title>{m.settings_settings()} · Stravia</title></svelte:head>
 
-<div class="route-page mx-auto max-w-[64rem]">
+<div class="route-page">
   <PageHeader eyebrow={m.common_system_label()} title={m.settings_settings()} description={m.settings_page_summary()} />
 
   {#if settingsError}
