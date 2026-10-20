@@ -201,8 +201,7 @@ pub(crate) fn shape(
     })
 }
 
-/// Claude Code 推理请求头，按真实 CLI 抓包的字节序排列。宿主在插件协商
-/// `Accept-Encoding` 时负责解码响应。
+/// Claude Code 推理请求头。压缩策略通过强类型契约交给宿主。
 pub(crate) fn inference_headers(
     access_token: &str,
     client_version: &str,
@@ -211,7 +210,6 @@ pub(crate) fn inference_headers(
 ) -> Vec<(String, String)> {
     vec![
         ("accept".into(), "application/json".into()),
-        ("accept-encoding".into(), "gzip, deflate, br, zstd".into()),
         ("authorization".into(), format!("Bearer {access_token}")),
         ("connection".into(), "keep-alive".into()),
         ("content-type".into(), "application/json".into()),

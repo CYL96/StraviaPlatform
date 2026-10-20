@@ -97,6 +97,8 @@ impl VendorGuest for LifecycleContractVendor {
                                 "oversized-event",
                                 "oversized-output",
                                 "websocket",
+                                "compression",
+                                "websocket-compression",
                                 "selection-http",
                                 "selection-state",
                                 "selection-event",
@@ -120,6 +122,10 @@ impl VendorGuest for LifecycleContractVendor {
                                     "oversized-event" => crate::messages::mode_oversized_event(),
                                     "oversized-output" => crate::messages::mode_oversized_output(),
                                     "websocket" => crate::messages::mode_websocket(),
+                                    "compression" => crate::messages::mode_compression(),
+                                    "websocket-compression" => {
+                                        crate::messages::mode_websocket_compression()
+                                    }
                                     "selection-http" => crate::messages::mode_selection_http(),
                                     "selection-state" => crate::messages::mode_selection_state(),
                                     "selection-event" => crate::messages::mode_selection_event(),
@@ -292,6 +298,33 @@ impl VendorGuest for LifecycleContractVendor {
                     reuse_max_age_millis: None,
                 })?;
             }
+            "websocket-compression" => {
+                let socket = host.ws_connect_with_compression(
+                    stravia_vendor_sdk::WsRequest {
+                        url: configured_url(&provider.options, "auxUrl")?.into(),
+                        headers: Vec::new(),
+                        protocols: Vec::new(),
+                        continuation_id: None,
+                        reuse_max_age_millis: Some(0),
+                    },
+                    stravia_vendor_sdk::WsCompression::PermessageDeflate(
+                        stravia_vendor_sdk::CompressionNegotiation::Required,
+                    ),
+                )?;
+                socket.send(&stravia_vendor_sdk::WsMessage::Text(
+                    serde_json::to_string(&request).map_err(invalid)?,
+                ))?;
+                let Some(stravia_vendor_sdk::WsMessage::Text(text)) = socket.next()? else {
+                    return Err(error(
+                        ErrorKind::upstream_unknown(),
+                        "compression fixture expected a WebSocket text response",
+                    ));
+                };
+                let response: AiResponse = serde_json::from_str(&text).map_err(invalid)?;
+                socket.close(None)?;
+                host.emit_completed(&response)?;
+                return Ok(OperationOutput::Infer(Box::new(response)));
+            }
             _ => {}
         }
 
@@ -353,12 +386,23 @@ impl VendorGuest for LifecycleContractVendor {
             headers.push(("x-plugin-state".into(), diagnostic_state.into()));
         }
 
-        let response = host.http_start(HttpRequest {
+        let http_request = HttpRequest {
             method: method.into(),
             url,
             headers,
             body,
-        })?;
+        };
+        let response = if mode == "compression" {
+            host.http_start_with_compression(
+                http_request,
+                stravia_vendor_sdk::HttpCompression {
+                    request: Some(stravia_vendor_sdk::HttpContentCoding::Gzip),
+                    response: vec![stravia_vendor_sdk::HttpContentCoding::Gzip],
+                },
+            )?
+        } else {
+            host.http_start(http_request)?
+        };
         let auxiliary = if mode == "parallel" {
             Some(host.http_start(HttpRequest {
                 method: "GET".into(),

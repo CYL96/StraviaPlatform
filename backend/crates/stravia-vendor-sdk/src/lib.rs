@@ -3,7 +3,7 @@
 //! A plugin crate links this SDK, fills a [`VendorDescriptor`], implements
 //! [`VendorGuest`] for the capabilities it claims, and calls
 //! [`export_vendor!`] once. The generated component exposes the versioned
-//! `stravia:vendor@0.5.0` world; all model traffic flows through the canonical
+//! `stravia:vendor@0.5.1` world; all model traffic flows through the canonical
 //! contract in [`stravia_runtime_contract::protocol::ir`].
 //!
 //! The WIT contract lives in `wit/` of this crate and is the single source for
@@ -36,7 +36,10 @@ mod request_compat;
 mod message_build_support;
 
 pub use crate::bindings::stravia::vendor::host::LogLevel;
-pub use crate::bindings::stravia::vendor::types::{HttpRequest, WsRequest};
+pub use crate::bindings::stravia::vendor::types::{
+    CompressionNegotiation, HttpCompression, HttpContentCoding, HttpRequest, WsCompression,
+    WsRequest,
+};
 pub use descriptor::{
     AuthCallback, AuthCallbackPort, AuthDescriptor, AuthFlow, AuthManualInput, AuthManualInputType,
     Capability, ChannelDescriptor, ConfigField, ConfigFieldKind, ConfigGroup, DataCompatibility,

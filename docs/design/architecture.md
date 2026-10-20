@@ -206,7 +206,7 @@ stravia/
 
 **开发构建与调试：**
 
-所有 Rust crate（包括三个 Wasm 测试夹具）的包版本和依赖版本统一声明在根 `Cargo.toml` 的 `workspace.package` 与 `workspace.dependencies`，crate 清单通过 `workspace = true` 继承，只补充自身的特性、可选依赖与目标平台条件。全工作区使用根 `Cargo.lock`；上游仍要求不同不兼容版本时，在根使用明确的多版本依赖键，不在 crate 内另写版本，也不强制覆盖第三方的版本约束。Wasm 夹具通过 `task build:vendor-fixtures` 定向构建，常规 host 检查和单元测试不编译这些 Wasm 专用包。
+所有 Rust crate（包括四个 Wasm 测试夹具）的包版本和依赖版本统一声明在根 `Cargo.toml` 的 `workspace.package` 与 `workspace.dependencies`，crate 清单通过 `workspace = true` 继承，只补充自身的特性、可选依赖与目标平台条件。全工作区使用根 `Cargo.lock`；上游仍要求不同不兼容版本时，在根使用明确的多版本依赖键，不在 crate 内另写版本，也不强制覆盖第三方的版本约束。Wasm 夹具通过 `task build:vendor-fixtures` 定向构建，常规 host 检查和单元测试不编译这些 Wasm 专用包。
 
 根 `Cargo.toml` 的开发配置保留工作区 crate 的完整调试信息与增量编译；常规测试继承这一配置。第三方依赖默认使用 `debug = 1`，保留文件、行号与模块级信息，但不生成完整的类型与局部变量信息，以减少 PDB 大小和增量构建成本。依赖的 `opt-level = 3` 与 release 配置保持不变；原生构建所需的个别符号例外以根配置为准。
 
@@ -863,9 +863,9 @@ model_turn/                  ← 路由与尝试策略；只调用 Gateway::exec
 
 ### 6.1 Descriptor 与操作入口
 
-WIT 契约为 `stravia:vendor@0.5.0`。`VendorDescriptor` 声明稳定 `vendor_id`、版本、展示元数据、canonical format 版本、`kind`（fallback 或 dedicated）及 `providers`；每个 `ProviderDescriptor` 独立声明 `provider_id`、可选 `catalog_id`、展示元数据、channels、能力、配置字段、网络权限与数据兼容版本。fallback descriptor 的 Vendor 身份必须为 `base`；dedicated descriptor 只能有一个 profile，且其 `provider_id` 必须等于 `vendor_id`。管理面和执行面都从 `VendorPlugins` 当前已安装且已加载的 descriptor 读取，不再聚合协议 registry 伪造插件 inventory。
+WIT 契约为 `stravia:vendor@0.5.1`，通过新增 HTTP / WebSocket 压缩函数的独立参数表达强类型策略，保留 `0.5.0` 的 request 形状、旧函数及资源；已有独立组件无需重建或重新导入。宿主只接受这两个明确的 Vendor ABI 版本，新旧入口共用传输与生命周期，旧入口保留原有 HTTP header 驱动行为和无压缩 WS。使用新增函数的插件仍要求支持它们的新宿主。`VendorDescriptor` 声明稳定 `vendor_id`、版本、展示元数据、canonical format 版本、`kind`（fallback 或 dedicated）及 `providers`；每个 `ProviderDescriptor` 独立声明 `provider_id`、可选 `catalog_id`、展示元数据、channels、能力、配置字段、网络权限与数据兼容版本。fallback descriptor 的 Vendor 身份必须为 `base`；dedicated descriptor 只能有一个 profile，且其 `provider_id` 必须等于 `vendor_id`。管理面和执行面都从 `VendorPlugins` 当前已安装且已加载的 descriptor 读取，不再聚合协议 registry 伪造插件 inventory。
 
-请求 canonical format 仍为 1，WIT 仍为 0.5.0。新增有默认值的 optional 字段可由使用兼容读取契约的已安装 format-1 插件忽略；忽略不代表插件支持该新语义。SDK `request_compat.rs` 按目标 family 从唯一 canonical 状态生成旧 `ext`、已知标准字段和 `reasoning.effort` 的 wire 视图，以供旧组件读取，不把这些别名恢复成宿主运行时状态，也不把未知 passthrough 提升为上游 body 权限。新增必选语义、破坏读取契约或改变 WIT 仍须版本化，不能以 optional 兼容性绕过。独立插件中的 codec 固化在已安装 WASM 内，须重建并重新导入插件才能获得新 codec／目标投影行为；只升级宿主不会更新旧 WASM。
+请求 canonical format 仍为 1；它与 WIT ABI 独立版本化。满足当前 WIT 的 format-1 插件可按兼容读取契约忽略新增且有默认值的 optional 字段；忽略不代表插件支持该新语义。SDK `request_compat.rs` 按目标 family 从唯一 canonical 状态生成旧 `ext`、已知标准字段和 `reasoning.effort` 的 wire 视图，以供兼容读取方使用，不把这些别名恢复成宿主运行时状态，也不把未知 passthrough 提升为上游 body 权限。新增必选语义、破坏读取契约或改变 WIT 仍须版本化，不能以 optional 兼容性绕过。独立插件中的 codec 固化在已安装 WASM 内，须重建并重新导入插件才能获得新 codec／目标投影行为；只升级宿主不会更新旧 WASM。
 
 这里的 `provider_id` 是供应商 profile 身份，不是已保存 Provider 连接的数据库 UUID。SDK 与 WIT 的 `ProviderSnapshot.provider_id` 为必填；准入、channel 校验、网络 origin 与 guest 分派都只使用当前 profile，不能合并其他 profile 的声明。基础 guest 按该身份分派，专属 guest 拒绝其他身份。
 
@@ -883,6 +883,7 @@ Wasm guest 不能直接取得宿主网络、存储或任意凭据。host 只提�
 
 - 根据 descriptor 的固定 origin、base URL 字段与显式配置解析最小网络授权；guest 输出不能扩大 origin。
 - HTTP / WebSocket 统一经过 host transport，遵循代理设置、取消、deadline、响应大小与消息大小限制。
+- HTTP 内容编码及 WS `permessage-deflate` 由 guest 的 typed 请求声明、host 协商和编解码，压缩头不接受 guest 手写。连接池保存真实 WS 压缩上下文并按策略隔离；具体编码、协商失败、流式读取及诊断边界见 [Vendor 传输压缩契约](vendor-plugins.md#http-与-websocket-传输压缩)。
 - Provider credentials 以 typed snapshot 交给当前操作；私有状态按供应商 profile 身份、已保存 Provider 连接 UUID 和 data epoch 隔离。
 - protocol codec 保持跨厂商通用，只负责 canonical IR 与 wire 表示能力；厂商 URL、headers、认证刷新、模型发现和错误解释留在 guest。
 

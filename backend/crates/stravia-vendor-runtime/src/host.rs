@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use stravia_runtime_contract::protocol::ir::AiStreamDelta;
-use stravia_vendor_sdk::ErrorKind;
+use stravia_vendor_sdk::{ErrorKind, HttpCompression, WsCompression};
 
 #[derive(Clone)]
 #[doc(hidden)]
@@ -19,6 +19,20 @@ pub struct HttpRequest {
     pub url: String,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
+    /// None preserves the legacy entry point's manual compression headers.
+    /// Some opts into host-owned compression, including an identity-only policy.
+    pub compression: Option<HttpCompression>,
+}
+
+#[derive(Debug, Clone)]
+pub struct WsRequest {
+    pub url: String,
+    pub headers: Vec<(String, String)>,
+    pub protocols: Vec<String>,
+    pub continuation_id: Option<String>,
+    pub reuse_max_age_millis: Option<u64>,
+    /// None is the legacy, non-negotiating entry point; Some is explicit policy.
+    pub compression: Option<WsCompression>,
 }
 
 #[derive(Debug, Clone)]
@@ -131,14 +145,7 @@ pub trait HostServices: Send + Sync {
     /// may cap the requested age. Age starts at the first handshake, and later
     /// checkouts may shorten but never extend the deadline. This policy does
     /// not shorten the independent in-flight I/O deadline.
-    async fn ws_connect(
-        &self,
-        url: String,
-        headers: Vec<(String, String)>,
-        protocols: Vec<String>,
-        continuation_id: Option<String>,
-        reuse_max_age_millis: Option<u64>,
-    ) -> Result<Arc<dyn HostWebSocket>, HostFailure>;
+    async fn ws_connect(&self, request: WsRequest) -> Result<Arc<dyn HostWebSocket>, HostFailure>;
 
     async fn read_private_state(&self) -> Result<Option<Vec<u8>>, HostFailure>;
     async fn write_private_state(&self, bytes: Vec<u8>) -> Result<(), HostFailure>;

@@ -1436,22 +1436,10 @@ impl HostServices for ScopedHostServices {
 
     async fn ws_connect(
         &self,
-        url: String,
-        headers: Vec<(String, String)>,
-        protocols: Vec<String>,
-        continuation_id: Option<String>,
-        reuse_max_age_millis: Option<u64>,
+        request: stravia_vendor_runtime::WsRequest,
     ) -> Result<Arc<dyn HostWebSocket>, HostFailure> {
         self.ensure_current()?;
-        self.network
-            .ws_connect(
-                url,
-                headers,
-                protocols,
-                continuation_id,
-                reuse_max_age_millis,
-            )
-            .await
+        self.network.ws_connect(request).await
     }
 
     async fn read_private_state(&self) -> Result<Option<Vec<u8>>, HostFailure> {

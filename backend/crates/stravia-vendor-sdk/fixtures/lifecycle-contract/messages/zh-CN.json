@@ -16,6 +16,8 @@
   "mode_oversized_event": "超大事件",
   "mode_oversized_output": "超大输出",
   "mode_websocket": "WebSocket",
+  "mode_compression": "HTTP 压缩",
+  "mode_websocket_compression": "WebSocket 压缩",
   "mode_selection_http": "选择阶段 HTTP 请求",
   "mode_selection_state": "选择阶段状态写入",
   "mode_selection_event": "选择阶段事件",

@@ -661,13 +661,18 @@ pub(super) fn infer_websocket(
         .filter(|id| !id.is_empty())
         .map(str::to_owned);
     let continuation_requested = continuation_id.is_some();
-    let connection = host.ws_connect(WsRequest {
-        url,
-        headers,
-        protocols: Vec::new(),
-        continuation_id,
-        reuse_max_age_millis: Some(WEBSOCKET_REUSE_MAX_AGE_MILLIS),
-    })?;
+    let connection = host.ws_connect_with_compression(
+        WsRequest {
+            url,
+            headers,
+            protocols: Vec::new(),
+            continuation_id,
+            reuse_max_age_millis: Some(WEBSOCKET_REUSE_MAX_AGE_MILLIS),
+        },
+        stravia_vendor_sdk::WsCompression::PermessageDeflate(
+            stravia_vendor_sdk::CompressionNegotiation::Preferred,
+        ),
+    )?;
     let mut frame = body.clone();
     let object = frame
         .as_object_mut()

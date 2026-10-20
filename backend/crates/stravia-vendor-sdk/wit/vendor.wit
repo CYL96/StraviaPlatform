@@ -1,10 +1,10 @@
-// Stravia vendor plugin contract, version 0.5.
+// Stravia vendor plugin contract, version 0.5.1.
 //
 // One package = one vendor. The guest orchestrates vendor flows and drives
 // controlled HTTP / WebSocket through host imports; it never gets raw sockets,
 // filesystem, env, or background tasks. Host enforces origin allowlists,
 // backpressure, cancellation, and resource limits.
-package stravia:vendor@0.5.0;
+package stravia:vendor@0.5.1;
 
 /// Types shared between the world exports and the host-side interfaces.
 interface types {
@@ -151,6 +151,30 @@ interface types {
         provider-not-found,
     }
 
+    enum http-content-coding {
+        gzip,
+        deflate,
+        br,
+        zstd,
+    }
+
+    /// The host encodes application request bytes and decodes response bytes.
+    /// An empty response list requests identity; identity is always accepted.
+    record http-compression {
+        request: option<http-content-coding>,
+        response: list<http-content-coding>,
+    }
+
+    enum compression-negotiation {
+        preferred,
+        required,
+    }
+
+    variant ws-compression {
+        disabled,
+        permessage-deflate(compression-negotiation),
+    }
+
     /// HTTP request issued by the guest through the controlled transport.
     record http-request {
         method: string,
@@ -239,7 +263,7 @@ interface types {
 /// Controlled host services imported by the guest. Every call is scoped to the
 /// single operation; no handle survives it.
 interface host {
-    use types.{http-request, ws-request, ws-message, canonical-event, plugin-error};
+    use types.{http-request, http-compression, ws-request, ws-compression, ws-message, canonical-event, plugin-error};
 
     /// An in-flight HTTP exchange. `http-start` returns the handle as soon as
     /// the request is admitted, so a single operation can run several
@@ -261,6 +285,10 @@ interface host {
     /// pending handle immediately.
     http-start: func(req: http-request) -> result<http-response, plugin-error>;
 
+    /// Start an HTTP request with host-owned request encoding and response decoding.
+    /// Compression headers are exclusive to this policy; the body is application bytes.
+    http-start-with-compression: func(req: http-request, compression: http-compression) -> result<http-response, plugin-error>;
+
     /// WebSocket connection controlled by the host.
     resource ws-connection {
         send: func(msg: ws-message) -> result<_, plugin-error>;
@@ -275,6 +303,9 @@ interface host {
     /// scheme/port match for `ws`/`wss`. Headers are explicit so authorized
     /// connection credentials and routing metadata can be sent on upgrade.
     ws-connect: func(req: ws-request) -> result<ws-connection, plugin-error>;
+
+    /// Open a WebSocket with an explicit handshake compression policy.
+    ws-connect-with-compression: func(req: ws-request, compression: ws-compression) -> result<ws-connection, plugin-error>;
 
     /// Operation-scoped private state. The host binds the connection or auth
     /// session; the guest never names a provider/session/vendor id.

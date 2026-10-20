@@ -26,10 +26,11 @@ tokio = { workspace = true, features = ["fs", "io-util", "net", "rt", "sync", "t
 axum = { workspace = true, features = ["json", "query", "ws"] }
 rmcp = { workspace = true, features = ["client", "server", "transport-streamable-http-client-reqwest", "transport-streamable-http-server"] }
 reqwest = { workspace = true, features = ["charset", "form", "http2", "json", "rustls", "stream"] }
-reqwest-websocket = { workspace = true }
-tungstenite = { workspace = true }
+tungstenite-deflate = { workspace = true }
+tokio-tungstenite-deflate = { workspace = true }
+async-compression = { workspace = true }
 url = { workspace = true }
-# 插件协商内容编码时由宿主解码响应；这些特性已随 wreq 进入依赖图。
+# 插件以强类型策略声明响应编码；解码始终由宿主执行。
 tower-http = { workspace = true, features = ["decompression-br", "decompression-deflate", "decompression-gzip", "decompression-zstd"] }
 tower = { workspace = true }
 http-body-util = { workspace = true }
@@ -97,6 +98,7 @@ url = { workspace = true }
 stable_deref_trait = { workspace = true }
 
 [dev-dependencies]
+reqwest-websocket = { workspace = true }
 sqlx = { workspace = true, features = ["sqlite-deserialize"] }
 office_oxide = { workspace = true }
 stravia-media = { workspace = true, features = ["test-support"] }

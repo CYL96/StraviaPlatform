@@ -1,6 +1,5 @@
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -8,29 +7,30 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use futures::{FutureExt, SinkExt, StreamExt};
-use http_body_util::BodyExt as _;
-use reqwest::header::{ACCEPT_ENCODING, HeaderMap, HeaderName, HeaderValue, LOCATION, RETRY_AFTER};
+use futures::FutureExt;
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue, LOCATION, RETRY_AFTER};
 use reqwest::{Client, Method, Response, Url};
-use reqwest_websocket::{Message, Upgrade, WebSocket};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use stravia_protocol_codec::registry::ProtocolRegistry;
 use stravia_runtime_contract::CancellationToken;
 use stravia_runtime_contract::protocol::ir::{AiError, AiErrorKind};
 use stravia_vendor_runtime::{
-    HostFailure, HostHttpResponse, HostWebSocket, HttpRequest, WebSocketMessage,
+    HostFailure, HostHttpResponse, HostWebSocket, HttpRequest, WebSocketMessage, WsRequest,
 };
-use stravia_vendor_sdk::{ErrorKind, TransportFailure};
+use stravia_vendor_sdk::{CompressionNegotiation, ErrorKind, TransportFailure, WsCompression};
 use tokio::sync::{Mutex, MutexGuard, Notify};
 use tokio::task::{AbortHandle, JoinHandle};
-use tower::ServiceExt as _;
-use tower_http::decompression::{Decompression, DecompressionBody};
 use tracing::Instrument as _;
 
 use crate::interaction_observation::{RunEvent, RunObserver};
 
 use super::lifecycle::VendorOperation;
+
+mod http;
+mod websocket;
+use http::UpstreamResponse;
+use websocket::{Handshake, Message, WebSocket};
 
 const MAX_REDIRECTS: usize = 10;
 const MAX_IDLE_WEBSOCKETS: usize = 64;
@@ -58,6 +58,7 @@ struct PooledWebSocket {
     actual_headers: [u8; 32],
     requested_protocols: Vec<String>,
     actual_protocols: Vec<String>,
+    compression_key: u8,
     socket: WebSocket,
     connected_at: tokio::time::Instant,
     reuse_expires_at: tokio::time::Instant,
@@ -73,6 +74,7 @@ struct WebSocketPoolIdentity {
     actual_headers: [u8; 32],
     requested_protocols: Vec<String>,
     actual_protocols: Vec<String>,
+    compression_key: u8,
 }
 
 /// Reuse lookup key; the pool matches every field exactly.
@@ -82,6 +84,7 @@ struct WebSocketPoolRequest<'a> {
     requested_url: &'a str,
     requested_headers: &'a [u8; 32],
     requested_protocols: &'a [String],
+    compression_key: u8,
     continuation_id: Option<&'a str>,
 }
 
@@ -97,6 +100,7 @@ impl VendorWebSocketPool {
             requested_url,
             requested_headers,
             requested_protocols,
+            compression_key,
             continuation_id,
         } = *request;
         let mut idle = self.idle.lock();
@@ -111,6 +115,8 @@ impl VendorWebSocketPool {
                 && entry.actual_headers == *requested_headers
                 && entry.requested_protocols == requested_protocols
                 && entry.actual_protocols == requested_protocols
+                && entry.compression_key == compression_key
+                && (compression_key != 2 || entry.socket.compressed())
         };
         let mut expiration_changed = false;
         idle.retain_mut(|entry| {
@@ -162,6 +168,7 @@ impl VendorWebSocketPool {
                 actual_headers: identity.actual_headers,
                 requested_protocols: identity.requested_protocols,
                 actual_protocols: identity.actual_protocols,
+                compression_key: identity.compression_key,
                 socket,
                 connected_at,
                 reuse_expires_at,
@@ -433,24 +440,28 @@ impl VendorNetwork {
         if method == Method::CONNECT {
             return Err(invalid("HTTP CONNECT is not a vendor operation"));
         }
-        let headers = request_headers(request.headers, &url)?;
-        // 插件自行协商内容编码时响应体可能被压缩；插件只处理明文，由宿主解码。
-        // 未协商的请求保持原样，旧插件的线上行为不变。
-        let decode = headers.contains_key(ACCEPT_ENCODING);
+        let mut headers = request_headers(request.headers, &url)?;
+        if let Some(compression) = &request.compression {
+            http::prepare(&mut headers, compression)?;
+        }
+        let legacy_decode = headers.contains_key(reqwest::header::ACCEPT_ENCODING);
         let network = self.clone();
         let sending = network.clone();
         // The task owns the operation lease only while the imported response
         // resource exists. Resource drop aborts the task before version drain.
         let task = tokio::spawn(
             async move {
+                let body = tokio::select! {
+                    _ = sending.cancelled() => return Err(cancelled()),
+                    body = http::encode(request.body, request.compression.as_ref().and_then(|policy| policy.request)) => body?,
+                };
                 let response = sending
-                    .send_http(method, url, headers, Bytes::from(request.body))
+                    .send_http(method.clone(), url, headers, body, request.compression.is_some())
                     .await?;
-                Ok(if decode {
-                    UpstreamResponse::decoded(response).await
-                } else {
-                    UpstreamResponse::Plain(response)
-                })
+                match &request.compression {
+                    Some(compression) => UpstreamResponse::decoded(response, &method, compression).await,
+                    None => Ok(UpstreamResponse::legacy(response, legacy_decode).await),
+                }
             }
             .in_current_span(),
         );
@@ -468,6 +479,7 @@ impl VendorNetwork {
         mut url: Url,
         mut headers: HeaderMap,
         mut body: Bytes,
+        explicit_compression: bool,
     ) -> Result<Response, HostFailure> {
         for redirects in 0..=MAX_REDIRECTS {
             self.ensure_current()?;
@@ -533,7 +545,13 @@ impl VendorNetwork {
                         "cross-origin redirect cannot forward a request body",
                     ));
                 }
+                let accept_encoding = explicit_compression
+                    .then(|| headers.get(reqwest::header::ACCEPT_ENCODING).cloned())
+                    .flatten();
                 headers.clear();
+                if let Some(accept_encoding) = accept_encoding {
+                    headers.insert(reqwest::header::ACCEPT_ENCODING, accept_encoding);
+                }
             }
             url = next;
         }
@@ -542,12 +560,21 @@ impl VendorNetwork {
 
     pub(crate) async fn ws_connect(
         &self,
-        url: String,
-        headers: Vec<(String, String)>,
-        protocols: Vec<String>,
-        continuation_id: Option<String>,
-        reuse_max_age_millis: Option<u64>,
+        request: WsRequest,
     ) -> Result<Arc<dyn HostWebSocket>, HostFailure> {
+        let WsRequest {
+            url,
+            headers,
+            protocols,
+            continuation_id,
+            reuse_max_age_millis,
+            compression,
+        } = request;
+        let compression_key = match &compression {
+            None | Some(WsCompression::Disabled) => 0,
+            Some(WsCompression::PermessageDeflate(CompressionNegotiation::Preferred)) => 1,
+            Some(WsCompression::PermessageDeflate(CompressionNegotiation::Required)) => 2,
+        };
         let reuse_age = reuse_max_age_millis
             .map(Duration::from_millis)
             .unwrap_or(MAX_WEBSOCKET_AGE)
@@ -555,6 +582,7 @@ impl VendorNetwork {
         let mut url = self.url(&url, true)?;
         let requested_url = url.as_str().to_owned();
         let mut headers = request_headers(headers, &url)?;
+        websocket::validate_headers(&headers, compression.as_ref())?;
         let requested_headers = canonical_headers(&headers);
         let requested_protocols = protocols.clone();
         let mut protocols = protocols;
@@ -570,6 +598,7 @@ impl VendorNetwork {
                 requested_url: &requested_url,
                 requested_headers: &requested_headers,
                 requested_protocols: &requested_protocols,
+                compression_key,
                 continuation_id: continuation_id.as_deref(),
             };
             while let Some(mut entry) = pool.take(&lookup, reuse_age) {
@@ -592,6 +621,7 @@ impl VendorNetwork {
                         actual_headers: entry.actual_headers,
                         requested_protocols: entry.requested_protocols,
                         actual_protocols: entry.actual_protocols,
+                        compression_key: entry.compression_key,
                     }),
                     connected_at: entry.connected_at,
                     reuse_expires_at: entry.reuse_expires_at,
@@ -614,6 +644,7 @@ impl VendorNetwork {
         for redirects in 0..=MAX_REDIRECTS {
             self.ensure_current()?;
             self.admit_send().await?;
+            let handshake = Handshake::new(&url, &headers, &protocols, compression.as_ref())?;
             self.wire(
                 WireDiagnostic {
                     direction: "upstream_request",
@@ -621,22 +652,13 @@ impl VendorNetwork {
                     message_type: "handshake_request",
                     url: &url,
                     status_code: None,
-                    headers: Some(&headers),
+                    headers: Some(handshake.headers()),
                 },
                 || Value::Null,
             );
             let response = tokio::select! {
                 _ = self.cancelled() => return Err(cancelled()),
-                result = self.websocket.get(url.clone()).version(reqwest::Version::HTTP_11)
-                    .headers(headers.clone())
-                    .upgrade()
-                    .web_socket_config(
-                        tungstenite::protocol::WebSocketConfig::default()
-                            .max_message_size(None)
-                            .max_frame_size(None),
-                    )
-                    .protocols(protocols.clone())
-                    .send() => result.map_err(websocket_transport_failure)?,
+                result = handshake.send(&self.websocket) => result.map_err(websocket_transport_failure)?,
             };
             let status = response.status().as_u16();
             self.wire(
@@ -672,7 +694,7 @@ impl VendorNetwork {
             }
             if status != 101 {
                 let retry_after = retry_after(response.headers());
-                let mut response = response.into_inner();
+                let mut response = response;
                 let mut body = Vec::new();
                 loop {
                     let chunk = tokio::select! {
@@ -730,7 +752,7 @@ impl VendorNetwork {
             }
             let socket = tokio::select! {
                 _ = self.cancelled() => return Err(cancelled()),
-                result = response.into_websocket() => result.map_err(websocket_transport_failure)?,
+                result = handshake.finish(response) => result?,
             };
             let connected_at = tokio::time::Instant::now();
             let actual_headers = canonical_headers(&headers);
@@ -753,6 +775,7 @@ impl VendorNetwork {
                         actual_headers,
                         requested_protocols: requested_protocols.clone(),
                         actual_protocols: protocols.clone(),
+                        compression_key,
                     })
                 }
                 _ => None,
@@ -829,82 +852,6 @@ fn canonical_headers(headers: &HeaderMap) -> [u8; 32] {
         digest.update(value);
     }
     digest.finalize().into()
-}
-
-/// 交给插件读取的上游响应。
-enum UpstreamResponse {
-    Plain(Response),
-    /// 按 `Content-Encoding` 解码后的响应；解码时已移除 `Content-Encoding`
-    /// 与 `Content-Length`，插件看到的头与读到的明文一致。
-    Decoded {
-        url: Url,
-        status: u16,
-        headers: HeaderMap,
-        body: Pin<Box<DecompressionBody<reqwest::Body>>>,
-    },
-}
-
-impl UpstreamResponse {
-    async fn decoded(response: Response) -> Self {
-        let url = response.url().clone();
-        let mut response = Some(axum::http::Response::from(response));
-        let decoded = Decompression::new(tower::service_fn(move |_: axum::http::Request<()>| {
-            std::future::ready(Ok::<_, std::convert::Infallible>(
-                response.take().expect("oneshot calls the service once"),
-            ))
-        }))
-        .oneshot(axum::http::Request::new(()))
-        .await
-        .unwrap_or_else(|never| match never {});
-        let (parts, body) = decoded.into_parts();
-        Self::Decoded {
-            url,
-            status: parts.status.as_u16(),
-            headers: parts.headers,
-            body: Box::pin(body),
-        }
-    }
-
-    fn url(&self) -> &Url {
-        match self {
-            Self::Plain(response) => response.url(),
-            Self::Decoded { url, .. } => url,
-        }
-    }
-
-    fn status(&self) -> u16 {
-        match self {
-            Self::Plain(response) => response.status().as_u16(),
-            Self::Decoded { status, .. } => *status,
-        }
-    }
-
-    fn headers(&self) -> &HeaderMap {
-        match self {
-            Self::Plain(response) => response.headers(),
-            Self::Decoded { headers, .. } => headers,
-        }
-    }
-
-    async fn chunk(&mut self) -> Result<Option<Bytes>, HostFailure> {
-        match self {
-            Self::Plain(response) => response.chunk().await.map_err(transport_failure),
-            Self::Decoded { body, .. } => loop {
-                match body.frame().await {
-                    None => return Ok(None),
-                    Some(Ok(frame)) => {
-                        // 尾部头不属于响应体；空数据帧继续读，None 只表示结束。
-                        if let Ok(data) = frame.into_data()
-                            && !data.is_empty()
-                        {
-                            return Ok(Some(data));
-                        }
-                    }
-                    Some(Err(error)) => return Err(transport_failure(error.as_ref())),
-                }
-            },
-        }
-    }
 }
 
 enum HttpState {
@@ -993,7 +940,7 @@ impl HostHttpResponse for PendingHttp {
                         WireDiagnostic {
                             direction: "upstream_response",
                             transport: "http",
-                            message_type: "body_chunk",
+                            message_type: response.body_message_type(),
                             url: response.url(),
                             status_code: Some(response.status()),
                             headers: None,
@@ -1120,10 +1067,7 @@ impl HostWebSocket for ScopedWebSocket {
             WebSocketMessage::Pong(bytes) => Message::Pong(bytes.into()),
             WebSocketMessage::Close(frame) => {
                 let (code, reason) = frame.unwrap_or((1000, String::new()));
-                Message::Close {
-                    code: code.into(),
-                    reason,
-                }
+                Message::Close { code, reason }
             }
         };
         let (result, expired) = tokio::select! {
@@ -1217,7 +1161,7 @@ impl HostWebSocket for ScopedWebSocket {
             Message::Ping(bytes) => WebSocketMessage::Ping(bytes.to_vec()),
             Message::Pong(bytes) => WebSocketMessage::Pong(bytes.to_vec()),
             Message::Close { code, reason } => {
-                let message = WebSocketMessage::Close(Some((code.into(), reason)));
+                let message = WebSocketMessage::Close(Some((code, reason)));
                 // 实际收到的 Close 必须先捕获；复用连接的分类失败不能吞掉线上的帧。
                 self.wire_message("upstream_response", &message);
                 if self.reused && !self.application_message_seen.load(Ordering::Acquire) {
@@ -1243,7 +1187,7 @@ impl HostWebSocket for ScopedWebSocket {
             .response_continuation_available
             .store(false, Ordering::Release);
         self.network.ensure_current()?;
-        let Some(socket) = self.socket.lock().await.take() else {
+        let Some(mut socket) = self.socket.lock().await.take() else {
             return Ok(());
         };
         let has_continuation = continuation_id.is_some();
@@ -1264,6 +1208,7 @@ impl HostWebSocket for ScopedWebSocket {
                     actual_headers: identity.actual_headers,
                     requested_protocols: identity.requested_protocols.clone(),
                     actual_protocols: identity.actual_protocols.clone(),
+                    compression_key: identity.compression_key,
                 },
                 socket,
                 self.connected_at,
@@ -1288,7 +1233,7 @@ impl HostWebSocket for ScopedWebSocket {
         self.wire_message("upstream_request", &close_message);
         tokio::select! {
             _ = self.network.cancelled() => Err(cancelled()),
-            result = socket.close(1000.into(), None) => result.map_err(transport_failure),
+            result = socket.close(1000, None) => result.map_err(transport_failure),
         }
     }
 }

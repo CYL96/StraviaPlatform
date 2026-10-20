@@ -254,11 +254,7 @@ impl HostServices for Services {
     }
     async fn ws_connect(
         &self,
-        _: String,
-        _: Vec<(String, String)>,
-        _: Vec<String>,
-        _: Option<String>,
-        _: Option<u64>,
+        _: stravia_vendor_runtime::WsRequest,
     ) -> Result<Arc<dyn HostWebSocket>, HostFailure> {
         Err(HostFailure::new(
             ErrorKind::Unsupported,

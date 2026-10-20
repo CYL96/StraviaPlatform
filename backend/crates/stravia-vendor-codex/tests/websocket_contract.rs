@@ -130,11 +130,7 @@ impl HostServices for LoopbackServices {
     }
     async fn ws_connect(
         &self,
-        _: String,
-        _: Vec<(String, String)>,
-        _: Vec<String>,
-        _: Option<String>,
-        _: Option<u64>,
+        _: stravia_vendor_runtime::WsRequest,
     ) -> Result<Arc<dyn HostWebSocket>, HostFailure> {
         panic!("HTTP-only attempt opened WebSocket")
     }
@@ -480,6 +476,7 @@ struct ConnectionRecord {
     headers: BTreeMap<String, String>,
     continuation_id: Option<String>,
     reuse_max_age_millis: Option<u64>,
+    compression: Option<stravia_vendor_sdk::WsCompression>,
 }
 
 struct MockServices {
@@ -522,16 +519,13 @@ impl HostServices for MockServices {
 
     async fn ws_connect(
         &self,
-        _url: String,
-        headers: Vec<(String, String)>,
-        _protocols: Vec<String>,
-        continuation_id: Option<String>,
-        reuse_max_age_millis: Option<u64>,
+        request: stravia_vendor_runtime::WsRequest,
     ) -> Result<Arc<dyn HostWebSocket>, HostFailure> {
         self.recorded.connections.lock().push(ConnectionRecord {
-            headers: headers.into_iter().collect(),
-            continuation_id,
-            reuse_max_age_millis,
+            headers: request.headers.into_iter().collect(),
+            continuation_id: request.continuation_id,
+            reuse_max_age_millis: request.reuse_max_age_millis,
+            compression: request.compression,
         });
         Ok(Arc::new(MockSocket {
             frames: Mutex::new(
@@ -900,6 +894,12 @@ async fn affinity_and_account_headers_follow_actual_codex_frames() {
     assert_eq!(sent.len(), cases.len());
     assert_eq!(closed.len(), cases.len());
     for (index, (_, previous_id, _, response_id)) in cases.iter().enumerate() {
+        assert!(matches!(
+            &connections[index].compression,
+            Some(stravia_vendor_sdk::WsCompression::PermessageDeflate(
+                stravia_vendor_sdk::CompressionNegotiation::Preferred
+            ))
+        ));
         assert_eq!(connections[index].continuation_id.as_deref(), *previous_id);
         assert_eq!(connections[index].reuse_max_age_millis, Some(3_300_000));
         assert_eq!(sent[index]["previous_response_id"].as_str(), *previous_id);

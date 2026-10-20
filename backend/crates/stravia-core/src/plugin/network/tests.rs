@@ -9,8 +9,10 @@ use axum::extract::{State, WebSocketUpgrade};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use stravia_runtime_contract::CancellationToken;
-use stravia_vendor_runtime::{HostWebSocket, WebSocketMessage};
-use stravia_vendor_sdk::AiErrorKind;
+use stravia_vendor_runtime::{HostWebSocket, WebSocketMessage, WsRequest};
+use stravia_vendor_sdk::{
+    AiErrorKind, CompressionNegotiation, HttpCompression, HttpContentCoding, WsCompression,
+};
 use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
 
@@ -157,13 +159,14 @@ async fn checkout_with_age(
     reuse_max_age_millis: Option<u64>,
 ) -> Arc<dyn HostWebSocket> {
     network
-        .ws_connect(
-            url.to_owned(),
-            Vec::new(),
-            Vec::new(),
-            None,
+        .ws_connect(WsRequest {
+            url: url.to_owned(),
+            headers: Vec::new(),
+            protocols: Vec::new(),
+            continuation_id: None,
             reuse_max_age_millis,
-        )
+            compression: None,
+        })
         .await
         .expect("connect local WebSocket upstream")
 }
@@ -222,13 +225,14 @@ async fn require_tip_with_age(
     reuse_max_age_millis: Option<u64>,
 ) -> Result<Arc<dyn HostWebSocket>, stravia_vendor_runtime::HostFailure> {
     network
-        .ws_connect(
-            url.to_owned(),
+        .ws_connect(WsRequest {
+            url: url.to_owned(),
             headers,
-            Vec::new(),
-            Some(tip.to_owned()),
+            protocols: Vec::new(),
+            continuation_id: Some(tip.to_owned()),
             reuse_max_age_millis,
-        )
+            compression: None,
+        })
         .await
 }
 
@@ -668,7 +672,14 @@ async fn continuation_does_not_cross_scope_affinity_or_credentials() {
     let network = network(&server.url, Arc::clone(&pool));
     let headers = vec![("authorization".into(), "Bearer first".into())];
     let socket = network
-        .ws_connect(server.url.clone(), headers.clone(), Vec::new(), None, None)
+        .ws_connect(WsRequest {
+            url: server.url.clone(),
+            headers: headers.clone(),
+            protocols: Vec::new(),
+            continuation_id: None,
+            reuse_max_age_millis: None,
+            compression: None,
+        })
         .await
         .expect("open credential-bound socket");
     complete_and_park(&socket, "response", Some("response")).await;
@@ -791,29 +802,183 @@ async fn read_all(response: &dyn stravia_vendor_runtime::HostHttpResponse) -> Ve
 }
 
 #[tokio::test]
-async fn plugin_negotiated_encoding_is_decoded_and_keep_alive_is_forwarded() {
-    let seen = Arc::new(parking_lot::Mutex::new(Vec::<(
-        Option<String>,
-        Option<String>,
-    )>::new()));
-    let recorded = Arc::clone(&seen);
+async fn compression_policy_isolates_pool_checkout_and_continuation() {
+    let server = test_server().await;
+    let network = network(&server.url, Arc::new(VendorWebSocketPool::default()));
+    for (compression, tip) in [
+        (WsCompression::Disabled, "disabled"),
+        (
+            WsCompression::PermessageDeflate(CompressionNegotiation::Preferred),
+            "preferred",
+        ),
+    ] {
+        for _ in 0..2 {
+            let socket = network
+                .ws_connect(WsRequest {
+                    url: server.url.clone(),
+                    headers: Vec::new(),
+                    protocols: Vec::new(),
+                    continuation_id: None,
+                    reuse_max_age_millis: None,
+                    compression: Some(compression),
+                })
+                .await
+                .expect("connect under matching compression policy");
+            complete_and_park(&socket, tip, Some(tip)).await;
+        }
+    }
+    assert_eq!(server.connections.load(Ordering::SeqCst), 2);
+    let changed_policy = network
+        .ws_connect(WsRequest {
+            url: server.url.clone(),
+            headers: Vec::new(),
+            protocols: Vec::new(),
+            continuation_id: Some("preferred".into()),
+            reuse_max_age_millis: None,
+            compression: Some(WsCompression::PermessageDeflate(
+                CompressionNegotiation::Required,
+            )),
+        })
+        .await;
+    assert_local_miss(
+        changed_policy
+            .err()
+            .expect("compression policy cannot cross a socket tip"),
+    );
+    assert_eq!(server.connections.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn legacy_websocket_headers_work_without_bypassing_explicit_policy_on_reuse() {
+    let server = test_server().await;
+    let network = network(&server.url, Arc::new(VendorWebSocketPool::default()));
+    let request = |compression| WsRequest {
+        url: server.url.clone(),
+        headers: vec![
+            ("connection".into(), "keep-alive".into()),
+            ("accept-encoding".into(), "gzip".into()),
+            ("content-encoding".into(), "custom".into()),
+            (
+                "sec-websocket-extensions".into(),
+                "permessage-deflate".into(),
+            ),
+        ],
+        protocols: Vec::new(),
+        continuation_id: None,
+        reuse_max_age_millis: None,
+        compression,
+    };
+    let socket = network.ws_connect(request(None)).await.unwrap();
+    complete_and_park(&socket, "legacy", Some("legacy")).await;
+    assert!(
+        network
+            .ws_connect(request(Some(WsCompression::Disabled)))
+            .await
+            .is_err()
+    );
+    let socket = network.ws_connect(request(None)).await.unwrap();
+    complete_and_park(&socket, "legacy-reused", None).await;
+    assert_eq!(server.connections.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn legacy_http_preserves_raw_responses_and_manual_request_encoding() {
+    let app = Router::new()
+        .route(
+            "/gzip",
+            get(|| async { ([("content-encoding", "gzip")], GZIP_BODY) }),
+        )
+        .route(
+            "/unknown",
+            get(|| async { ([("content-encoding", "custom")], GZIP_BODY) }),
+        )
+        .route(
+            "/echo",
+            axum::routing::post(
+                |headers: axum::http::HeaderMap, body: bytes::Bytes| async move {
+                    assert_eq!(headers["content-encoding"], "gzip");
+                    assert_eq!(headers["connection"], "keep-alive");
+                    assert!(!headers.contains_key("accept-encoding"));
+                    body
+                },
+            ),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let network = network(&base, Arc::new(VendorWebSocketPool::default()));
+    for (path, accept_encoding, decoded) in [
+        ("gzip", None, false),
+        ("unknown", None, false),
+        ("gzip", Some("gzip"), true),
+        ("unknown", Some("custom"), false),
+    ] {
+        let response = network
+            .http_start(stravia_vendor_runtime::HttpRequest {
+                method: "GET".into(),
+                url: format!("{base}/{path}"),
+                headers: accept_encoding
+                    .map(|value| vec![("accept-encoding".into(), value.into())])
+                    .unwrap_or_default(),
+                body: Vec::new(),
+                compression: None,
+            })
+            .unwrap();
+        assert_eq!(response.status().await.unwrap(), 200);
+        let headers = response.headers().await.unwrap();
+        assert_eq!(
+            headers.iter().any(|(name, _)| name == "content-encoding"),
+            !decoded,
+            "{path}, accept-encoding={accept_encoding:?}: {headers:?}"
+        );
+        assert_eq!(
+            headers.iter().any(|(name, _)| name == "content-length"),
+            !decoded,
+            "{path}, accept-encoding={accept_encoding:?}: {headers:?}"
+        );
+        assert_eq!(
+            read_all(response.as_ref()).await,
+            if decoded {
+                &b"decoded upstream body"[..]
+            } else {
+                GZIP_BODY
+            }
+        );
+    }
+    let request = |headers| stravia_vendor_runtime::HttpRequest {
+        method: "POST".into(),
+        url: format!("{base}/echo"),
+        headers,
+        body: GZIP_BODY.to_vec(),
+        compression: None,
+    };
+    let response = network
+        .http_start(request(vec![
+            ("content-encoding".into(), "gzip".into()),
+            ("connection".into(), "keep-alive".into()),
+        ]))
+        .unwrap();
+    assert_eq!(read_all(response.as_ref()).await, GZIP_BODY);
+    for name in [
+        "content-length",
+        "transfer-encoding",
+        "proxy-authorization",
+        "upgrade",
+    ] {
+        assert!(
+            network
+                .http_start(request(vec![(name.into(), "1".into())]))
+                .is_err()
+        );
+    }
+    task.abort();
+}
+
+#[tokio::test]
+async fn declared_response_compression_is_decoded_and_undeclared_encoding_is_rejected() {
     let app = Router::new().route(
         "/gzip",
-        get(move |headers: axum::http::HeaderMap| {
-            let recorded = Arc::clone(&recorded);
-            async move {
-                let header = |name: &str| {
-                    headers
-                        .get(name)
-                        .and_then(|value| value.to_str().ok())
-                        .map(str::to_owned)
-                };
-                recorded
-                    .lock()
-                    .push((header("connection"), header("accept-encoding")));
-                ([("content-encoding", "gzip")], GZIP_BODY)
-            }
-        }),
+        get(|| async { ([("content-encoding", "gzip")], GZIP_BODY) }),
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -825,7 +990,7 @@ async fn plugin_negotiated_encoding_is_decoded_and_keep_alive_is_forwarded() {
             .expect("serve local HTTP upstream");
     });
     let network = network(&url, Arc::new(VendorWebSocketPool::default()));
-    let request = |headers: &[(&str, &str)]| stravia_vendor_runtime::HttpRequest {
+    let request = |headers: &[(&str, &str)], response| stravia_vendor_runtime::HttpRequest {
         method: "GET".into(),
         url: url.clone(),
         headers: headers
@@ -833,13 +998,14 @@ async fn plugin_negotiated_encoding_is_decoded_and_keep_alive_is_forwarded() {
             .map(|(name, value)| ((*name).into(), (*value).into()))
             .collect(),
         body: Vec::new(),
+        compression: Some(HttpCompression {
+            request: None,
+            response,
+        }),
     };
 
     let negotiated = network
-        .http_start(request(&[
-            ("accept-encoding", "gzip, deflate, br, zstd"),
-            ("connection", "keep-alive"),
-        ]))
+        .http_start(request(&[], vec![HttpContentCoding::Gzip]))
         .expect("start negotiated request");
     assert_eq!(negotiated.status().await.expect("status"), 200);
     let headers = negotiated.headers().await.expect("headers");
@@ -852,34 +1018,22 @@ async fn plugin_negotiated_encoding_is_decoded_and_keep_alive_is_forwarded() {
         b"decoded upstream body"
     );
 
-    // 未协商编码的旧插件读到原样字节，宿主不擅自解码。
+    // 不再把未协商的压缩正文当作应用字节传给插件。
     let plain = network
-        .http_start(request(&[]))
+        .http_start(request(&[], Vec::new()))
         .expect("start plain request");
-    assert!(
-        plain
-            .headers()
-            .await
-            .expect("headers")
-            .iter()
-            .any(|(name, value)| name == "content-encoding" && value == "gzip")
-    );
-    assert_eq!(read_all(plain.as_ref()).await, GZIP_BODY);
-
-    assert_eq!(
-        seen.lock().as_slice(),
-        [
-            (
-                Some("keep-alive".to_owned()),
-                Some("gzip, deflate, br, zstd".to_owned())
-            ),
-            (None, None),
-        ]
-    );
+    let error = plain
+        .status()
+        .await
+        .expect_err("unaccepted encoding must fail");
+    assert!(matches!(
+        error.kind,
+        stravia_vendor_sdk::ErrorKind::Upstream(_)
+    ));
     for value in ["close", "upgrade", "keep-alive, x-secret"] {
         assert!(
             network
-                .http_start(request(&[("connection", value)]))
+                .http_start(request(&[("connection", value)], Vec::new()))
                 .is_err(),
             "connection: {value} must stay host-controlled"
         );

@@ -252,15 +252,26 @@ fn infer(
         shaped.betas,
     );
     host.emit_started()?;
-    let response = host.http_start(HttpRequest {
-        method: "POST".into(),
-        url: format!(
-            "{}?beta=true",
-            common::endpoint_url(&provider.base_url, &encoded.path)?
-        ),
-        headers,
-        body: shaped.body,
-    })?;
+    let response = host.http_start_with_compression(
+        HttpRequest {
+            method: "POST".into(),
+            url: format!(
+                "{}?beta=true",
+                common::endpoint_url(&provider.base_url, &encoded.path)?
+            ),
+            headers,
+            body: shaped.body,
+        },
+        stravia_vendor_sdk::HttpCompression {
+            request: None,
+            response: vec![
+                stravia_vendor_sdk::HttpContentCoding::Gzip,
+                stravia_vendor_sdk::HttpContentCoding::Deflate,
+                stravia_vendor_sdk::HttpContentCoding::Br,
+                stravia_vendor_sdk::HttpContentCoding::Zstd,
+            ],
+        },
+    )?;
     common::decode_ai_response_renaming_tools(
         host,
         &protocol,

@@ -1,0 +1,16 @@
+[package]
+name = "stravia-vendor-legacy-contract-fixture"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[lints]
+workspace = true
+
+[dependencies]
+flate2.workspace = true
+serde_json.workspace = true
+wit-bindgen.workspace = true

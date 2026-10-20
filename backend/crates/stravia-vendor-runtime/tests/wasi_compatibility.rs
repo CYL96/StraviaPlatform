@@ -66,9 +66,33 @@ async fn rejects_forbidden_wasi_interfaces_and_versions() {
 }
 
 #[tokio::test]
+async fn accepts_compatible_vendor_abi_before_descriptor_admission() {
+    let runtime = VendorRuntime::new().expect("runtime");
+    for version in ["0.5.0", "0.5.1"] {
+        for interface in ["host", "types"] {
+            let name = format!("stravia:vendor/{interface}@{version}");
+            let bytes = wat::parse_str(format!("(component (import \"{name}\" (instance)))"))
+                .expect("valid component without guest exports");
+            match runtime.load(&bytes).await {
+                Err(LoadError::DescriptorExecution(_)) => {}
+                Err(other) => panic!("{name}: compatible ABI rejected before exports: {other:?}"),
+                Ok(_) => panic!("{name}: component without descriptor was admitted"),
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn rejects_retired_vendor_abi_before_descriptor_admission() {
     let runtime = VendorRuntime::new().expect("runtime");
-    for name in ["stravia:vendor/host@0.4.0", "stravia:vendor/types@0.4.0"] {
+    for name in [
+        "stravia:vendor/host@0.4.0",
+        "stravia:vendor/types@0.4.0",
+        "stravia:vendor/host@0.5.2",
+        "stravia:vendor/types@0.5.2",
+        "stravia:vendor/host@0.6.0",
+        "stravia:vendor/types@0.6.0",
+    ] {
         let bytes = wat::parse_str(format!("(component (import \"{name}\" (instance)))"))
             .expect("valid retired-ABI component");
         match runtime.load(&bytes).await {

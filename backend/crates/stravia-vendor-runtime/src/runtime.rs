@@ -18,7 +18,7 @@ use crate::bindings::stravia::vendor::{host as wit_host, types as wit_types};
 use crate::error::{LoadError, RuntimeError};
 use crate::host::{
     HostFailure, HostServices, HttpRequest, HttpResponseResource, LogLevel, RuntimeEvent,
-    WebSocketMessage, WebSocketResource,
+    WebSocketMessage, WebSocketResource, WsRequest,
 };
 
 #[derive(Clone)]
@@ -459,7 +459,10 @@ impl VendorRuntime {
         for (name, _) in component.component_type().imports(&self.engine) {
             let allowed = matches!(
                 name,
-                "stravia:vendor/host@0.5.0" | "stravia:vendor/types@0.5.0"
+                "stravia:vendor/host@0.5.0"
+                    | "stravia:vendor/types@0.5.0"
+                    | "stravia:vendor/host@0.5.1"
+                    | "stravia:vendor/types@0.5.1"
             ) || name.rsplit_once('@').is_some_and(|(interface, version)| {
                 // Component compilation already validates SemVer. Ignore build
                 // metadata and admit only stable 0.2.x; the linker still checks
@@ -639,12 +642,11 @@ impl StoreState {
         }
         Ok(())
     }
-}
 
-impl wit_host::Host for StoreState {
-    async fn http_start(
+    fn start_http(
         &mut self,
         request: wit_types::HttpRequest,
+        compression: Option<wit_types::HttpCompression>,
     ) -> Result<Result<Resource<HttpResponseResource>, wit_types::PluginError>, wasmtime::Error>
     {
         if let Err(error) = self.network_active() {
@@ -655,6 +657,14 @@ impl wit_host::Host for StoreState {
             url: request.url,
             headers: request.headers,
             body: request.body,
+            compression: compression.map(|compression| stravia_vendor_sdk::HttpCompression {
+                request: compression.request.map(convert_http_content_coding),
+                response: compression
+                    .response
+                    .into_iter()
+                    .map(convert_http_content_coding)
+                    .collect(),
+            }),
         };
         match self.services.http_start(request) {
             Ok(response) => self
@@ -666,22 +676,24 @@ impl wit_host::Host for StoreState {
         }
     }
 
-    async fn ws_connect(
+    async fn connect_ws(
         &mut self,
         request: wit_types::WsRequest,
+        compression: Option<wit_types::WsCompression>,
     ) -> Result<Result<Resource<WebSocketResource>, wit_types::PluginError>, wasmtime::Error> {
         if let Err(error) = self.operation_active() {
             return Ok(Err(to_wit_failure(error)));
         }
         match self
             .services
-            .ws_connect(
-                request.url,
-                request.headers,
-                request.protocols,
-                request.continuation_id,
-                request.reuse_max_age_millis,
-            )
+            .ws_connect(WsRequest {
+                url: request.url,
+                headers: request.headers,
+                protocols: request.protocols,
+                continuation_id: request.continuation_id,
+                reuse_max_age_millis: request.reuse_max_age_millis,
+                compression: compression.map(convert_ws_compression),
+            })
             .await
         {
             Ok(socket) => self
@@ -691,6 +703,40 @@ impl wit_host::Host for StoreState {
                 .map_err(Into::into),
             Err(error) => Ok(Err(to_wit_failure(error))),
         }
+    }
+}
+
+impl wit_host::Host for StoreState {
+    async fn http_start(
+        &mut self,
+        request: wit_types::HttpRequest,
+    ) -> Result<Result<Resource<HttpResponseResource>, wit_types::PluginError>, wasmtime::Error>
+    {
+        self.start_http(request, None)
+    }
+
+    async fn http_start_with_compression(
+        &mut self,
+        request: wit_types::HttpRequest,
+        compression: wit_types::HttpCompression,
+    ) -> Result<Result<Resource<HttpResponseResource>, wit_types::PluginError>, wasmtime::Error>
+    {
+        self.start_http(request, Some(compression))
+    }
+
+    async fn ws_connect(
+        &mut self,
+        request: wit_types::WsRequest,
+    ) -> Result<Result<Resource<WebSocketResource>, wit_types::PluginError>, wasmtime::Error> {
+        self.connect_ws(request, None).await
+    }
+
+    async fn ws_connect_with_compression(
+        &mut self,
+        request: wit_types::WsRequest,
+        compression: wit_types::WsCompression,
+    ) -> Result<Result<Resource<WebSocketResource>, wit_types::PluginError>, wasmtime::Error> {
+        self.connect_ws(request, Some(compression)).await
     }
 
     async fn read_private_state(
@@ -1026,6 +1072,31 @@ fn convert_model_error_kind(
     }
 }
 
+fn convert_http_content_coding(
+    value: wit_types::HttpContentCoding,
+) -> stravia_vendor_sdk::HttpContentCoding {
+    use stravia_vendor_sdk::HttpContentCoding;
+    match value {
+        wit_types::HttpContentCoding::Gzip => HttpContentCoding::Gzip,
+        wit_types::HttpContentCoding::Deflate => HttpContentCoding::Deflate,
+        wit_types::HttpContentCoding::Br => HttpContentCoding::Br,
+        wit_types::HttpContentCoding::Zstd => HttpContentCoding::Zstd,
+    }
+}
+
+fn convert_ws_compression(value: wit_types::WsCompression) -> stravia_vendor_sdk::WsCompression {
+    use stravia_vendor_sdk::{CompressionNegotiation, WsCompression};
+    match value {
+        wit_types::WsCompression::Disabled => WsCompression::Disabled,
+        wit_types::WsCompression::PermessageDeflate(negotiation) => {
+            WsCompression::PermessageDeflate(match negotiation {
+                wit_types::CompressionNegotiation::Preferred => CompressionNegotiation::Preferred,
+                wit_types::CompressionNegotiation::Required => CompressionNegotiation::Required,
+            })
+        }
+    }
+}
+
 fn convert_transport_failure(
     value: wit_types::TransportFailure,
 ) -> stravia_vendor_sdk::TransportFailure {
@@ -1184,11 +1255,7 @@ impl HostServices for DenyServices {
 
     async fn ws_connect(
         &self,
-        _url: String,
-        _headers: Vec<(String, String)>,
-        _protocols: Vec<String>,
-        _continuation_id: Option<String>,
-        _reuse_max_age_millis: Option<u64>,
+        _request: WsRequest,
     ) -> Result<Arc<dyn crate::host::HostWebSocket>, HostFailure> {
         Err(HostFailure::new(
             ErrorKind::Trapped,
@@ -1221,115 +1288,6 @@ impl HostServices for DenyServices {
 
     fn generation_is_current(&self, _generation: u64) -> bool {
         true
-    }
-}
-
-#[cfg(test)]
-mod websocket_contract_tests {
-    use super::*;
-
-    #[derive(Default)]
-    struct RecordingServices {
-        requests: Mutex<Vec<wit_types::WsRequest>>,
-    }
-
-    #[async_trait]
-    impl HostServices for RecordingServices {
-        fn http_start(
-            &self,
-            request: HttpRequest,
-        ) -> Result<Arc<dyn crate::host::HostHttpResponse>, HostFailure> {
-            DenyServices.http_start(request)
-        }
-
-        async fn ws_connect(
-            &self,
-            url: String,
-            headers: Vec<(String, String)>,
-            protocols: Vec<String>,
-            continuation_id: Option<String>,
-            reuse_max_age_millis: Option<u64>,
-        ) -> Result<Arc<dyn crate::host::HostWebSocket>, HostFailure> {
-            self.requests
-                .lock()
-                .expect("record requests")
-                .push(wit_types::WsRequest {
-                    url,
-                    headers,
-                    protocols,
-                    continuation_id,
-                    reuse_max_age_millis,
-                });
-            Err(HostFailure::new(ErrorKind::Trapped, "recorded connection"))
-        }
-
-        async fn read_private_state(&self) -> Result<Option<Vec<u8>>, HostFailure> {
-            DenyServices.read_private_state().await
-        }
-
-        async fn write_private_state(&self, bytes: Vec<u8>) -> Result<(), HostFailure> {
-            DenyServices.write_private_state(bytes).await
-        }
-
-        async fn emit_event(&self, event: RuntimeEvent) -> Result<(), HostFailure> {
-            DenyServices.emit_event(event).await
-        }
-
-        fn log(&self, level: LogLevel, message: &str) {
-            DenyServices.log(level, message);
-        }
-
-        fn generation_is_current(&self, generation: u64) -> bool {
-            DenyServices.generation_is_current(generation)
-        }
-    }
-
-    #[tokio::test]
-    async fn forwards_guest_reuse_policy_without_interpretation() {
-        let services = Arc::new(RecordingServices::default());
-        let mut state = StoreState {
-            wasi: WasiCtx::builder().build(),
-            table: ResourceTable::new(),
-            services: services.clone(),
-            cancellation: CancellationToken::new(),
-            deadline: Deadline::from_now(Duration::from_secs(60)),
-            generation: 0,
-            operation: Some(Operation::Infer),
-            upstream_starts: 0,
-            catalog_sync: false,
-        };
-        for policy in [None, Some(0), Some(3_300_000), Some(u64::MAX)] {
-            let result = wit_host::Host::ws_connect(
-                &mut state,
-                wit_types::WsRequest {
-                    url: "wss://example.invalid/socket".into(),
-                    headers: vec![("x-test".into(), "value".into())],
-                    protocols: vec!["test".into()],
-                    continuation_id: Some("response-1".into()),
-                    reuse_max_age_millis: policy,
-                },
-            )
-            .await
-            .expect("host boundary must not trap");
-            assert!(
-                result.is_err(),
-                "recording service returns its declared error"
-            );
-            let requests = services.requests.lock().expect("recorded requests");
-            let request = requests.last().expect("host received request");
-            assert_eq!(request.url, "wss://example.invalid/socket");
-            assert_eq!(
-                request.headers,
-                vec![("x-test".to_owned(), "value".to_owned())]
-            );
-            assert_eq!(request.protocols, vec!["test".to_owned()]);
-            assert_eq!(request.continuation_id.as_deref(), Some("response-1"));
-            assert_eq!(request.reuse_max_age_millis, policy);
-        }
-        assert_eq!(
-            services.requests.lock().expect("recorded requests").len(),
-            4
-        );
     }
 }
 

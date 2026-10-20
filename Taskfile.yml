@@ -86,6 +86,7 @@ tasks:
       - backend/crates/stravia-vendor-sdk/fixtures/*/build.rs
       - backend/crates/stravia-vendor-sdk/fixtures/*/messages/*.json
       - backend/crates/stravia-vendor-sdk/fixtures/*/src/**/*.rs
+      - backend/crates/stravia-vendor-sdk/fixtures/*/wit/**/*.wit
       - backend/crates/stravia-vendor-sdk/src/**/*.rs
       - backend/crates/stravia-vendor-sdk/build-support/**/*.rs
       - backend/crates/stravia-vendor-sdk/wit/**/*.wit
@@ -288,14 +289,14 @@ tasks:
     deps: [check:web, build:vendors]
     cmds:
       - cargo fmt --all -- --check
-      - cargo clippy --locked --workspace --exclude stravia-vendor-capability-contract-fixture --exclude stravia-vendor-lifecycle-contract-fixture --exclude stravia-vendor-management-contract-fixture --all-targets -- -D warnings
+      - cargo clippy --locked --workspace --exclude stravia-vendor-capability-contract-fixture --exclude stravia-vendor-lifecycle-contract-fixture --exclude stravia-vendor-management-contract-fixture --exclude stravia-vendor-legacy-contract-fixture --all-targets -- -D warnings
 
   test:
     desc: Run WebUI and supported Rust unit tests without building embedded WebUI assets.
     deps: [install:web, build:vendor-fixtures]
     cmds:
       - bun tests/common/run-in-tempdir.ts bun run --filter stravia-webui test:unit
-      - bun tests/common/run-in-tempdir.ts cargo test --locked --workspace --exclude stravia-desktop --exclude stravia-vendor-capability-contract-fixture --exclude stravia-vendor-lifecycle-contract-fixture --exclude stravia-vendor-management-contract-fixture
+      - bun tests/common/run-in-tempdir.ts cargo test --locked --workspace --exclude stravia-desktop --exclude stravia-vendor-capability-contract-fixture --exclude stravia-vendor-lifecycle-contract-fixture --exclude stravia-vendor-management-contract-fixture --exclude stravia-vendor-legacy-contract-fixture
 
   test:all:
     desc: Run every local test surface, including incremental builds and cleanup, with a five-minute budget.

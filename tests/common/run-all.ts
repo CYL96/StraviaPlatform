@@ -141,6 +141,8 @@ const workspace = [
   "stravia-vendor-lifecycle-contract-fixture",
   "--exclude",
   "stravia-vendor-management-contract-fixture",
+  "--exclude",
+  "stravia-vendor-legacy-contract-fixture",
   "--features",
   "stravia-server/test-harness",
 ];

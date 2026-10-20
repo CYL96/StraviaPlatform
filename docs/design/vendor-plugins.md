@@ -217,7 +217,7 @@ Schema 投影在 schema 节点将布尔 `true` 等价转换为 `{}`，将 `false
 - 媒体生成沿用 Provider Model → Target → Route，不另建直接绑定 Provider 的执行路径。Provider Model 可表示纯图片模型；Codex 的 GPT 模型可以同时支持推理与图片生成。
 - 媒体生成绑定及执行按所需能力校验；纯图片模型不能被普通聊天请求选中，不以虚构聊天能力满足路由接入要求。继续遵守媒体生成设计中所有已启用 Target 的资格校验规则。
 - 完整联网搜索引入 Route 绑定，替代 Codex 专属的固定 Provider 与 upstream Model 绑定。搜索与其他能力一致，Target 必须绑定 Provider 和非空白的上游模型，并通过对应 Provider Model 的能力校验。
-- Channel 描述符不再提供搜索模型可省略的开关。第三方 Rust 描述符构造代码需要同步移除该字段；此删除不改变 `stravia:vendor@0.5.0` 的 WIT 布局或 canonical payload 版本。通用 `ProviderSnapshot.model` 仍可用于不涉及 Target 的 Provider 操作，但宿主执行搜索 Target 时始终传入所选模型；旧组件 JSON 中的额外字段不会恢复无模型执行权限。
+- Channel 描述符不再提供搜索模型可省略的开关。第三方 Rust 描述符构造代码需要同步移除该字段；该描述符字段删除本身不改变 WIT 布局或 canonical payload 版本。通用 `ProviderSnapshot.model` 仍可用于不涉及 Target 的 Provider 操作，但宿主执行搜索 Target 时始终传入所选模型；旧组件 JSON 中的额外字段不会恢复无模型执行权限。
 - 独立搜索服务以 [Parallel Responses API](https://docs.parallel.ai/responses-api/responses-quickstart) 一类直接交付带引用综合答案的服务为参考，仍接入完整 Search Report 契约，不扩展为仅返回基础检索结果的来源。正式接入必须提供可选择的真实 Provider Model，不自动列入本期交付清单。
 - 外部完整搜索后端按单次独立调用处理，不提供续接，不跨请求保存可用于续接的上游研究会话；即使供应商具有会话能力，本次也不使用。此决定不取消既有 Local 搜索的续接能力。
 - 外部搜索沿用 Route 的选择、重试与 Target 切换策略，由插件提供上游错误分类，宿主决定执行。明确可重试的上游错误可在结果提交前重试或切换；用户取消、参数错误及权限错误不触发。接受可能重复执行与重复消耗额度，不承诺恰好执行一次。
@@ -254,7 +254,7 @@ Channel 的 `client_header_names` 声明其需要读取的额外客户端头名�
 
 描述符加载和执行时均拒绝凭据及 hop-by-hop 头的声明，包括 `Authorization`、`Proxy-Authorization`、`Cookie`、API-key 头、`Connection`、`Host` 和 framing 头；声明不是获取 Stravia 平台凭据的授权。值必须符合 HTTP 头字节规则：允许 HTAB 和 obs-text，拒绝其他 ASCII 控制字节及 DEL。插件决定如何使用已获准的上下文，宿主不维护供应商私有头名。
 
-预置 channel 均不声明额外客户端头。Codex 的 thread、window、parent、turn 等会话头由宿主入口归一为统一 `session` 字段，插件只读取宿主按 Principal／Target 作用域派生的 affinity，不能让客户端自报的身份覆盖宿主作用域身份；描述父身份不授予父响应访问或续接权限。`x-codex-installation-id` 是插件私有状态中按凭据持久化的 UUID，`x-codex-turn-state` 只回传同一 turn 内上游 HTTP 响应头给出的值；客户端的 `x-codex-beta-features`、`x-openai-subagent` 与 `x-codex-turn-metadata` 不再读取或转发。`client_header_names` 仍是 SDK 描述 JSON 的可选字段，WIT 仍为 `stravia:vendor@0.5.0`，request format 仍为 1，数据库 schema 不变；需要新身份投影的 Codex 插件须重新构建并导入。
+预置 channel 均不声明额外客户端头。Codex 的 thread、window、parent、turn 等会话头由宿主入口归一为统一 `session` 字段，插件只读取宿主按 Principal／Target 作用域派生的 affinity，不能让客户端自报的身份覆盖宿主作用域身份；描述父身份不授予父响应访问或续接权限。`x-codex-installation-id` 是插件私有状态中按凭据持久化的 UUID，`x-codex-turn-state` 只回传同一 turn 内上游 HTTP 响应头给出的值；客户端的 `x-codex-beta-features`、`x-openai-subagent` 与 `x-codex-turn-metadata` 不再读取或转发。`client_header_names` 仍是 SDK 描述 JSON 的可选字段，request format 仍为 1，数据库 schema 不变；需要新身份投影的 Codex 插件须重新构建并导入。
 
 所有客户端入口的已知请求控制与会话 header 先归一到唯一 canonical 参数；目标 codec/插件从该参数按正向白名单投影，不从旧协议扩展、raw snapshot 或别名恢复一份冲突值。OAuth／订阅插件的参数清单以对应官方工具实际产出为准，不以公共 API 字段超集代替；未列入的参数与参数型嵌套成员透明丢弃，不转发、不使请求失败。平台不提供任意参数袋或 extra-body 注入。官方声明为任意业务映射的 metadata 与工具 schema／入参内部键不按参数清单递归裁剪；CLI 身份 metadata 等结构化控制的成员仍受白名单约束。缺失与显式 false/零/空值保持语义区别；显式 null 只记为统一 `resets`，出口不发送 null。统一字段由 SDK 的 format-1 桥接同时投影为迁移前的旧拼写，已安装插件无需重建即可读取能表达的控制；已删除的供应商专属控制不再提供给任何插件。旧独立 Wasm 不会因宿主升级获得新 codec，需要重建并导入。
 
@@ -301,7 +301,7 @@ base 插件为 `custom` Profile 的 OpenAI-compatible Chat Completions 声明固
 ## 已确认的技术栈与插件契约
 
 - 唯一目标技术栈为 Wasmtime + WebAssembly Component Model + WIT，不同时提供 Extism 或另一套自定义 Core Wasm ABI。
-- Wasmtime 负责加载、执行与能力隔离；`stravia:vendor@0.5.0` WIT 定义插件导出的供应商能力和导入的受控网络、凭据等宿主能力。该版本在 `ws-request` 增加 `reuse-max-age-millis`，由插件声明 WebSocket 连接的复用寿命；`0.4.0` 及更早的 Component 必须用新 SDK 重新构建，升级宿主时已导入的独立插件也必须重新导入。不保留旧接口兼容层；客户端 API 与数据库 schema 不变。
+- Wasmtime 负责加载、执行与能力隔离；`stravia:vendor@0.5.1` WIT 通过新增 `http-start-with-compression` 与 `ws-connect-with-compression` 表达传输压缩。`0.5.0` 的 HTTP/WS request 字段、顺序、旧函数和资源契约不变，已有插件无需重编译或重新导入；只有采用新增压缩入口的插件需要更新。宿主明确接受 `0.5.0`、`0.5.1`，不推断未来 patch 或其他 ABI 兼容；canonical format、客户端 API 与数据库 schema 不变。
 - `VendorDescriptor` 包含 `vendor_id`、版本、展示元数据、canonical 格式版本、`kind` 与 `providers`；`kind` 为 `fallback` 或 `dedicated`。每个 `ProviderDescriptor` 独立声明 `provider_id`、可选 `catalog_id`、channel、能力、配置、网络权限和数据兼容信息。
 - `fallback` 描述符的 Vendor ID 必须是 `base`，可声明多个互不重复的 Profile；`dedicated` 描述符必须恰有一个 Profile，且 `provider_id` 等于 `vendor_id`。旧描述符形状不保留 alias 或兼容 shim。
 - `ProviderSnapshot.provider_id` 在 SDK 与 WIT 中均为必填供应商 Profile ID，不是连接 UUID。运行时按该字段选择唯一 `ProviderDescriptor` 后再做能力、channel 和网络准入，不得合并其他 Profile；`base` guest 据此分派，专属 guest 拒绝其他 ID。
@@ -312,12 +312,12 @@ base 插件为 `custom` Profile 的 OpenAI-compatible Chat Completions 声明固
 - `descriptor`、`select-protocol`、`execute` 的导出结构保持不变。首先提供 Rust 插件 SDK，以复用现有供应商实现；WIT 契约不限定插件必须使用 Rust，其他语言的实际工具链兼容性需要验证。
 - 发布产物为单个自包含 Wasm Component，携带锁定的 codec 依赖；不直接跨契约暴露 Gateway、数据库对象或 Rust trait 内存布局。
 - 宿主与插件通过明确版本的类型和资源交互。Wasmtime 版本以根目录 `Cargo.toml` 与 `Cargo.lock` 为准，guest 工具链以 `rust-toolchain.toml` 为准；技术栈决策见 [ADR-0072](../adr/0072-use-wasmtime-components-and-wit-for-vendor-plugins.md)。
-- SDK 的 WASI WIT 依赖统一为 `0.2.12`，来自 [Wasmtime v49.0.1 的 WASIp2 定义](https://github.com/bytecodealliance/wasmtime/tree/v49.0.1/crates/wasi/src/p2/wit/deps)。`stravia:vendor@0.5.0` 契约不变；宿主接受稳定版 WASI `0.2.x` 的既定受限接口，包括 `0.2.9`、`0.2.12` 及同一 Component 内不同 patch 的混合导入。仍兼容的旧插件不因本次 WASI 升级而必须重建。
+- SDK 的 WASI WIT 依赖统一为 `0.2.12`，来自 [Wasmtime v49.0.1 的 WASIp2 定义](https://github.com/bytecodealliance/wasmtime/tree/v49.0.1/crates/wasi/src/p2/wit/deps)。宿主接受稳定版 WASI `0.2.x` 的既定受限接口，包括 `0.2.9`、`0.2.12` 及同一 Component 内不同 patch 的混合导入。WASI patch 兼容不放宽独立的 Vendor ABI 准入：Vendor imports 仍只接受上述两个明确版本，函数、类型和资源必须通过 Linker 校验。
 - WASI 准入按完整接口名称与稳定版本系列校验：仅允许既有的 stdio、terminal、空 environment、exit、clocks、random 与 io 支持接口；拒绝相似名称、无版本、预发布版及其他 major/minor 系列。SemVer build metadata 不影响稳定版判定。版本系列匹配不承诺未来所有功能可用：[Wasmtime Linker](https://docs.rs/wasmtime/49.0.1/wasmtime/component/struct.Linker.html) 仍校验所需函数签名和资源类型，宿主缺少函数或类型不兼容时明确加载失败。`WasiCtx` 不继承宿主 stdio、环境或目录；filesystem、sockets 与 WASI HTTP imports 始终拒绝，插件网络仍只能使用受控的 `stravia:vendor/host`。
 - 当前 Rust 预编译标准库仍导入 WASI `0.2.9`，因此新构建的插件可以同时包含 SDK 的 `0.2.12` 与标准库的 `0.2.9` imports。更新项目 `wasip2` 依赖不会替换工具链的标准库；本次不更换 Rust 工具链或自建标准库。构建产物的实际 imports 可用 `wasm-tools component wit <component.wasm>` 检查。
 - 推理与原生压缩在执行前调用同一固定版本的 `select-protocol` 导出，由插件根据连接快照与 canonical 请求选择实际上游协议。该阶段只允许纯计算，禁止网络、私有状态和事件副作用，并受相同的取消与截止时间约束。宿主随后基于返回协议确定回放身份和语义转换，不维护 OpenAI 等供应商的协议偏好分支。
 
-Rust 运行时执行入口接收 SDK 的操作类型与已编码输入，准入直接检查连接快照与 channel，不将完整 canonical payload 再解码为第二份 Native IR。请求准备、模型覆盖与续接使用共享 `Arc<AiRequest>`，只在真实修改时分离；文本叶子 `MessageContent::Text` 与 `ContentBlock::Text.text` 使用 `Arc<String>`。Rust 调用方从 `String` 构造时使用 `.into()`，从字符串字面量构造时使用 `.to_owned().into()`，编辑共享文本时使用 `Arc::make_mut` 或既有的 `output_text_mut()`。这些是 Rust 源码接口变化，canonical JSON、格式版本与 `stravia:vendor@0.5.0` WIT 不变，兼容的已安装 Component 无需为接口兼容而重建。
+Rust 运行时执行入口接收 SDK 的操作类型与已编码输入，准入直接检查连接快照与 channel，不将完整 canonical payload 再解码为第二份 Native IR。请求准备、模型覆盖与续接使用共享 `Arc<AiRequest>`，只在真实修改时分离；文本叶子 `MessageContent::Text` 与 `ContentBlock::Text.text` 使用 `Arc<String>`。Rust 调用方从 `String` 构造时使用 `.into()`，从字符串字面量构造时使用 `.to_owned().into()`，编辑共享文本时使用 `Arc::make_mut` 或既有的 `output_text_mut()`。这些共享所有权调整只改变 Rust 源码接口，本身不改变 canonical JSON、格式版本或 WIT 布局；当前 Vendor ABI 切换的重建要求仍按本节执行。
 
 `ProtocolAdapter::encode_request`、`ProtocolPair::encode_request`、`ProtocolTransform::encode_request_with` 和 `vendor_common::common::encode_inference_request` 消费 `AiRequest`，不再提供借用请求的编码入口。标准协议经共享准备入口按目标能力省略不可表达部分，私有 wire 由所属插件准备，再消费此次编码的 canonical 视图，不损坏共享历史快照；真实编码、解析与安全错误仍返回，目标表达能力不足不再整体拒绝。调用方先保留消费后仍需要的 model、stream、display 或 compaction 字段；确实需要继续使用完整请求时才显式克隆。四类标准 codec 在文本唯一归属时取出底层 `String`，共享文本仍保持只读；已拥有的原生字段、工具定义、工具结果和数组/对象直接移入 wire JSON，避免父对象再次序列化整段正文。已安装插件的性能优化需要重建并重新导入；内嵌 `base` 随宿主构建更新。
 
@@ -330,8 +330,8 @@ Canonical `MessageContent` 与 Chat 文本/parts 解码直接接收 owned string
 ### 实现与验证入口
 
 - 所有 crate（包括 Wasm 契约 fixture）的 package 版本与依赖统一由根 `Cargo.toml` 的 workspace 声明，依赖解析由唯一的根 `Cargo.lock` 管理；子清单继承 workspace，不维护独立版本、依赖版本或锁文件。
-- `stravia-vendor-capability-contract-fixture`、`stravia-vendor-lifecycle-contract-fixture`、`stravia-vendor-management-contract-fixture` 是根 workspace 中的 Wasm 专用工作负载，通过 `task build:vendor-fixtures` 构建，并由既有真实 Component 契约、生命周期及管理回归覆盖。常规 host clippy 与 unit lane（包括测试预编译）显式排除这三个 crate，不在 host 上编译 fixture；unit lane 仍排除 `stravia-desktop`。
-- `backend/crates/stravia-vendor-sdk/` 提供 Rust SDK 与 `stravia:vendor@0.5.0` WIT；`stravia-runtime-contract` 提供 canonical 类型，`stravia-protocol-codec` 提供四类标准 codec 与通用 canonical 转换辅助。
+- `stravia-vendor-capability-contract-fixture`、`stravia-vendor-lifecycle-contract-fixture`、`stravia-vendor-management-contract-fixture`、`stravia-vendor-legacy-contract-fixture` 是根 workspace 中的 Wasm 专用工作负载，通过 `task build:vendor-fixtures` 构建，并由真实 Component 契约、生命周期及管理回归覆盖。legacy fixture 使用独立冻结的 `0.5.0` Vendor WIT，不依赖当前 SDK，验证旧 HTTP 协商、原始响应、预编码请求及无压缩 WS。常规 host clippy 与 unit lane（包括测试预编译）显式排除这四个 crate，不在 host 上编译 fixture；unit lane 仍排除 `stravia-desktop`。
+- `backend/crates/stravia-vendor-sdk/` 提供 Rust SDK 与 `stravia:vendor@0.5.1` WIT；`stravia-runtime-contract` 提供 canonical 类型，`stravia-protocol-codec` 提供四类标准 codec 与通用 canonical 转换辅助。
 - `backend/crates/stravia-vendor-runtime/` 实现 Component 执行与受控资源；Core 的 `src/plugin/` 负责安装、连接快照、网络授权、私有状态及版本切换协调。
 - 同一 Engine 的运行时克隆可复用相同完整 SHA-256 字节身份、仍被已加载版本持有的不可变编译 Component，并合并同一身份的并发编译。缓存只保存有界元数据与弱引用，不延长退役版本的生命周期，也不缓存加载失败；每次加载仍检查 imports，并使用新的 Store 实例读取和验证 descriptor。操作的 HostServices、私有状态、取消与权限边界不共享。
 - `stravia-vendor-runtime/tests/wasi_compatibility.rs` 通过公开加载接口检查权限边界、预发布版与其他版本系列拒绝，以及非法 SemVer 的组件校验失败。真实 base Component 的多个稳定 patch、build metadata、混合版本加载和协议选择回归为显式 opt-in，并验证新 patch 要求宿主不存在的函数时加载失败：先执行 `task build:vendors`，再运行 `cargo test --locked -p stravia-vendor-runtime --test wasi_compatibility -- --ignored`；该用例也纳入 `task test:all` 的本地 opt-in 清单。缺少 manifest 或产物时明确失败，不静默跳过。测试重定向实际 Component 的顶层 WASI import 名称，保留 guest 实现和内部元数据，并保持跨接口资源族的版本一致。
@@ -380,7 +380,7 @@ Canonical `MessageContent` 与 Chat 文本/parts 解码直接接收 owned string
 
 ### 已确认的动态表单多语言契约
 
-动态表单多语言使用 `stravia:vendor@0.5.0` 契约。语言只改变展示，不改变配置含义、校验规则、网络授权或插件执行行为。
+动态表单多语言使用当前 `stravia:vendor@0.5.1` 契约，与既有 `0.5.0` 的描述符和本地化文本形状兼容。语言只改变展示，不改变配置含义、校验规则、网络授权或插件执行行为。
 
 #### 文本所有权与结构
 
@@ -501,6 +501,29 @@ Provider 描述符通过 `config_groups` 声明分组，每项包含稳定的 `i
 - OAuth 回放与原生压缩的账户身份采用宿主持久化的稳定认证连接标识，而不是 access token、refresh token 或到期时间。正常刷新保持身份，重新登录创建新身份；非 OAuth 凭据变更仍改变其指纹。Target、供应商、channel、协议、模型、代理、地址与选项边界保持不变。
 - 具体职责取舍见 [ADR-0071](../adr/0071-orchestrate-vendors-through-host-network-capabilities.md)，网络授权采用下述元数据声明与白名单原则。
 
+### HTTP 与 WebSocket 传输压缩
+
+传输压缩由插件按每次请求声明、宿主执行，不是 Provider 持久化配置，也不改变模型原生的上下文压缩语义。新增入口将压缩策略作为独立参数，不向旧 request record 增加字段，并复用原来的响应和连接资源。SDK 保留 `http_start(request)` / `ws_connect(request)`，另提供 `http_start_with_compression(request, compression)` / `ws_connect_with_compression(request, compression)`。新入口提交和读取的始终是应用字节；HTTP 内容编码与 WebSocket 消息扩展是两个独立契约：
+
+| 新入口及参数 | 取值 | 宿主行为 |
+| --- | --- | --- |
+| `http-start-with-compression` 的 `compression.request` | `none` 或 `gzip` / `deflate` / `br` / `zstd` | `none` 不编码；其余值编码整个应用请求体，并生成 `Content-Encoding`。HTTP `deflate` 使用 zlib 包装，不是裸 DEFLATE。 |
+| `http-start-with-compression` 的 `compression.response` | 上述编码的接受列表 | 生成 `Accept-Encoding` 并仅解码已声明的响应编码。空列表发送 `identity`；无论列表内容如何，始终接受 identity。列表不是优先级或协商结果。 |
+| `ws-connect-with-compression` 的 `compression` | `disabled` | 不提供压缩扩展；上游擅自返回扩展时握手失败。 |
+| `ws-connect-with-compression` 的 `compression` | `permessage-deflate(preferred)` | 在一次握手中提供 RFC 7692 扩展；未接受时在同一连接使用非压缩消息。 |
+| `ws-connect-with-compression` 的 `compression` | `permessage-deflate(required)` | 必须成功协商 RFC 7692 扩展；否则在任何业务消息发送前失败。 |
+
+- 旧 `http-start` 保持 header 驱动语义：请求带 `Accept-Encoding` 时由宿主沿用原有解码器，未知编码保留原样；不带时返回原始正文及响应头，不自动插入 `identity`，即使上游返回 gzip 也不隐式解码。手写 `Content-Encoding` 的请求体原样发送，不二次编码。旧 `ws-connect` 不协商消息压缩，保留旧合法握手头的处理。新旧入口只转换内部策略，共用传输、解码器与资源生命周期，不维护两套网络实现。
+- 新宿主兼容旧插件，不承诺使用新增入口的插件可在旧宿主运行；旧宿主缺少新增函数时明确加载失败，不能静默忽略压缩策略或通过重发业务请求探测能力。
+- HTTP 请求体只编码一次，允许的重定向复用同一份 wire 字节；按现有规则改为无正文 GET 时移除请求编码头。上游 415 不触发宿主自动改用 identity 重发，既有 Route 重试与结果提交边界不变。
+- 新 HTTP 入口的响应流逐块解码，不等待 SSE 或长流结束。未知、未声明、重复或叠加的 `Content-Encoding` 明确失败，损坏及截断的压缩流不得退回原始压缩字节。解码后的响应头移除 `Content-Encoding` 与 wire `Content-Length`；HEAD、1xx、204、205、304 不读取压缩正文。
+- WS 的扩展响应参数经过严格校验；重复、未知、非法参数不能在 `preferred` 下被忽略或通过另一次握手降级。实际协商的窗口与 context-takeover 状态绑定 socket，消息分片、控制帧交错和后续消息沿用引擎的真实编解码上下文。单帧及解压后单消息上限均为 256 MiB，解压期间就执行消息预算检查，不能先无限展开再检查。
+- WS 池按 `disabled`、`preferred`、`required` 分隔，精确续接同样包含压缩策略；`required` 不能取出未协商压缩的连接。原有凭据、origin、代理、作用域亲和、tip 和复用寿命隔离继续生效，压缩不授予重放或扩大网络权限。
+- Claude Code 推理通过新入口的强类型响应列表请求 gzip、deflate、br、zstd；Codex WS 通过新入口使用 `preferred`。其余现有调用继续使用旧入口，不因宿主支持压缩就推测上游接受压缩请求体或自动提供 WS 扩展。
+- HTTP 请求诊断保留实际编码后的 wire 正文；新入口解码后的响应正文标记为 `decoded_body_chunk`，不冒充压缩线上字节。旧入口保留 `body_chunk` 及其已有正文语义。WS 诊断内容仍是消息层应用数据，不是带 RSV 位的原始压缩帧。
+
+HTTP 由 `async-compression` 编码、`tower-http` 流式解码。WS 的 HTTP、代理和 TLS 继续由 reqwest 承担，帧与压缩使用 [固定提交的 tungstenite 实现](https://github.com/openai-oss-forks/tungstenite-rs/tree/4fffad30fe373adbdcffab9545e9e9bf4f2fc19f)及 [Tokio 适配](https://github.com/openai-oss-forks/tokio-tungstenite/tree/0e5b2d73aa18dd9f0a50ee9ff199d5aef7594186)，不全局替换其他客户端的 WebSocket 依赖。宿主只验证握手并映射实际协商参数，不维护第二套帧或 DEFLATE 引擎。依赖提交和 Nix 源码哈希分别固定在根 Cargo 清单／锁文件及 `nix/package.nix`。
+
 ## 已确认的操作调度与后台执行限制
 
 - 推理、完整搜索、媒体生成、OAuth、模型同步、额度查询与凭据刷新均由宿主创建操作并调用插件，不开放插件独立常驻后台任务。
@@ -522,7 +545,7 @@ Provider 描述符通过 `config_groups` 声明分组，每项包含稳定的 `i
 - origin 按协议、主机与有效端口匹配，路径由插件构造。HTTP 与 WebSocket 使用各自明确获准的协议，不因主机相同就隐式扩大协议或端口范围。
 - 管理员可以显式将当前连接配置为本机或局域网服务，不一刀切禁止私网目标；这一配置不授权访问其他本机或私网地址。
 - 安装或更新页面展示插件声明的附属服务地址。每次重定向后的目标也必须重新检查，不自动将原目标的认证头转发到另一 origin。
-- 连接管理与报文分帧由宿主负责：插件不得设置 `Transfer-Encoding`、`Content-Length`、`Upgrade`、代理头，`Connection` 只允许 `keep-alive`（HTTP/2 下由传输层移除）。插件自行发送 `Accept-Encoding` 时，宿主按响应的 `Content-Encoding`（gzip、deflate、br、zstd）解码，并在交给插件的响应头中移除 `Content-Encoding` 与 `Content-Length`；未发送 `Accept-Encoding` 的请求保持原样字节，已安装的旧插件行为不变。
+- 所有入口的连接管理与报文分帧仍由宿主负责：插件不得设置 `Transfer-Encoding`、`Content-Length`、`Upgrade` 或受控代理头。HTTP 的 `Connection` 只允许 `keep-alive`（HTTP/2 下由传输层移除）；WS 的标准握手头由宿主生成。新增压缩入口独占 `Accept-Encoding`、`Content-Encoding` 和 `Sec-WebSocket-Extensions`，手写受控头在发送或复用连接前拒绝；旧入口仅保留上述既有 header 驱动行为，不扩大 origin、凭据或代理权限。
 - 使用出站代理不扩大允许访问的目标范围。允许访问目标与向目标发送凭据是不同的授权，不得根据网络白名单自动注入其他目标的凭据。
 - 内嵌 `base` 随宿主自动更新时，新增声明的网络 origin 无需单独确认，由宿主随受信内置版本更新生效白名单；这不授予插件在运行期间自行修改声明或访问任意目标的权力。
 - 本地包手动更新在已有确认界面展示网络范围变化，沿用一次更新确认，不额外增加网络授权步骤。

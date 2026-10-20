@@ -4,6 +4,7 @@
 
 ### Added
 
+- Added plugin-declared HTTP request compression and streaming response decompression for gzip, deflate, Brotli, and Zstandard, plus host-negotiated WebSocket permessage-deflate with disabled/preferred/required policies, bounded inflation, and compression-aware socket reuse. Claude Code declares its accepted response encodings; Codex requests preferred WS compression without replaying an unsuccessful negotiation.
 - Added a source-built Linux Server flake with embedded production WebUI and base Wasm vendor, locked offline build dependencies, and a `services.stravia` NixOS module. The service owns deployment flags and persistent directory permissions while the application retains its writable database/cache configuration and existing setup flow. Chromium remains optional; the existing devenv workflow is unchanged.
 
 ### Fixed
@@ -28,6 +29,7 @@
 
 ### Changed
 
+- Extended the Vendor WIT ABI to `stravia:vendor@0.5.1` with separate HTTP and WebSocket compression functions, preserving the `0.5.0` request records, functions, and resources. Existing standalone `0.5.0` plugins remain usable without rebuilding or re-importing; only plugins opting into the new functions need an SDK update and a supporting host. Legacy HTTP header-driven behavior and uncompressed WebSockets are preserved, while the new functions own compression headers and reuse the same host transport. No canonical-format change, client API change, or database migration is included.
 - WebUI controls no longer enforce a universal minimum click-target size. Buttons, fields, tabs and row actions size to their visible content and padding; status labels, help icons, switches, checkboxes and sliders no longer enlarge invisible hit areas or use compensating negative margins. Keyboard access, focus indicators and existing control behavior are preserved.
 - Navigation pages now share the Providers page's centered 90rem content width, including settings, lists, monitoring workspaces, and resource editors. Page-specific width overrides are removed while narrow-screen layouts, field sizing, and chat reading widths are preserved.
 - Allowance provider rows show refresh progress only in the right-side refresh button and no longer append a saving-pause-settings label to the provider heading. Guard switches retain their busy and disabled states during saving, and error feedback is preserved.

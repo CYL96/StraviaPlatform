@@ -6,6 +6,6 @@ mod runtime;
 pub use error::{LoadError, RuntimeError};
 pub use host::{
     HostFailure, HostHttpResponse, HostServices, HostWebSocket, HttpRequest, LogLevel,
-    RuntimeEvent, WebSocketMessage,
+    RuntimeEvent, WebSocketMessage, WsRequest,
 };
 pub use runtime::{LoadedPlugin, OperationScope, VendorRuntime};

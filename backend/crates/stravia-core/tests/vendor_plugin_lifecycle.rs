@@ -478,6 +478,236 @@ fn options(entries: &[(&str, &str)]) -> serde_json::Map<String, serde_json::Valu
 }
 
 #[tokio::test]
+async fn frozen_0_5_0_component_preserves_manual_raw_and_preencoded_http() -> anyhow::Result<()> {
+    use async_compression::tokio::{bufread::GzipDecoder, write::GzipEncoder};
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let directory = tempfile::tempdir()?;
+    let gateway = new_gateway(directory.path().to_owned()).await?;
+    install(&gateway, "legacy-v0.5.0.wasm", false).await?;
+    let mut upstream = TestUpstream::start().await;
+    let mut targets = Vec::with_capacity(3);
+
+    for mode in ["manual", "raw", "preencoded"] {
+        let target = connection(
+            &gateway,
+            "fixture.legacy-abi",
+            &format!("legacy {mode} account"),
+            &format!("legacy-{mode}"),
+            &upstream.base_url,
+            "legacy-secret",
+            options(&[("mode", mode)]),
+        )
+        .await?;
+        targets.push((mode, target));
+    }
+    let route_ids = targets
+        .iter()
+        .map(|(_, target)| target.route_id.as_str())
+        .collect::<Vec<_>>();
+    let token = api_key(&gateway, &route_ids).await?;
+    for (mode, target) in targets {
+        let mut call = tokio::spawn(invoke(
+            create_router(gateway.clone()),
+            token.clone(),
+            target.route_id,
+        ));
+        let request = upstream.next_for(&mut call).await;
+        assert_eq!(
+            request.header("authorization"),
+            Some("Bearer legacy-secret")
+        );
+        assert_eq!(
+            request.header("accept-encoding"),
+            (mode == "manual").then_some("gzip"),
+        );
+        if mode == "preencoded" {
+            assert_eq!(request.header("content-encoding"), Some("gzip"));
+            let mut application = Vec::new();
+            GzipDecoder::new(request.body.as_slice())
+                .read_to_end(&mut application)
+                .await?;
+            let application: serde_json::Value = serde_json::from_slice(&application)?;
+            assert!(
+                application
+                    .to_string()
+                    .contains("exercise the lifecycle fixture")
+            );
+        } else {
+            assert_eq!(request.header("content-encoding"), None);
+        }
+
+        let expected = format!("legacy {mode} response");
+        let mut reply = UpstreamReply::model(&expected);
+        if mode != "preencoded" {
+            let mut encoder = GzipEncoder::new(Vec::new());
+            encoder.write_all(&reply.body).await?;
+            encoder.shutdown().await?;
+            reply.body = encoder.into_inner();
+            reply.headers.push(("content-encoding", "gzip".into()));
+            reply
+                .headers
+                .push(("content-length", reply.body.len().to_string()));
+        }
+        request.reply(reply);
+        assert_success_with(&call.await?, &expected);
+        upstream.assert_no_request();
+    }
+    gateway.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn frozen_0_5_0_component_exchanges_uncompressed_websocket_messages() -> anyhow::Result<()> {
+    use axum::extract::ws::{Message, WebSocketUpgrade};
+    use axum::routing::get;
+
+    let directory = tempfile::tempdir()?;
+    let gateway = new_gateway(directory.path().to_owned()).await?;
+    install(&gateway, "legacy-v0.5.0.wasm", false).await?;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let base_url = format!("http://{}", listener.local_addr()?);
+    let (observed, mut messages) = mpsc::unbounded_channel();
+    let reply = UpstreamReply::model("legacy WebSocket response");
+    let reply = String::from_utf8(reply.body)?;
+    let upstream = Router::new().route(
+        "/socket",
+        get(move |upgrade: WebSocketUpgrade, headers: HeaderMap| {
+            let observed = observed.clone();
+            let reply = reply.clone();
+            async move {
+                upgrade
+                    .protocols(["legacy-v1"])
+                    .on_upgrade(move |mut socket| async move {
+                        let Message::Text(text) = socket
+                            .recv()
+                            .await
+                            .expect("request frame")
+                            .expect("valid request")
+                        else {
+                            panic!("legacy request must be text");
+                        };
+                        observed
+                            .send((headers, text))
+                            .expect("test observes request");
+                        socket
+                            .send(Message::Text(reply.into()))
+                            .await
+                            .expect("send response");
+                        // 保持连接直到 guest 释放资源，避免以抢先断开掩盖 close 行为。
+                        while let Some(message) = socket.recv().await {
+                            if matches!(message, Ok(Message::Close(_))) {
+                                break;
+                            }
+                        }
+                    })
+            }
+        }),
+    );
+    let server = tokio::spawn(async move {
+        axum::serve(listener, upstream)
+            .await
+            .expect("serve legacy WS upstream");
+    });
+    let target = connection(
+        &gateway,
+        "fixture.legacy-abi",
+        "legacy WebSocket account",
+        "legacy-websocket",
+        &base_url,
+        "legacy-ws-secret",
+        options(&[
+            ("mode", "websocket"),
+            (
+                "auxUrl",
+                &format!("{}/socket", base_url.replacen("http", "ws", 1)),
+            ),
+        ]),
+    )
+    .await?;
+    let token = api_key(&gateway, &[&target.route_id]).await?;
+    let mut call = tokio::spawn(invoke(
+        create_router(gateway.clone()),
+        token,
+        target.route_id,
+    ));
+    let (headers, text) = tokio::select! {
+        biased;
+        request = messages.recv() => request.expect("legacy WS request"),
+        response = &mut call => panic!("legacy WS returned before request: {:?}", response?),
+    };
+    assert_eq!(
+        headers.get("authorization").unwrap(),
+        "Bearer legacy-ws-secret"
+    );
+    assert_eq!(headers.get("accept-encoding").unwrap(), "gzip");
+    assert_eq!(headers.get("sec-websocket-protocol").unwrap(), "legacy-v1");
+    assert!(!headers.contains_key("sec-websocket-extensions"));
+    let application: serde_json::Value = serde_json::from_str(&text)?;
+    assert!(
+        application
+            .to_string()
+            .contains("exercise the lifecycle fixture")
+    );
+    assert_success_with(&call.await?, "legacy WebSocket response");
+    gateway.shutdown().await;
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn real_wasm_compression_transports_application_bytes_in_both_directions()
+-> anyhow::Result<()> {
+    use async_compression::tokio::{bufread::GzipDecoder, write::GzipEncoder};
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let directory = tempfile::tempdir()?;
+    let gateway = new_gateway(directory.path().to_owned()).await?;
+    install(&gateway, "lifecycle-v1.wasm", false).await?;
+    let mut upstream = TestUpstream::start().await;
+    let target = connection(
+        &gateway,
+        LIFECYCLE_VENDOR,
+        "compressed account",
+        "lifecycle-compression",
+        &upstream.base_url,
+        "local-compression-secret",
+        options(&[("mode", "compression")]),
+    )
+    .await?;
+    let token = api_key(&gateway, &[&target.route_id]).await?;
+    let mut call = tokio::spawn(invoke(
+        create_router(gateway.clone()),
+        token,
+        target.route_id,
+    ));
+    let request = upstream.next_for(&mut call).await;
+    assert_eq!(request.header("content-encoding"), Some("gzip"));
+    let mut decoder = GzipDecoder::new(request.body.as_slice());
+    let mut application = Vec::new();
+    decoder.read_to_end(&mut application).await?;
+    let application: serde_json::Value = serde_json::from_slice(&application)?;
+
+    assert!(
+        application
+            .to_string()
+            .contains("exercise the lifecycle fixture")
+    );
+
+    let mut reply = UpstreamReply::model("compressed upstream response");
+    let mut encoder = GzipEncoder::new(Vec::new());
+    encoder.write_all(&reply.body).await?;
+    encoder.shutdown().await?;
+    reply.body = encoder.into_inner();
+    reply.headers.push(("content-encoding", "gzip".into()));
+    request.reply(reply);
+    assert_success_with(&call.await?, "compressed upstream response");
+    upstream.assert_no_request();
+    gateway.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn real_wasm_stream_preserves_typed_quota_over_http_429() -> anyhow::Result<()> {
     let directory = tempfile::tempdir()?;
     let gateway = new_gateway(directory.path().to_owned()).await?;

@@ -62,11 +62,7 @@ impl HostServices for Services {
     }
     async fn ws_connect(
         &self,
-        _url: String,
-        _headers: Vec<(String, String)>,
-        _protocols: Vec<String>,
-        _continuation_id: Option<String>,
-        _reuse_max_age_millis: Option<u64>,
+        _request: stravia_vendor_runtime::WsRequest,
     ) -> Result<Arc<dyn HostWebSocket>, HostFailure> {
         Err(HostFailure::new(ErrorKind::Trapped, "Unexpected websocket"))
     }

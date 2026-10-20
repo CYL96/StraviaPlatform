@@ -131,11 +131,7 @@ impl HostServices for MockServices {
 
     async fn ws_connect(
         &self,
-        _url: String,
-        _headers: Vec<(String, String)>,
-        _protocols: Vec<String>,
-        _continuation_id: Option<String>,
-        _reuse_max_age_millis: Option<u64>,
+        _request: stravia_vendor_runtime::WsRequest,
     ) -> Result<Arc<dyn HostWebSocket>, HostFailure> {
         Err(HostFailure::new(
             ErrorKind::Trapped,
@@ -520,30 +516,25 @@ async fn inference_is_sent_in_claude_code_shape_and_tool_names_round_trip() {
     assert_eq!(requests.len(), 1);
     let sent = &requests[0];
     assert_eq!(sent.url, "https://api.anthropic.com/v1/messages?beta=true");
-    let names: Vec<&str> = sent.headers.iter().map(|(name, _)| name.as_str()).collect();
-    assert_eq!(
-        names,
+    let compression = sent
+        .compression
+        .as_ref()
+        .expect("explicit HTTP compression");
+    assert!(compression.request.is_none());
+    assert!(matches!(
+        compression.response.as_slice(),
         [
-            "accept",
-            "accept-encoding",
-            "authorization",
-            "connection",
-            "content-type",
-            "user-agent",
-            "x-claude-code-session-id",
-            "x-stainless-arch",
-            "x-stainless-lang",
-            "x-stainless-os",
-            "x-stainless-package-version",
-            "x-stainless-retry-count",
-            "x-stainless-runtime",
-            "x-stainless-runtime-version",
-            "x-stainless-timeout",
-            "anthropic-beta",
-            "anthropic-dangerous-direct-browser-access",
-            "anthropic-version",
-            "x-app",
+            stravia_vendor_sdk::HttpContentCoding::Gzip,
+            stravia_vendor_sdk::HttpContentCoding::Deflate,
+            stravia_vendor_sdk::HttpContentCoding::Br,
+            stravia_vendor_sdk::HttpContentCoding::Zstd,
         ]
+    ));
+    assert!(
+        !sent
+            .headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("accept-encoding"))
     );
     let header = |name: &str| {
         sent.headers
