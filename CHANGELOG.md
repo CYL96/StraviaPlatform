@@ -8,6 +8,7 @@
 
 ### Fixed
 
+- Codex, OpenCode, and OMP configuration generation now uses each model's saved default thinking level instead of choosing `medium`, the first supported effort, or omitting an explicitly configured default. Codex and OpenCode map `off` to `none`; unset defaults remain null or omitted as required by each format. Pi no longer receives OMP-only `thinking` fields. Client-wide reasoning preferences are unchanged. Copy or re-apply the client configuration to receive the correction.
 - Console Chat, image attachments, and Mermaid diagrams prefer native `crypto.randomUUID`, falling back to `crypto.getRandomValues` only when that API is unavailable. Local identifiers remain cryptographically random UUID v4 values when the management UI is accessed over HTTP.
 - The application shell and document no longer force a large-viewport minimum height over the small viewport, keeping the mobile chat composer above expanded browser toolbars.
 - The management UI declares its selected language before application modules load and opts out of automatic browser translation. Saved-language precedence, first-visit language detection, and in-app language switching are preserved.
