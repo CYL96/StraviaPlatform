@@ -363,7 +363,7 @@ export const admin = {
   },
   performance: {
     metrics: async (): Promise<Blob> => {
-      const response = await authenticatedFetch('/performance/metrics')
+      const response = await authenticatedFetch('/performance/snapshot')
       if (!response.ok) await decodeAdmin(response)
       return response.blob()
     },

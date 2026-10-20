@@ -60,7 +60,7 @@ async fn performance_export_requires_admin_and_clears_session_after_debug_is_dis
 
     let denied = app
         .clone()
-        .oneshot(Request::get("/api/v1/performance/metrics").body(Body::empty())?)
+        .oneshot(Request::get("/api/v1/performance/snapshot").body(Body::empty())?)
         .await?;
     assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
     let denied_timeline = app
@@ -91,9 +91,14 @@ async fn performance_export_requires_admin_and_clears_session_after_debug_is_dis
             .header("authorization", format!("Bearer {}", tokens.access_token))
             .body(Body::empty())
     };
-    let exported = app
+    let removed = app
         .clone()
         .oneshot(request("/api/v1/performance/metrics")?)
+        .await?;
+    assert_eq!(removed.status(), StatusCode::NOT_FOUND);
+    let exported = app
+        .clone()
+        .oneshot(request("/api/v1/performance/snapshot")?)
         .await?;
     assert_eq!(exported.status(), StatusCode::OK);
     assert_eq!(exported.headers()["cache-control"], "no-store");
@@ -156,7 +161,9 @@ async fn performance_export_requires_admin_and_clears_session_after_debug_is_dis
     assert_eq!(cleared["traceEvents"], serde_json::json!([]));
     assert_eq!(cleared["metadata"]["active_spans"], 0);
     assert_eq!(cleared["metadata"]["resource_sample_count"], 0);
-    let metrics = app.oneshot(request("/api/v1/performance/metrics")?).await?;
+    let metrics = app
+        .oneshot(request("/api/v1/performance/snapshot")?)
+        .await?;
     assert_eq!(metrics.status(), StatusCode::OK);
     let metrics = String::from_utf8(to_bytes(metrics.into_body(), usize::MAX).await?.to_vec())?;
     assert!(metrics.contains("operation=\"test.admin_export\""));
