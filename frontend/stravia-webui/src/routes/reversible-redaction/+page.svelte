@@ -336,7 +336,7 @@ function selectMatch(match: CredentialMatch): void {
   {/if}
 {/snippet}
 
-<div class={['route-page protection-page', { 'rules-workspace': tab === 'rules' }]}>
+<div class={['route-page', { 'rules-workspace': tab === 'rules' }]}>
   <PageHeader
     eyebrow={m.app_shell_nav_advanced_features()}
     title={m.reversible_redaction_title()}
@@ -826,11 +826,6 @@ function selectMatch(match: CredentialMatch): void {
 </Sheet.Root>
 
 <style>
-.protection-page {
-  max-width: 90rem;
-  margin-inline: auto;
-  width: 100%;
-}
 .rules-workspace {
   display: grid;
   grid-template-rows: auto auto minmax(24rem, 1fr);

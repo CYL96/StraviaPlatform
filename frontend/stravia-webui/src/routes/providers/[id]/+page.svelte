@@ -139,8 +139,7 @@ async function syncModels(id = providerId): Promise<ProviderModelSyncSummary | u
       ><ArrowLeftIcon data-icon="inline-start" />{m.providers_back_model_services()}</Button>
   </div>
 {:else}
-  <!-- 页头、页签和各页签内容共用同一最大宽度，右上角操作与表单、保存按钮右边界对齐；宽度需容纳服务模型表格的全部列。 -->
-  <div class="route-page mx-auto w-full max-w-[90rem]">
+  <div class="route-page">
     <PageHeader eyebrow={m.common_model_service()} title={provider.name}>
       {#snippet meta()}
         {@const credentialInvalid = provider.credential_status === 'invalid'}

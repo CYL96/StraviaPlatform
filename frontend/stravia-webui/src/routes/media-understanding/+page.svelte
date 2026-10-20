@@ -136,7 +136,7 @@ function selectThinkingLevel(value?: string): void {
 
 <svelte:head><title>{m.media_understanding_title()} · Stravia</title></svelte:head>
 
-<div class="route-page mx-auto max-w-[64rem]">
+<div class="route-page">
   <PageHeader
     eyebrow={m.app_shell_nav_advanced_features()}
     title={m.media_understanding_title()}

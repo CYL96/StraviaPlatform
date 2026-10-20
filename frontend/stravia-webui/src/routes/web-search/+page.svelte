@@ -237,7 +237,7 @@ async function save(): Promise<void> {
 
 <svelte:head><title>{m.web_search_title()} · Stravia</title></svelte:head>
 
-<div class="route-page mx-auto max-w-[64rem]">
+<div class="route-page">
   <PageHeader
     eyebrow={m.app_shell_nav_advanced_features()}
     title={m.web_search_title()}

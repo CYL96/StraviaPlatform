@@ -430,8 +430,7 @@ async function copyProvider(): Promise<void> {
   </div>
 {/snippet}
 
-<!-- 与模型服务详情页同宽，从列表进入详情时页头、操作与内容边界不跳动。 -->
-<div class="route-page providers-page mx-auto w-full max-w-[90rem]">
+<div class="route-page providers-page">
   <PageHeader
     eyebrow={m.common_setup()}
     title={m.common_model_services()}
