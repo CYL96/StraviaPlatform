@@ -348,9 +348,7 @@ for (const locale of ['en-US', 'zh-CN']) {
       await saveStarted.promise
       await expect(weekly).toHaveAttribute('aria-busy', 'true')
       await expect(weekly).not.toBeChecked()
-      await expect(
-        provider.getByText(locale === 'en-US' ? 'Saving pause settings…' : '正在保存暂停设置…'),
-      ).toBeVisible()
+      await expect(weekly).toBeDisabled()
       saveGate.release()
       await expect(weekly).toBeChecked()
       await expect(weekly).toBeEnabled()

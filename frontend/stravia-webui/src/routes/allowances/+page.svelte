@@ -736,14 +736,10 @@ function allowanceErrorMessage(category: ProviderAllowanceErrorCategory): string
                   tone={conditionStatusTone(providerCondition)} />
               {/if}
               {#if suspension}
-                <!-- 独立定位上下文让提示入口位于整行展开命中区之上。 -->
-                <span class="relative z-10"><AllowanceSuspension {suspension} /></span>
+                <!-- 保留 40px 点击区，但不让它撑高标题行；z-10 避开整行展开命中区。 -->
+                <span class="relative z-10 -my-2.5"><AllowanceSuspension {suspension} /></span>
               {/if}
               {#if presentation}<Badge variant={presentation.variant}>{presentation.label}</Badge>{/if}
-              {#if provider.savingGuards}
-                <span class="inline-flex items-center gap-1 text-xs text-muted-foreground" role="status"
-                  ><Spinner class="size-3" aria-hidden="true" />{m.allowances_guard_saving()}</span>
-              {/if}
               {#if snapshot?.plan_label}<span class="text-xs text-muted-foreground">{snapshot.plan_label}</span>{/if}
             </div>
             <p class="font-technical mt-0.5 text-xs break-all text-muted-foreground">
