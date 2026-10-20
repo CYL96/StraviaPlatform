@@ -512,7 +512,7 @@ fn effort_control_encodes_adaptive_without_replaying_raw_thinking() {
     );
     request.reasoning.target_control = Some(
         stravia_runtime_contract::thinking::TargetThinkingControl::Effort {
-            value: "high".into(),
+            value: "xhigh".into(),
         },
     );
     request.meta.vendor.ingress.insert(
@@ -524,7 +524,7 @@ fn effort_control_encodes_adaptive_without_replaying_raw_thinking() {
         .encode_request(request)
         .expect("adaptive thinking");
     assert_eq!(body["thinking"]["type"], "adaptive");
-    assert_eq!(body["output_config"]["effort"], "high");
+    assert_eq!(body["output_config"]["effort"], "xhigh");
 }
 
 #[test]
@@ -1001,12 +1001,23 @@ fn canonical_reasoning_modes_and_levels_project_without_target_controls() {
         assert_eq!(request.reasoning.mode.as_deref(), Some(mode));
         let (body, _) = AnthropicEncoder.encode_request(request).unwrap();
         assert_eq!(body["thinking"], expected);
+        assert!(
+            body.get("output_config")
+                .and_then(|config| config.get("effort"))
+                .is_none(),
+            "omitted effort must preserve the model default"
+        );
     }
     let mut request = parameter_request();
-    request.reasoning.level = Some(ThinkingLevel::Medium);
-    let (body, _) = AnthropicEncoder.encode_request(request.clone()).unwrap();
-    assert_eq!(body["thinking"]["type"], "adaptive");
-    assert_eq!(body["output_config"]["effort"], "medium");
+    for (level, effort) in [
+        (ThinkingLevel::Medium, "medium"),
+        (ThinkingLevel::Xhigh, "xhigh"),
+    ] {
+        request.reasoning.level = Some(level);
+        let (body, _) = AnthropicEncoder.encode_request(request.clone()).unwrap();
+        assert_eq!(body["thinking"]["type"], "adaptive");
+        assert_eq!(body["output_config"]["effort"], effort);
+    }
     request.generation.max_tokens = Some(2048);
     request.reasoning.mode = Some("enabled".into());
     request.reasoning.budget_tokens = Some(50_000);

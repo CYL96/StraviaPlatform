@@ -432,7 +432,7 @@ inference_run::execute(RunInput)（一次性 crate-private interface）
          ├─ Vendor Plugin 经受控 host transport 执行（HTTP/SSE 或 Responses WebSocket）
               ├─ 两种 transport 均归一为 canonical AiResponse / AiStreamDelta
               ├─ 按原始 Provider 视图记录引用与续接证明，再还原回答及工具参数
-              └─ 仅 retryable provider 失败且尚未提交首个 canonical 输出时切换 Target
+              └─ 仅在首个 canonical 输出前，因可重试 provider 失败或 Target 局部 Unsupported 切换；不放宽状态绑定
          └─ 内部终态 gate：还原尾部 delta → 当前共享引用发布 → 唯一 Completed
               ├─ 取消 / deadline 可抢占读取和发布等待，已发布映射不回滚
               └─ gate 拥有 Model Turn 终态观测，上游 attempt / usage 保持独立真实
@@ -958,11 +958,13 @@ SQLite/PostgreSQL migration 0012 删除旧的无模型 Target，并将 `model_ba
 
 运行时固定按 Target Continuation、Conversation Affinity、无对话身份时的 Cache Affinity、Target Priority、组内 Route Scheduling Strategy 分层选择。`UsageStatsStore` 从 `target_attempt_observations` 读取 Confirmed Upstream Usage：Traffic Equalization 比较过去 24 小时的加权 Token 流量与进行中输入占位；Latency Preference 在至少两个 Target 各有 20 个近期成功样本时比较过去一小时的成功率与输出 Token 速度，否则回退 Traffic Equalization。查询失败时返回最后一次成功的进程内 snapshot 并标记 `stale`；尚无 snapshot 或 Observation gap 造成历史不完整时按无历史样本执行原有确定性 fallback，观测故障不能阻断选路。
 
-客户端继续使用 Chat Completions、Open Responses、Anthropic Messages 或 Gemini 的原生 thinking 字段。codec 先解码为规范 Thinking Level，Request Hook 可修改该等级；客户端未提供任何推理指令时才继承 Route 的可选默认档位。先按既有策略选择 Target，再以原请求档位在该 Target 的非 Hidden Thinking Level Map 中匹配：精确档位优先，否则优先向上选择最近档位，无更高档位时才向下选择最近档位，并生成 protocol-native control。off 并非禁止向上匹配；不同 Target 的实际档位可以不同。每次 failover 都从原请求档位重新匹配，不沿用上一个 Target 的实际档位。若选中 Target 全部 Mapping 为 Hidden，则清除本次请求的 level 和 effort，不发送上游 effort 参数，保留其他推理指令并继续请求该 Target；客户端显式档位与 Route 默认档位都遵循此规则，不因未配置档位而触发 failover。Route 的 Supported Thinking Levels 由所有已启用 Target 的非 Hidden Mapping 并集派生，供管理面、模型发现及客户端配置导出展示至少一个已启用 Target 支持的等级，不钳制执行，也不决定 Target 准入。无已启用 Target 时集合为空；等级按 off、minimal、low、medium、high、xhigh、max 排序且不重复。`GET /v1/models` 仅在并集非空时返回可选的 `stravia:thinking_levels`，不暴露 Target control；客户端配置导出使用该并集，字段与导出格式不变。
+客户端继续使用 Chat Completions、Open Responses、Anthropic Messages 或 Gemini 的原生 thinking 字段。codec 先解码为规范 Thinking Level，Request Hook 可修改该等级；客户端未提供任何推理指令时才继承 Route 的可选默认档位。先按既有策略选择 Target，按模型明确声明的原生 Effort 集合过滤非 Hidden Thinking Level Map，再以原请求档位在剩余映射中匹配：精确档位优先，否则优先向上选择最近档位，无更高档位时才向下选择最近档位，并生成 protocol-native control。off 并非禁止向上匹配；不同 Target 的实际档位可以不同。每次 failover 都从原请求档位重新匹配，不沿用上一个 Target 的实际档位。若选中 Target 没有可用 Mapping（全部 Hidden 或被模型原生 Effort 声明排除），则清除本次请求的 level 和 effort，不发送上游 effort 参数，保留其他推理指令并继续请求该 Target；客户端显式档位与 Route 默认档位都遵循此规则，不因未配置档位而触发 failover。Route 的 Supported Thinking Levels 由所有已启用 Target 的非 Hidden Mapping 并集派生，供管理面、模型发现及客户端配置导出展示至少一个已启用 Target 支持的等级，不钳制执行，也不决定 Target 准入。无已启用 Target 时集合为空；等级按 off、minimal、low、medium、high、xhigh、max 排序且不重复。`GET /v1/models` 仅在并集非空时返回可选的 `stravia:thinking_levels`，不暴露 Target control；客户端配置导出使用该并集，字段与导出格式不变。
 
 客户端配置中的模型级默认思考等级使用 Route 保存的 `default_thinking_level`，不从 Supported Thinking Levels 推断或钳制。Codex catalog 的 `default_reasoning_level` 和 OpenCode 模型的 `options.reasoningEffort` 将 `off` 转为 `none`；未配置时，Codex 写 `null`，OpenCode 省略该选项。OMP 的 `thinking.defaultLevel` 保留原等级，未配置时省略；该 `thinking` 结构是 OMP 配置，不写入 Pi 的 `models.json`。接入操作仍只更新既有 Stravia provider/catalog 及已约定的激活 provider 或 Claude Code 环境映射，不修改客户端全局推理偏好，也不额外写入 provider/catalog 之外的模型偏好。
 
 按 Provider Model `reasoning_efforts` 中明确登记的值生成 Thinking Level Map；缺失或空列表生成全 Hidden，不根据开关、预算或旧功能标志猜测档位。自定义 Effort 保留在规格中，但未知值不映射到猜测的 Canonical Thinking Level。新生成的 Generated 行若无法由 Provider 协议表达，则降级为 Hidden；用户显式提交的不可写 Control 仍按 `THINKING_CONTROL_UNREPRESENTABLE` 拒绝。Target 的显式开关与预算控制及真实协议编码保留。
+
+执行副本以锁定 Provider Model 的 `reasoning_efforts` 为原生 Effort 授权来源：非空列表只允许已声明的值，明确空列表不允许任何 Effort；缺省声明才沿用既有显式映射与协议表达规则。此过滤不重写已保存的 Thinking Level Map。未来原生值须有明确能力声明并映射到既有 Canonical Thinking Level，不推断未知值的顺序或预算。Anthropic encoder 直接保留已解析的原生 Effort，不再维护第二份封闭值列表；没有显式 level 或原生 effort 的 adaptive 请求省略 effort，让模型使用自身默认强度。
 
 Thinking Summary 的可见性与 Thinking Level 分离。未显式指定摘要时，仅在已确认支持的发送路径启用原生摘要：Responses 使用 `reasoning.summary=auto`，Gemini 使用 `includeThoughts=true`；原生 Anthropic 在已经启用的 thinking 上使用 `display=summarized`，Claude Code 还可依据已有 `ModelProfile.always_on()` 处理隐式开启的型号。原生 Anthropic 未指定 thinking 且没有权威隐式开启信息时，不猜测型号、不通过新增 adaptive 控制改变推理强度。未知能力的 Messages 兼容适配器和其它自然输出路径不添加摘要字段或提示词。
 

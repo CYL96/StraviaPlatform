@@ -1509,6 +1509,226 @@ async fn pure_image_vendor_stores_real_owned_png_and_cannot_chat() -> anyhow::Re
 }
 
 #[tokio::test]
+async fn model_turn_unsupported_target_fails_over_without_retry_or_health_penalty()
+-> anyhow::Result<()> {
+    model_turn_guest_input_error("unsupported", true, false).await
+}
+
+#[tokio::test]
+async fn model_turn_invalid_target_input_remains_terminal() -> anyhow::Result<()> {
+    model_turn_guest_input_error("invalid", false, false).await
+}
+
+#[tokio::test]
+async fn model_turn_unsupported_opaque_conversation_remains_terminal() -> anyhow::Result<()> {
+    model_turn_guest_input_error("unsupported", false, true).await
+}
+
+async fn model_turn_guest_input_error(
+    mode: &str,
+    should_fail_over: bool,
+    opaque_conversation: bool,
+) -> anyhow::Result<()> {
+    use stravia_core::thinking::{ThinkingLevelMapping, ThinkingMappingSource};
+    use stravia_runtime_contract::thinking::{TargetThinkingControl, ThinkingLevel};
+
+    let harness = TestHarness::new().await?;
+    install_fixture(&harness.gateway, "capability-multi.wasm", false).await?;
+    let primary_upstream = LocalUpstream::start().await?;
+    let fallback_upstream = LocalUpstream::start().await?;
+    let primary = create_provider(
+        &harness.gateway,
+        "Locally incompatible inference",
+        "fixture.capability-contract",
+        &primary_upstream.url,
+        "fixture-multi",
+    )
+    .await?;
+    let fallback = create_provider(
+        &harness.gateway,
+        "Compatible inference",
+        "custom",
+        &fallback_upstream.url,
+        "openai-compatible",
+    )
+    .await?;
+    let route = create_route(
+        &harness.gateway,
+        "guest-input-error",
+        vec![(&primary, "primary", 20), (&fallback, "fallback", 10)],
+        5,
+        stravia_core::db::models::RouteOutputModality::Text,
+    )
+    .await?;
+    for (provider, model, efforts) in [
+        (&primary, "primary", vec!["low"]),
+        (&fallback, "fallback", vec!["low", "high"]),
+    ] {
+        let detail = harness
+            .gateway
+            .admin()
+            .get_provider_model(&provider.id, model)
+            .await?;
+        harness
+            .gateway
+            .admin()
+            .update_provider_model(
+                &provider.id,
+                model,
+                stravia_core::provider_models::UpdateProviderModel {
+                    revision: detail.revision,
+                    metadata: json!({
+                        "modalities": {"input":["text"],"output":["text"]},
+                        "reasoning_efforts": efforts,
+                    }),
+                },
+            )
+            .await?;
+    }
+    let targets = [(&primary, "primary", 20), (&fallback, "fallback", 10)]
+        .into_iter()
+        .map(|(provider, model, priority)| CreateTarget {
+            provider_id: provider.id.clone(),
+            model: model.into(),
+            enabled: true,
+            priority: Some(priority),
+            first_token_timeout_ms: None,
+            target_retry_budget: Some(5),
+            target_cooldown_ms: Some(60_000),
+            thinking_level_map: ThinkingLevel::ALL
+                .into_iter()
+                .map(|level| ThinkingLevelMapping {
+                    level,
+                    control: if level == ThinkingLevel::Low
+                        || (provider.id == fallback.id && level == ThinkingLevel::High)
+                    {
+                        TargetThinkingControl::Effort {
+                            value: level.as_str().into(),
+                        }
+                    } else {
+                        TargetThinkingControl::Hidden
+                    },
+                    source: ThinkingMappingSource::Overridden,
+                })
+                .collect(),
+        })
+        .collect();
+    harness
+        .gateway
+        .admin()
+        .update_model(
+            &route.model_id,
+            stravia_core::db::models::UpdateRoute {
+                targets: Some(targets),
+                ..Default::default()
+            },
+        )
+        .await?;
+    harness
+        .gateway
+        .admin()
+        .update_api_key(
+            &harness.key_id,
+            serde_json::from_value(json!({"model_ids":[route.id]}))?,
+        )
+        .await?;
+
+    // 重复独立请求可暴露错误累计的健康失败；每次仍应恰好尝试一次不适配的首选 Target。
+    let request_count = if should_fail_over { 7 } else { 1 };
+    let client = reqwest::Client::new();
+    for attempt in 1..=request_count {
+        primary_upstream
+            .push_json(
+                "/infer",
+                StatusCode::OK,
+                json!({"fixture_infer_error": mode}),
+            )
+            .await;
+        fallback_upstream
+            .push_json(
+                "/v1/chat/completions",
+                StatusCode::OK,
+                json!({
+                    "id": "chatcmpl-compatible",
+                    "object": "chat.completion",
+                    "created": 1,
+                    "model": "fallback",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "compatible Target completed"},
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+                }),
+            )
+            .await;
+        let (path, request) = if opaque_conversation {
+            (
+                "/v1/responses",
+                json!({
+                    "model": route.model_id,
+                    "input": "Continue the opaque upstream conversation",
+                    "conversation": "conversation-not-replayable-on-another-target",
+                    "reasoning": {"effort": "high"},
+                    "stream": false
+                }),
+            )
+        } else {
+            (
+                "/v1/chat/completions",
+                json!({
+                    "model": route.model_id,
+                    "messages": [{"role":"user","content":"Use the original high effort on fallback"}],
+                    "reasoning_effort": "high",
+                    "stream": false
+                }),
+            )
+        };
+        let response = client
+            .post(harness.endpoint.trim_end_matches("/mcp").to_owned() + path)
+            .bearer_auth(&harness.token)
+            .json(&request)
+            .send()
+            .await?;
+        let status = response.status();
+        let body: Value = response.json().await?;
+        assert_eq!(
+            primary_upstream.call_count("/infer").await,
+            attempt,
+            "local incompatibility must neither retry the same Target nor make it unhealthy"
+        );
+        if should_fail_over {
+            let requests = fallback_upstream.requests().await;
+            assert!(
+                status.is_success(),
+                "{status}: {body}; fallback paths: {:?}",
+                requests
+                    .iter()
+                    .map(|request| request.path.as_str())
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                body["choices"][0]["message"]["content"],
+                "compatible Target completed"
+            );
+            assert_eq!(requests.len(), attempt);
+            assert_eq!(
+                requests.last().unwrap().body["reasoning_effort"],
+                "high",
+                "fallback must restart from the client's level, not the first Target's low clamp"
+            );
+        } else {
+            assert!(!status.is_success(), "{status}: {body}");
+            assert!(
+                fallback_upstream.requests().await.is_empty(),
+                "terminal input errors must not dispatch any fallback request"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn mixed_capability_channel_keeps_image_only_models_out_of_chat() -> anyhow::Result<()> {
     let harness = TestHarness::new().await?;
     install_fixture(&harness.gateway, "capability-multi.wasm", false).await?;

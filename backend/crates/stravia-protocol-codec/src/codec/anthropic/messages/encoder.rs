@@ -423,17 +423,19 @@ fn encode_thinking(
         }
     };
     if mode == "adaptive" {
-        let effort = match effort {
-            Some(effort @ ("low" | "medium" | "high" | "max")) => effort,
-            Some(other) => anyhow::bail!("unsupported Anthropic thinking effort: {other}"),
-            None => match reasoning.level {
-                Some(ThinkingLevel::Off | ThinkingLevel::Minimal | ThinkingLevel::Low) => "low",
-                Some(ThinkingLevel::Medium) => "medium",
-                Some(ThinkingLevel::Max) => "max",
-                _ => "high",
-            },
-        };
-        output.insert("effort".into(), effort.into());
+        // Target 控制已按模型能力解析；保留原生值，省略时不覆盖模型默认档位。
+        let effort = effort.or_else(|| {
+            reasoning.level.map(|level| match level {
+                ThinkingLevel::Off | ThinkingLevel::Minimal | ThinkingLevel::Low => "low",
+                ThinkingLevel::Medium => "medium",
+                ThinkingLevel::High => "high",
+                ThinkingLevel::Xhigh => "xhigh",
+                ThinkingLevel::Max => "max",
+            })
+        });
+        if let Some(effort) = effort {
+            output.insert("effort".into(), effort.into());
+        }
         return Ok(Some(serde_json::json!({"type": "adaptive"})));
     }
     if mode == "disabled" {

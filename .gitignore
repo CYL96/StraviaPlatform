@@ -63,6 +63,7 @@ venv/
 *.sw?
 .agents/
 /.omp/
+/.orca/
 .antigravitycli/
 .claude/
 /.scratch/

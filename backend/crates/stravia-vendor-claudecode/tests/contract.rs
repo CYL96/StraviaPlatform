@@ -475,6 +475,109 @@ async fn always_on_default_summary_preserves_explicit_omission_and_effort() {
 
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires task build:vendors:all"]
+async fn declared_future_native_effort_survives_claude_code_normalization() {
+    let (runtime, plugin) = load_plugin().await;
+    for (declared, requested, expected, raw_capabilities) in [
+        (
+            Some(json!(["future-native"])),
+            "future-native",
+            Some("future-native"),
+            true,
+        ),
+        (Some(json!([])), "high", None, true),
+        (None, "high", Some("high"), true),
+        (None, "future-native", None, true),
+        (
+            Some(json!(["future-native"])),
+            "future-native",
+            Some("future-native"),
+            false,
+        ),
+    ] {
+        let services = Arc::new(MockServices {
+            routes: vec![(UPSTREAM, 200, "text/event-stream", SSE_TOOL_USE.into())],
+            ..MockServices::default()
+        });
+        let mut request = anthropic_client_request(json!({
+            "model": "synthetic-adaptive-effort-model",
+            "max_tokens": 1024,
+            "thinking": {"type": "adaptive"},
+            "messages": [{"role": "user", "content": "Read a."}]
+        }));
+        request.reasoning.summary = Some(ReasoningSummary::Detailed);
+        request.reasoning.target_control = Some(
+            stravia_runtime_contract::thinking::TargetThinkingControl::Effort {
+                value: requested.into(),
+            },
+        );
+        let mut provider = signed_in();
+        provider.model = Some("synthetic-adaptive-effort-model".into());
+        // 标准声明供 Target 解析使用；原生能力快照供 Claude Code 的模式约束使用。
+        provider.model_metadata = Some(stravia_vendor_sdk::ModelMetadata {
+            extensions: BTreeMap::from([(
+                "anthropic_capabilities".into(),
+                json!({
+                    "thinking": {
+                        "supported": true,
+                        "types": {
+                            "adaptive": {"supported": true},
+                            "enabled": {"supported": false}
+                        }
+                    },
+                    "effort": {
+                        "supported": true,
+                        "high": {"supported": true}
+                    }
+                }),
+            )]),
+            ..Default::default()
+        });
+        if !raw_capabilities {
+            provider
+                .model_metadata
+                .as_mut()
+                .unwrap()
+                .extensions
+                .remove("anthropic_capabilities");
+        }
+        if let Some(declared) = declared {
+            provider
+                .model_metadata
+                .as_mut()
+                .unwrap()
+                .extensions
+                .insert("reasoning_efforts".into(), declared);
+        }
+        run(
+            &runtime,
+            &plugin,
+            &services,
+            OperationInput::Infer { provider, request },
+        )
+        .await
+        .expect("native effort inference succeeds");
+
+        let requests = services.requests.lock();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].url,
+            "https://api.anthropic.com/v1/messages?beta=true"
+        );
+        let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["thinking"]["type"], "adaptive");
+        assert_eq!(body["thinking"]["display"], "summarized");
+        assert!(body["thinking"].get("budget_tokens").is_none());
+        assert_eq!(body["max_tokens"], 1024);
+        assert_eq!(
+            body["output_config"]["effort"].as_str(),
+            expected,
+            "{requested}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires task build:vendors:all"]
 async fn inference_is_sent_in_claude_code_shape_and_tool_names_round_trip() {
     let (runtime, plugin) = load_plugin().await;
     let services = Arc::new(MockServices {

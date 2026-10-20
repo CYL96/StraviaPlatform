@@ -128,6 +128,49 @@ fn model_declares_control(
     }
 }
 
+/// 派发时模型声明是 Effort 白名单；缺少声明才回退到协议基线。
+/// protocol 为 None 时仅执行选协议之前的模型能力过滤。
+pub(crate) fn resolve_runtime_thinking_level<'a>(
+    mappings: &'a [ThinkingLevelMapping],
+    requested: ThinkingLevel,
+    metadata: &ProviderModelMetadata,
+    toggle_declared: bool,
+    protocol: Option<&str>,
+) -> Option<(ThinkingLevel, &'a TargetThinkingControl)> {
+    let mut supported = ThinkingLevel::ALL;
+    let mut count = 0;
+    for level in ThinkingLevel::ALL {
+        let Some(control) = mapping_control(mappings, level) else {
+            continue;
+        };
+        let available = match control {
+            TargetThinkingControl::Hidden => false,
+            TargetThinkingControl::Effort { value } => {
+                match metadata.reasoning_efforts.as_deref() {
+                    Some(efforts) => efforts
+                        .iter()
+                        .any(|effort| effort.eq_ignore_ascii_case(value)),
+                    None => protocol.is_none_or(|protocol| {
+                        stravia_runtime_contract::protocol::ids::Protocol::from_identifier(protocol)
+                            .is_some_and(|protocol| {
+                                protocol.represents_target_thinking_control(control)
+                            })
+                    }),
+                }
+            }
+            _ => protocol.is_none_or(|protocol| {
+                control_is_writable(protocol, metadata, toggle_declared, control)
+            }),
+        };
+        if available {
+            supported[count] = level;
+            count += 1;
+        }
+    }
+    let level = requested.clamp(&supported[..count])?;
+    mapping_control(mappings, level).map(|control| (level, control))
+}
+
 pub fn mapping_control(
     mappings: &[ThinkingLevelMapping],
     level: ThinkingLevel,

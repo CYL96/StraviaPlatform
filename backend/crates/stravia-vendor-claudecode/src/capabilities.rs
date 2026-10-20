@@ -26,8 +26,8 @@ pub(crate) struct ModelCapabilities {
     pub thinking: Option<bool>,
     pub adaptive: Option<bool>,
     pub enabled: Option<bool>,
-    /// 受支持的 effort 档位，升序；`Some(空)` 表示型号不支持 effort。
-    pub efforts: Option<Vec<&'static str>>,
+    /// 受支持的 effort 原生值；仅已知词表有顺序，`Some(空)` 表示不支持 effort。
+    pub efforts: Option<Vec<String>>,
     /// `context_management.supported`。
     pub context_management: Option<bool>,
     /// 各上下文编辑策略是否受支持，键为编辑类型。
@@ -41,22 +41,27 @@ impl ModelCapabilities {
 
     /// 解析 `/v1/models` 条目里的原生 `capabilities` 对象。
     pub(crate) fn from_wire(capabilities: &Value) -> Self {
+        Self::from_wire_with_efforts(capabilities, None)
+    }
+
+    fn from_wire_with_efforts(capabilities: &Value, efforts: Option<Vec<String>>) -> Self {
         let supported = |path: &str| {
             capabilities
                 .pointer(&format!("{path}/supported"))
                 .and_then(Value::as_bool)
         };
-        let efforts = match supported("/effort") {
+        let efforts = efforts.or_else(|| match supported("/effort") {
             Some(false) => Some(Vec::new()),
             Some(true) => {
                 let levels = EFFORTS
                     .into_iter()
                     .filter(|level| supported(&format!("/effort/{level}")) == Some(true))
+                    .map(str::to_owned)
                     .collect::<Vec<_>>();
                 (!levels.is_empty()).then_some(levels)
             }
             None => None,
-        };
+        });
         Self {
             thinking: supported("/thinking"),
             adaptive: supported("/thinking/types/adaptive"),
@@ -79,9 +84,23 @@ impl ModelCapabilities {
         else {
             return Self::default();
         };
+        // 标准模型声明是推理时的授权来源；显式空列表同样覆盖发现时的原生能力。
+        let efforts = extensions
+            .get("reasoning_efforts")
+            .and_then(Value::as_array)
+            .map(|efforts| {
+                efforts
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            });
         match extensions.get(METADATA_KEY) {
-            Some(capabilities) => Self::from_wire(capabilities),
-            None => Self::default(),
+            Some(capabilities) => Self::from_wire_with_efforts(capabilities, efforts),
+            None => Self {
+                efforts,
+                ..Self::default()
+            },
         }
     }
 
@@ -203,7 +222,15 @@ mod tests {
         let caps = ModelCapabilities::from_wire(&wire);
         assert_eq!(caps.adaptive, Some(true));
         assert_eq!(caps.enabled, Some(false));
-        assert_eq!(caps.efforts, Some(vec!["low", "medium", "high", "max"]));
+        assert_eq!(
+            caps.efforts,
+            Some(vec![
+                "low".into(),
+                "medium".into(),
+                "high".into(),
+                "max".into()
+            ])
+        );
         assert_eq!(
             caps.context_edits.get("clear_tool_uses_20250919"),
             Some(&false)

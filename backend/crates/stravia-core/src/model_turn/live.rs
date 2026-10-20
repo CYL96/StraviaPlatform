@@ -805,6 +805,18 @@ fn execute_inner(
                 // to another Target, but they are not evidence that the upstream
                 // Target failed and must not consume its shared failure budget.
                 if !failure.is_upstream() {
+                    // Conversation 是上游持有的不透明历史，不能把本地不适配当作完整回放授权。
+                    if failure.error.code == "vendor_operation_unsupported"
+                        && input
+                            .request
+                            .parameters
+                            .continuation
+                            .as_ref()
+                            .and_then(|continuation| continuation.conversation_id())
+                            .is_some()
+                    {
+                        return Err(failure.finish(input.observer.as_ref()));
+                    }
                     if failure.try_next_target {
                         attempts.skip_current();
                         last_error = Some(failure);
@@ -1282,24 +1294,51 @@ async fn prepare_attempt(
             }
         }
     }
-    if provider_request.reasoning.level.is_some() {
-        let mut supported = ThinkingLevel::ALL;
-        let mut count = 0;
-        for level in ThinkingLevel::ALL {
-            if crate::thinking::mapping_control(&target.thinking_level_map, level)
-                .is_some_and(|control| !control.is_hidden())
-            {
-                supported[count] = level;
-                count += 1;
-            }
-        }
-        let level = provider_request
-            .reasoning
-            .level
-            .and_then(|requested| requested.clamp(&supported[..count]));
-        if level != provider_request.reasoning.level {
-            Arc::make_mut(&mut provider_request).reasoning.level = level;
-        }
+    // 保留本 Target 钳制之前的档位；选定实际协议后仍从原档位择邻。
+    let requested_thinking_level = provider_request.reasoning.level;
+    // 无客户端档位或 Route 默认档位时，不克隆、反序列化整份模型 metadata。
+    let canonical_model_metadata = requested_thinking_level
+        .and(provider_model)
+        .and_then(|metadata| {
+            serde_json::from_value::<crate::provider_models::ProviderModelMetadata>(
+                serde_json::Value::Object(metadata.extensions.clone().into_iter().collect()),
+            )
+            .ok()
+        })
+        .unwrap_or_default();
+    let toggle_declared = requested_thinking_level.is_some()
+        && (execution
+            .descriptor()
+            .channels
+            .iter()
+            .find(|channel| channel.id == execution.provider().channel)
+            .is_some_and(|channel| {
+                channel
+                    .model_capabilities
+                    .contains(stravia_vendor_sdk::MODEL_CAPABILITY_THINKING_TOGGLE)
+            })
+            || provider_model.is_some_and(|metadata| {
+                vendor_metadata_declares_capability(
+                    metadata,
+                    stravia_vendor_sdk::MODEL_CAPABILITY_THINKING_TOGGLE,
+                )
+            }));
+    let model_level = requested_thinking_level.and_then(|requested| {
+        crate::thinking::resolve_runtime_thinking_level(
+            &target.thinking_level_map,
+            requested,
+            &canonical_model_metadata,
+            toggle_declared,
+            None,
+        )
+        .map(|(level, _)| level)
+    });
+    if model_level != provider_request.reasoning.level
+        || provider_request.reasoning.target_control.is_some()
+    {
+        let reasoning = &mut Arc::make_mut(&mut provider_request).reasoning;
+        reasoning.level = model_level;
+        reasoning.target_control = None;
     }
 
     gateway
@@ -1308,7 +1347,6 @@ async fn prepare_attempt(
         .map_err(classify_vendor_error)?;
     let protocol_hint = execution.protocol().trim().to_owned();
     let provider_snapshot = execution.provider().clone();
-    let provider_model = provider_snapshot.model_metadata.as_ref();
     let ingress = input.request.meta.source_protocol;
     let egress =
         stravia_protocol_codec::registry::ProtocolRegistry::global().resolve_alias(&protocol_hint);
@@ -1393,69 +1431,20 @@ async fn prepare_attempt(
             "Native compaction state is not compatible with this Target binding",
         ));
     }
-    if let Some(level) = provider_request.reasoning.level {
-        let Some(control) = crate::thinking::mapping_control(&target.thinking_level_map, level)
-        else {
-            return Err(AttemptFailure::reroutable(
-                "protocol_lossy_rejected",
-                format!(
-                    "Target has no mapping for Thinking Level {}",
-                    level.as_str()
-                ),
-            ));
-        };
-        if control.is_hidden() {
-            return Err(AttemptFailure::reroutable(
-                "protocol_lossy_rejected",
-                format!("Target hides Thinking Level {}", level.as_str()),
-            ));
-        }
-        let canonical_model_metadata = provider_model
-            .and_then(|metadata| {
-                serde_json::from_value::<crate::provider_models::ProviderModelMetadata>(
-                    serde_json::Value::Object(metadata.extensions.clone().into_iter().collect()),
-                )
-                .ok()
-            })
-            .unwrap_or_default();
-        let toggle_declared = execution
-            .descriptor()
-            .channels
-            .iter()
-            .find(|channel| channel.id == provider_snapshot.channel)
-            .is_some_and(|channel| {
-                channel
-                    .model_capabilities
-                    .contains(stravia_vendor_sdk::MODEL_CAPABILITY_THINKING_TOGGLE)
-            })
-            || provider_model.is_some_and(|metadata| {
-                vendor_metadata_declares_capability(
-                    metadata,
-                    stravia_vendor_sdk::MODEL_CAPABILITY_THINKING_TOGGLE,
-                )
-            });
-        if !crate::thinking::control_is_writable(
-            &protocol_hint,
+    let resolved_thinking = requested_thinking_level.and_then(|requested| {
+        crate::thinking::resolve_runtime_thinking_level(
+            &target.thinking_level_map,
+            requested,
             &canonical_model_metadata,
             toggle_declared,
-            control,
-        ) {
-            return Err(AttemptFailure::reroutable(
-                "protocol_lossy_rejected",
-                format!(
-                    "Target cannot write Thinking Level {} control {}",
-                    level.as_str(),
-                    control.kind()
-                ),
-            ));
-        }
-        Arc::make_mut(&mut provider_request)
-            .reasoning
-            .target_control = Some(control.clone());
-    } else if provider_request.reasoning.target_control.is_some() {
-        Arc::make_mut(&mut provider_request)
-            .reasoning
-            .target_control = None;
+            Some(&protocol_hint),
+        )
+    });
+    let resolved_level = resolved_thinking.map(|(level, _)| level);
+    if resolved_level != provider_request.reasoning.level || resolved_thinking.is_some() {
+        let reasoning = &mut Arc::make_mut(&mut provider_request).reasoning;
+        reasoning.level = resolved_level;
+        reasoning.target_control = resolved_thinking.map(|(_, control)| control.clone());
     }
     // 准备期间保留逻辑模型；仅在交给 guest 的请求副本上改写派发模型。
     input
@@ -2566,7 +2555,7 @@ fn classify_vendor_kind(
                 .upstream_origin()
                 .with_status(upstream_status)
         }
-        ErrorKind::Unsupported => AttemptFailure::terminal(
+        ErrorKind::Unsupported => AttemptFailure::reroutable(
             "vendor_operation_unsupported",
             "Vendor operation is not supported",
         ),

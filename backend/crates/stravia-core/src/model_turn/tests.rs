@@ -446,6 +446,16 @@ async fn serve_capture_text(
                 serde_json::Value::Null,
                 serde_json::Value::Null,
             )
+        } else if protocol == "anthropic-messages" {
+            serde_json::json!({
+                "id": "msg-capture",
+                "type": "message",
+                "role": "assistant",
+                "model": "upstream-model",
+                "content": [{"type": "text", "text": text}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            })
         } else {
             serde_json::json!({
                 "id": "chatcmpl-capture",
@@ -2721,6 +2731,33 @@ async fn add_captured_thinking_provider(gateway: &Gateway, base_url: String) -> 
     provider.id
 }
 
+async fn set_thinking_metadata(gateway: &Gateway, provider_id: &str, efforts: Option<&[&str]>) {
+    let detail = gateway
+        .admin()
+        .get_provider_model(provider_id, "upstream-model")
+        .await
+        .expect("Provider Model");
+    let mut metadata = serde_json::json!({
+        "id": "upstream-model",
+        "modalities": {"input": ["text"], "output": ["text"]},
+    });
+    if let Some(efforts) = efforts {
+        metadata["reasoning_efforts"] = serde_json::json!(efforts);
+    }
+    gateway
+        .admin()
+        .update_provider_model(
+            provider_id,
+            "upstream-model",
+            crate::provider_models::UpdateProviderModel {
+                revision: detail.revision,
+                metadata,
+            },
+        )
+        .await
+        .expect("update declared reasoning efforts");
+}
+
 async fn captured_reasoning_effort(
     gateway: &crate::Gateway,
     captured: &Arc<Mutex<Vec<u8>>>,
@@ -2733,7 +2770,14 @@ async fn captured_reasoning_effort(
         .execute(TurnInput::new(Principal::new(key_id.to_owned()), request))
         .await
         .unwrap_or_else(|error| panic!("Model Turn for {model}: {error}"));
-    let _ = turn.output.collect::<Vec<_>>().await;
+    let events = turn.output.collect::<Vec<_>>().await;
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            Ok(CanonicalEvent::Completed(response)) if response.error.is_none()
+        )),
+        "Model Turn must complete successfully: {events:?}"
+    );
     let (_, body) = captured_http(&captured.lock());
     body
 }
@@ -2939,6 +2983,99 @@ async fn target_thinking_prefers_upward_then_falls_back_downward() {
         .await;
         assert_eq!(body["reasoning_effort"], expected, "request {requested:?}");
     }
+}
+
+#[tokio::test]
+async fn target_thinking_filters_model_efforts_before_selecting_nearest_mapping() {
+    for (declared, requested, expected) in [
+        (vec!["low", "high"], ThinkingLevel::Medium, "high"),
+        (vec!["low"], ThinkingLevel::Medium, "low"),
+    ] {
+        let model = "model-effort-whitelist";
+        let (_directory, gateway, captured, key) =
+            gateway_with_captured_thinking(model, true, "ok", None).await;
+        let provider = gateway.admin().get_model(model).await.unwrap().targets[0]
+            .provider_id()
+            .to_owned();
+        set_thinking_metadata(&gateway, &provider, Some(&declared)).await;
+        // 持久映射刻意保留 Medium：运行时模型授权比管理面的协议可写性校验更严格。
+        set_thinking_targets(
+            &gateway,
+            model,
+            vec![thinking_target(
+                &provider,
+                &[
+                    ThinkingLevel::Low,
+                    ThinkingLevel::Medium,
+                    ThinkingLevel::High,
+                ],
+                10,
+            )],
+        )
+        .await;
+        let mut request = AiRequest::new(model, Vec::new());
+        request.reasoning.level = Some(requested);
+        let body = captured_reasoning_effort(&gateway, &captured, &key.id, model, request).await;
+        assert_eq!(body["reasoning_effort"], expected, "{declared:?}");
+    }
+}
+
+#[tokio::test]
+async fn target_thinking_distinguishes_unknown_efforts_from_explicit_empty_support() {
+    for (declared, expected) in [(None, Some("high")), (Some(&[][..]), None)] {
+        let model = "model-effort-three-state";
+        let (_directory, gateway, captured, key) =
+            gateway_with_captured_protocol(model, true, "ok", None, "open-responses").await;
+        let provider = gateway.admin().get_model(model).await.unwrap().targets[0]
+            .provider_id()
+            .to_owned();
+        set_thinking_metadata(&gateway, &provider, declared).await;
+        set_thinking_targets(
+            &gateway,
+            model,
+            vec![thinking_target(&provider, &[ThinkingLevel::High], 10)],
+        )
+        .await;
+        let request = stravia_protocol_codec::codec::open_responses::decoder::ResponsesDecoder
+            .decode_request(serde_json::json!({
+                "model": model,
+                "input": "Keep the model default when effort is unavailable",
+                "reasoning": {"effort": "high", "summary": "auto"}
+            }))
+            .expect("decode reasoning request");
+        let body = captured_reasoning_effort(&gateway, &captured, &key.id, model, request).await;
+        assert_eq!(body["reasoning"]["effort"].as_str(), expected);
+        assert_eq!(
+            body["reasoning"]["summary"], "auto",
+            "dropping unavailable effort must preserve other reasoning directives"
+        );
+    }
+}
+
+#[tokio::test]
+async fn target_thinking_sends_model_declared_future_native_effort() {
+    let model = "future-native-effort";
+    let (_directory, gateway, captured, key) =
+        gateway_with_captured_protocol(model, true, "ok", None, "anthropic-messages").await;
+    let provider = gateway.admin().get_model(model).await.unwrap().targets[0]
+        .provider_id()
+        .to_owned();
+    set_thinking_metadata(&gateway, &provider, Some(&["future-native"])).await;
+    let mut target = thinking_target(&provider, &[ThinkingLevel::High], 10);
+    target
+        .thinking_level_map
+        .iter_mut()
+        .find(|row| row.level == ThinkingLevel::High)
+        .unwrap()
+        .control = stravia_runtime_contract::thinking::TargetThinkingControl::Effort {
+        value: "future-native".into(),
+    };
+    set_thinking_targets(&gateway, model, vec![target]).await;
+    let mut request = AiRequest::new(model, Vec::new());
+    request.reasoning.level = Some(ThinkingLevel::High);
+    let body = captured_reasoning_effort(&gateway, &captured, &key.id, model, request).await;
+    assert_eq!(body["thinking"]["type"], "adaptive");
+    assert_eq!(body["output_config"]["effort"], "future-native");
 }
 
 #[tokio::test]

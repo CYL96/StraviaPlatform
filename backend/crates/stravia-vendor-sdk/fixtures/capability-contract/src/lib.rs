@@ -215,13 +215,27 @@ impl VendorGuest for CapabilityContractVendor {
             }
             OperationInput::Infer { provider, request } => {
                 ensure_capability(Capability::Infer)?;
-                let response = post_json::<_, AiResponse>(
+                let response = post_json::<_, serde_json::Value>(
                     host,
                     &provider.base_url,
                     "/infer",
                     &request,
                     state_before,
                 )?;
+                if let Some(mode) = response.get("fixture_infer_error").and_then(|v| v.as_str()) {
+                    let kind = match mode {
+                        "unsupported" => ErrorKind::Unsupported,
+                        "invalid" => ErrorKind::Invalid,
+                        _ => return Err(invalid("unknown fixture inference error mode")),
+                    };
+                    return Err(PluginError {
+                        kind,
+                        message: "capability fixture cannot represent this inference request"
+                            .into(),
+                        upstream_status: None,
+                    });
+                }
+                let response: AiResponse = serde_json::from_value(response).map_err(invalid)?;
                 write_next_state(host, state_before)?;
                 host.emit_completed(&response)?;
                 Ok(OperationOutput::Infer(Box::new(response)))

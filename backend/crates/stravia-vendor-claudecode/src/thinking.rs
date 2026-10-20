@@ -129,33 +129,48 @@ impl<'a> ModelProfile<'a> {
         self.adaptive_only()
     }
 
-    /// 型号接受的 effort 档位（升序）；空表示不支持 `output_config.effort`。
-    fn efforts(&self) -> Vec<&'static str> {
-        if let Some(levels) = &self.caps.efforts {
-            return levels.clone();
-        }
-        let ladder: &[&str] = match self.known {
-            Some((Family::Haiku, _)) | None => &[],
-            Some((Family::Sonnet, revision)) if revision < [4, 6, 0] => &[],
-            Some((Family::Opus, revision)) if revision < [4, 5, 0] => &[],
-            Some((Family::Opus, revision)) if revision < [4, 6, 0] => &EFFORTS[..3],
-            Some((Family::Opus, revision)) if revision < [4, 7, 0] => &EFFORTS_WITHOUT_XHIGH,
-            Some((Family::Sonnet, revision)) if revision < [5, 0, 0] => &EFFORTS_WITHOUT_XHIGH,
-            Some(_) => &EFFORTS,
+    /// 型号接受的 effort 原生值；未知词表不推断顺序。
+    fn efforts(&self) -> impl Iterator<Item = &str> {
+        let ladder: &[&str] = if self.caps.efforts.is_some() {
+            &[]
+        } else {
+            match self.known {
+                Some((Family::Haiku, _)) | None => &[],
+                Some((Family::Sonnet, revision)) if revision < [4, 6, 0] => &[],
+                Some((Family::Opus, revision)) if revision < [4, 5, 0] => &[],
+                Some((Family::Opus, revision)) if revision < [4, 6, 0] => &EFFORTS[..3],
+                Some((Family::Opus, revision)) if revision < [4, 7, 0] => &EFFORTS_WITHOUT_XHIGH,
+                Some((Family::Sonnet, revision)) if revision < [5, 0, 0] => &EFFORTS_WITHOUT_XHIGH,
+                Some(_) => &EFFORTS,
+            }
         };
-        ladder.to_vec()
+        ladder
+            .iter()
+            .copied()
+            .chain(self.caps.efforts.iter().flatten().map(String::as_str))
     }
 
     /// 取不高于请求档位的最高受支持档位；请求低于全部档位时取最低档。
-    fn clamp_effort(&self, requested: &str) -> Option<&'static str> {
-        let rank = effort_rank(requested)?;
-        let ladder = self.efforts();
-        ladder
-            .iter()
-            .rev()
-            .find(|candidate| effort_rank(candidate).is_some_and(|value| value <= rank))
-            .or(ladder.first())
-            .copied()
+    fn clamp_effort(&self, requested: &str) -> Option<&str> {
+        let rank = effort_rank(requested);
+        let mut lower: Option<(usize, &str)> = None;
+        let mut lowest: Option<(usize, &str)> = None;
+        // 未来原生值只允许精确命中，不参与邻档比较或最低档回退。
+        for candidate in self.efforts() {
+            if candidate == requested {
+                return Some(candidate);
+            }
+            let (Some(rank), Some(value)) = (rank, effort_rank(candidate)) else {
+                continue;
+            };
+            if lowest.is_none_or(|(current, _)| value < current) {
+                lowest = Some((value, candidate));
+            }
+            if value <= rank && lower.is_none_or(|(current, _)| value > current) {
+                lower = Some((value, candidate));
+            }
+        }
+        lower.or(lowest).map(|(_, candidate)| candidate)
     }
 }
 
@@ -344,6 +359,24 @@ pub(crate) fn normalize(object: &mut Map<String, Value>, caps: &ModelCapabilitie
     let Some(profile) = ModelProfile::of_request(object, caps) else {
         return;
     };
+    if profile.known.is_none()
+        && caps.thinking != Some(false)
+        && caps.adaptive.is_none()
+        && caps.enabled.is_none()
+    {
+        // effort 声明不提供思考模式或预算证据；未知型号仅约束授权，其余保持透传。
+        if let Some(efforts) = &caps.efforts {
+            let unauthorized = object
+                .get("output_config")
+                .and_then(|config| config.get("effort"))
+                .and_then(Value::as_str)
+                .is_some_and(|value| !efforts.iter().any(|effort| effort == value));
+            if unauthorized {
+                set_effort(object, None);
+            }
+        }
+        return;
+    }
     if caps.thinking == Some(false) {
         // 型号声明不支持思考：任何思考控制都会 400，整体移除。
         object.remove("thinking");
@@ -378,7 +411,13 @@ pub(crate) fn normalize(object: &mut Map<String, Value>, caps: &ModelCapabilitie
         forced = false;
     }
 
-    let effort = requested.as_deref().and_then(parse_effort);
+    let effort = requested.as_deref().and_then(|value| {
+        caps.efforts
+            .as_ref()
+            .filter(|efforts| efforts.iter().any(|candidate| candidate == value))
+            .map(|_| value)
+            .or_else(|| parse_effort(value))
+    });
     let off = kind.as_deref() == Some("disabled") || requested.as_deref() == Some("none");
     let on = !off && matches!(kind.as_deref(), Some("adaptive" | "enabled"));
 
@@ -389,11 +428,11 @@ pub(crate) fn normalize(object: &mut Map<String, Value>, caps: &ModelCapabilitie
             Some("low")
         } else if profile.between_tools() {
             object.insert("thinking".into(), json!({ "type": "between_tools" }));
-            effort.map(cap_at_high)
+            effort.and_then(parse_effort).map(cap_at_high)
         } else {
             object.insert("thinking".into(), json!({ "type": "disabled" }));
             if profile.disabled_requires_effort_cap() {
-                effort.map(cap_at_high)
+                effort.and_then(parse_effort).map(cap_at_high)
             } else {
                 effort
             }
@@ -746,7 +785,7 @@ mod tests {
             thinking: Some(adaptive || enabled),
             adaptive: Some(adaptive),
             enabled: Some(enabled),
-            efforts: Some(efforts.to_vec()),
+            efforts: Some(efforts.iter().map(|effort| (*effort).to_owned()).collect()),
             ..ModelCapabilities::default()
         }
     }
