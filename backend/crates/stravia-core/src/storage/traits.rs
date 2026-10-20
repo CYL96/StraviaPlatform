@@ -95,6 +95,127 @@ pub trait ProviderStore: Send + Sync {
 }
 
 #[cfg(test)]
+pub(crate) async fn verify_oauth_refresh_recovery_storage_contract(
+    oauth: &dyn OAuthCredentialStore,
+    provider_id: &str,
+) -> anyhow::Result<()> {
+    let input = |access_token: &str, refresh_token: &str| UpsertOAuthCredential {
+        driver_key: "openai-codex".into(),
+        scheme: "oauth".into(),
+        access_token: access_token.into(),
+        refresh_token: Some(refresh_token.into()),
+        expires_at: Some("2000-01-01T00:00:00Z".into()),
+        ..Default::default()
+    };
+    let original = oauth
+        .upsert(provider_id, input("original-access", "original-refresh"))
+        .await?;
+    let lease = oauth
+        .try_begin_refresh(provider_id, original.status_version)
+        .await?
+        .expect("connected credential can acquire a refresh lease");
+    oauth
+        .recover_stale_refreshing(Duration::from_secs(120))
+        .await?;
+    let active = oauth.get(provider_id).await?.expect("active credential");
+    assert_eq!(active.status, "refreshing", "active lease is not stale");
+    assert_eq!(active.status_version, lease.status_version);
+    assert!(
+        oauth
+            .try_begin_refresh(provider_id, lease.status_version)
+            .await?
+            .is_none(),
+        "an active refresh lease cannot be taken over"
+    );
+    assert!(
+        !oauth
+            .list_expiring(Duration::from_secs(300))
+            .await?
+            .iter()
+            .any(|credential| credential.provider_id == provider_id)
+    );
+    assert!(
+        oauth
+            .fail_refresh(
+                provider_id,
+                lease.status_version,
+                "temporary upstream failure"
+            )
+            .await?
+    );
+    let failed = oauth
+        .get(provider_id)
+        .await?
+        .expect("credential is retained");
+    assert_eq!(failed.status, "error");
+    assert_eq!(failed.access_token, original.access_token);
+    assert_eq!(failed.refresh_token, original.refresh_token);
+    assert_eq!(failed.connection_id, original.connection_id);
+    assert_eq!(
+        failed.last_error.as_deref(),
+        Some("temporary upstream failure")
+    );
+    assert!(
+        oauth
+            .list_expiring(Duration::from_secs(300))
+            .await?
+            .iter()
+            .any(|credential| credential.provider_id == provider_id),
+        "temporary refresh failure remains eligible for background retry"
+    );
+    assert!(
+        oauth
+            .try_begin_refresh(provider_id, original.status_version)
+            .await?
+            .is_none(),
+        "retry must use the current credential version"
+    );
+    let retry = oauth
+        .try_begin_refresh(provider_id, failed.status_version)
+        .await?
+        .expect("failed refresh can acquire a new lease");
+    assert!(
+        !oauth
+            .fail_refresh(provider_id, lease.status_version, "stale failure")
+            .await?
+    );
+    assert!(
+        !oauth
+            .cancel_refresh(provider_id, lease.status_version)
+            .await?
+    );
+    assert!(
+        oauth
+            .complete_refresh(
+                provider_id,
+                lease.status_version,
+                input("stale-access", "stale-refresh"),
+            )
+            .await
+            .is_err(),
+        "an obsolete lease cannot replace the retry's credentials"
+    );
+    let refreshed = oauth
+        .complete_refresh(
+            provider_id,
+            retry.status_version,
+            input("new-access", "new-refresh"),
+        )
+        .await?;
+    assert_eq!(refreshed.status, "connected");
+    assert_eq!(refreshed.connection_id, original.connection_id);
+    assert_eq!(refreshed.access_token, "new-access");
+    assert_eq!(refreshed.refresh_token.as_deref(), Some("new-refresh"));
+    assert_eq!(refreshed.last_error, None);
+    assert!(refreshed.last_refresh_at.is_some());
+    let stored = oauth.get(provider_id).await?.expect("refreshed credential");
+    assert_eq!(stored.access_token, refreshed.access_token);
+    assert_eq!(stored.refresh_token, refreshed.refresh_token);
+    assert_eq!(stored.status_version, refreshed.status_version);
+    Ok(())
+}
+
+#[cfg(test)]
 pub(crate) async fn verify_allowance_storage_contract(
     store: &dyn ProviderStore,
     oauth: &dyn OAuthCredentialStore,

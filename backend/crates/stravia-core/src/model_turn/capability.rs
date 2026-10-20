@@ -301,6 +301,7 @@ impl Gateway {
                 break;
             };
             let mut prepared: Option<PreparedVendorExecution> = None;
+            let mut auth_recovered = false;
             loop {
                 if context.cancellation.is_cancelled() {
                     return Err(RuntimeError::Cancelled.into());
@@ -435,12 +436,20 @@ impl Gateway {
                     attempt_context.attempt_id = Some(attempt.id.clone());
                     self.execute_independent_attempt(
                         prepared
-                            .as_ref()
-                            .expect("prepared execution exists after admission")
-                            .clone(),
+                            .as_mut()
+                            .expect("prepared execution exists after admission"),
                         clone_request(&request),
                         attempt_context,
                         &vendor_leases,
+                        &mut auth_recovered,
+                        || {
+                            policy.state().try_record_recovery_failure(
+                                &selected_target_key(&target),
+                                policy.current_epoch(),
+                                target.target_retry_budget,
+                                target.target_cooldown_ms,
+                            )
+                        },
                     )
                     .await
                 };
@@ -504,6 +513,7 @@ impl Gateway {
                         // ADR-0073：上游确认的凭据拒绝按执行快照的凭据代际
                         // 条件写 Provider 失效；失败只记 warn，不影响重试决策。
                         if let Some(execution) = &prepared
+                            && execution.oauth_connection_id().is_none()
                             && crate::plugin::execution::is_credential_rejection(&failure.error)
                         {
                             self.mark_provider_credential_invalid(
@@ -567,9 +577,89 @@ impl Gateway {
 
     async fn execute_independent_attempt(
         &self,
-        prepared: PreparedVendorExecution,
+        prepared: &mut PreparedVendorExecution,
         request: VendorRequest,
         mut context: VendorCallContext,
+        route_leases: &BTreeMap<String, PreparedVendorExecution>,
+        auth_recovered: &mut bool,
+        allow_recovery: impl FnOnce() -> bool,
+    ) -> Result<crate::plugin::VendorExecution, RouteFailure> {
+        if prepared.oauth_connection_id().is_none() {
+            return self
+                .execute_independent_attempt_once(
+                    prepared.clone(),
+                    request,
+                    &mut context,
+                    route_leases,
+                )
+                .await;
+        }
+        match self
+            .execute_independent_attempt_once(
+                prepared.clone(),
+                request.clone(),
+                &mut context,
+                route_leases,
+            )
+            .await
+        {
+            Ok(execution) => return Ok(execution),
+            Err(failure) if crate::plugin::execution::is_credential_rejection(&failure.error) => {
+                if *auth_recovered || !allow_recovery() {
+                    self.mark_provider_credential_invalid(
+                        prepared.provider_id(),
+                        prepared.credential_version(),
+                    )
+                    .await;
+                    return Err(failure);
+                }
+            }
+            Err(failure) => return Err(failure),
+        }
+        self.admin()
+            .recover_provider_auth_with_lease(
+                prepared.provider_id(),
+                prepared,
+                context.cancellation.clone(),
+                context.deadline.clone(),
+            )
+            .await
+            .map_err(|error| RouteFailure::new(error, true))?;
+        *auth_recovered = true;
+        let refreshed = self
+            .prepare_vendor_execution_with_lease(
+                prepared,
+                prepared.provider_id(),
+                prepared.provider().model.as_deref(),
+                request.operation(),
+                &context,
+            )
+            .await
+            .map_err(|error| RouteFailure::new(error, false))?;
+        // Keep the refreshed connection snapshot for ordinary retries too, while
+        // retaining the Target's original component lease and recovery boundary.
+        *prepared = refreshed;
+        // 独立能力只在完整结果返回后提交，恢复可重发，但不重放失败事件。
+        let result = self
+            .execute_independent_attempt_once(prepared.clone(), request, &mut context, route_leases)
+            .await;
+        if let Err(failure) = &result
+            && crate::plugin::execution::is_credential_rejection(&failure.error)
+        {
+            self.mark_provider_credential_invalid(
+                prepared.provider_id(),
+                prepared.credential_version(),
+            )
+            .await;
+        }
+        result
+    }
+
+    async fn execute_independent_attempt_once(
+        &self,
+        prepared: PreparedVendorExecution,
+        request: VendorRequest,
+        context: &mut VendorCallContext,
         route_leases: &BTreeMap<String, PreparedVendorExecution>,
     ) -> Result<crate::plugin::VendorExecution, RouteFailure> {
         let (events, mut receiver) = tokio::sync::mpsc::channel(32);

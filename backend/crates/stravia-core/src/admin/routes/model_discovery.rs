@@ -66,7 +66,7 @@ pub(super) async fn discover_provider_models(
 ) -> Result<DiscoveredModels, RouteModelDiscoveryError> {
     let cancellation = gw.lifecycle.cancellation.clone();
     let deadline = stravia_runtime_contract::Deadline::fixed(Instant::now() + DISCOVERY_TIMEOUT);
-    let prepared = gw
+    let mut prepared = gw
         .prepare_vendor_execution(
             provider_id,
             None,
@@ -109,21 +109,43 @@ pub(super) async fn discover_provider_models(
                 VendorRequest::Discover(stravia_vendor_sdk::DiscoverRequest {
                     cursor: cursor.clone(),
                 }),
-                VendorCallContext::new(cancellation.clone(), deadline.clone()),
+                &VendorCallContext::new(cancellation.clone(), deadline.clone()),
             )
             .await
         {
             Ok(execution) => execution,
             Err(error) => {
-                // ADR-0073：Discover 与 Infer 携带同一份凭据，上游拒绝同样
-                // 算失效证据；按准备时锁定的代际条件写。
-                if crate::plugin::execution::is_credential_rejection(&error) {
-                    gw.mark_provider_credential_invalid(provider_id, prepared.credential_version())
-                        .await;
-                }
                 return Err(RouteModelDiscoveryError::setup(provider_id, error));
             }
         };
+        if execution.oauth_connection_id.as_deref() != prepared.oauth_connection_id() {
+            return Err(RouteModelDiscoveryError::setup(
+                provider_id,
+                anyhow::anyhow!("provider OAuth connection changed during model discovery"),
+            ));
+        }
+        if execution.credential_version != Some(prepared.credential_version()) {
+            // 401 恢复后的下一页必须沿用新凭据，但不能跨连接、组件或执行代际。
+            let updated = gw
+                .prepare_vendor_execution_with_lease(
+                    &prepared,
+                    provider_id,
+                    None,
+                    stravia_vendor_sdk::Operation::Discover,
+                    &VendorCallContext::new(cancellation.clone(), deadline.clone()),
+                )
+                .await
+                .map_err(|error| RouteModelDiscoveryError::setup(provider_id, error))?;
+            if Some(updated.credential_version()) != execution.credential_version
+                || updated.oauth_connection_id() != execution.oauth_connection_id.as_deref()
+            {
+                return Err(RouteModelDiscoveryError::setup(
+                    provider_id,
+                    anyhow::anyhow!("provider credentials changed during model discovery"),
+                ));
+            }
+            prepared = updated;
+        }
         let response = match execution.output {
             stravia_vendor_sdk::OperationOutput::Discover(response) => response,
             _ => {

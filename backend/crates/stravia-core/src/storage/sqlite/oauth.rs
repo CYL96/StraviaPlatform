@@ -85,7 +85,7 @@ impl OAuthCredentialStore for SqliteOAuthCredentialStore {
             r#"UPDATE provider_oauth_credentials
        SET status = 'refreshing', status_version = status_version + 1,
            updated_at = datetime('now')
-       WHERE provider_id = ? AND status = 'connected' AND status_version = ?"#,
+       WHERE provider_id = ? AND status IN ('connected', 'error') AND status_version = ?"#,
         )
         .bind(provider_id)
         .bind(expected_version)
@@ -184,7 +184,7 @@ impl OAuthCredentialStore for SqliteOAuthCredentialStore {
               status, status_version, last_error, last_refresh_at,
               created_at, updated_at
        FROM provider_oauth_credentials
-       WHERE status = 'connected'
+       WHERE status IN ('connected', 'error')
          AND expires_at IS NOT NULL
          AND datetime(expires_at) <= datetime('now', '+' || ? || ' seconds')"#,
         )

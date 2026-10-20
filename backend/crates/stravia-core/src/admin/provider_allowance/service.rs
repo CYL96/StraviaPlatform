@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
 use crate::admin::AdminService;
-use crate::db::models::Provider;
+use crate::db::models::{OAuthCredential, Provider, ProviderCredentialVersion};
 use crate::plugin::{VendorCallContext, VendorRequest};
 use crate::runtime_cache::RuntimeCache;
 
@@ -618,6 +618,10 @@ async fn register_allowance_fetch(
                         return Ok(None);
                     }
 
+                    // Refresh may change OAuth secrets, but never the provider
+                    // configuration or the admitted plugin descriptor.
+                    let configuration_fingerprint =
+                        provider_configuration_digest(&admin, &current)?.finalize();
                     let context = VendorCallContext::new(
                         stravia_runtime_contract::CancellationToken::new(),
                         stravia_runtime_contract::Deadline::fixed(Instant::now() + REQUEST_TIMEOUT),
@@ -631,7 +635,6 @@ async fn register_allowance_fetch(
                             &context,
                         )
                         .await;
-                    let mut evidence_version = None;
                     let execution = match prepared {
                         Ok(prepared) => {
                             let Some(latest) =
@@ -645,79 +648,77 @@ async fn register_allowance_fetch(
                                     invalid_credential_snapshot(&admin, &latest, &identity).await,
                                 ));
                             }
-                            let credential_version = prepared.credential_version();
-                            evidence_version = Some(credential_version);
-                            let result = admin
+                            admin
                                 .gw
                                 .execute_prepared_vendor(
                                     prepared,
                                     VendorRequest::Allowance(
                                         stravia_vendor_sdk::AllowanceRequest::default(),
                                     ),
-                                    context,
+                                    &context,
                                 )
-                                .await;
-                            // ADR-0073：Allowance 与 Infer 携带同一份凭据，
-                            // 上游拒绝同样算失效证据。
-                            if let Err(error) = &result
-                                && crate::plugin::execution::is_credential_rejection(error)
-                            {
-                                admin
-                                    .gw
-                                    .mark_provider_credential_invalid(
-                                        &provider_id,
-                                        credential_version,
-                                    )
-                                    .await;
-                            }
-                            result
+                                .await
                         }
                         Err(error) => Err(error),
                     };
 
                     let completed_at = chrono::Utc::now().timestamp_micros();
-                    let (mut snapshot, publication) = match execution {
-                        Ok(execution) => {
-                            let response = match execution.output {
-                                stravia_vendor_sdk::OperationOutput::Allowance(response) => {
-                                    response
+                    let (mut snapshot, publication, evidence_version, oauth_connection_id) =
+                        match execution {
+                            Ok(execution) => {
+                                let version = execution.credential_version.ok_or_else(|| {
+                                    anyhow::anyhow!(
+                                        "persisted allowance execution has no credential version"
+                                    )
+                                })?;
+                                let response = match execution.output {
+                                    stravia_vendor_sdk::OperationOutput::Allowance(response) => {
+                                        response
+                                    }
+                                    _ => anyhow::bail!("vendor returned a non-allowance result"),
+                                };
+                                let mapped = map_allowance_response(&current, response)
+                                    .unwrap_or_else(|error| {
+                                        tracing::warn!(
+                                            provider_id = %provider_id,
+                                            error = %error,
+                                            "vendor allowance result was invalid"
+                                        );
+                                        stale_or_error_snapshot(
+                                            &current,
+                                            previous.as_ref().map(|entry| &entry.snapshot),
+                                            safe_error(
+                                                ProviderAllowanceErrorCategory::InvalidResponse,
+                                            ),
+                                        )
+                                    });
+                                (
+                                    mapped,
+                                    Some(execution.publication),
+                                    Some(version),
+                                    execution.oauth_connection_id,
+                                )
+                            }
+                            Err(error) => {
+                                if matches!(
+                                    error.downcast_ref::<stravia_vendor_runtime::RuntimeError>(),
+                                    Some(stravia_vendor_runtime::RuntimeError::Cancelled)
+                                ) || error.to_string().contains("vendor operation was cancelled")
+                                {
+                                    return Err(error);
                                 }
-                                _ => anyhow::bail!("vendor returned a non-allowance result"),
-                            };
-                            let mapped = map_allowance_response(&current, response).unwrap_or_else(
-                                |error| {
-                                    tracing::warn!(
-                                        provider_id = %provider_id,
-                                        error = %error,
-                                        "vendor allowance result was invalid"
-                                    );
+                                (
                                     stale_or_error_snapshot(
                                         &current,
                                         previous.as_ref().map(|entry| &entry.snapshot),
-                                        safe_error(ProviderAllowanceErrorCategory::InvalidResponse),
-                                    )
-                                },
-                            );
-                            (mapped, Some(execution.publication))
-                        }
-                        Err(error) => {
-                            if matches!(
-                                error.downcast_ref::<stravia_vendor_runtime::RuntimeError>(),
-                                Some(stravia_vendor_runtime::RuntimeError::Cancelled)
-                            ) || error.to_string().contains("vendor operation was cancelled")
-                            {
-                                return Err(error);
+                                        safe_error(error_category(&error)),
+                                    ),
+                                    None,
+                                    None,
+                                    None,
+                                )
                             }
-                            (
-                                stale_or_error_snapshot(
-                                    &current,
-                                    previous.as_ref().map(|entry| &entry.snapshot),
-                                    safe_error(error_category(&error)),
-                                ),
-                                None,
-                            )
-                        }
-                    };
+                        };
 
                     let Some(latest) = admin.gw.storage.providers().get(&provider_id).await? else {
                         return Ok(None);
@@ -728,12 +729,29 @@ async fn register_allowance_fetch(
                             invalid_credential_snapshot(&admin, &latest, &identity).await,
                         ));
                     }
-                    if !latest.is_enabled
-                        || !eligible_allowance_provider(&admin, &latest)
-                        || provider_identity(&admin, &latest).await? != identity_for_future
-                    {
+                    if !latest.is_enabled || !eligible_allowance_provider(&admin, &latest) {
                         return Ok(None);
                     }
+                    let publication_identity = if let Some(version) = evidence_version {
+                        let Some(identity) = successful_execution_identity(
+                            &admin,
+                            &latest,
+                            configuration_fingerprint.as_slice(),
+                            version,
+                            oauth_connection_id.as_deref(),
+                        )
+                        .await?
+                        else {
+                            return Ok(None);
+                        };
+                        identity
+                    } else {
+                        let identity = provider_identity(&admin, &latest).await?;
+                        if identity != identity_for_future {
+                            return Ok(None);
+                        }
+                        identity
+                    };
 
                     // Successful guest results remain fenced until the final
                     // sample, forecast and cache publication has completed.
@@ -748,9 +766,22 @@ async fn register_allowance_fetch(
                         return Ok(None);
                     }
 
-                    if !latest.is_enabled
-                        || provider_identity(&admin, &latest).await? != identity_for_future
-                    {
+                    if !latest.is_enabled || !eligible_allowance_provider(&admin, &latest) {
+                        return Ok(None);
+                    }
+                    let fenced_identity = if let Some(version) = evidence_version {
+                        successful_execution_identity(
+                            &admin,
+                            &latest,
+                            configuration_fingerprint.as_slice(),
+                            version,
+                            oauth_connection_id.as_deref(),
+                        )
+                        .await?
+                    } else {
+                        Some(provider_identity(&admin, &latest).await?)
+                    };
+                    if fenced_identity.as_deref() != Some(publication_identity.as_str()) {
                         return Ok(None);
                     }
                     if snapshot.status == ProviderAllowanceStatus::Fresh {
@@ -796,7 +827,7 @@ async fn register_allowance_fetch(
                         }
                     }
 
-                    snapshot = state.cache_snapshot(&identity_for_future, snapshot).await;
+                    snapshot = state.cache_snapshot(&publication_identity, snapshot).await;
                     Ok(Some(snapshot))
                 }
                 .await;
@@ -861,7 +892,10 @@ async fn invalid_credential_snapshot(
     snapshot
 }
 
-async fn provider_identity(admin: &AdminService, provider: &Provider) -> anyhow::Result<String> {
+fn provider_configuration_digest(
+    admin: &AdminService,
+    provider: &Provider,
+) -> anyhow::Result<Sha256> {
     let mut digest = Sha256::new();
     for value in [
         provider.id.as_str(),
@@ -891,14 +925,14 @@ async fn provider_identity(admin: &AdminService, provider: &Provider) -> anyhow:
         digest.update(serde_json::to_vec(&descriptor)?);
         digest.update([0]);
     }
-    if provider.auth_mode.trim() == "oauth"
-        && let Some(credential) = admin
-            .gw
-            .storage
-            .oauth_credentials()
-            .get(&provider.id)
-            .await?
-    {
+    Ok(digest)
+}
+
+fn provider_identity_with_oauth(
+    mut digest: Sha256,
+    credential: Option<&OAuthCredential>,
+) -> String {
+    if let Some(credential) = credential {
         for value in [
             credential.connection_id.as_str(),
             credential.access_token.as_str(),
@@ -912,7 +946,64 @@ async fn provider_identity(admin: &AdminService, provider: &Provider) -> anyhow:
             digest.update([0]);
         }
     }
-    Ok(URL_SAFE_NO_PAD.encode(digest.finalize()))
+    URL_SAFE_NO_PAD.encode(digest.finalize())
+}
+
+async fn provider_identity(admin: &AdminService, provider: &Provider) -> anyhow::Result<String> {
+    let digest = provider_configuration_digest(admin, provider)?;
+    let credential = if provider.auth_mode.trim() == "oauth" {
+        admin
+            .gw
+            .storage
+            .oauth_credentials()
+            .get(&provider.id)
+            .await?
+    } else {
+        None
+    };
+    Ok(provider_identity_with_oauth(digest, credential.as_ref()))
+}
+
+/// Accept refreshed credentials only when the successful attempt still owns
+/// this exact connection and generation. Identity and version use the same
+/// OAuth row read, including across delete/reinsert where versions can repeat.
+async fn successful_execution_identity(
+    admin: &AdminService,
+    provider: &Provider,
+    configuration_fingerprint: &[u8],
+    version: ProviderCredentialVersion,
+    oauth_connection_id: Option<&str>,
+) -> anyhow::Result<Option<String>> {
+    let digest = provider_configuration_digest(admin, provider)?;
+    if digest.clone().finalize().as_slice() != configuration_fingerprint
+        || provider.revision != version.provider_revision
+    {
+        return Ok(None);
+    }
+    let credential = admin
+        .gw
+        .storage
+        .oauth_credentials()
+        .get(&provider.id)
+        .await?;
+    if credential
+        .as_ref()
+        .map(|credential| credential.status_version)
+        != version.oauth_status_version
+        || credential
+            .as_ref()
+            .filter(|_| provider.auth_mode.trim() == "oauth")
+            .map(|credential| credential.connection_id.as_str())
+            != oauth_connection_id
+    {
+        return Ok(None);
+    }
+    Ok(Some(provider_identity_with_oauth(
+        digest,
+        credential
+            .as_ref()
+            .filter(|_| provider.auth_mode.trim() == "oauth"),
+    )))
 }
 
 fn map_allowance_response(

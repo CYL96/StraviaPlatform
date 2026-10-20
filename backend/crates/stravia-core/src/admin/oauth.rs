@@ -1,6 +1,6 @@
 use super::*;
 
-mod runtime;
+pub(super) mod runtime;
 mod session_store;
 
 fn callback_parameter(url: &reqwest::Url, key: &str) -> Option<String> {

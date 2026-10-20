@@ -12,6 +12,21 @@
 - 管理员为所选插件的连接登录或填写凭据，即授权插件处理该连接的上游秘密；宿主拥有凭据持久化与跨连接隔离，见 [ADR-0068](../adr/0068-trust-vendor-plugins-with-connection-credentials.md)。
 - 本文“仅 `base` 默认内嵌”的分发策略取代 [ADR-0067](../adr/0067-separate-vendor-identity-from-package-and-protocol.md) 中五个包均随程序交付的历史描述；ADR 所确定的 Vendor 身份与协议边界不变。
 
+### OAuth 刷新与凭据健康
+
+Core 统一管理已保存 OAuth 连接的刷新，不由各管理入口或 Vendor 分别维护第二套恢复状态：
+
+- 非认证操作在冻结连接快照时检查凭据新鲜度；有可用 refresh token 且到期时间距当前不超过 60 秒，或上次刷新为 `error`、已有 `refreshing` 租约时，先等待共享刷新，再使用新凭据。Core 不为缺失的到期时间新增 TTL 回退，也不为没有 refresh grant 的连接伪造续期。
+- 同一 Provider、OAuth 连接与配置代际共享一次在途交换，存储 CAS 租约负责跨 Gateway 的互斥。等待方不得拿旧凭据冒充刷新成功；单个请求取消或超时只结束自己的等待，共享交换仍可完成并保存轮换后的令牌。共享操作有 120 秒时限，超过 125 秒的存储租约才可回收；应用关闭、连接替换与不兼容组件变更仍取消或阻止旧任务写回。
+- 暂时刷新失败保留 access token、refresh token、到期时间和连接身份，记录 OAuth `error` / `last_error`，后续请求或后台调度仍可尝试。刷新响应未轮换 refresh token 或返回空值时保留原值。SQLite、PostgreSQL 与 Memory 使用相同状态与活跃租约规则。
+- 上游 401 的恢复遵守原组件、连接代际、截止时间与结果提交边界；推理和独立能力使用既有 Target 恢复预算，管理操作的单次 Vendor 调用最多刷新并重发一次。分页发现与独立能力的普通重试沿用本次恢复后的快照，不再次发送旧 token。刷新失败保留真实错误分类；只有明确授权拒绝、不可恢复的已拒凭据或刷新后的凭据仍被拒绝，才按 [ADR-0073](../adr/0073-mark-provider-credential-invalid-on-upstream-auth-rejection.md) 条件标记 Provider 失效。
+- 已保存连接的显式 `ConfigValidation` 不要求启用 Provider，测试不会修改 `is_enabled`；其它非认证操作仍遵守停用状态。
+- 额度缓存及守卫证据采用最终成功执行的凭据版本和连接身份；本次刷新可以更新缓存身份，但不能把旧配置、旧账号连接或旧组件身份的查询结果写入新身份。
+
+`OAuth status = error` 是最近一次刷新结果，`Provider credential_status = invalid` 是持久化的授权失效判定，两者不同。后台任务跳过已失效或禁用的 Provider，不以半开探测自动解封。此前已被标记失效的连接，升级后可显式「重新连接」：刷新成功即恢复 `ok`；上游明确撤销 refresh grant 时仍需重新登录，不删除或自动重绑原连接。
+
+宿主生命周期修复需要升级并重启宿主；令牌错误分类和响应解析修复位于各 Wasm 插件，已安装的 Antigravity、Claude Code、Codex、Devin、Grok 等独立插件还须重新构建并导入。仅更新宿主不会替换已安装的独立组件。
+
 ### 组件身份映射
 
 | crate | Vendor ID / kind | Provider Profile |

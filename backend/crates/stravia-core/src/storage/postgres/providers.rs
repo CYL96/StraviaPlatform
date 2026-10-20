@@ -388,6 +388,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn oauth_refresh_recovery_storage_contract() -> anyhow::Result<()> {
+        let Some((admin, schema, store)) = store().await? else {
+            return Ok(());
+        };
+        let result = async {
+            crate::migrations::migrate_postgres(&store.pool, None).await?;
+            let provider = create_provider(&store, "oauth-recovery").await?;
+            let oauth = PostgresOAuthCredentialStore {
+                pool: store.pool.clone(),
+            };
+            crate::storage::traits::verify_oauth_refresh_recovery_storage_contract(
+                &oauth,
+                &provider.id,
+            )
+            .await
+        }
+        .await;
+        cleanup(admin, schema, &store).await?;
+        result
+    }
+
+    #[tokio::test]
     async fn allowance_suspension_storage_contract() -> anyhow::Result<()> {
         let Some((admin, schema, store)) = store().await? else {
             return Ok(());

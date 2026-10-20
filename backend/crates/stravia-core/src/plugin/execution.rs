@@ -73,7 +73,7 @@ impl VendorRequest {
         input.encode_for_host()
     }
 
-    fn operation(&self) -> Operation {
+    pub(crate) fn operation(&self) -> Operation {
         match self {
             Self::Infer(_) => Operation::Infer,
             Self::Compact(_) => Operation::Compact,
@@ -95,6 +95,10 @@ pub(crate) struct VendorEvent {
 pub(crate) struct VendorExecution {
     pub(crate) output: OperationOutput,
     pub(crate) publication: VendorPublicationFence,
+    /// Persisted credential generation actually used by the successful attempt.
+    /// Unpersisted sessions have neither a version nor an OAuth connection.
+    pub(crate) credential_version: Option<ProviderCredentialVersion>,
+    pub(crate) oauth_connection_id: Option<String>,
     /// Exact protocol hint pinned from the acquired component snapshot.
     pub(crate) protocol: String,
 }
@@ -162,6 +166,10 @@ pub(crate) struct PreparedVendorExecution {
 impl PreparedVendorExecution {
     pub(crate) fn protocol(&self) -> &str {
         &self.provider.protocol
+    }
+
+    pub(crate) fn provider_id(&self) -> &str {
+        &self.provider_id
     }
 
     pub(crate) fn vendor_id(&self) -> &str {
@@ -275,7 +283,7 @@ impl Gateway {
             self.select_vendor_protocol(&mut prepared, request, &context)
                 .await?;
         }
-        self.execute_prepared_vendor(prepared, request, context)
+        self.execute_prepared_vendor(prepared, request, &context)
             .await
     }
 
@@ -400,7 +408,11 @@ impl Gateway {
             let connection = self
                 .read_connection_after_admission(provider_id, vendor_id, model)
                 .await?;
-            anyhow::ensure!(connection.provider.is_enabled, "provider is disabled");
+            anyhow::ensure!(
+                connection.provider.is_enabled
+                    || matches!(kind, Operation::ConfigValidation | Operation::Auth),
+                "provider is disabled"
+            );
             ensure_recovery_complete(
                 &self.vendor_plugins.store,
                 provider_id,
@@ -511,7 +523,7 @@ impl Gateway {
                     .insert("catalog_models".into(), Value::Array(models));
             }
             operation.ensure_current()?;
-            Ok(PreparedVendorExecution {
+            let mut prepared = PreparedVendorExecution {
                 plugin,
                 operation,
                 data_epoch,
@@ -523,7 +535,65 @@ impl Gateway {
                 origins,
                 kind,
                 credential_version,
-            })
+            };
+            if kind != Operation::Auth
+                && connection.provider.auth_mode.trim() == "oauth"
+                && connection
+                    .oauth
+                    .as_ref()
+                    .is_some_and(crate::admin::provider_oauth_needs_refresh)
+            {
+                // Auth 本身不触发预刷新；共享协调器只为刷新慢路径装箱。
+                self.admin()
+                    .refresh_provider_oauth_with_lease(
+                        provider_id,
+                        &prepared,
+                        context.cancellation.clone(),
+                        context.deadline.clone(),
+                        false,
+                    )
+                    .await?;
+                let current = self
+                    .read_connection_after_admission(provider_id, vendor_id, model)
+                    .await?;
+                anyhow::ensure!(
+                    same_provider_generation(&connection.provider, &current.provider)
+                        && connection.model == current.model
+                        && current.oauth.as_ref().map(|oauth| &oauth.connection_id)
+                            == connection.oauth.as_ref().map(|oauth| &oauth.connection_id),
+                    "provider connection changed during OAuth preparation"
+                );
+                let catalog_models = prepared
+                    .provider
+                    .operation_metadata
+                    .remove("catalog_models");
+                let (mut provider, use_proxy, origins) = provider_snapshot(
+                    prepared.descriptor(),
+                    &current,
+                    model,
+                    kind,
+                    prepared
+                        .provider
+                        .operation_metadata
+                        .get("models_source")
+                        .and_then(Value::as_str),
+                    context,
+                )?;
+                if let Some(models) = catalog_models {
+                    provider
+                        .operation_metadata
+                        .insert("catalog_models".into(), models);
+                }
+                prepared.provider = provider;
+                prepared.use_proxy = use_proxy;
+                prepared.origins = origins;
+                prepared.credential_version = ProviderCredentialVersion {
+                    provider_revision: current.provider.revision,
+                    oauth_status_version: current.oauth.as_ref().map(|oauth| oauth.status_version),
+                };
+                prepared.operation.ensure_current()?;
+            }
+            Ok(prepared)
         };
         tokio::select! {
             biased;
@@ -536,9 +606,72 @@ impl Gateway {
 
     pub(crate) async fn execute_prepared_vendor(
         &self,
+        prepared: PreparedVendorExecution,
+        request: VendorRequest,
+        context: &VendorCallContext,
+    ) -> anyhow::Result<VendorExecution> {
+        if !matches!(
+            prepared.kind,
+            Operation::Discover | Operation::Allowance | Operation::ConfigValidation
+        ) {
+            return self
+                .execute_prepared_vendor_once(prepared, request, context)
+                .await;
+        }
+
+        let error = match self
+            .execute_prepared_vendor_once(prepared.clone(), request.clone(), context)
+            .await
+        {
+            Ok(execution) => return Ok(execution),
+            Err(error) if is_credential_rejection(&error) => error,
+            Err(error) => return Err(error),
+        };
+        if prepared.oauth_connection_id().is_none() {
+            self.mark_provider_credential_invalid(
+                &prepared.provider_id,
+                prepared.credential_version(),
+            )
+            .await;
+            return Err(error);
+        }
+
+        // 管理查询与推理遵守同一规则：先恢复 OAuth，再确认新凭据是否仍被拒绝。
+        // 刷新服务的暂时故障直接返回，不把旧 access token 的 401 升级为授权撤销。
+        Box::pin(self.admin().recover_provider_auth_with_lease(
+            &prepared.provider_id,
+            &prepared,
+            context.cancellation.clone(),
+            context.deadline.clone(),
+        ))
+        .await?;
+        let refreshed = self
+            .prepare_vendor_execution_with_lease(
+                &prepared,
+                &prepared.provider_id,
+                prepared.provider.model.as_deref(),
+                prepared.kind,
+                context,
+            )
+            .await?;
+        let version = refreshed.credential_version();
+        let result = self
+            .execute_prepared_vendor_once(refreshed, request, context)
+            .await;
+        if let Err(error) = &result
+            && is_credential_rejection(error)
+        {
+            self.mark_provider_credential_invalid(&prepared.provider_id, version)
+                .await;
+        }
+        result
+    }
+
+    async fn execute_prepared_vendor_once(
+        &self,
         mut prepared: PreparedVendorExecution,
         request: VendorRequest,
-        context: VendorCallContext,
+        context: &VendorCallContext,
     ) -> anyhow::Result<VendorExecution> {
         if context.cancellation.is_cancelled() {
             return Err(RuntimeError::Cancelled.into());
@@ -571,19 +704,25 @@ impl Gateway {
                 .operation_metadata
                 .insert("transport_affinity".into(), Value::String(affinity.clone()));
         }
-        self.execute_vendor_input(
-            prepared.plugin,
-            prepared.operation,
-            prepared.data_epoch,
-            Some(prepared.provider_id),
-            None,
-            prepared.use_proxy,
-            prepared.origins,
-            prepared.provider,
-            request,
-            context,
-        )
-        .await
+        let credential_version = prepared.credential_version;
+        let oauth_connection_id = prepared.oauth_connection_id;
+        let mut execution = self
+            .execute_vendor_input(
+                prepared.plugin,
+                prepared.operation,
+                prepared.data_epoch,
+                Some(prepared.provider_id),
+                None,
+                prepared.use_proxy,
+                prepared.origins,
+                prepared.provider,
+                request,
+                context,
+            )
+            .await?;
+        execution.credential_version = Some(credential_version);
+        execution.oauth_connection_id = oauth_connection_id;
+        Ok(execution)
     }
 
     /// Executes the two operations that may legitimately target an
@@ -656,7 +795,7 @@ impl Gateway {
             session.origins.clone(),
             provider,
             request,
-            context,
+            &context,
         )
         .await
     }
@@ -748,7 +887,7 @@ impl Gateway {
         origins: BTreeSet<String>,
         provider: ProviderSnapshot,
         request: VendorRequest,
-        context: VendorCallContext,
+        context: &VendorCallContext,
     ) -> anyhow::Result<VendorExecution> {
         if context.deadline.is_exceeded() {
             return Err(RuntimeError::DeadlineExceeded.into());
@@ -820,7 +959,7 @@ impl Gateway {
             network,
             operation: operation.clone(),
             cancellation: context.cancellation.clone(),
-            events: context.events,
+            events: context.events.clone(),
             publication: publication.clone(),
             state,
             secrets,
@@ -867,6 +1006,8 @@ impl Gateway {
         Ok(VendorExecution {
             output,
             publication,
+            credential_version: None,
+            oauth_connection_id: None,
             protocol,
         })
     }
@@ -1223,22 +1364,6 @@ pub(crate) fn is_credential_rejection(error: &anyhow::Error) -> bool {
             kind: ErrorKind::Auth,
             ..
         }
-    )
-}
-
-/// ADR-0073：取消与超时是执行中断而非凭据证据——恢复路径因中断失败时
-/// 不得把 Provider 标记为凭据失效。
-pub(crate) fn is_execution_interruption(error: &anyhow::Error) -> bool {
-    matches!(
-        error.downcast_ref::<RuntimeError>(),
-        Some(
-            RuntimeError::Cancelled
-                | RuntimeError::DeadlineExceeded
-                | RuntimeError::Plugin {
-                    kind: ErrorKind::Cancelled | ErrorKind::DeadlineExceeded,
-                    ..
-                }
-        )
     )
 }
 
@@ -1701,23 +1826,5 @@ mod tests {
         assert!(!is_credential_rejection(&runtime(ErrorKind::Trapped, None)));
         // 非 RuntimeError（如本地 anyhow）不算
         assert!(!is_credential_rejection(&anyhow::anyhow!("local")));
-    }
-
-    #[test]
-    fn execution_interruption_covers_cancel_and_deadline() {
-        assert!(is_execution_interruption(&RuntimeError::Cancelled.into()));
-        assert!(is_execution_interruption(
-            &RuntimeError::DeadlineExceeded.into()
-        ));
-        assert!(is_execution_interruption(&runtime(
-            ErrorKind::Cancelled,
-            None
-        )));
-        assert!(is_execution_interruption(&runtime(
-            ErrorKind::DeadlineExceeded,
-            None
-        )));
-        assert!(!is_execution_interruption(&runtime(ErrorKind::Auth, None)));
-        assert!(!is_execution_interruption(&anyhow::anyhow!("local")));
     }
 }

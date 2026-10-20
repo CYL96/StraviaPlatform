@@ -1226,46 +1226,36 @@ impl AdminService {
                     .contains(&stravia_vendor_sdk::Capability::ConfigValidation)
             });
         let result = if supports_validation {
-            // ADR-0073：预览前先锁定凭据代际，手动测试的上游 401 同样算
-            // 失效证据（条件写仍按代际比对，不覆盖更新的凭据）。
-            let credential_version = crate::db::models::ProviderCredentialVersion {
-                provider_revision: provider.revision,
-                oauth_status_version: self
-                    .gw
-                    .storage
-                    .oauth_credentials()
-                    .get(&provider.id)
-                    .await?
-                    .map(|credential| credential.status_version),
+            let execution = self
+                .gw
+                .execute_vendor(
+                    &provider.id,
+                    None,
+                    crate::plugin::VendorRequest::ConfigValidation(
+                        stravia_vendor_sdk::ConfigValidationRequest {
+                            options: serde_json::from_str(&provider.vendor_options)?,
+                        },
+                    ),
+                    crate::plugin::VendorCallContext::new(
+                        stravia_runtime_contract::CancellationToken::new(),
+                        stravia_runtime_contract::Deadline::fixed(
+                            std::time::Instant::now() + std::time::Duration::from_secs(30),
+                        ),
+                    ),
+                )
+                .await?;
+            let _publication = execution.publication.write_fence().await?;
+            let stravia_vendor_sdk::OperationOutput::ConfigValidation(validation) =
+                execution.output
+            else {
+                anyhow::bail!("vendor returned the wrong configuration validation result")
             };
-            let preview = match self
-                .preview_provider_configuration(ProviderConfigurationPreviewInput {
-                    provider_id: Some(provider.id.clone()),
-                    vendor_id: vendor_id.to_owned(),
-                    channel: channel_id.to_owned(),
-                    protocol: Some(provider.protocol.clone()),
-                    base_url: provider.base_url.clone(),
-                    options: serde_json::from_str(&provider.vendor_options)?,
-                    credentials: std::collections::BTreeMap::new(),
-                })
-                .await
-            {
-                Ok(preview) => preview,
-                Err(error) => {
-                    if crate::plugin::execution::is_credential_rejection(&error) {
-                        self.gw
-                            .mark_provider_credential_invalid(&provider.id, credential_version)
-                            .await;
-                    }
-                    return Err(error);
-                }
-            };
-            let error = if preview.issues.is_empty() {
+            let error = if validation.issues.is_empty() {
                 None
             } else {
                 Some(format!(
                     "Vendor configuration validation failed: {}",
-                    serde_json::to_string(&preview.issues)?
+                    serde_json::to_string(&validation.issues)?
                 ))
             };
             TestResult {
