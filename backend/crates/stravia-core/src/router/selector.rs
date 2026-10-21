@@ -901,7 +901,6 @@ impl RouteAttemptPolicy {
         // Never trust a stale signal timestamp over the evidence clock or the
         // state's own clock — the floor keeps cooldown writes monotonic.
         let now_ms = now_ms.max(self.context.now_ms).max(self.state.now_ms());
-        let can_fail_over = transient_failure(&kind) || kind == AiErrorKind::QuotaExceeded;
         let failures = self.state.inner.lock().record_failure(
             &key,
             self.current_epoch,
@@ -917,7 +916,8 @@ impl RouteAttemptPolicy {
                 .retry_after_until
                 .max(now_ms.saturating_add(delay.as_millis().min(u64::MAX as u128) as u64));
         }
-        if client_output_committed || !can_fail_over {
+        // 调用方只传入上游失败；除已提交输出和请求级错误外，任何上游错误都换 Target。
+        if client_output_committed {
             self.skip_current();
             return AttemptFailureDisposition::Stop;
         }
@@ -1758,7 +1758,7 @@ mod tests {
     }
 
     #[test]
-    fn committed_or_semantic_failures_stop_the_request() {
+    fn committed_output_and_request_level_failures_stop_the_request() {
         let state = RoutePolicyState::default();
         let targets = vec![target("first", 0), target("second", 0)];
         let mut policy = RouteAttemptPolicy::new(
@@ -1782,19 +1782,107 @@ mod tests {
             ),
             AttemptFailureDisposition::Stop
         );
-        assert_eq!(
-            policy.record_failure(
-                &first,
-                AttemptFailureSignal {
-                    kind: AiErrorKind::InvalidRequest,
-                    client_output_committed: false,
-                    retry_after: None,
-                    now_ms: 0,
-                    jitter_sample: 0.0,
-                },
-            ),
-            AttemptFailureDisposition::Stop
-        );
+        for kind in [
+            AiErrorKind::ContextLengthExceeded,
+            AiErrorKind::ContentFiltered,
+        ] {
+            assert_eq!(
+                policy.record_failure(
+                    &first,
+                    AttemptFailureSignal {
+                        kind,
+                        client_output_committed: false,
+                        retry_after: None,
+                        now_ms: 0,
+                        jitter_sample: 0.0,
+                    },
+                ),
+                AttemptFailureDisposition::Stop
+            );
+        }
+    }
+
+    #[test]
+    fn non_transient_upstream_failures_try_the_next_target() {
+        for kind in [
+            AiErrorKind::AuthenticationError,
+            AiErrorKind::AuthorizationError,
+            AiErrorKind::InvalidRequest,
+            AiErrorKind::NotFoundError,
+            AiErrorKind::Unknown,
+        ] {
+            let state = RoutePolicyState::default();
+            let targets = vec![target("first", 0), target("second", 0)];
+            let mut policy = policy_at(&state, &targets, 0);
+            let first = policy.next_healthy().expect("first Target");
+            assert_eq!(
+                policy.record_failure(
+                    &first,
+                    AttemptFailureSignal {
+                        kind: kind.clone(),
+                        client_output_committed: false,
+                        retry_after: None,
+                        now_ms: 0,
+                        jitter_sample: 0.0,
+                    },
+                ),
+                AttemptFailureDisposition::TryNextTarget,
+                "{kind}"
+            );
+            assert_eq!(
+                state.target_status(&selected_target_key(&first)).state,
+                TargetRuntimeState::Available,
+                "{kind} 只计入共享失败数，未超过重试预算不得冷却"
+            );
+        }
+    }
+
+    #[test]
+    fn auth_failures_cool_only_after_the_shared_threshold() {
+        for kind in [
+            AiErrorKind::AuthenticationError,
+            AiErrorKind::AuthorizationError,
+        ] {
+            let state = RoutePolicyState::default();
+            let mut configured = target("denied", 0);
+            configured.target_retry_budget = 1;
+            configured.target_cooldown_ms = 120_000;
+            let targets = vec![configured, target("fallback", 0)];
+            for (attempt, expected) in [
+                (0, TargetRuntimeState::Available),
+                (1, TargetRuntimeState::CoolingDown),
+            ] {
+                let mut policy = policy_at(&state, &targets, attempt * 1_000);
+                let denied = policy.next_healthy().expect("first Target");
+                assert_eq!(denied.provider_id().as_str(), "denied", "{kind} #{attempt}");
+                assert_eq!(
+                    policy.record_failure(
+                        &denied,
+                        AttemptFailureSignal {
+                            kind: kind.clone(),
+                            client_output_committed: false,
+                            retry_after: None,
+                            now_ms: attempt * 1_000,
+                            jitter_sample: 0.0,
+                        },
+                    ),
+                    AttemptFailureDisposition::TryNextTarget,
+                    "{kind} #{attempt}"
+                );
+                assert_eq!(next_provider(&mut policy).as_deref(), Some("fallback"));
+                assert_eq!(
+                    state.target_status(&selected_target_key(&denied)).state,
+                    expected,
+                    "{kind} #{attempt}"
+                );
+            }
+            let mut next_request = policy_at(&state, &targets, 2_000);
+            assert_eq!(
+                next_provider(&mut next_request).as_deref(),
+                Some("fallback"),
+                "{kind}"
+            );
+        }
     }
 
     fn policy_at(
@@ -2006,7 +2094,7 @@ mod tests {
         assert_eq!(selected.provider_id().as_str(), "recovering");
         assert_eq!(
             second_probe.record_failure(&selected, failure_at(AiErrorKind::InvalidRequest, 12_000)),
-            AttemptFailureDisposition::Stop
+            AttemptFailureDisposition::TryNextTarget
         );
         assert_eq!(
             next_provider(&mut policy_at(&state, &targets, 12_999)).as_deref(),

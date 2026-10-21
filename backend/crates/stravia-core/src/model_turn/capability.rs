@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use futures::stream::{FuturesUnordered, StreamExt};
 use stravia_runtime_contract::Principal;
-use stravia_runtime_contract::protocol::ir::AiErrorKind;
+use stravia_runtime_contract::protocol::ir::{AiError, AiErrorKind};
 use stravia_vendor_runtime::{RuntimeError, RuntimeEvent};
 use stravia_vendor_sdk::{Capability, Operation, OperationOutput};
 
@@ -758,13 +758,30 @@ impl RouteFailure {
         let upstream_status = runtime.and_then(RuntimeError::upstream_status);
         let retry_kind = runtime
             .filter(|runtime| upstream_started && runtime.is_upstream_failure())
-            .and_then(RuntimeError::model_error_kind)
+            .map(|runtime| {
+                runtime.model_error_kind().unwrap_or_else(|| {
+                    upstream_status
+                        .map(|status| AiError::kind_from_status(status, None))
+                        .unwrap_or(AiErrorKind::Unknown)
+                })
+            })
+            // 上下文超限与内容过滤是请求级错误，换 Target 只会重复同一失败。
             .filter(|kind| {
-                let safe_kind = kind.is_retryable() || *kind == AiErrorKind::QuotaExceeded;
-                let safe_status = !kind.is_retryable()
-                    || upstream_status
-                        .is_none_or(|status| matches!(status, 408 | 429 | 500 | 502 | 503 | 529));
-                safe_kind && safe_status
+                !matches!(
+                    kind,
+                    AiErrorKind::ContextLengthExceeded | AiErrorKind::ContentFiltered
+                )
+            })
+            .map(|kind| {
+                // 错误类别可能合并不同 HTTP 状态；同 Target 重试范围不能因此扩大，
+                // 但仍然是上游失败，按非瞬时失败直接换 Target。
+                let transient_status = upstream_status
+                    .is_none_or(|status| matches!(status, 408 | 429 | 500 | 502 | 503 | 529));
+                if kind.is_retryable() && !transient_status {
+                    AiErrorKind::Unknown
+                } else {
+                    kind
+                }
             });
         let retry_after = runtime.and_then(RuntimeError::retry_after);
         let code = match runtime {

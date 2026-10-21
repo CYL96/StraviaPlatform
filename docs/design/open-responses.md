@@ -448,9 +448,9 @@ Open Responses `2026-04-24` 定义 canonical baseline；Ingress 可以接受其 
 
 ## 11. Provider interaction 与失败边界
 
-同协议合法标准字段原样发送 upstream，不建立静态 per-field Provider capability matrix；具体 Target 是否支持由 upstream 决定。普通生成 request 得到 upstream 4xx 时，Stravia 规范化 error envelope 并返回，不切换 Target；客户端远程压缩保留上游 error envelope。
+同协议合法标准字段原样发送 upstream，不建立静态 per-field Provider capability matrix；具体 Target 是否支持由 upstream 决定。普通生成 request 得到 upstream 4xx 时，Stravia 规范化 error envelope；换 Target 的规则见下一段，所有合格 Target 用尽后返回最后一次上游错误；客户端远程压缩保留上游 error envelope。
 
-普通生成的 Target failover 仅沿用现有可重试 transport/5xx policy。绝不因 schema、auth、quota、unsupported parameter 或其它 4xx 改投不同 Provider，以免重复副作用或改变语义；客户端远程压缩不参与这些重试或切换。
+普通生成的 Target failover 在 Client Output Commit 前适用于任何上游失败（transport/5xx、auth、quota 及其它 4xx）；非瞬时错误计入共享失败数，达到阈值才冷却。仅上下文超限、内容过滤等请求级错误不换 Target，客户端远程压缩不参与这些重试或切换。
 
 同协议 Target 出现以下情况时视为 provider protocol violation：
 

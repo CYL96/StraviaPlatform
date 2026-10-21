@@ -1923,6 +1923,52 @@ mod rpm_admission {
     }
 
     #[tokio::test]
+    async fn upstream_forbidden_switches_target_and_cools_after_the_threshold() {
+        let mut fixture = fixture(false).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let denied_calls = Arc::new(AtomicUsize::new(0));
+        let observed = denied_calls.clone();
+        let denied = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                drain_test_http_request(&mut socket).await;
+                observed.fetch_add(1, Ordering::SeqCst);
+                let body = serde_json::json!({"error":{
+                    "message":"Your Go plan doesn't include API access"}})
+                .to_string();
+                socket.write_all(format!("HTTP/1.1 403 Forbidden\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            }
+        });
+        fixture.providers[0] =
+            add_captured_thinking_provider(&fixture.gateway, format!("http://{address}/v1")).await;
+        let mut primary = target(&fixture.providers[0]);
+        primary.priority = Some(10);
+        primary.target_retry_budget = Some(1);
+        primary.target_cooldown_ms = Some(120_000);
+        set_thinking_targets(
+            &fixture.gateway,
+            "rpm-a",
+            vec![primary, target(&fixture.providers[1])],
+        )
+        .await;
+
+        for (denied_total, fallback_total) in [(1, 1), (2, 2), (2, 3)] {
+            let events = execute(&fixture.gateway, &fixture.key, "rpm-a")
+                .await
+                .unwrap();
+            assert!(events.iter().any(
+                |event| matches!(event, Ok(CanonicalEvent::Completed(response))
+                    if response.error.is_none() && response.output_texts().eq(["admitted"]))
+            ));
+            assert_eq!(denied_calls.load(Ordering::SeqCst), denied_total);
+            assert_eq!(fixture.calls[1].load(Ordering::SeqCst), fallback_total);
+        }
+        // 第二次 403 超过重试预算后冷却，第三次请求不再打到被拒绝的 Target。
+        denied.abort();
+    }
+
+    #[tokio::test]
     async fn transport_redirects_debit_each_real_send_in_the_destination() {
         let mut fixture = fixture(false).await;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

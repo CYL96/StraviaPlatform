@@ -824,7 +824,7 @@ fn execute_inner(
                     }
                     return Err(failure.finish(input.observer.as_ref()));
                 }
-                let Some(kind) = failure.error.upstream_error_kind.clone() else {
+                let Some(kind) = failure_kind(&failure) else {
                     record_upstream_failure(&attempts, &target, &failure);
                     return Err(failure.finish(input.observer.as_ref()));
                 };
@@ -2631,6 +2631,22 @@ fn record_upstream_failure(
             target.target_cooldown_ms,
             failure.retry_after,
         );
+    }
+}
+
+/// 路由判定使用的上游错误类别。Vendor 直接声明的凭据拒绝与流中断没有 canonical
+/// `upstream_error_kind`，但同样是上游失败，必须按对应类别换 Target。
+fn failure_kind(failure: &AttemptFailure) -> Option<AiErrorKind> {
+    if let Some(kind) = &failure.error.upstream_error_kind {
+        return Some(kind.clone());
+    }
+    if !failure.is_upstream() {
+        return None;
+    }
+    match failure.error.code.as_str() {
+        "provider_auth_error" => Some(AiErrorKind::AuthenticationError),
+        "upstream_stream_incomplete" => Some(AiErrorKind::UnexpectedEof),
+        _ => None,
     }
 }
 
