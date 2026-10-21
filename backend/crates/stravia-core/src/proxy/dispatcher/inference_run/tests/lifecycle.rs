@@ -1649,8 +1649,11 @@ async fn thinking_level_is_clamped_and_mapped_without_replaying_omitted_control(
 }
 
 #[tokio::test]
-async fn unrepresentable_thinking_control_is_a_typed_422_before_upstream() {
-    let (base_url, calls) = serve_openai_sequence(vec![openai_response("must not run")]).await;
+async fn unrepresentable_thinking_mapping_uses_nearest_protocol_supported_level() {
+    use stravia_runtime_contract::thinking::{TargetThinkingControl, ThinkingLevel};
+
+    let (base_url, calls, requests) =
+        serve_openai_sequence_with_requests(vec![openai_response("compatible thinking")]).await;
     let data_dir = tempfile::tempdir().expect("temporary data directory");
     let gateway = Gateway::new(crate::config::GatewayConfig {
         data_dir: data_dir.path().to_path_buf(),
@@ -1671,11 +1674,18 @@ async fn unrepresentable_thinking_control_is_a_typed_422_before_upstream() {
         .find(|route| route.id == route_id)
         .expect("thinking Route");
     let mut map = route.targets[0].thinking_level_map.clone();
-    map.iter_mut()
-        .find(|row| row.level == stravia_runtime_contract::thinking::ThinkingLevel::Medium)
-        .expect("medium row")
-        .control =
-        stravia_runtime_contract::thinking::TargetThinkingControl::Budget { value: 8192 };
+    for row in &mut map {
+        row.control = match row.level {
+            ThinkingLevel::Low => TargetThinkingControl::Effort {
+                value: "low".into(),
+            },
+            ThinkingLevel::Medium => TargetThinkingControl::Budget { value: 8192 },
+            ThinkingLevel::High => TargetThinkingControl::Effort {
+                value: "high".into(),
+            },
+            _ => TargetThinkingControl::Hidden,
+        };
+    }
     gateway
         .storage
         .routes()
@@ -1720,9 +1730,41 @@ async fn unrepresentable_thinking_control_is_a_typed_422_before_upstream() {
         "/v1/chat/completions",
     )
     .await;
-    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
-    assert_eq!(calls.load(Ordering::SeqCst), 0);
-    drop(response);
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("client response");
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let body: serde_json::Value = serde_json::from_slice(&body).expect("client response JSON");
+    assert_eq!(
+        body["choices"][0]["message"]["content"],
+        "compatible thinking"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    {
+        let requests = requests.lock();
+        let request: serde_json::Value =
+            serde_json::from_str(requests[0].split_once("\r\n\r\n").expect("HTTP body").1)
+                .expect("upstream request JSON");
+        assert_eq!(request["reasoning_effort"], "high", "{request}");
+    }
+    let persisted = gateway
+        .admin()
+        .list_models()
+        .await
+        .expect("persisted Routes")
+        .into_iter()
+        .find(|route| route.id == route_id)
+        .expect("persisted thinking Route");
+    let medium = persisted.targets[0]
+        .thinking_level_map
+        .iter()
+        .find(|row| row.level == ThinkingLevel::Medium)
+        .expect("persisted medium row");
+    assert!(matches!(
+        medium.control,
+        TargetThinkingControl::Budget { value: 8192 }
+    ));
     close_test_gateway(gateway, data_dir).await;
 }
 
