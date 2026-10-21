@@ -87,16 +87,32 @@ export function specificationField(field: string): string {
     output_modalities: m.model_specification_output_modalities,
     reasoning_efforts: m.model_specification_reasoning_efforts,
     price: m.model_changes_price,
+    input: m.provider_model_field_input,
+    output: m.provider_model_field_output,
+    cache_read: m.provider_model_field_cache_read,
+    cache_write: m.provider_model_field_cache_write,
+    context_over_200k: m.model_specification_extended_context_prices,
+    type: m.model_changes_tier_type,
+    size: m.model_changes_tier_size,
   }
-  return labels[field]?.() ?? field
+  return field
+    .split('.')
+    .flatMap((key, index, path) => {
+      if (key === 'tiers' || key === 'tier') return []
+      if (path[index - 1] === 'tiers') return [m.provider_model_editor_tier_value({ index: Number(key) + 1 })]
+      return [labels[key]?.() ?? key]
+    })
+    .join(' / ')
 }
 export function specificationValue(value: unknown): string {
   if (value == null) return m.model_specification_not_registered()
-  if (Array.isArray(value)) return value.length ? value.map(specificationValue).join(', ') : '[]'
+  if (Array.isArray(value)) return value.length ? value.map(specificationValue).join(', ') : m.model_changes_no_values()
   if (typeof value === 'object')
-    return Object.entries(value)
-      .map(([key, entry]) => `${key}: ${specificationValue(entry)}`)
-      .join(' · ')
+    return (
+      Object.entries(value)
+        .map(([key, entry]) => `${specificationField(key)}: ${specificationValue(entry)}`)
+        .join(' · ') || '{}'
+    )
   if (value === '') return m.model_changes_empty_value()
   if (typeof value === 'string') return value
   if (typeof value === 'number' || typeof value === 'boolean') return String(value)

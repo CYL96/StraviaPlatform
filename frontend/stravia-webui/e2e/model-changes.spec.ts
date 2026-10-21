@@ -271,8 +271,10 @@ for (const locale of ['en-US', 'zh-CN']) {
       const selected = panel.getByLabel(locale === 'en-US' ? 'View details' : '查看详情', { exact: true })
       await expect(selected).toContainText('Exact Model')
       await expect(selected).toContainText('exact-model')
-      await expect(selected).toContainText('[]')
-      await expect(selected).toContainText(locale === 'en-US' ? 'After: 0' : '之后: 0')
+      const context = selected
+        .getByRole('row')
+        .filter({ has: page.getByRole('rowheader', { name: locale === 'en-US' ? 'Context' : '上下文', exact: true }) })
+      await expect(context.getByRole('cell').nth(1)).toHaveText('0')
       await expect(selected).not.toContainText('Newer Service')
       await expect(selected.getByRole('button')).toHaveAttribute('aria-expanded', 'true')
     })

@@ -15,10 +15,12 @@ import {
   specificationValue,
   modelChangeReason,
 } from '#lib/model-changes.js'
+import { specificationRows } from '#lib/model-specification-diff.js'
 import type { ModelChangeType, ModelChangeSource, ModelChangeRecord } from '#lib/types.js'
 import * as Sheet from '#lib/components/ui/sheet/index.js'
 import * as Select from '#lib/components/ui/select/index.js'
 import * as Empty from '#lib/components/ui/empty/index.js'
+import * as Table from '#lib/components/ui/table/index.js'
 import { Input } from '#lib/components/ui/input/index.js'
 import { Button } from '#lib/components/ui/button/index.js'
 import { Badge } from '#lib/components/ui/badge/index.js'
@@ -126,6 +128,7 @@ $effect(() => {
 
 {#snippet batch(record: ModelChangeRecord)}
   {@const open = Boolean(expanded[record.id])}
+  {@const updatedModels = record.changes.filter((item) => item.types.includes('specification_updated'))}
   <article class="min-w-0 border-b last:border-b-0">
     <Button
       variant="ghost"
@@ -165,6 +168,20 @@ $effect(() => {
           {#if record.initial_sync}<Badge variant="outline">{m.model_changes_initial()}</Badge>{/if}
           {#if record.provider_deleted}<Badge variant="outline">{m.model_changes_deleted()}</Badge>{/if}
         </span>
+        {#if !open && updatedModels.length > 0}
+          <span class="text-[0.8125rem] break-words text-foreground">
+            {m.model_changes_specification_updated()}:
+            {updatedModels
+              .slice(0, 3)
+              .map((item) => item.name || item.model_id)
+              .join(', ')}
+            {#if updatedModels.length > 3}
+              <span class="text-muted-foreground">
+                {m.model_changes_more_models({ count: updatedModels.length - 3 })}
+              </span>
+            {/if}
+          </span>
+        {/if}
       </span>
     </Button>
     {#if open}
@@ -173,16 +190,19 @@ $effect(() => {
             {modelChangeReason(record.error)}
           </p>{/if}
         {#each record.changes as item (item.model_id)}
-          <div class="flex min-w-0 flex-col gap-1.5 border-b border-border/60 py-2.5 last:border-b-0">
-            <div class="flex min-w-0 items-start justify-between gap-3">
+          {@const differences = item.specification.flatMap(specificationRows)}
+          <div class="flex min-w-0 flex-col gap-3 border-b border-border/60 py-3 last:border-b-0">
+            <div class="flex min-w-0 flex-col gap-2">
               <div class="min-w-0">
-                <p class="text-sm font-medium break-all">{item.name || item.model_id}</p>
+                <h3 id={`model-change-${record.id}-${item.model_id}`} class="text-sm font-semibold break-all">
+                  {item.name || item.model_id}
+                </h3>
                 {#if item.name && item.name !== item.model_id}<p
                     class="font-technical text-xs break-all text-muted-foreground">
                     {item.model_id}
                   </p>{/if}
               </div>
-              <div class="flex shrink-0 flex-wrap justify-end gap-1">
+              <div class="flex flex-wrap gap-1">
                 {#each item.types as kind (kind)}<Badge variant="outline">{changeLabel(kind)}</Badge>{/each}
               </div>
             </div>
@@ -190,19 +210,44 @@ $effect(() => {
                 class="text-[0.8125rem]">
                 {policyLabel(item.before_policy)} → {policyLabel(item.after_policy)}
               </p>{/if}
-            {#each item.specification as diff (diff.field)}
-              <dl class="flex min-w-0 flex-col gap-0.5 text-[0.8125rem] leading-[1.45]">
-                <dt class="font-medium">{specificationField(diff.field)}</dt>
-                <dd class="break-words">
-                  <span class="text-muted-foreground">{m.model_changes_before()}:</span>
-                  {specificationValue(diff.before)}
-                </dd>
-                <dd class="break-words">
-                  <span class="text-muted-foreground">{m.model_changes_after()}:</span>
-                  {specificationValue(diff.after)}
-                </dd>
-              </dl>
-            {/each}
+            {#if differences.length > 0}
+              <Table.Root
+                class="table-fixed text-[0.8125rem]"
+                aria-labelledby={`model-change-${record.id}-${item.model_id}`}>
+                <Table.Header>
+                  <Table.Row>
+                    <Table.Head scope="col" class="w-[36%] ps-0 whitespace-normal"
+                      >{m.model_changes_field()}</Table.Head>
+                    <Table.Head scope="col" class="w-[32%] whitespace-normal">{m.model_changes_before()}</Table.Head>
+                    <Table.Head scope="col" class="w-[32%] pe-0 whitespace-normal"
+                      >{m.model_changes_after()}</Table.Head>
+                  </Table.Row>
+                </Table.Header>
+                <Table.Body>
+                  {#each differences as diff (diff.field)}
+                    <Table.Row>
+                      <Table.Head scope="row" class="h-auto py-2 ps-0 align-top break-words whitespace-normal">
+                        {specificationField(diff.field)}
+                      </Table.Head>
+                      <Table.Cell class="align-top break-words whitespace-normal">
+                        <span class={cn('tabular-nums', typeof diff.before === 'number' && 'font-technical')}>
+                          {specificationValue(diff.before)}
+                        </span>
+                      </Table.Cell>
+                      <Table.Cell class="pe-0 align-top break-words whitespace-normal">
+                        <span
+                          class={cn('font-medium tabular-nums', typeof diff.after === 'number' && 'font-technical')}>
+                          {specificationValue(diff.after)}
+                        </span>
+                      </Table.Cell>
+                    </Table.Row>
+                  {/each}
+                </Table.Body>
+              </Table.Root>
+              {#if item.specification.some((diff) => diff.field === 'price')}
+                <p class="text-xs text-muted-foreground">{m.model_changes_price_unit()}</p>
+              {/if}
+            {/if}
           </div>
         {/each}
       </div>
