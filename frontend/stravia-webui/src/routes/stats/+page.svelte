@@ -270,13 +270,15 @@ const modelPie = $derived.by((): PieSlice[] => {
   if (rest > 0) slices.push({ key: '__other__', label: m.stats_other(), value: rest, color: 'var(--muted)' })
   return slices
 })
-const TOKEN_PIE_COLORS = ['var(--chart-1)', 'var(--chart-2)']
+const TOKEN_PIE_COLORS = ['var(--chart-1)', 'var(--chart-2)', 'var(--chart-3)', 'var(--chart-4)']
 // 未上报的类别不计入占比，避免把"未报告"显示成 0%。
 const tokenPie = $derived.by((): { slices: PieSlice[]; total: number } | null => {
   if (overview == null) return null
   const categories = [
     { key: 'input', label: m.stats_input_tokens(), value: overview.total_input_tokens },
     { key: 'output', label: m.stats_output_tokens(), value: overview.total_output_tokens },
+    { key: 'cache-read', label: m.stats_cache_read_tokens(), value: overview.total_cache_read_tokens },
+    { key: 'cache-write', label: m.stats_cache_write_tokens(), value: overview.total_cache_write_tokens },
   ]
   const slices = categories.flatMap((category, index) =>
     category.value == null
@@ -284,7 +286,7 @@ const tokenPie = $derived.by((): { slices: PieSlice[]; total: number } | null =>
       : [{ key: category.key, label: category.label, value: category.value, color: TOKEN_PIE_COLORS[index] }],
   )
   const total = slices.reduce((sum, slice) => sum + slice.value, 0)
-  return total > 0 ? { slices, total } : null
+  return { slices, total }
 })
 const metrics = $derived([
   { label: m.common_total_requests(), value: formatCompactCount(overview?.total_requests) },
@@ -542,7 +544,7 @@ function retryAll(): void {
         </div>
         {#if overviewQuery.error && overview === undefined}
           {@render queryFailure(overviewQuery.error, overviewQuery.refetch, overviewQuery.isFetching)}
-        {:else if tokenPie}<div class="flex flex-col items-center gap-4">
+        {:else if tokenPie && tokenPie.total > 0}<div class="flex flex-col items-center gap-4">
             <div class="relative size-40 min-w-0" aria-label={m.stats_token_breakdown()}>
               <PieChart
                 data={tokenPie.slices}
@@ -574,9 +576,7 @@ function retryAll(): void {
             ><Empty.Header
               ><Empty.Description
                 >{hasTraffic
-                  ? overview &&
-                    [overview.total_input_tokens, overview.total_output_tokens].some((value) => value != null) &&
-                    (overview.total_input_tokens ?? 0) + (overview.total_output_tokens ?? 0) === 0
+                  ? tokenPie?.slices.length
                     ? m.stats_zero_tokens()
                     : m.stats_token_usage_unavailable()
                   : m.stats_send_first_request()}</Empty.Description

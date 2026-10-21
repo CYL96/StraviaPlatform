@@ -1378,7 +1378,7 @@
   "stats_time_series": "Time series",
   "stats_token_activity": "Token activity",
   "stats_token_breakdown": "Token breakdown",
-  "stats_token_breakdown_share": "Share of total input and output tokens.",
+  "stats_token_breakdown_share": "Share of reported input, output, cache-read, and cache-write tokens.",
   "stats_token_usage_unavailable": "Providers did not report token usage.",
   "stats_updating_30s": "Updating · 30s",
   "stats_usage": "Usage",

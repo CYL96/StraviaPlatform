@@ -1372,7 +1372,7 @@
   "stats_time_series": "时间序列",
   "stats_token_activity": "Token 活动",
   "stats_token_breakdown": "Token 构成",
-  "stats_token_breakdown_share": "总输入与输出 Token 的占比。",
+  "stats_token_breakdown_share": "已报告的输入、输出、缓存读取与缓存写入 Token 占比。",
   "stats_token_usage_unavailable": "供应商未报告 Token 用量。",
   "stats_updating_30s": "更新中 · 30 秒",
   "stats_usage": "用量分析",
