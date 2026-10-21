@@ -162,6 +162,8 @@ interface types {
     /// An empty response list requests identity; identity is always accepted.
     record http-compression {
         request: option<http-content-coding>,
+        /// Accept-Encoding preserves this order, retaining only the first occurrence
+        /// of each coding. An empty list requests identity.
         response: list<http-content-coding>,
     }
 
