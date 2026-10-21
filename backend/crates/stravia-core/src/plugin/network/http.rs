@@ -34,18 +34,22 @@ pub(super) fn prepare(
         HeaderValue::from_static("identity")
     } else {
         let mut accepted = String::new();
-        for coding in [
-            HttpContentCoding::Gzip,
-            HttpContentCoding::Deflate,
-            HttpContentCoding::Br,
-            HttpContentCoding::Zstd,
-        ] {
-            if compression.response.contains(&coding) {
-                if !accepted.is_empty() {
-                    accepted.push_str(", ");
-                }
-                accepted.push_str(coding_name(coding));
+        let mut seen = 0_u8;
+        for &coding in &compression.response {
+            let bit = match coding {
+                HttpContentCoding::Gzip => 1,
+                HttpContentCoding::Deflate => 2,
+                HttpContentCoding::Br => 4,
+                HttpContentCoding::Zstd => 8,
+            };
+            if seen & bit != 0 {
+                continue;
             }
+            seen |= bit;
+            if !accepted.is_empty() {
+                accepted.push_str(", ");
+            }
+            accepted.push_str(coding_name(coding));
         }
         HeaderValue::from_maybe_shared(Bytes::from(accepted))
             .expect("content coding names are valid header values")

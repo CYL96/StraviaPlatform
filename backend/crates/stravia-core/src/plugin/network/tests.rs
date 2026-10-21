@@ -975,6 +975,62 @@ async fn legacy_http_preserves_raw_responses_and_manual_request_encoding() {
 }
 
 #[tokio::test]
+async fn declared_response_compression_preserves_order_and_first_occurrence_on_wire() {
+    let (accepted_tx, mut accepted_rx) = mpsc::channel(1);
+    let app = Router::new().route(
+        "/",
+        get(move |headers: axum::http::HeaderMap| {
+            let accepted_tx = accepted_tx.clone();
+            async move {
+                accepted_tx
+                    .send(headers["accept-encoding"].to_str().unwrap().to_owned())
+                    .await
+                    .unwrap();
+                axum::http::StatusCode::NO_CONTENT
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind local HTTP upstream");
+    let url = format!("http://{}/", listener.local_addr().expect("address"));
+    let task = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("serve local HTTP upstream");
+    });
+    let network = network(&url, Arc::new(VendorWebSocketPool::default()));
+    use HttpContentCoding::{Br, Deflate, Gzip, Zstd};
+    for (response, expected) in [
+        (vec![Br, Gzip, Deflate], "br, gzip, deflate"),
+        (
+            vec![Zstd, Br, Zstd, Gzip, Br, Deflate, Gzip, Deflate],
+            "zstd, br, gzip, deflate",
+        ),
+        (Vec::new(), "identity"),
+    ] {
+        let response = network
+            .http_start(stravia_vendor_runtime::HttpRequest {
+                method: "GET".into(),
+                url: url.clone(),
+                headers: Vec::new(),
+                body: Vec::new(),
+                compression: Some(HttpCompression {
+                    request: None,
+                    response,
+                }),
+            })
+            .expect("start negotiated request");
+        assert_eq!(response.status().await.expect("status"), 204);
+        assert_eq!(
+            accepted_rx.recv().await.expect("wire Accept-Encoding"),
+            expected
+        );
+    }
+    task.abort();
+}
+
+#[tokio::test]
 async fn declared_response_compression_is_decoded_and_undeclared_encoding_is_rejected() {
     let app = Router::new().route(
         "/gzip",
