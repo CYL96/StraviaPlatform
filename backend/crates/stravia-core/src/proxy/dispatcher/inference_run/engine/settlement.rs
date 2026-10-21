@@ -344,7 +344,6 @@ mod tests {
             7,
             true,
             gateway.generation_chains.clone(),
-            Some(std::sync::Arc::new(tokio::sync::Mutex::new(()))),
         )
         .await;
         let observer = observation

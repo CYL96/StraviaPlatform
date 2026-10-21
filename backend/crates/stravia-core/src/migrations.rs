@@ -869,17 +869,14 @@ mod tests {
         assert!(sqlx::query("UPDATE provider_models SET snapshot_state='not json' WHERE provider_id='p' AND model_id='upstream'")
             .execute(&pool).await.is_err());
         use stravia_runtime_contract::turn_chain::{TurnChainStore, TurnNodeId, TurnNodeKind};
-        let nodes = crate::turn_chain::SqlTurnChainStore::sqlite(
-            pool.clone(),
-            std::sync::Arc::new(tokio::sync::Mutex::new(())),
-        )
-        .materialize(
-            &stravia_runtime_contract::Principal::new("alice"),
-            TurnNodeKind::Response,
-            &TurnNodeId::new("child"),
-        )
-        .await
-        .unwrap();
+        let nodes = crate::turn_chain::SqlTurnChainStore::sqlite(pool.clone())
+            .materialize(
+                &stravia_runtime_contract::Principal::new("alice"),
+                TurnNodeKind::Response,
+                &TurnNodeId::new("child"),
+            )
+            .await
+            .unwrap();
         assert_eq!(nodes[0].payload, serde_json::json!({"items":[1]}));
         assert_eq!(nodes[1].payload, serde_json::json!({"items":[historical]}));
         use crate::history_marker::{

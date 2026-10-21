@@ -302,14 +302,16 @@ impl PluginStore {
                 Ok(())
             }
             PluginStoreBackend::Sqlite(pool) => {
+                let mut connection = pool.acquire_write().await.map_err(storage_error)?;
                 let changed =
                     sqlx::query("DELETE FROM vendor_plugins WHERE vendor_id=$1 AND revision=$2")
                         .bind(vendor_id)
                         .bind(expected_revision)
-                        .execute(pool)
+                        .execute(&mut *connection)
                         .await
                         .map_err(storage_error)?
                         .rows_affected();
+                connection.finish().await.map_err(storage_error)?;
                 if changed != 1 {
                     return Err(PluginStorageError::Changed);
                 }
@@ -358,7 +360,7 @@ impl PluginStore {
     ) -> Result<(), PluginStorageError> {
         macro_rules! install {
     ($pool:expr, $begin:literal) => {{
-        let mut connection = $pool.acquire().await.map_err(storage_error)?;
+        let mut connection = $pool.acquire_write().await.map_err(storage_error)?;
         let mut tx = connection.begin_with($begin).await.map_err(storage_error)?;
         let changed = if let Some(expected) = expected_revision {
             sqlx::query(
@@ -495,6 +497,7 @@ impl PluginStore {
             }
         }
         tx.commit().await.map_err(storage_error)?;
+        connection.finish().await.map_err(storage_error)?;
         Ok(())
     }};
             }
@@ -559,7 +562,7 @@ impl PluginStore {
     ON CONFLICT(provider_id) DO UPDATE SET vendor_id=excluded.vendor_id,format_version=excluded.format_version,payload=excluded.payload,updated_at=excluded.updated_at";
         macro_rules! write {
             ($pool:expr, $begin:literal, $lock:literal) => {{
-                let mut connection = $pool.acquire().await.map_err(storage_error)?;
+                let mut connection = $pool.acquire_write().await.map_err(storage_error)?;
                 let mut tx = connection.begin_with($begin).await.map_err(storage_error)?;
                 // PostgreSQL 的 INSERT ... SELECT 可持有旧 MVCC 快照；
                 // 与包切换锁住同一行，确保旧写入在重置之前提交或被拒绝。
@@ -586,6 +589,7 @@ impl PluginStore {
                     return Err(PluginStorageError::StaleOperation);
                 }
                 tx.commit().await.map_err(storage_error)?;
+                connection.finish().await.map_err(storage_error)?;
                 Ok(())
             }};
         }
@@ -674,13 +678,16 @@ impl PluginStore {
                     .retain(|(candidate, data_kind)| candidate != provider_id || data_kind != kind);
                 Ok(())
             }
-            PluginStoreBackend::Sqlite(pool) => sqlx::query(SQL)
-                .bind(provider_id)
-                .bind(kind)
-                .execute(pool)
-                .await
-                .map(|_| ())
-                .map_err(storage_error),
+            PluginStoreBackend::Sqlite(pool) => {
+                let mut connection = pool.acquire_write().await.map_err(storage_error)?;
+                sqlx::query(SQL)
+                    .bind(provider_id)
+                    .bind(kind)
+                    .execute(&mut *connection)
+                    .await
+                    .map_err(storage_error)?;
+                connection.finish().await.map_err(storage_error)
+            }
             PluginStoreBackend::Postgres(pool) => sqlx::query(SQL)
                 .bind(provider_id)
                 .bind(kind)

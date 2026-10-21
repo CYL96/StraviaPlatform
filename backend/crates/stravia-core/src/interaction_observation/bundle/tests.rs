@@ -1,7 +1,7 @@
 use crate::interaction_observation::*;
 use futures::StreamExt;
 use serde_json::Value;
-use std::{io::Cursor, sync::Arc};
+use std::io::Cursor;
 
 async fn fixture() -> anyhow::Result<(tempfile::TempDir, sqlx::SqlitePool, InteractionObservation)>
 {
@@ -14,7 +14,6 @@ async fn fixture() -> anyhow::Result<(tempfile::TempDir, sqlx::SqlitePool, Inter
         1,
         true,
         crate::generation_chain::test_chain().await,
-        Some(Arc::new(tokio::sync::Mutex::new(()))),
     )
     .await;
     Ok((directory, pool, observation))

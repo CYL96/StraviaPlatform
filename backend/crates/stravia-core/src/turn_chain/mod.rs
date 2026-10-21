@@ -18,7 +18,7 @@ pub(crate) async fn test_store() -> SqlTurnChainStore {
     let pool = crate::test_support::migrated_sqlite_pool()
         .await
         .expect("SQLite Turn Chain test database");
-    SqlTurnChainStore::sqlite(pool, std::sync::Arc::new(tokio::sync::Mutex::new(())))
+    SqlTurnChainStore::sqlite(pool)
 }
 
 #[cfg(test)]

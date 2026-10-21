@@ -380,21 +380,23 @@ pub fn timeline_snapshot() -> Value {
         .iter()
         .filter_map(|event| event["args"]["span_id"].as_u64())
         .collect::<HashSet<_>>();
-    let mut flows = Vec::new();
-    for event in &events {
+    // 只遍历原始事件，flow 直接追加到同一数组，保持原事件在前、flow 在后的顺序。
+    let source_event_count = events.len();
+    for index in 0..source_event_count {
+        let event = &events[index];
         if let Some(parent) = event["args"]["parent_id"]
             .as_u64()
             .filter(|parent| present.contains(parent))
         {
             let id = &event["args"]["span_id"];
-            flows.push(json!({"name":"parent","cat":"stravia.perf","ph":"s","ts":event["ts"],"pid":1,"tid":parent,"id":id}));
-            flows.push(json!({"name":"parent","cat":"stravia.perf","ph":"f","ts":event["ts"],"pid":1,"tid":id,"id":id,"bp":"s"}));
+            let start = json!({"name":"parent","cat":"stravia.perf","ph":"s","ts":event["ts"],"pid":1,"tid":parent,"id":id});
+            let finish = json!({"name":"parent","cat":"stravia.perf","ph":"f","ts":event["ts"],"pid":1,"tid":id,"id":id,"bp":"s"});
+            events.push(start);
+            events.push(finish);
         }
     }
-    events.extend(flows);
     let exported_at = Instant::now();
     let mut snapshot = json!({
-        "traceEvents": events,
         "displayTimeUnit": "ms",
         "metadata": {
             "schema_version": 3,
@@ -440,6 +442,8 @@ pub fn timeline_snapshot() -> Value {
             "remote_cache_scope":"last received successful command snapshot; response order and remote TTL are not live gauges",
         }
     });
+    // json! 的泛型表达式会通过 to_value(&events) 重建 DOM；这里直接转移所有权。
+    snapshot["traceEvents"] = Value::Array(events);
     snapshot["metadata"]["buffered"] = json!({
         "completed": buffered[0],
         "sql_completed": buffered[1],
@@ -452,7 +456,7 @@ pub fn timeline_snapshot() -> Value {
 fn trace_event(span: TraceRecord, capture_state: &str) -> Value {
     let mut args = json!({ "span_id": span.id, "capture_state": capture_state });
     if let Some(request_id) = span.request_id {
-        args["request_id"] = json!(request_id);
+        args["request_id"] = Value::String(request_id);
     }
     if let Some(parent_id) = span.parent_id {
         args["parent_id"] = json!(parent_id);
@@ -490,8 +494,8 @@ fn trace_event(span: TraceRecord, capture_state: &str) -> Value {
         "ts": timestamp(span.started),
         "pid": 1,
         "tid": span.id,
-        "args": args,
     });
+    event["args"] = args;
     if let Some(finished) = span.finished {
         event["dur"] = json!(micros(finished.saturating_duration_since(span.started)));
     }
@@ -509,8 +513,10 @@ fn sample_events(sample: ResourceSample) -> Vec<Value> {
         process.insert("cpu_percent".into(), json!(cpu));
     }
     if !process.is_empty() {
-        events.push(json!({"name":"process","cat":"stravia.resources","ph":"C",
-                "pid":1,"tid":0,"ts":ts,"args":process}));
+        let mut event = json!({"name":"process","cat":"stravia.resources","ph":"C",
+                "pid":1,"tid":0,"ts":ts});
+        event["args"] = Value::Object(process);
+        events.push(event);
     }
     for point in sample.resources {
         let mut args = json!({"items":point.items,"logical_bytes":point.logical_bytes});
@@ -520,8 +526,10 @@ fn sample_events(sample: ResourceSample) -> Vec<Value> {
         if let Some(age) = point.observation_age_ms {
             args["observation_age_ms"] = json!(age);
         }
-        events.push(json!({"name":format!("{}.{}",point.resource,point.domain),
-                "cat":"stravia.resources","ph":"C","pid":1,"tid":0,"ts":ts,"args":args}));
+        let mut event = json!({"name":format!("{}.{}",point.resource,point.domain),
+                "cat":"stravia.resources","ph":"C","pid":1,"tid":0,"ts":ts});
+        event["args"] = args;
+        events.push(event);
     }
     for pool in sample.pools {
         let mut args = json!({"observation_age_us":ts.saturating_sub(pool.observed_at_us)});
@@ -540,10 +548,10 @@ fn sample_events(sample: ResourceSample) -> Vec<Value> {
         if let Some(value) = pool.cancelled {
             args["instrumented_cancelled"] = json!(value);
         }
-        events.push(
-            json!({"name":format!("sql_pool.{}.{}",pool.backend,pool.pool),
-                "cat":"stravia.resources","ph":"C","pid":1,"tid":0,"ts":ts,"args":args}),
-        );
+        let mut event = json!({"name":format!("sql_pool.{}.{}",pool.backend,pool.pool),
+                "cat":"stravia.resources","ph":"C","pid":1,"tid":0,"ts":ts});
+        event["args"] = args;
+        events.push(event);
     }
     events.push(
         json!({"name":"debug.epoch","cat":"stravia.resources","ph":"C",

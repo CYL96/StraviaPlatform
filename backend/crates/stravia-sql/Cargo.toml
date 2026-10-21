@@ -15,8 +15,10 @@ futures = { workspace = true }
 tracing = { workspace = true }
 sha2 = { workspace = true }
 log = { workspace = true }
+tokio = { workspace = true, features = ["rt", "sync"] }
 
 [dev-dependencies]
+tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "time"] }
 tracing-subscriber = { workspace = true, features = ["registry"] }
 

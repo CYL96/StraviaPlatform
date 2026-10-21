@@ -8,6 +8,56 @@ mod support;
 use support::Captured;
 
 #[tokio::test(flavor = "current_thread")]
+async fn postgres_write_leases_preserve_database_lock_concurrency()
+-> Result<(), Box<dyn std::error::Error>> {
+    let Ok(url) = std::env::var("STRAVIA_TEST_POSTGRES_URL") else {
+        return Ok(());
+    };
+    let pool = PgPool::connect(&url).await?;
+    let key = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_micros())?;
+    let mut first = pool.acquire_write().await?;
+    let mut transaction = first.begin().await?;
+    stravia_sql::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(key)
+        .execute(&mut *transaction)
+        .await?;
+
+    let second = async {
+        let mut connection = pool.acquire_write().await?;
+        let mut transaction = connection.begin().await?;
+        let acquired: bool = stravia_sql::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
+            .bind(key)
+            .fetch_one(&mut *transaction)
+            .await?;
+        transaction.rollback().await?;
+        connection.finish().await?;
+        Ok::<_, stravia_sql::Error>(acquired)
+    };
+    let acquired = tokio::time::timeout(std::time::Duration::from_secs(5), second).await??;
+    assert!(
+        !acquired,
+        "independent writer must reach PostgreSQL while the first holds its lock"
+    );
+    transaction.commit().await?;
+    first.finish().await?;
+
+    let mut connection = pool.acquire_write().await?;
+    let mut transaction = connection.begin().await?;
+    let acquired: bool = stravia_sql::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
+        .bind(key)
+        .fetch_one(&mut *transaction)
+        .await?;
+    assert!(
+        acquired,
+        "committing the first transaction must release its database lock"
+    );
+    transaction.rollback().await?;
+    connection.finish().await?;
+    pool.close().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn postgres_queries_transactions_and_database_errors_keep_their_results()
 -> Result<(), Box<dyn std::error::Error>> {
     let Ok(url) = std::env::var("STRAVIA_TEST_POSTGRES_URL") else {

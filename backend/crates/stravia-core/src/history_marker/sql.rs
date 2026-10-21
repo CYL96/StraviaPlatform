@@ -76,6 +76,7 @@ impl SqlHistoryMarkerStore {
         let expires_at = Self::after(now, input.pending_retention);
         match self {
             Self::Sqlite(pool) => {
+                let mut connection = pool.acquire_write().await.map_err(storage)?;
                 sqlx::query(
             "INSERT INTO history_markers \
              (reference, principal, kind, activity, segment_payload, created_at, updated_at, expires_at) \
@@ -88,9 +89,10 @@ impl SqlHistoryMarkerStore {
                             .bind(now)
                             .bind(now)
                             .bind(expires_at)
-                            .execute(pool)
+                            .execute(&mut *connection)
                             .await
         .map_err(storage)?;
+                connection.finish().await.map_err(storage)?;
             }
             Self::Postgres(pool) => {
                 sqlx::query(
@@ -270,6 +272,7 @@ impl SqlHistoryMarkerStore {
             .map_err(|error| HistoryMarkerError::Storage(error.to_string()))?;
         match self {
             Self::Sqlite(pool) => {
+                let mut connection = pool.acquire_write().await.map_err(storage)?;
                 sqlx::query(
                     "UPDATE history_markers SET execution_state = ?, segment_payload = ?, \
                      execution_owner = NULL, lease_expires_at = NULL, updated_at = ? \
@@ -286,9 +289,10 @@ impl SqlHistoryMarkerStore {
                 .bind(now)
                 .bind(deadline_expired)
                 .bind(now)
-                .execute(pool)
+                .execute(&mut *connection)
                 .await
                 .map_err(storage)?;
+                connection.finish().await.map_err(storage)?;
             }
             Self::Postgres(pool) => {
                 sqlx::query(
@@ -415,7 +419,8 @@ impl HistoryMarkerStore for SqlHistoryMarkerStore {
             return Err(HistoryMarkerError::TerminalConflict);
         }
         backend!(self, pool, {
-            let mut tx = pool.begin().await.map_err(storage)?;
+            let mut connection = pool.acquire_write().await.map_err(storage)?;
+            let mut tx = connection.begin().await.map_err(storage)?;
             // Preserve the original absolute acceptance deadline.
             sqlx::query(
                 "UPDATE history_markers SET execution_deadline = CASE WHEN execution_deadline < $1 \
@@ -449,6 +454,7 @@ impl HistoryMarkerStore for SqlHistoryMarkerStore {
                 return Err(HistoryMarkerError::TerminalConflict);
             }
             tx.commit().await.map_err(storage)?;
+            connection.finish().await.map_err(storage)?;
         });
         Ok(id)
     }
@@ -514,7 +520,8 @@ impl HistoryMarkerStore for SqlHistoryMarkerStore {
     ) -> Result<(), HistoryMarkerError> {
         let key = principal.continuation_key();
         backend!(self, pool, {
-            let mut transaction = pool.begin().await.map_err(storage)?;
+            let mut connection = pool.acquire_write().await.map_err(storage)?;
+            let mut transaction = connection.begin().await.map_err(storage)?;
             let updated = sqlx::query(
                 "UPDATE public_tool_executions SET handed_off_at = COALESCE(handed_off_at, $1) \
                  WHERE id = $2 AND principal = $3 AND id IN \
@@ -529,11 +536,13 @@ impl HistoryMarkerStore for SqlHistoryMarkerStore {
             .rows_affected();
             if updated != 1 || !before_commit() {
                 transaction.rollback().await.map_err(storage)?;
+                connection.finish().await.map_err(storage)?;
                 return Err(HistoryMarkerError::TerminalConflict);
             }
             match transaction.commit().await {
-                Ok(()) => Ok(()),
+                Ok(()) => connection.finish().await.map_err(storage),
                 Err(commit_error) => {
+                    connection.finish().await.map_err(storage)?;
                     // A failed acknowledgement does not establish that COMMIT
                     // failed. Read the durable fact without replaying the update.
                     let persisted: Result<i64, sqlx::Error> = sqlx::query_scalar(
@@ -558,18 +567,21 @@ impl HistoryMarkerStore for SqlHistoryMarkerStore {
 
     async fn recover_public_executions(&self) -> Result<(), HistoryMarkerError> {
         let interrupted: Vec<(String, String)> = backend!(self, pool, {
+            let mut connection = pool.acquire_write().await.map_err(storage)?;
             // Reuse the existing stale-owner transition and payload construction.
             // No owner from another process may finish or reclaim these markers.
-            sqlx::query_as(
+            let interrupted = sqlx::query_as(
                 "UPDATE history_markers SET execution_state = 'running', lease_expires_at = 0, \
                  execution_owner = NULL WHERE execution_state IN ('pending', 'running') \
                  AND reference IN (SELECT marker_reference FROM public_tool_executions WHERE process_id <> $1) \
                  RETURNING principal, reference",
             )
             .bind(process_id())
-            .fetch_all(pool)
+            .fetch_all(&mut *connection)
             .await
-            .map_err(storage)?
+            .map_err(storage)?;
+            connection.finish().await.map_err(storage)?;
+            interrupted
         });
         for (principal, reference) in interrupted {
             self.interrupt_if_stale(&principal, &reference).await?;
@@ -597,6 +609,7 @@ impl HistoryMarkerStore for SqlHistoryMarkerStore {
         let expires_at = Self::after(now, input.pending_retention);
         match self {
             Self::Sqlite(pool) => {
+                let mut connection = pool.acquire_write().await.map_err(storage)?;
                 sqlx::query(
                     "INSERT INTO history_markers \
              (reference, principal, kind, activity, tool_id, call_payload, execution_state, \
@@ -612,9 +625,10 @@ impl HistoryMarkerStore for SqlHistoryMarkerStore {
                 .bind(now)
                 .bind(now)
                 .bind(expires_at)
-                .execute(pool)
+                .execute(&mut *connection)
                 .await
                 .map_err(storage)?;
+                connection.finish().await.map_err(storage)?;
             }
             Self::Postgres(pool) => {
                 sqlx::query(
@@ -721,7 +735,9 @@ impl HistoryMarkerStore for SqlHistoryMarkerStore {
         let lease_expires_at = Self::after(now, lease);
         let principal_key = principal.continuation_key();
         let updated = match self {
-            Self::Sqlite(pool) => sqlx::query(
+            Self::Sqlite(pool) => {
+                let mut connection = pool.acquire_write().await.map_err(storage)?;
+                let updated = sqlx::query(
                 "UPDATE history_markers SET execution_state = 'running', execution_owner = ?, \
      lease_expires_at = ?, updated_at = ? WHERE principal = ? AND reference = ? \
      AND kind = 'platform' AND execution_state = 'pending' AND execution_deadline > ? \
@@ -737,10 +753,13 @@ impl HistoryMarkerStore for SqlHistoryMarkerStore {
             .bind(now)
             .bind(now)
             .bind(now)
-            .execute(pool)
+            .execute(&mut *connection)
             .await
             .map_err(storage)?
-            .rows_affected(),
+            .rows_affected();
+                connection.finish().await.map_err(storage)?;
+                updated
+            }
             Self::Postgres(pool) => sqlx::query(
                 "UPDATE history_markers SET execution_state = 'running', execution_owner = $1, \
      lease_expires_at = $2, updated_at = $3 WHERE principal = $4 AND reference = $5 \
@@ -815,7 +834,9 @@ impl HistoryMarkerStore for SqlHistoryMarkerStore {
         let now = Self::now();
         let principal_key = principal.continuation_key();
         let updated = match self {
-            Self::Sqlite(pool) => sqlx::query(
+            Self::Sqlite(pool) => {
+                let mut connection = pool.acquire_write().await.map_err(storage)?;
+                let updated = sqlx::query(
                 "UPDATE history_markers SET execution_state = ?, segment_payload = ?, \
          execution_owner = NULL, lease_expires_at = NULL, updated_at = ? \
          WHERE principal = ? AND reference = ? AND execution_state = 'running' \
@@ -831,10 +852,13 @@ impl HistoryMarkerStore for SqlHistoryMarkerStore {
             .bind(now)
             .bind(now)
             .bind(now)
-            .execute(pool)
+            .execute(&mut *connection)
             .await
             .map_err(storage)?
-            .rows_affected(),
+            .rows_affected();
+                connection.finish().await.map_err(storage)?;
+                updated
+            }
             Self::Postgres(pool) => sqlx::query(
                 "UPDATE history_markers SET execution_state = $1, segment_payload = $2, \
          execution_owner = NULL, lease_expires_at = NULL, updated_at = $3 \
@@ -923,7 +947,8 @@ impl HistoryMarkerStore for SqlHistoryMarkerStore {
         let principal = principal.continuation_key();
         match self {
             Self::Sqlite(pool) => {
-                let mut transaction = pool.begin().await.map_err(storage)?;
+                let mut connection = pool.acquire_write().await.map_err(storage)?;
+                let mut transaction = connection.begin().await.map_err(storage)?;
                 for reference in references {
                     let updated = sqlx::query(
                         "UPDATE history_markers SET published_at = COALESCE(published_at, ?), \
@@ -947,6 +972,7 @@ impl HistoryMarkerStore for SqlHistoryMarkerStore {
                     }
                 }
                 transaction.commit().await.map_err(storage)?;
+                connection.finish().await.map_err(storage)?;
             }
             Self::Postgres(pool) => {
                 let mut transaction = pool.begin().await.map_err(storage)?;
@@ -993,7 +1019,7 @@ impl HistoryMarkerStore for SqlHistoryMarkerStore {
             "trusted Generation Chain references an unavailable history marker";
         match self {
             Self::Sqlite(pool) => {
-                let mut connection = pool.acquire().await.map_err(storage)?;
+                let mut connection = pool.acquire_write().await.map_err(storage)?;
                 let mut transaction = connection
                     .begin_with("BEGIN IMMEDIATE")
                     .await
@@ -1028,10 +1054,12 @@ impl HistoryMarkerStore for SqlHistoryMarkerStore {
                         .rows_affected();
                     if updated != references.len() as u64 {
                         transaction.rollback().await.map_err(storage)?;
+                        connection.finish().await.map_err(storage)?;
                         return Err(HistoryMarkerError::Storage(UNAVAILABLE.into()));
                     }
                 }
                 transaction.commit().await.map_err(storage)?;
+                connection.finish().await.map_err(storage)?;
             }
             Self::Postgres(pool) => {
                 let mut transaction = pool.begin().await.map_err(storage)?;
@@ -1075,7 +1103,8 @@ impl HistoryMarkerStore for SqlHistoryMarkerStore {
     async fn cleanup_expired(&self) -> Result<u64, HistoryMarkerError> {
         let now = Self::now();
         backend!(self, pool, {
-            let mut tx = pool.begin().await.map_err(storage)?;
+            let mut connection = pool.acquire_write().await.map_err(storage)?;
+            let mut tx = connection.begin().await.map_err(storage)?;
             sqlx::query("DELETE FROM public_tool_executions WHERE expires_at <= $1")
                 .bind(now)
                 .execute(&mut *tx)
@@ -1084,6 +1113,7 @@ impl HistoryMarkerStore for SqlHistoryMarkerStore {
             let removed = sqlx::query("DELETE FROM history_markers WHERE expires_at <= $1 AND NOT EXISTS (SELECT 1 FROM public_tool_executions p WHERE p.marker_reference = history_markers.reference)")
                     .bind(now).execute(&mut *tx).await.map_err(storage)?.rows_affected();
             tx.commit().await.map_err(storage)?;
+            connection.finish().await.map_err(storage)?;
             Ok(removed)
         })
     }

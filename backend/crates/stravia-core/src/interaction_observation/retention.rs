@@ -17,9 +17,9 @@ impl ObservationStore {
     pub async fn update_retention(&self, days: u32) -> anyhow::Result<()> {
         let ttl = i64::from(days).saturating_mul(86_400_000);
         match self {
-            Self::Sqlite(p, _, write_gate) => {
-                let _write_gate = write_gate.lock().await;
-                let mut tx = p.begin().await?;
+            Self::Sqlite(p, _) => {
+                let mut connection = p.acquire_write().await?;
+                let mut tx = connection.begin().await?;
                 for sql in [
                     "UPDATE interaction_observations SET expires_at=last_active_at+?",
                     "UPDATE inference_run_observations SET expires_at=last_active_at+?",
@@ -28,7 +28,8 @@ impl ObservationStore {
                 ] {
                     sqlx::query(sql).bind(ttl).execute(&mut *tx).await?;
                 }
-                tx.commit().await?
+                tx.commit().await?;
+                connection.finish().await?;
             }
             Self::Postgres(p, _) => {
                 let mut tx = p.begin().await?;
@@ -54,10 +55,10 @@ impl ObservationStore {
     )]
     pub(super) async fn purge_expired_batch(&self, now: i64) -> anyhow::Result<RetentionBatch> {
         match self {
-            Self::Sqlite(p, _, write_gate) => {
+            Self::Sqlite(p, _) => {
                 // 每批单独持有协调器与事务，避免一次清理长期阻塞其他写入。
-                let _write_gate = write_gate.lock().await;
-                let mut tx = p.begin().await?;
+                let mut connection = p.acquire_write().await?;
+                let mut tx = connection.begin().await?;
                 let rejected = sqlx::query("DELETE FROM rejected_request_observations WHERE expires_at<=?1 AND id IN (SELECT id FROM rejected_request_observations WHERE expires_at<=?1 ORDER BY expires_at,id LIMIT ?2)")
                     .bind(now)
                     .bind(RETENTION_BATCH_SIZE)
@@ -70,6 +71,7 @@ impl ObservationStore {
                     .fetch_all(&mut *tx)
                     .await?;
                 tx.commit().await?;
+                connection.finish().await?;
 
                 Ok(RetentionBatch {
                     has_more: rejected == RETENTION_BATCH_SIZE as u64
@@ -109,7 +111,7 @@ impl ObservationStore {
     )]
     pub async fn mark_clear_tombstones(&self) -> anyhow::Result<ClearHistoryResult> {
         match self {
-            Self::Sqlite(p, _, _) => {
+            Self::Sqlite(p, _) => {
                 // SQL 仅冻结 owner 快照；文件 tombstone 不占用数据库写锁或协调器。
                 let mut tx = p.begin().await?;
                 let skipped:i64=sqlx::query_scalar("SELECT COUNT(*) FROM interaction_observations WHERE status IN ('running','waiting_client')").fetch_one(&mut *tx).await?;
@@ -169,15 +171,16 @@ impl ObservationStore {
     )]
     pub async fn purge_clear_rows(&self) -> anyhow::Result<Vec<String>> {
         match self {
-            Self::Sqlite(p, _, write_gate) => {
+            Self::Sqlite(p, _) => {
                 let deleted = {
-                    let _write_gate = write_gate.lock().await;
-                    let mut tx = p.begin().await?;
+                    let mut connection = p.acquire_write().await?;
+                    let mut tx = connection.begin().await?;
                     sqlx::query("DELETE FROM rejected_request_observations")
                         .execute(&mut *tx)
                         .await?;
                     let deleted = sqlx::query_scalar("DELETE FROM interaction_observations WHERE status NOT IN ('running','waiting_client') RETURNING id").fetch_all(&mut *tx).await?;
                     tx.commit().await?;
+                    connection.finish().await?;
                     deleted
                 };
 
@@ -199,7 +202,7 @@ impl ObservationStore {
     }
     pub(super) async fn remove_orphan_manifests(&self) -> anyhow::Result<()> {
         let runs: Vec<String> = match self {
-            Self::Sqlite(pool, _, _) => {
+            Self::Sqlite(pool, _) => {
                 sqlx::query_scalar("SELECT id FROM inference_run_observations")
                     .fetch_all(pool)
                     .await?
@@ -211,7 +214,7 @@ impl ObservationStore {
             }
         };
         let rejections: Vec<String> = match self {
-            Self::Sqlite(pool, _, _) => {
+            Self::Sqlite(pool, _) => {
                 sqlx::query_scalar("SELECT id FROM rejected_request_observations")
                     .fetch_all(pool)
                     .await?
@@ -263,7 +266,7 @@ impl ObservationStore {
     pub async fn mark_expired_tombstones(&self, now: i64) -> anyhow::Result<Vec<String>> {
         let sql = "SELECT r.id FROM inference_run_observations r JOIN interaction_observations i ON i.id=r.interaction_id WHERE i.status<>'running'";
         let eligible: Vec<String> = match self {
-            Self::Sqlite(pool, _, _) => sqlx::query_scalar(sql).fetch_all(pool).await?,
+            Self::Sqlite(pool, _) => sqlx::query_scalar(sql).fetch_all(pool).await?,
             Self::Postgres(pool, _) => sqlx::query_scalar(sql).fetch_all(pool).await?,
         };
         let eligible: HashSet<String> = eligible.into_iter().collect();

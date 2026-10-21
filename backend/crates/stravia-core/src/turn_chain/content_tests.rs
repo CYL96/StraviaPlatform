@@ -7,12 +7,13 @@ use std::sync::{
 
 async fn execute(store: &SqlTurnChainStore, sql: &str) {
     match store {
-        SqlTurnChainStore::Sqlite(pool, gate) => {
-            let _write_gate = gate.lock().await;
+        SqlTurnChainStore::Sqlite(pool) => {
+            let mut writer = pool.acquire_write().await.unwrap();
             sqlx::query(sqlx::AssertSqlSafe(sql.to_owned()))
-                .execute(pool)
+                .execute(&mut *writer)
                 .await
                 .unwrap();
+            writer.finish().await.unwrap();
         }
         SqlTurnChainStore::Postgres(pool) => {
             sqlx::query(sqlx::AssertSqlSafe(sql.to_owned()))
@@ -25,12 +26,10 @@ async fn execute(store: &SqlTurnChainStore, sql: &str) {
 
 async fn scalar(store: &SqlTurnChainStore, sql: &str) -> i64 {
     match store {
-        SqlTurnChainStore::Sqlite(pool, _) => {
-            sqlx::query_scalar(sqlx::AssertSqlSafe(sql.to_owned()))
-                .fetch_one(pool)
-                .await
-                .unwrap()
-        }
+        SqlTurnChainStore::Sqlite(pool) => sqlx::query_scalar(sqlx::AssertSqlSafe(sql.to_owned()))
+            .fetch_one(pool)
+            .await
+            .unwrap(),
         SqlTurnChainStore::Postgres(pool) => {
             sqlx::query_scalar(sqlx::AssertSqlSafe(sql.to_owned()))
                 .fetch_one(pool)
@@ -457,19 +456,19 @@ async fn complete_items_preserve_order_repeats_and_agent_transcript() {
         scalar(&store, "SELECT COUNT(*) FROM turn_chain_node_contents").await,
         4
     );
-    let SqlTurnChainStore::Sqlite(pool, gate) = &store else {
+    let SqlTurnChainStore::Sqlite(pool) = &store else {
         unreachable!()
     };
-    let _write_gate = gate.lock().await;
+    let mut writer = pool.acquire_write().await.unwrap();
     let foreign: i64 = sqlx::query_scalar(
         "INSERT INTO turn_chain_contents (principal, content_key, content) VALUES ('foreign-owner', 'foreign-content', X'00') RETURNING id",
     )
-    .fetch_one(pool)
+    .fetch_one(&mut *writer)
     .await
     .unwrap();
     let error = sqlx::query("INSERT INTO turn_chain_node_contents (node_id, principal, content_id) VALUES ('agent-item-test', 'foreign-owner', ?)")
         .bind(foreign)
-        .execute(pool)
+        .execute(&mut *writer)
         .await;
     assert!(
         error.is_err(),
@@ -478,12 +477,13 @@ async fn complete_items_preserve_order_repeats_and_agent_transcript() {
     let error = sqlx::query("INSERT INTO turn_chain_node_contents (node_id, principal, content_id) VALUES ('agent-item-test', ?, ?)")
         .bind(principal.continuation_key())
         .bind(foreign)
-        .execute(pool)
+        .execute(&mut *writer)
         .await;
     assert!(
         error.is_err(),
         "content composite foreign key must reject foreign contents"
     );
+    writer.finish().await.unwrap();
 }
 
 #[tokio::test]
@@ -626,7 +626,7 @@ async fn stale_content_hint_preserves_history_after_gc() {
         .await
         .unwrap();
     let principal = owner.continuation_key();
-    let SqlTurnChainStore::Sqlite(pool, gate) = &store else {
+    let SqlTurnChainStore::Sqlite(pool) = &store else {
         unreachable!()
     };
     let mut encoded = super::content::encode(original.clone()).unwrap();
@@ -646,8 +646,8 @@ async fn stale_content_hint_preserves_history_after_gc() {
     assert_eq!(store.sweep_expired().await.unwrap(), 1);
     let id = TurnNodeId::response();
     {
-        let _write_gate = gate.lock().await;
-        let mut transaction = pool.begin().await.unwrap();
+        let mut writer = pool.acquire_write().await.unwrap();
+        let mut transaction = writer.begin().await.unwrap();
         let now = chrono::Utc::now().timestamp_millis();
         sqlx::query(
             "INSERT INTO turn_chain_nodes \
@@ -667,6 +667,7 @@ async fn stale_content_hint_preserves_history_after_gc() {
             .await
             .unwrap();
         transaction.commit().await.unwrap();
+        writer.finish().await.unwrap();
     }
     assert_eq!(
         store
@@ -710,10 +711,10 @@ async fn optimization_sqlite_history_restore_ignores_unrelated_references() {
             .expect("commit test chain");
     }
 
-    let SqlTurnChainStore::Sqlite(pool, gate) = &store else {
+    let SqlTurnChainStore::Sqlite(pool) = &store else {
         unreachable!("SQLite test store")
     };
-    let _write_gate = gate.lock().await;
+    let mut writer = pool.acquire_write().await.unwrap();
     let now = chrono::Utc::now().timestamp_millis();
     sqlx::query(
         "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ?) \
@@ -727,7 +728,7 @@ async fn optimization_sqlite_history_restore_ignores_unrelated_references() {
     .bind(super::content::encode(json!({})).unwrap().payload)
     .bind(now)
     .bind(now + 60_000)
-    .execute(pool)
+    .execute(&mut *writer)
     .await
     .expect("seed unrelated nodes");
     sqlx::query(
@@ -737,7 +738,7 @@ async fn optimization_sqlite_history_restore_ignores_unrelated_references() {
          WHERE n.id LIKE 'unrelated-ref-%' AND r.node_id = ? LIMIT 10000",
     )
     .bind(root.as_str())
-    .execute(pool)
+    .execute(&mut *writer)
     .await
     .expect("seed unrelated references");
     sqlx::query(
@@ -747,9 +748,10 @@ async fn optimization_sqlite_history_restore_ignores_unrelated_references() {
     )
     .bind(UNRELATED_REFERENCES)
     .bind(owner.continuation_key())
-    .execute(pool)
+    .execute(&mut *writer)
     .await
     .expect("seed unrelated contents");
+    writer.finish().await.unwrap();
     assert!(
         scalar(&store, "SELECT COUNT(*) FROM turn_chain_node_contents").await
             >= UNRELATED_REFERENCES,
@@ -781,7 +783,7 @@ async fn optimization_sqlite_history_restore_ignores_unrelated_references() {
 #[tokio::test]
 async fn sqlite_content_gc_releases_writer_within_transaction_budget() {
     let pool = crate::test_support::migrated_sqlite_pool().await.unwrap();
-    let store = SqlTurnChainStore::sqlite(pool.clone(), Arc::new(tokio::sync::Mutex::new(())));
+    let store = SqlTurnChainStore::sqlite(pool.clone());
     let owner = Principal::new("gc-budget-owner");
     let live = TurnNodeId::response();
     let expected = json!({"effective_system": "live system ".repeat(100)});

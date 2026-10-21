@@ -321,21 +321,14 @@ impl Gateway {
                 7
             }
         };
-        let (turn_chains, sqlite_write_gate) = if let Some(pool) = history_sqlite_pool.as_ref() {
-            let gate = Arc::new(tokio::sync::Mutex::new(()));
-            (
-                turn_chain::SqlTurnChainStore::sqlite(pool.clone(), Arc::clone(&gate)),
-                Some(gate),
-            )
+        let turn_chains = if let Some(pool) = history_sqlite_pool.as_ref() {
+            turn_chain::SqlTurnChainStore::sqlite(pool.clone())
         } else {
-            (
-                turn_chain::SqlTurnChainStore::postgres(
-                    postgres_pool
-                        .as_ref()
-                        .expect("Gateway requires a SQL history store")
-                        .clone(),
-                ),
-                None,
+            turn_chain::SqlTurnChainStore::postgres(
+                postgres_pool
+                    .as_ref()
+                    .expect("Gateway requires a SQL history store")
+                    .clone(),
             )
         };
         let turn_chains: Arc<dyn stravia_runtime_contract::turn_chain::TurnChainStore> =
@@ -472,7 +465,6 @@ impl Gateway {
             retention_days,
             !matches!(storage_kind, RuntimeStorageKind::Memory),
             generation_chains.clone(),
-            sqlite_write_gate,
         )
         .await;
         let allowance_samples = match storage_kind {

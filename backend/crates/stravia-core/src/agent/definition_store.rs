@@ -150,7 +150,8 @@ impl AgentDefinitionStore for SqlAgentDefinitionStore {
         let now = chrono::Utc::now().timestamp_millis();
         match self {
             Self::Sqlite(pool) => {
-                let mut transaction = pool.begin().await.map_err(storage_error)?;
+                let mut connection = pool.acquire_write().await.map_err(storage_error)?;
+                let mut transaction = connection.begin().await.map_err(storage_error)?;
                 sqlx::query(
                     "INSERT OR IGNORE INTO agent_definition_revisions \
                      (definition_id, slug, version, spec_hash, spec_json, created_at) \
@@ -196,6 +197,7 @@ impl AgentDefinitionStore for SqlAgentDefinitionStore {
                     .await
                     .map_err(storage_error)?;
                 transaction.commit().await.map_err(storage_error)?;
+                connection.finish().await.map_err(storage_error)?;
                 Ok(AgentDefinitionConfig {
                     enabled,
                     model_id,
@@ -299,19 +301,24 @@ impl AgentDefinitionStore for SqlAgentDefinitionStore {
     ) -> Result<AgentDefinitionConfig, AgentDefinitionError> {
         let now = chrono::Utc::now().timestamp_millis();
         let rows = match self {
-            Self::Sqlite(pool) => sqlx::query(
-                "UPDATE agent_definition_configs \
-                 SET enabled = ?, model_id = ?, thinking_level = ?, updated_at = ? \
-                 WHERE definition_id = ?",
-            )
-            .bind(config.enabled)
-            .bind(&config.model_id)
-            .bind(config.thinking_level.map(|level| level.as_str()))
-            .bind(now)
-            .bind(id.as_str())
-            .execute(pool)
-            .await
-            .map(|result| result.rows_affected()),
+            Self::Sqlite(pool) => {
+                let mut connection = pool.acquire_write().await.map_err(storage_error)?;
+                let result = sqlx::query(
+                    "UPDATE agent_definition_configs \
+                     SET enabled = ?, model_id = ?, thinking_level = ?, updated_at = ? \
+                     WHERE definition_id = ?",
+                )
+                .bind(config.enabled)
+                .bind(&config.model_id)
+                .bind(config.thinking_level.map(|level| level.as_str()))
+                .bind(now)
+                .bind(id.as_str())
+                .execute(&mut *connection)
+                .await
+                .map_err(storage_error)?;
+                connection.finish().await.map_err(storage_error)?;
+                Ok(result.rows_affected())
+            }
             Self::Postgres(pool) => sqlx::query(
                 "UPDATE agent_definition_configs \
                  SET enabled = $1, model_id = $2, thinking_level = $3, updated_at = $4 \

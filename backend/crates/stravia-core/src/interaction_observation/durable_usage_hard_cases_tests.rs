@@ -43,13 +43,8 @@ impl Database {
     fn observation(&self, directory: &std::path::Path) -> anyhow::Result<ObservationStore> {
         let index = Arc::new(DebugTraceIndex::load(directory)?);
         match self {
-            Self::Sqlite(pool) => ObservationStore::new(
-                Some(pool.clone()),
-                None,
-                index,
-                Some(Arc::new(tokio::sync::Mutex::new(()))),
-            ),
-            Self::Postgres(pool) => ObservationStore::new(None, Some(pool.clone()), index, None),
+            Self::Sqlite(pool) => ObservationStore::new(Some(pool.clone()), None, index),
+            Self::Postgres(pool) => ObservationStore::new(None, Some(pool.clone()), index),
         }
     }
     async fn seed(

@@ -3368,7 +3368,14 @@ CREATE TRIGGER retain_terminal_tool_execution AFTER UPDATE OF execution_state ON
 -- Name: target_attempt_observations stats_usage_attempt_change; Type: TRIGGER; Schema: public; Owner: -
 --
 
-CREATE TRIGGER stats_usage_attempt_change AFTER INSERT OR DELETE OR UPDATE ON public.target_attempt_observations FOR EACH ROW EXECUTE FUNCTION public.stats_usage_attempt_change();
+CREATE TRIGGER stats_usage_attempt_change AFTER INSERT OR DELETE ON public.target_attempt_observations FOR EACH ROW EXECUTE FUNCTION public.stats_usage_attempt_change();
+
+
+--
+-- Name: target_attempt_observations stats_usage_attempt_update; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER stats_usage_attempt_update AFTER UPDATE OF id, model_turn_id, run_id, provider_id, provider_name, status, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens, first_token_ms, duration_ms ON public.target_attempt_observations FOR EACH ROW WHEN (((old.id IS DISTINCT FROM new.id) OR (old.model_turn_id IS DISTINCT FROM new.model_turn_id) OR (old.run_id IS DISTINCT FROM new.run_id) OR (old.provider_id IS DISTINCT FROM new.provider_id) OR (old.provider_name IS DISTINCT FROM new.provider_name) OR (old.status IS DISTINCT FROM new.status) OR (old.input_tokens IS DISTINCT FROM new.input_tokens) OR (old.output_tokens IS DISTINCT FROM new.output_tokens) OR (old.cache_read_tokens IS DISTINCT FROM new.cache_read_tokens) OR (old.cache_write_tokens IS DISTINCT FROM new.cache_write_tokens) OR (old.reasoning_tokens IS DISTINCT FROM new.reasoning_tokens) OR (old.first_token_ms IS DISTINCT FROM new.first_token_ms) OR (old.duration_ms IS DISTINCT FROM new.duration_ms))) EXECUTE FUNCTION public.stats_usage_attempt_change();
 
 
 --
@@ -3382,21 +3389,42 @@ CREATE TRIGGER stats_usage_credit AFTER INSERT ON public.stats_usage_checkpoints
 -- Name: rejected_request_observations stats_usage_rejection_change; Type: TRIGGER; Schema: public; Owner: -
 --
 
-CREATE TRIGGER stats_usage_rejection_change AFTER INSERT OR DELETE OR UPDATE ON public.rejected_request_observations FOR EACH ROW EXECUTE FUNCTION public.stats_usage_rejection_change();
+CREATE TRIGGER stats_usage_rejection_change AFTER INSERT OR DELETE ON public.rejected_request_observations FOR EACH ROW EXECUTE FUNCTION public.stats_usage_rejection_change();
+
+
+--
+-- Name: rejected_request_observations stats_usage_rejection_update; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER stats_usage_rejection_update AFTER UPDATE OF id, started_at, occurred_at, status_code, code ON public.rejected_request_observations FOR EACH ROW WHEN (((old.id IS DISTINCT FROM new.id) OR (old.started_at IS DISTINCT FROM new.started_at) OR (old.occurred_at IS DISTINCT FROM new.occurred_at) OR (old.status_code IS DISTINCT FROM new.status_code) OR (old.code IS DISTINCT FROM new.code))) EXECUTE FUNCTION public.stats_usage_rejection_change();
 
 
 --
 -- Name: inference_run_observations stats_usage_run_change; Type: TRIGGER; Schema: public; Owner: -
 --
 
-CREATE TRIGGER stats_usage_run_change AFTER INSERT OR DELETE OR UPDATE ON public.inference_run_observations FOR EACH ROW EXECUTE FUNCTION public.stats_usage_run_change();
+CREATE TRIGGER stats_usage_run_change AFTER INSERT OR DELETE ON public.inference_run_observations FOR EACH ROW EXECUTE FUNCTION public.stats_usage_run_change();
+
+
+--
+-- Name: inference_run_observations stats_usage_run_update; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER stats_usage_run_update AFTER UPDATE OF id, started_at, status, finished_at, failure_json, terminal_reason ON public.inference_run_observations FOR EACH ROW WHEN (((old.id IS DISTINCT FROM new.id) OR (old.started_at IS DISTINCT FROM new.started_at) OR (old.status IS DISTINCT FROM new.status) OR (old.finished_at IS DISTINCT FROM new.finished_at) OR (old.failure_json IS DISTINCT FROM new.failure_json) OR (old.terminal_reason IS DISTINCT FROM new.terminal_reason))) EXECUTE FUNCTION public.stats_usage_run_change();
 
 
 --
 -- Name: model_turn_observations stats_usage_turn_change; Type: TRIGGER; Schema: public; Owner: -
 --
 
-CREATE TRIGGER stats_usage_turn_change AFTER INSERT OR DELETE OR UPDATE ON public.model_turn_observations FOR EACH ROW EXECUTE FUNCTION public.stats_usage_turn_change();
+CREATE TRIGGER stats_usage_turn_change AFTER INSERT OR DELETE ON public.model_turn_observations FOR EACH ROW EXECUTE FUNCTION public.stats_usage_turn_change();
+
+
+--
+-- Name: model_turn_observations stats_usage_turn_update; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER stats_usage_turn_update AFTER UPDATE OF id, route_id, model_display_name, api_key_id, api_key_name, started_at, finished_at ON public.model_turn_observations FOR EACH ROW WHEN (((old.id IS DISTINCT FROM new.id) OR (old.route_id IS DISTINCT FROM new.route_id) OR (old.model_display_name IS DISTINCT FROM new.model_display_name) OR (old.api_key_id IS DISTINCT FROM new.api_key_id) OR (old.api_key_name IS DISTINCT FROM new.api_key_name) OR (old.started_at IS DISTINCT FROM new.started_at) OR (old.finished_at IS DISTINCT FROM new.finished_at))) EXECUTE FUNCTION public.stats_usage_turn_change();
 
 
 --

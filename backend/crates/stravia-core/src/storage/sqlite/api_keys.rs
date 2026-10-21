@@ -72,6 +72,7 @@ impl ApiKeyStore for SqliteApiKeyStore {
         let key = input
             .key
             .unwrap_or_else(|| format!("sk-{}", uuid::Uuid::new_v4().simple()));
+        let mut connection = self.pool.acquire_write().await?;
         sqlx::query(
     "INSERT INTO api_keys (id, token, name, rpm_limit, mcp_access_enabled, transparent_injection_enabled, inject_media_understanding, inject_web_search, inject_media_generation, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
@@ -85,8 +86,9 @@ impl ApiKeyStore for SqliteApiKeyStore {
             .bind(input.inject_web_search)
             .bind(input.inject_media_generation)
             .bind(input.expires_at.as_ref().map(|v| v.trim()).filter(|v| !v.is_empty()))
-            .execute(&self.pool)
+            .execute(&mut *connection)
             .await?;
+        connection.finish().await?;
 
         replace_api_key_models(&self.pool, &id, &input.model_ids).await?;
         self.get(&id).await?.context("api key missing after create")
@@ -120,6 +122,7 @@ impl ApiKeyStore for SqliteApiKeyStore {
             .unwrap_or(current.inject_media_generation);
         let expires_at = input.expires_at.or(current.expires_at);
 
+        let mut connection = self.pool.acquire_write().await?;
         sqlx::query(
     "UPDATE api_keys SET token=?, name=?, rpm_limit=?, is_enabled=?, mcp_access_enabled=?, transparent_injection_enabled=?, inject_media_understanding=?, inject_web_search=?, inject_media_generation=?, expires_at=?, updated_at=datetime('now') WHERE id=?",
             )
@@ -134,8 +137,9 @@ impl ApiKeyStore for SqliteApiKeyStore {
             .bind(inject_media_generation)
             .bind(expires_at.as_ref().map(|v| v.trim()).filter(|v| !v.is_empty()))
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *connection)
             .await?;
+        connection.finish().await?;
 
         if let Some(model_ids) = input.model_ids {
             replace_api_key_models(&self.pool, id, &model_ids).await?;
@@ -145,10 +149,12 @@ impl ApiKeyStore for SqliteApiKeyStore {
     }
 
     async fn delete(&self, id: &str) -> anyhow::Result<()> {
+        let mut connection = self.pool.acquire_write().await?;
         sqlx::query("DELETE FROM api_keys WHERE id = ?")
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *connection)
             .await?;
+        connection.finish().await?;
         Ok(())
     }
 
@@ -329,7 +335,8 @@ pub(super) async fn replace_api_key_models(
     api_key_id: &str,
     model_ids: &[String],
 ) -> anyhow::Result<()> {
-    let mut tx = pool.begin().await?;
+    let mut connection = pool.acquire_write().await?;
+    let mut tx = connection.begin().await?;
     sqlx::query("DELETE FROM api_key_models WHERE api_key_id = ?")
         .bind(api_key_id)
         .execute(&mut *tx)
@@ -344,5 +351,6 @@ pub(super) async fn replace_api_key_models(
     }
 
     tx.commit().await?;
+    connection.finish().await?;
     Ok(())
 }

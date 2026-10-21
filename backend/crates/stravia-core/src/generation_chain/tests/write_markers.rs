@@ -5,10 +5,7 @@ use stravia_runtime_contract::artifact::{ArtifactStore, bytes_stream};
 async fn completed_inline_window_is_the_parent_after_cold_restore() {
     let pool = crate::test_support::migrated_sqlite_pool().await.unwrap();
     let compaction = crate::compaction::Compaction::sqlite(pool.clone());
-    let durable = Arc::new(crate::turn_chain::SqlTurnChainStore::sqlite(
-        pool,
-        Arc::new(tokio::sync::Mutex::new(())),
-    ));
+    let durable = Arc::new(crate::turn_chain::SqlTurnChainStore::sqlite(pool));
     let chain = GenerationChain::from_turn_chain(
         durable.clone(),
         DEFAULT_GENERATION_CHAIN_TTL,
@@ -294,10 +291,7 @@ async fn native_compaction_source_keeps_reference_and_artifact_resolution() {
         .await
         .unwrap();
     let chain = GenerationChain::from_turn_chain(
-        Arc::new(crate::turn_chain::SqlTurnChainStore::sqlite(
-            pool,
-            Arc::new(tokio::sync::Mutex::new(())),
-        )),
+        Arc::new(crate::turn_chain::SqlTurnChainStore::sqlite(pool)),
         DEFAULT_GENERATION_CHAIN_TTL,
         Some(artifacts),
         crate::runtime_cache::RuntimeCache::tinyufo(16 * 1024 * 1024),
@@ -358,10 +352,7 @@ async fn recompaction_excludes_source_prefix_and_native_window_from_new_user_del
     let pool = crate::test_support::migrated_sqlite_pool().await.unwrap();
     let compaction = crate::compaction::Compaction::sqlite(pool.clone());
     let chain = GenerationChain::from_turn_chain(
-        Arc::new(crate::turn_chain::SqlTurnChainStore::sqlite(
-            pool,
-            Arc::new(tokio::sync::Mutex::new(())),
-        )),
+        Arc::new(crate::turn_chain::SqlTurnChainStore::sqlite(pool)),
         DEFAULT_GENERATION_CHAIN_TTL,
         None,
         crate::runtime_cache::RuntimeCache::tinyufo(16 * 1024 * 1024),
@@ -444,10 +435,7 @@ async fn explicit_parent_native_compacted_continuation_reads_source_without_disc
     let pool = crate::test_support::migrated_sqlite_pool().await.unwrap();
     let compaction = crate::compaction::Compaction::sqlite(pool.clone());
     let chain = GenerationChain::from_turn_chain(
-        Arc::new(crate::turn_chain::SqlTurnChainStore::sqlite(
-            pool,
-            Arc::new(tokio::sync::Mutex::new(())),
-        )),
+        Arc::new(crate::turn_chain::SqlTurnChainStore::sqlite(pool)),
         DEFAULT_GENERATION_CHAIN_TTL,
         None,
         crate::runtime_cache::RuntimeCache::tinyufo(1),

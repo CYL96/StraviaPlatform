@@ -1,5 +1,132 @@
 use super::*;
 
+#[tokio::test]
+async fn artifact_ingest_reuse_and_thinking_wait_for_same_pool_write_lease() {
+    use crate::history_marker::{
+        HiddenHistorySegment, HistoryMarkerStore, SqlHistoryMarkerStore, ThinkingMarkerInput,
+    };
+    use stravia_runtime_contract::protocol::ir::ContentBlock;
+
+    let directory = tempfile::tempdir().unwrap();
+    let busy_timeout = Duration::from_millis(25);
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .min_connections(4)
+        .max_connections(4)
+        .connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(directory.path().join("coordination.sqlite"))
+                .create_if_missing(true)
+                .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+                .busy_timeout(busy_timeout),
+        )
+        .await
+        .unwrap();
+    crate::migrations::migrate_sqlite(&pool, None)
+        .await
+        .unwrap();
+    let store = LocalArtifactStore::sqlite(pool.clone(), directory.path().join("artifacts"));
+    let markers = SqlHistoryMarkerStore::sqlite(pool.clone());
+    let owner = Principal::new("coordinated-consumers");
+    let existing = store
+        .ingest(
+            &owner,
+            "image/png",
+            None,
+            bytes_stream(Bytes::from_static(b"reusable")),
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+
+    let mut connection = pool.acquire_write().await.unwrap();
+    let mut transaction = connection.begin_with("BEGIN IMMEDIATE").await.unwrap();
+    sqlx::query("UPDATE artifacts SET expires_at=expires_at WHERE id=?")
+        .bind(existing.id.as_str())
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+
+    let ingest = |payload: &'static [u8]| {
+        let store = store.clone();
+        let owner = owner.clone();
+        tokio::spawn(async move {
+            store
+                .ingest(
+                    &owner,
+                    "image/png",
+                    None,
+                    bytes_stream(Bytes::from_static(payload)),
+                    Duration::from_secs(60),
+                )
+                .await
+        })
+    };
+    let fresh = ingest(b"fresh");
+    let reused = ingest(b"reusable");
+    let marker = {
+        let markers = markers.clone();
+        let owner = owner.clone();
+        tokio::spawn(async move {
+            markers
+                .create_thinking(
+                    &owner,
+                    ThinkingMarkerInput {
+                        source: None,
+                        block: ContentBlock::RedactedThinking {
+                            data: "coordinated-thinking".into(),
+                        },
+                        activity: "Preserving reasoning".into(),
+                        pending_retention: Duration::from_secs(60),
+                    },
+                )
+                .await
+        })
+    };
+    let consumers = async move {
+        (
+            fresh.await.unwrap(),
+            reused.await.unwrap(),
+            marker.await.unwrap(),
+        )
+    };
+    tokio::pin!(consumers);
+    // 首笔真实写入故意超过 fixture 的 BUSY 时限，消费者应排队而不是失败。
+    let early = tokio::time::timeout(busy_timeout * 6, &mut consumers).await;
+    transaction.commit().await.unwrap();
+    connection.finish().await.unwrap();
+
+    let (fresh, reused, marker) = match early {
+        Ok(values) => values,
+        Err(_) => tokio::time::timeout(Duration::from_secs(5), consumers)
+            .await
+            .expect("all consumers finish after the writer releases its lease"),
+    };
+    let (fresh, reused, marker) = (fresh.unwrap(), reused.unwrap(), marker.unwrap());
+    assert_eq!(reused.id, existing.id);
+    for (artifact, expected) in [
+        (fresh, b"fresh".as_slice()),
+        (reused, b"reusable".as_slice()),
+    ] {
+        let (_, bytes) =
+            ArtifactStore::read_bytes(&store, &owner, &artifact.id, Duration::from_secs(60))
+                .await
+                .unwrap();
+        assert_eq!(bytes.as_ref(), expected);
+    }
+    let resolved = markers
+        .resolve(&owner, &marker.reference)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        resolved.segment,
+        Some(HiddenHistorySegment::Thinking {
+            block: ContentBlock::RedactedThinking { data },
+            ..
+        }) if data == "coordinated-thinking"
+    ));
+}
+
 #[test]
 fn artifact_reference_identity_ignores_question_and_rejects_non_digest_identities() {
     let digest = "a".repeat(stravia_runtime_contract::identifier::DIGEST_ID_LEN);

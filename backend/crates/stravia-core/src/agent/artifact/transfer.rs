@@ -268,9 +268,12 @@ impl LocalArtifactStore {
         let now = self.now();
         Self::complete_guarded(async move {
             let _guard = _guard;
-            sqlx::query("INSERT INTO artifact_download_grants(token_hash,artifact_id,expires_at) SELECT ?,id,? FROM artifacts WHERE id=? AND principal=? AND state='ready' AND expires_at>?")
+            let mut connection = pool.acquire_write().await.map_err(storage_error)?;
+            let affected = sqlx::query("INSERT INTO artifact_download_grants(token_hash,artifact_id,expires_at) SELECT ?,id,? FROM artifacts WHERE id=? AND principal=? AND state='ready' AND expires_at>?")
                 .bind(&hash).bind(expires_at).bind(id.as_str()).bind(principal_key).bind(now)
-                .execute(&pool).await.map(|result| result.rows_affected()).map_err(storage_error)
+                .execute(&mut *connection).await.map_err(storage_error)?.rows_affected();
+            connection.finish().await.map_err(storage_error)?;
+            Ok(affected)
         }).await
     }
     ArtifactDatabase::Postgres(pool) => sqlx::query("INSERT INTO artifact_download_grants(token_hash,artifact_id,expires_at) SELECT $1,id,$2 FROM artifacts WHERE id=$3 AND principal=$4 AND state='ready' AND expires_at>$5").bind(&hash).bind(expires_at).bind(id.as_str()).bind(principal.continuation_key()).bind(self.now()).execute(pool).await.map(|result| result.rows_affected()).map_err(storage_error),
@@ -326,7 +329,8 @@ impl LocalArtifactStore {
     if size.is_none() {
         match &self.database {
             ArtifactDatabase::Sqlite(pool) => {
-                let mut transaction = pool.begin().await.map_err(storage_error)?;
+                let mut connection = pool.acquire_write().await.map_err(storage_error)?;
+                let mut transaction = connection.begin().await.map_err(storage_error)?;
                 sqlx::query("UPDATE artifact_uploads SET declared_size=? WHERE id=?")
                     .bind(part.size as i64)
                     .bind(&upload.upload_id)
@@ -340,6 +344,7 @@ impl LocalArtifactStore {
                     .await
                     .map_err(storage_error)?;
                 transaction.commit().await.map_err(storage_error)?;
+                connection.finish().await.map_err(storage_error)?;
             }
             ArtifactDatabase::Postgres(pool) => {
                 let mut transaction = pool.begin().await.map_err(storage_error)?;

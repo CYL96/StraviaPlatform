@@ -1492,7 +1492,21 @@ BEGIN
     WHERE source_kind = 'attempt' AND source_id = OLD.id;
 END;
 
-CREATE TRIGGER stats_usage_attempt_update AFTER UPDATE ON target_attempt_observations
+CREATE TRIGGER stats_usage_attempt_update
+AFTER UPDATE OF id, model_turn_id, run_id, provider_id, provider_name, status, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens, first_token_ms, duration_ms ON target_attempt_observations
+WHEN OLD.id IS NOT NEW.id
+    OR OLD.model_turn_id IS NOT NEW.model_turn_id
+    OR OLD.run_id IS NOT NEW.run_id
+    OR OLD.provider_id IS NOT NEW.provider_id
+    OR OLD.provider_name IS NOT NEW.provider_name
+    OR OLD.status IS NOT NEW.status
+    OR OLD.input_tokens IS NOT NEW.input_tokens
+    OR OLD.output_tokens IS NOT NEW.output_tokens
+    OR OLD.cache_read_tokens IS NOT NEW.cache_read_tokens
+    OR OLD.cache_write_tokens IS NOT NEW.cache_write_tokens
+    OR OLD.reasoning_tokens IS NOT NEW.reasoning_tokens
+    OR OLD.first_token_ms IS NOT NEW.first_token_ms
+    OR OLD.duration_ms IS NOT NEW.duration_ms
 BEGIN
 -- Drive the delta from this source checkpoint, never from the growing aggregate history.
 UPDATE stats_usage_buckets SET
@@ -1962,7 +1976,13 @@ BEGIN
     WHERE source_kind = 'rejection' AND source_id = OLD.id;
 END;
 
-CREATE TRIGGER stats_usage_rejection_update AFTER UPDATE ON rejected_request_observations
+CREATE TRIGGER stats_usage_rejection_update
+AFTER UPDATE OF id, started_at, occurred_at, status_code, code ON rejected_request_observations
+WHEN OLD.id IS NOT NEW.id
+    OR OLD.started_at IS NOT NEW.started_at
+    OR OLD.occurred_at IS NOT NEW.occurred_at
+    OR OLD.status_code IS NOT NEW.status_code
+    OR OLD.code IS NOT NEW.code
 BEGIN
 -- Drive the delta from this source checkpoint, never from the growing aggregate history.
 UPDATE stats_usage_buckets SET
@@ -2224,7 +2244,14 @@ BEGIN
     WHERE source_kind = 'run' AND source_id = OLD.id;
 END;
 
-CREATE TRIGGER stats_usage_run_update AFTER UPDATE ON inference_run_observations
+CREATE TRIGGER stats_usage_run_update
+AFTER UPDATE OF id, started_at, status, finished_at, failure_json, terminal_reason ON inference_run_observations
+WHEN OLD.id IS NOT NEW.id
+    OR OLD.started_at IS NOT NEW.started_at
+    OR OLD.status IS NOT NEW.status
+    OR OLD.finished_at IS NOT NEW.finished_at
+    OR OLD.failure_json IS NOT NEW.failure_json
+    OR OLD.terminal_reason IS NOT NEW.terminal_reason
 BEGIN
 -- Drive the delta from this source checkpoint, never from the growing aggregate history.
 UPDATE stats_usage_buckets SET
@@ -2486,7 +2513,15 @@ BEGIN
     WHERE source_kind = 'turn' AND source_id = OLD.id;
 END;
 
-CREATE TRIGGER stats_usage_turn_update AFTER UPDATE ON model_turn_observations
+CREATE TRIGGER stats_usage_turn_update
+AFTER UPDATE OF id, route_id, model_display_name, api_key_id, api_key_name, started_at, finished_at ON model_turn_observations
+WHEN OLD.id IS NOT NEW.id
+    OR OLD.route_id IS NOT NEW.route_id
+    OR OLD.model_display_name IS NOT NEW.model_display_name
+    OR OLD.api_key_id IS NOT NEW.api_key_id
+    OR OLD.api_key_name IS NOT NEW.api_key_name
+    OR OLD.started_at IS NOT NEW.started_at
+    OR OLD.finished_at IS NOT NEW.finished_at
 BEGIN
 -- Drive the delta from this source checkpoint, never from the growing aggregate history.
 UPDATE stats_usage_buckets SET

@@ -1936,13 +1936,14 @@ async fn reasoning_tracking_metadata_does_not_fork_generation_history() {
 
     // Simulate durable indexes written by the previous projection, without
     // changing immutable payloads or parent edges.
-    let crate::turn_chain::SqlTurnChainStore::Sqlite(pool, gate) = backend.as_ref() else {
+    let crate::turn_chain::SqlTurnChainStore::Sqlite(pool) = backend.as_ref() else {
         unreachable!()
     };
     {
-        let _write_gate = gate.lock().await;
+        let mut writer = pool.acquire_write().await.unwrap();
         sqlx::query("UPDATE turn_chain_nodes SET prefix_namespace = 'old-controls', prefix_fingerprint = 'old-projection', prefix_item_count = 99, prefix_projection_version = 999, prefix_controls_fingerprint = 'stale-controls', prefix_context_fingerprint = 'stale-context' WHERE id = ?")
-            .bind(b.id()).execute(pool).await.unwrap();
+            .bind(b.id()).execute(&mut *writer).await.unwrap();
+        writer.finish().await.unwrap();
     }
     let mut rebuild = PrefixRebuild::default();
     backend
@@ -2320,10 +2321,7 @@ async fn materialization_cache_does_not_outlive_the_generation_ttl() {
         .expect("SQLite database");
     let cache = crate::runtime_cache::RuntimeCache::tinyufo(16 * 1024 * 1024);
     let backend = Arc::new(ControlledDiscoveryTurnChainStore::new(
-        crate::turn_chain::SqlTurnChainStore::sqlite(
-            pool.clone(),
-            Arc::new(tokio::sync::Mutex::new(())),
-        ),
+        crate::turn_chain::SqlTurnChainStore::sqlite(pool.clone()),
     ));
     let store = GenerationChainStore::from_turn_chain(
         backend.clone(),

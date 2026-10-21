@@ -84,7 +84,8 @@ impl AllowanceSampleStore {
                 rows.retain(|sample| sample.sampled_at >= cutoff);
             }
             Self::Sqlite(pool) => {
-                let mut transaction = pool.begin().await?;
+                let mut connection = pool.acquire_write().await?;
+                let mut transaction = connection.begin().await?;
                 for sample in samples {
                     sqlx::query(
                         "INSERT INTO provider_allowance_samples (
@@ -112,6 +113,7 @@ impl AllowanceSampleStore {
                     .execute(&mut *transaction)
                     .await?;
                 transaction.commit().await?;
+                connection.finish().await?;
             }
             Self::Postgres(pool) => {
                 let mut transaction = pool.begin().await?;
@@ -156,10 +158,12 @@ impl AllowanceSampleStore {
                     .retain(|sample| sample.sampled_at >= cutoff);
             }
             Self::Sqlite(pool) => {
+                let mut connection = pool.acquire_write().await?;
                 sqlx::query("DELETE FROM provider_allowance_samples WHERE sampled_at < ?")
                     .bind(cutoff)
-                    .execute(pool)
+                    .execute(&mut *connection)
                     .await?;
+                connection.finish().await?;
             }
             Self::Postgres(pool) => {
                 sqlx::query("DELETE FROM provider_allowance_samples WHERE sampled_at < $1")

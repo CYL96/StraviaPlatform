@@ -479,7 +479,6 @@ async fn deferred_concurrent_agents_export_tool_wire_in_their_parent_debug_bundl
         1,
         true,
         crate::generation_chain::test_chain().await,
-        Some(Arc::new(tokio::sync::Mutex::new(()))),
     )
     .await;
     observation.set_debug_enabled(true);

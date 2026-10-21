@@ -261,7 +261,11 @@ impl LocalArtifactStore {
         s3: &ArtifactS3Settings,
     ) -> Result<(), ArtifactError> {
         match &self.database {
-    ArtifactDatabase::Sqlite(pool) => sqlx::query("UPDATE artifacts SET storage_backend='s3',storage_endpoint=?,storage_bucket=? WHERE id=?").bind(&s3.endpoint).bind(&s3.bucket).bind(id).execute(pool).await.map(|_|()),
+    ArtifactDatabase::Sqlite(pool) => {
+        let mut connection = pool.acquire_write().await.map_err(storage_error)?;
+        sqlx::query("UPDATE artifacts SET storage_backend='s3',storage_endpoint=?,storage_bucket=? WHERE id=?").bind(&s3.endpoint).bind(&s3.bucket).bind(id).execute(&mut *connection).await.map_err(storage_error)?;
+        connection.finish().await
+    },
     ArtifactDatabase::Postgres(pool) => sqlx::query("UPDATE artifacts SET storage_backend='s3',storage_endpoint=$1,storage_bucket=$2 WHERE id=$3").bind(&s3.endpoint).bind(&s3.bucket).bind(id).execute(pool).await.map(|_|()),
         }.map_err(storage_error)
     }

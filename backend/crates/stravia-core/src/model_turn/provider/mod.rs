@@ -477,7 +477,7 @@ mod diagnostic_tests {
     use crate::interaction_observation::{
         AdmissionFacts, IngressStart, InteractionObservation, RunEvent, RunStart,
     };
-    use std::sync::Arc;
+
     use stravia_runtime_contract::protocol::ir::{AiItemMetadata, AiRequest, AiStreamDelta, Usage};
 
     #[tokio::test]
@@ -492,7 +492,6 @@ mod diagnostic_tests {
             1,
             false,
             crate::generation_chain::test_chain().await,
-            Some(Arc::new(tokio::sync::Mutex::new(()))),
         )
         .await;
         let reported = Usage {

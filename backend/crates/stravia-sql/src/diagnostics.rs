@@ -179,7 +179,7 @@ impl<'q, DB: Database, Q: Execute<'q, DB>> Execute<'q, DB> for Identified<Q> {
     }
 }
 
-fn error_kind(error: &Error) -> &'static str {
+pub(super) fn error_kind(error: &Error) -> &'static str {
     match error {
         Error::Database(_) => "database",
         Error::PoolTimedOut => "pool_timeout",

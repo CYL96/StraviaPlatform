@@ -260,7 +260,6 @@ async fn capture_observer(
         1,
         true,
         crate::generation_chain::test_chain().await,
-        Some(Arc::new(tokio::sync::Mutex::new(()))),
     )
     .await;
     observation.set_debug_enabled(debug);

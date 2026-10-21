@@ -175,7 +175,7 @@ impl ObservationStore {
             .transpose()?;
         let limit = i64::from(q.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT));
         let (total, mut rows) = match self {
-            Self::Sqlite(pool, _, _) => failed_rows!(
+            Self::Sqlite(pool, _) => failed_rows!(
                 pool,
                 sqlx::Sqlite,
                 &q,
@@ -227,7 +227,7 @@ impl ObservationStore {
             return Ok(());
         }
         let rows: Vec<(String, String, String)> = match self {
-            Self::Sqlite(pool, _, _) => {
+            Self::Sqlite(pool, _) => {
                 let mut sql = QueryBuilder::<sqlx::Sqlite>::new(
                     "SELECT DISTINCT run_id,provider_id,provider_name FROM target_attempt_observations WHERE run_id IN (",
                 );
@@ -277,7 +277,7 @@ impl ObservationStore {
         let window = query_window(None, None, None, None)?;
         let cursor: Option<&FailedCursor> = None;
         let (_, rows) = match self {
-            Self::Sqlite(pool, _, _) => failed_rows!(
+            Self::Sqlite(pool, _) => failed_rows!(
                 pool,
                 sqlx::Sqlite,
                 &q,
@@ -310,7 +310,7 @@ impl ObservationStore {
             )
         } else {
             let events = match self {
-                Self::Sqlite(pool, _, _) => map_sqlite_events(sqlx::query("SELECT sequence,occurred_at,interaction_id,run_id,rejection_id,kind,payload FROM observation_events WHERE run_id=? AND sequence<=? ORDER BY sequence")
+                Self::Sqlite(pool, _) => map_sqlite_events(sqlx::query("SELECT sequence,occurred_at,interaction_id,run_id,rejection_id,kind,payload FROM observation_events WHERE run_id=? AND sequence<=? ORDER BY sequence")
                     .bind(id).bind(snapshot_sequence).fetch_all(pool).await?)?,
                 Self::Postgres(pool, _) => map_postgres_events(sqlx::query("SELECT sequence,occurred_at,interaction_id,run_id,rejection_id,kind,payload FROM observation_events WHERE run_id=$1 AND sequence<=$2 ORDER BY sequence")
                     .bind(id).bind(snapshot_sequence).fetch_all(pool).await?)?,

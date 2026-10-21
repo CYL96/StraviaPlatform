@@ -11,7 +11,6 @@ async fn confirmed_sent_receipt_uses_terminal_waiting_fact_without_history_proje
         7,
         false,
         crate::generation_chain::test_chain().await,
-        Some(std::sync::Arc::new(tokio::sync::Mutex::new(()))),
     )
     .await;
     for (id, waiting, expected) in [
@@ -105,7 +104,6 @@ async fn delivered_model_legs_keep_distinct_ordinals_after_late_item_ids() {
         7,
         true,
         crate::generation_chain::test_chain().await,
-        Some(std::sync::Arc::new(tokio::sync::Mutex::new(()))),
     )
     .await;
     let observer = observation
@@ -202,7 +200,6 @@ async fn websocket_sent_partial_excludes_unsent_staged_output_and_preserves_item
         7,
         true,
         crate::generation_chain::test_chain().await,
-        Some(std::sync::Arc::new(tokio::sync::Mutex::new(()))),
     )
     .await;
     let observer = observation
@@ -320,7 +317,6 @@ async fn delivered_native_state_survives_later_failure_but_unexposed_states_expi
         7,
         true,
         crate::generation_chain::test_chain().await,
-        Some(std::sync::Arc::new(tokio::sync::Mutex::new(()))),
     )
     .await;
     let observer = observation

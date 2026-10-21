@@ -7,6 +7,8 @@
 //! Prometheus label. Dynamic query shape/literal changes produce different IDs.
 //! Stream timing covers the consumed driver stream lifetime, including consumer
 //! backpressure, rather than claiming database-server CPU time.
+//! Runtime SQLite writes explicitly acquire a pool-owned write lease; ordinary
+//! reads and upstream-owned migrations do not acquire the writer gate.
 
 use futures::{future::BoxFuture, stream::BoxStream};
 use sqlx_native::{ConnectOptions as _, Connection as NativeConnection};
@@ -21,6 +23,8 @@ use std::{
 
 pub use sqlx_native::*;
 mod diagnostics;
+mod write;
+pub use write::WriteConnection;
 
 pub type SqlitePool = Pool<Sqlite>;
 pub type PgPool = Pool<Postgres>;
@@ -48,12 +52,14 @@ pub mod pool {
 pub struct Pool<DB: Database> {
     inner: sqlx_native::Pool<DB>,
     name: &'static str,
+    write_gate: Option<Arc<tokio::sync::Mutex<()>>>,
 }
 impl<DB: Database> Clone for Pool<DB> {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
             name: self.name,
+            write_gate: self.write_gate.clone(),
         }
     }
 }
@@ -70,6 +76,8 @@ impl<DB: Database> Pool<DB> {
         Self {
             inner,
             name: "main",
+            write_gate: (DB::NAME == <Sqlite as Database>::NAME)
+                .then(|| Arc::new(tokio::sync::Mutex::new(()))),
         }
     }
     pub fn named(mut self, name: &'static str) -> Self {
@@ -104,6 +112,25 @@ impl<DB: Database> Pool<DB> {
                 },
             })
         }
+    }
+    /// 在取得连接前协调同池 SQLite 写入；PostgreSQL 不加全局锁。
+    ///
+    /// 租约只覆盖数据库阶段，不能跨文件、网络 I/O 或再次申请同池写租约。
+    /// 正常路径应调用 `WriteConnection::finish`，取消路径自动等候驱动清理。
+    /// SQLite 租约须在 Tokio runtime 中获取，取消后的清理继续由该 runtime 执行。
+    pub async fn acquire_write(&self) -> Result<WriteConnection<DB>, Error> {
+        let guard = match &self.write_gate {
+            Some(gate) => Some(
+                tracing::Instrument::instrument(
+                    Arc::clone(gate).lock_owned(),
+                    tracing::info_span!(target: "stravia::perf", "sqlite.write_gate.wait"),
+                )
+                .await,
+            ),
+            None => None,
+        };
+        let connection = self.acquire().await?;
+        Ok(WriteConnection::new(connection, guard))
     }
     #[track_caller]
     pub fn begin(

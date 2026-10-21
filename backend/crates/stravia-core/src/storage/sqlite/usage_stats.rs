@@ -1061,7 +1061,143 @@ mod tests {
         Ok(())
     }
 
+    async fn verify_observation_stat_revisions(pool: &SqlitePool) -> anyhow::Result<()> {
+        let selected = StatsWindow {
+            start_at: Some(900_000),
+            end_at: Some(2_700_000),
+        };
+        let store = SqliteUsageStatsStore {
+            pool: pool.clone(),
+            last_route_snapshot: Arc::new(parking_lot::RwLock::new(Vec::new())),
+        };
+        insert_turn(
+            pool,
+            "revision-a",
+            900_000,
+            "revision-model-a",
+            "revision-key",
+        )
+        .await?;
+        // 无子 attempt 时修订 Turn 身份、标签及时间桶，不能被 guard 漏掉。
+        sqlx::query("UPDATE model_turn_observations SET route_id='revision-model-b',model_display_name='Revised model',api_key_id=NULL,api_key_name='',started_at=1800000,finished_at=NULL WHERE id='revision-a'")
+            .execute(pool).await?;
+        let models = store.stats_by_model(selected).await?;
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].model_id.as_deref(), Some("revision-model-b"));
+        assert_eq!(models[0].model, "Revised model");
+        assert_eq!(models[0].avg_duration_ms, None);
+        let keys = store.stats_by_api_key(selected).await?;
+        assert_eq!(keys[0].api_key_name, "Unknown API Key");
+        assert!(
+            store
+                .stats_by_model(StatsWindow {
+                    start_at: Some(900_000),
+                    end_at: Some(1_800_000),
+                })
+                .await?
+                .is_empty()
+        );
+        sqlx::query("UPDATE model_turn_observations SET finished_at=1800020 WHERE id='revision-a'")
+            .execute(pool)
+            .await?;
+        assert_eq!(
+            store.stats_overview(selected).await?.avg_duration_ms,
+            Some(20.0)
+        );
+        insert_attempt(pool, "revision-attempt", "revision-a", 1_800_000, 12, None).await?;
+        assert_eq!(
+            store.stats_overview(selected).await?.total_input_tokens,
+            None
+        );
+        // NULL -> 已知零以及已知 -> NULL 的覆盖，不把未知当成零。
+        sqlx::query("UPDATE target_attempt_observations SET cache_read_tokens=0,output_tokens=0,cache_write_tokens=0,first_token_ms=0 WHERE id='revision-attempt'")
+            .execute(pool).await?;
+        let overview = store.stats_overview(selected).await?;
+        assert_eq!(overview.total_input_tokens, Some(12));
+        assert_eq!(overview.total_output_tokens, Some(0));
+        assert_eq!(overview.total_cache_write_tokens, Some(0));
+        assert_eq!(overview.avg_first_token_ms, Some(0.0));
+        sqlx::query(
+            "UPDATE target_attempt_observations SET output_tokens=NULL WHERE id='revision-attempt'",
+        )
+        .execute(pool)
+        .await?;
+        assert_eq!(
+            store.stats_overview(selected).await?.total_output_tokens,
+            None
+        );
+        // Provider 标签也是 run source 的间接依赖，不能只检查用量列。
+        sqlx::query("UPDATE target_attempt_observations SET provider_id='revision-provider',provider_name='Revised provider' WHERE id='revision-attempt'")
+            .execute(pool).await?;
+        let providers = store.stats_by_provider(selected).await?;
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].provider, "Revised provider");
+        assert_eq!(providers[0].request_count, 1);
+        sqlx::query("UPDATE inference_run_observations SET status='failed',terminal_reason='cancelled' WHERE id='revision-a'")
+            .execute(pool).await?;
+        assert_eq!(store.stats_overview(selected).await?.error_count, 0);
+        sqlx::query(
+            "UPDATE inference_run_observations SET failure_json='{}' WHERE id='revision-a'",
+        )
+        .execute(pool)
+        .await?;
+        assert_eq!(store.stats_overview(selected).await?.error_count, 1);
+        assert_eq!(store.stats_by_provider(selected).await?[0].error_count, 1);
+        sqlx::query("INSERT INTO rejected_request_observations (id,occurred_at,method,path,ingress_protocol,stage,code,status_code,debug_enabled,last_event_sequence,expires_at) VALUES ('revision-rejection',900000,'POST','/v1/responses','responses','authentication','cancelled',400,false,0,9223372036854775807)")
+            .execute(pool).await?;
+        assert_eq!(store.stats_overview(selected).await?.error_count, 1);
+        sqlx::query("UPDATE rejected_request_observations SET code='invalid_api_key',started_at=1800000 WHERE id='revision-rejection'")
+            .execute(pool).await?;
+        assert_eq!(store.stats_overview(selected).await?.error_count, 2);
+        sqlx::query("UPDATE rejected_request_observations SET status_code=499 WHERE id='revision-rejection'")
+            .execute(pool).await?;
+        assert_eq!(store.stats_overview(selected).await?.error_count, 1);
+        // 无关更新和相关列原值赋值都必须保持公开统计结果不变。
+        let before = serde_json::to_value(store.stats_overview(selected).await?)?;
+        for statement in [
+            "UPDATE model_turn_observations SET last_event_sequence=last_event_sequence+1,api_key_id=api_key_id,finished_at=finished_at WHERE id='revision-a'",
+            "UPDATE target_attempt_observations SET last_event_sequence=last_event_sequence+1,output_tokens=output_tokens,provider_name=provider_name WHERE id='revision-attempt'",
+            "UPDATE inference_run_observations SET last_event_sequence=last_event_sequence+1,failure_json=failure_json WHERE id='revision-a'",
+            "UPDATE rejected_request_observations SET last_event_sequence=last_event_sequence+1,occurred_at=occurred_at WHERE id='revision-rejection'",
+        ] {
+            sqlx::query(statement).execute(pool).await?;
+        }
+        assert_eq!(
+            serde_json::to_value(store.stats_overview(selected).await?)?,
+            before
+        );
+        // attempt 的 Turn 归属决定模型、API Key 及分桶，与自身 started_at 无关。
+        insert_turn(
+            pool,
+            "revision-b",
+            900_000,
+            "revision-model-c",
+            "revision-key-c",
+        )
+        .await?;
+        sqlx::query("UPDATE target_attempt_observations SET model_turn_id='revision-b',output_tokens=9 WHERE id='revision-attempt'")
+            .execute(pool).await?;
+        let models = store.stats_by_model(selected).await?;
+        let moved = models
+            .iter()
+            .find(|model| model.model_id.as_deref() == Some("revision-model-c"))
+            .unwrap();
+        assert_eq!(moved.total_input_tokens, Some(12));
+        assert_eq!(moved.total_output_tokens, Some(9));
+        let previous = models
+            .iter()
+            .find(|model| model.model_id.as_deref() == Some("revision-model-b"))
+            .unwrap();
+        assert_eq!(previous.total_input_tokens, None);
+        assert_eq!(
+            store.stats_series(selected, BASE_BUCKET_MS).await?[0].total_output_tokens,
+            Some(9)
+        );
+        Ok(())
+    }
+
     async fn verify_fixed_range_survives_detail_cleanup(pool: &SqlitePool) -> anyhow::Result<()> {
+        verify_observation_stat_revisions(pool).await?;
         let start = 9_900_000;
         let end = start + 513 * BASE_BUCKET_MS;
         let selected = StatsWindow {

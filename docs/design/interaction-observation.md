@@ -332,7 +332,11 @@ Observation writer 为持久化事件分配递增 `event_sequence`；持久事�
 
 SQLite 的 Run admission 使用 `BEGIN IMMEDIATE`，在读取父 Run 状态前取得写锁，使父分支中断与子 Interaction 入库保持原子性，避免并发写入导致读事务升级失败。
 
-同一 Gateway 内，历史与普通 Observation 的 SQLite 写入先取得共享异步写锁，再取得连接和事务；锁覆盖实际写入至提交，不覆盖独立只读查询或 manifest/Trace 文件操作。清理中的 owner 快照读事务在文件 tombstone 操作前提交，不持有 SQLite 写锁等待文件系统。PostgreSQL 保持原数据库并发与锁协议。
+同一 Gateway 内，来自同一 SQLite pool 及其克隆的运行期写入口统一通过 `Pool::acquire_write` 取得池级写租约，包括历史、普通 Observation、Artifact、History Marker、凭据映射及管理和后台存储。租约先取得共享 FIFO 异步写锁，再取得连接；事务必须从租约连接开启，autocommit DML 和 `UPDATE ... RETURNING` 同样不能绕过租约。独立只读查询和只读事务仍使用普通 pool，不因写协调而串行化。PostgreSQL 不增加全局写锁，保持原数据库并发与锁协议。
+
+正常提交或回滚后显式调用 `WriteConnection::finish`，在同一 SQLite worker 队列执行完成屏障并确认已退出事务后释放协调权。请求取消或错误退出时，租约的清理任务继续持锁，不能因调用方 future 被丢弃就放行下一笔写入；后台回滚失败或连接状态无法确认时，等待连接关闭后再释放。健康连接仍归还原池，不因普通取消关闭内存库的唯一连接。
+
+写租约仅覆盖数据库阶段，不覆盖文件／网络 I/O、Artifact 对象锁等待或再次申请同池写租约。清理中的 owner 快照读事务在文件 tombstone 操作前提交；保留期更新也在完成数据库写租约后才改写 manifest。协调范围仅限同源 pool，不替代跨进程或独立连接池的数据库锁；外部写者与底层 I/O 停顿仍可能造成 SQLite 等待或 `SQLITE_BUSY`。现有 `busy_timeout` 和持久性配置不变。
 
 页面先查询快照并取得 `snapshot_sequence`，再从该 sequence 订阅，避免查询与订阅之间丢事件。重连携带最后确认的 sequence：
 
@@ -407,7 +411,7 @@ SQLite 与 PostgreSQL 使用等价 schema 和索引。具体 SQL 由各自迁移
 
 Core 的 `UsageStatsStore` 在现有 SQLite/PostgreSQL 数据库内拥有长期管理汇总，不新建统计服务、第二个数据库或前端事实源。配对迁移 `0018_stats_usage.sql` 建立 `stats_usage_buckets` 和 `stats_usage_checkpoints` 及来源视图、触发器；全局、模型、Provider、API Key 的基础桶按绝对时间每 `900000` 毫秒划分。永久桶只保存维度身份、非秘密展示标签、时间、计数、已知值计数及指标的分子/分母，不保存正文、工具内容、Debug 或永久逐请求清单。不设自动过期或长期降采样期限；空间随时间桶和身份维度增长，不承诺固定容量。
 
-- **事实与修订：** 来源为保留中的请求、拒绝请求、Model Turn 和 Target attempt 数值投影。来源 INSERT/UPDATE 的触发器在同一源事务中扣除旧 checkpoint 贡献、替换 checkpoint、计入新贡献；checkpoint 以来源种类和稳定来源 ID 标识，不把重复 usage 帧或迟到修订作为新增消耗。未知修订字段保留已知值，明确零替换旧值。充分聚合信息使跨桶平均耗时、首字延迟、错误率与成功 attempt 加权 TPS 可重新计算，保留全部未知、部分已知和明确零的区别。
+- **事实与修订：** 来源为保留中的请求、拒绝请求、Model Turn 和 Target attempt 数值投影。来源 INSERT 及统计相关 UPDATE 的触发器在同一源事务中扣除旧 checkpoint 贡献、替换 checkpoint、计入新贡献；checkpoint 以来源种类和稳定来源 ID 标识，不把重复 usage 帧或迟到修订作为新增消耗。配对迁移 `0025_stats_usage_update_guards.sql` 仅替换 UPDATE 触发条件，不重算历史桶或 checkpoint：统计投影及其关联键、Provider 请求归属依赖字段发生实际变化时才更新，使用 NULL-safe 比较；事件序号、预览等无关更新与同值赋值不再触发汇总写入。未知修订字段保留已知值，明确零替换旧值。充分聚合信息使跨桶平均耗时、首字延迟、错误率与成功 attempt 加权 TPS 可重新计算，保留全部未知、部分已知和明确零的区别。
 - **清理与并发：** 来源 DELETE 只回收对应 checkpoint，不扣减永久桶。清理与源写入共享数据库事务一致性：汇总或 checkpoint 写入失败时源事务回滚，不能先成功删除来源再丢掉应计贡献。来源仍存在时保留修订所需 checkpoint；删除后该来源不能再合法修订，工作元数据随之回收，不另留永久请求账本。当前进程若发生携带统计事实的持久化失败，使用仅限清理的粘性失败标记拒绝清理：不能证明待处理统计事实已可靠汇总时，手动或自动清理明确失败。该标记不持久化，不新增重试或正常推理准入门槛；单纯正文、Debug、工具诊断的普通缺口不阻止清理。重启后已提交来源与汇总仍一致，但无法恢复此前被丢弃、未保存的已确认事实，因此不承诺完整账本。手动 Clear History、到期回收和保留期修改继续保护活动记录；Debug 清理、管理端本地 Console Chat 清理均不删除长期汇总。
 - **升级与恢复：** 建表、触发器安装及对实际保留事实的回填在同一 SQLx 迁移事务内完成；失败或中断回滚，重入不会重复入账。现有启动迁移完成后才构造存储并开放管理读取，不以空统计掩盖未完成升级；没有独立异步回填游标。只能恢复仍存在且可判定的事实，已删除或从未持久化的历史不可恢复，不调用上游补账、不解析 Debug 猜用量、不把缺口补零，也不自动重放模型调用。
 - **历史身份：** 以模型内部 Route ID、Provider ID、API Key ID 归属，不按可复用的客户端模型名或展示名称合并。桶不依赖配置外键级联；删除配置后保留非秘密名称与可信身份，不保留凭据或授权能力。同名重建是新身份，更名不拆分身份；旧事实无法证明归属时保留未知边界，不凭同名关联当前对象。分类返回 `deleted`，历史 `model_id` / `provider_id` 可为 `null`；已删除对象仍可识别，但不提供失效配置操作。
@@ -509,7 +513,7 @@ writer 在每批提交后立即失效对应的实时状态和归属索引；后�
 
 已结束操作、SQL 明细、资源帧各自积累，达到容量即将整个批次的所有权交给后台 writer，立即换成空缓冲继续采集；后台顺序追加写入匿名临时文件，写完释放该批次及其容器分配，不保留最近 N 条的环形窗口。后台待写队列最多容纳四个批次，另有一个正在写入的批次；业务线程不等待磁盘，不在时间线锁内执行文件 I/O。慢盘导致队列满、writer 不可用或写入失败时，按实际丢失的记录数增加相应 `dropped_*`，失败另计 `storage_errors`，不回退为无界内存积压。活动区满仍拒收新 span（相应耗时也不入直方图）。SQL 明细不会挤掉已结束的业务操作。
 
-导出以会话 epoch 和批次序号截取一致快照，合并已写入文件、后台已接收但尚未写完、以及当前未满内存批次，避免遗漏或重复；HTTP 适配层在阻塞任务中等待文件读取。正常采集的历史只驻留于有界缓冲或临时文件；导出时仍会暂时在内存构造完整 JSON，不保证导出峰值内存固定。磁盘占用随会话增长，不设时间或总条数保留设置。临时文件由操作系统在最后一个句柄关闭时自动删除，包括进程异常退出；关闭 Debug 会使旧 writer 任务失效并释放文件，新开启只接收新 epoch。随后结束的旧 span 不补写终态或直方图；旧队列上下文即使没有 parent ID，也保留原 epoch，其拒收标记传播至后续业务和 SQL span。
+导出以会话 epoch 和批次序号截取一致快照，合并已写入文件、后台已接收但尚未写完、以及当前未满内存批次，避免遗漏或重复；HTTP 适配层在阻塞任务中等待文件读取。正常采集的历史只驻留于有界缓冲或临时文件；导出将已拥有的事件数组和参数直接移入 JSON，并在原事件之后追加 causal flow，不再复制完整事件树或另存 flow 缓冲。导出时仍会暂时在内存构造完整 JSON，不保证导出峰值内存固定。磁盘占用随会话增长，不设时间或总条数保留设置。临时文件由操作系统在最后一个句柄关闭时自动删除，包括进程异常退出；关闭 Debug 会使旧 writer 任务失效并释放文件，新开启只接收新 epoch。随后结束的旧 span 不补写终态或直方图；旧队列上下文即使没有 parent ID，也保留原 epoch，其拒收标记传播至后续业务和 SQL span。
 
 `metadata.schema_version=3`、`storage=memory_and_temporary_file` 描述这一会话存储模型。`capacity` 报告活动区、三类批次和 `writer_queue` 容量，`writer_queue_unit=batches` 明确队列以批次计；`buffered` 报告当前三类未满缓冲的记录数；`spilled_completed`、`spilled_sql_completed`、`spilled_resource_samples` 报告成功写入文件的记录数。`storage_status` 为 `ready`、`error` 或 `unavailable`，配合 `storage_errors` 与四项 `dropped_*` 判断真实损失；成功写盘不是丢弃，不承诺在错误或拒收时仍有完整请求树。采集状态计数取自一致快照：`active_spans` 是当前活动 map 数；关闭时不再保留冻结记录，`frozen_spans`、`frozen_total` 均为零，`incomplete`、`incomplete_total` 等于当前活动数。其他请求仍活动不意味着目标请求缺失，不能仅因存在 `B` 事件就拒收导出，应核对目标 span／parent ID 因果树和真实损失。
 

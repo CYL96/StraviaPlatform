@@ -16,13 +16,15 @@ impl SettingsStore for SqliteSettingsStore {
     }
 
     async fn set(&self, key: &str, value: &str) -> anyhow::Result<()> {
+        let mut connection = self.pool.acquire_write().await?;
         sqlx::query(
     "INSERT INTO settings (name, value, updated_at) VALUES (?, ?, datetime('now')) ON CONFLICT(name) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
             )
             .bind(key)
             .bind(value)
-            .execute(&self.pool)
+            .execute(&mut *connection)
             .await?;
+        connection.finish().await?;
         Ok(())
     }
 }

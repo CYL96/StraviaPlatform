@@ -329,7 +329,7 @@ impl ArtifactStore for LocalArtifactStore {
         let backend_key = format!("objects/{}", artifact_id.as_str());
         match &self.database {
             ArtifactDatabase::Sqlite(pool) => {
-                let mut connection = pool.acquire().await.map_err(storage_error)?;
+                let mut connection = pool.acquire_write().await.map_err(storage_error)?;
                 let mut transaction = connection
                     .begin_with("BEGIN IMMEDIATE")
                     .await
@@ -375,6 +375,7 @@ impl ArtifactStore for LocalArtifactStore {
                 .await
                 .map_err(storage_error)?;
                 transaction.commit().await.map_err(storage_error)?;
+                connection.finish().await.map_err(storage_error)?;
             }
             ArtifactDatabase::Postgres(pool) => {
                 let mut transaction = pool.begin().await.map_err(storage_error)?;
@@ -526,6 +527,7 @@ impl ArtifactStore for LocalArtifactStore {
         let etag = hex_bytes(&digest.finalize());
         match &self.database {
             ArtifactDatabase::Sqlite(pool) => {
+                let mut connection = pool.acquire_write().await.map_err(storage_error)?;
                 sqlx::query(
                     "INSERT INTO artifact_upload_parts (upload_id, part_number, etag, size) \
              VALUES (?, ?, ?, ?) ON CONFLICT(upload_id, part_number) \
@@ -535,9 +537,10 @@ impl ArtifactStore for LocalArtifactStore {
                 .bind(i64::from(part_number))
                 .bind(&etag)
                 .bind(size as i64)
-                .execute(pool)
+                .execute(&mut *connection)
                 .await
                 .map_err(storage_error)?;
+                connection.finish().await.map_err(storage_error)?;
             }
             ArtifactDatabase::Postgres(pool) => {
                 sqlx::query(
@@ -558,12 +561,14 @@ impl ArtifactStore for LocalArtifactStore {
         let refreshed_expiry = self.now().saturating_add(idle_ttl);
         match &self.database {
             ArtifactDatabase::Sqlite(pool) => {
+                let mut connection = pool.acquire_write().await.map_err(storage_error)?;
                 sqlx::query("UPDATE artifact_uploads SET expires_at = ? WHERE id = ?")
                     .bind(refreshed_expiry)
                     .bind(upload_id)
-                    .execute(pool)
+                    .execute(&mut *connection)
                     .await
                     .map_err(storage_error)?;
+                connection.finish().await.map_err(storage_error)?;
             }
             ArtifactDatabase::Postgres(pool) => {
                 sqlx::query("UPDATE artifact_uploads SET expires_at = $1 WHERE id = $2")
@@ -762,7 +767,8 @@ impl ArtifactStore for LocalArtifactStore {
                 let now = self.now();
                 Self::complete_guarded(async move {
                     let _guard = _guard;
-                    sqlx::query(
+                    let mut connection = pool.acquire_write().await.map_err(storage_error)?;
+                    let affected = sqlx::query(
                         "UPDATE artifacts SET expires_at = MAX(expires_at, ?) \
                  WHERE id = ? AND principal = ? AND state = 'ready' AND expires_at > ?",
                     )
@@ -770,10 +776,12 @@ impl ArtifactStore for LocalArtifactStore {
                     .bind(id.as_str())
                     .bind(&principal_key)
                     .bind(now)
-                    .execute(&pool)
+                    .execute(&mut *connection)
                     .await
-                    .map_err(storage_error)
-                    .map(|result| result.rows_affected())
+                    .map_err(storage_error)?
+                    .rows_affected();
+                    connection.finish().await.map_err(storage_error)?;
+                    Ok(affected)
                 })
                 .await?
             }
@@ -800,11 +808,13 @@ impl ArtifactStore for LocalArtifactStore {
         let now = self.now();
         match &self.database {
             ArtifactDatabase::Sqlite(pool) => {
+                let mut connection = pool.acquire_write().await.map_err(storage_error)?;
                 sqlx::query("DELETE FROM artifact_download_grants WHERE expires_at<=?")
                     .bind(now)
-                    .execute(pool)
+                    .execute(&mut *connection)
                     .await
                     .map_err(storage_error)?;
+                connection.finish().await.map_err(storage_error)?;
             }
             ArtifactDatabase::Postgres(pool) => {
                 sqlx::query("DELETE FROM artifact_download_grants WHERE expires_at<=$1")
@@ -846,11 +856,13 @@ impl ArtifactStore for LocalArtifactStore {
             }
             match &self.database {
                 ArtifactDatabase::Sqlite(pool) => {
+                    let mut connection = pool.acquire_write().await.map_err(storage_error)?;
                     sqlx::query("DELETE FROM artifact_uploads WHERE id = ?")
                         .bind(upload_id)
-                        .execute(pool)
+                        .execute(&mut *connection)
                         .await
                         .map_err(storage_error)?;
+                    connection.finish().await.map_err(storage_error)?;
                 }
                 ArtifactDatabase::Postgres(pool) => {
                     sqlx::query("DELETE FROM artifact_uploads WHERE id = $1")
@@ -921,11 +933,17 @@ impl ArtifactStore for LocalArtifactStore {
                 }
             }
             let result = match &self.database {
-                ArtifactDatabase::Sqlite(pool) => sqlx::query("DELETE FROM artifacts WHERE id = ?")
-                    .bind(&artifact_id)
-                    .execute(pool)
-                    .await
-                    .map(|result| result.rows_affected()),
+                ArtifactDatabase::Sqlite(pool) => {
+                    let mut connection = pool.acquire_write().await.map_err(storage_error)?;
+                    let affected = sqlx::query("DELETE FROM artifacts WHERE id = ?")
+                        .bind(&artifact_id)
+                        .execute(&mut *connection)
+                        .await
+                        .map_err(storage_error)?
+                        .rows_affected();
+                    connection.finish().await.map_err(storage_error)?;
+                    Ok(affected)
+                }
                 ArtifactDatabase::Postgres(pool) => {
                     sqlx::query("DELETE FROM artifacts WHERE id = $1")
                         .bind(&artifact_id)
@@ -987,16 +1005,19 @@ impl LocalArtifactStore {
             return Ok(0);
         }
         store.remove_object_at(&artifact_id, location, &settings).await?;
-        sqlx::query(
+        let mut connection = pool.acquire_write().await.map_err(storage_error)?;
+        let affected = sqlx::query(
             "DELETE FROM artifacts WHERE id = ? AND state = 'ready' AND expires_at <= ? AND NOT EXISTS (SELECT 1 FROM artifact_download_grants g WHERE g.artifact_id=artifacts.id AND g.expires_at>?)",
         )
         .bind(&artifact_id)
         .bind(now)
         .bind(now)
-        .execute(&pool)
+        .execute(&mut *connection)
         .await
-        .map_err(storage_error)
-        .map(|result| result.rows_affected())
+        .map_err(storage_error)?
+        .rows_affected();
+        connection.finish().await.map_err(storage_error)?;
+        Ok(affected)
         }).await
     }
 
@@ -1191,19 +1212,24 @@ impl LocalArtifactStore {
         }
 
         let affected = match &self.database {
-            ArtifactDatabase::Sqlite(pool) => sqlx::query(
-                "UPDATE artifacts SET expires_at = MAX(expires_at, ?) \
+            ArtifactDatabase::Sqlite(pool) => {
+                let mut connection = pool.acquire_write().await.map_err(storage_error)?;
+                let affected = sqlx::query(
+                    "UPDATE artifacts SET expires_at = MAX(expires_at, ?) \
          WHERE id = ? AND principal = ? AND mime_type = ? AND size = ? AND state = 'ready'",
-            )
-            .bind(upload.artifact_expires_at)
-            .bind(id.as_str())
-            .bind(&upload.principal)
-            .bind(&upload.mime_type)
-            .bind(upload.declared_size)
-            .execute(pool)
-            .await
-            .map_err(storage_error)?
-            .rows_affected(),
+                )
+                .bind(upload.artifact_expires_at)
+                .bind(id.as_str())
+                .bind(&upload.principal)
+                .bind(&upload.mime_type)
+                .bind(upload.declared_size)
+                .execute(&mut *connection)
+                .await
+                .map_err(storage_error)?
+                .rows_affected();
+                connection.finish().await.map_err(storage_error)?;
+                affected
+            }
             ArtifactDatabase::Postgres(pool) => sqlx::query(
                 "UPDATE artifacts SET expires_at = GREATEST(expires_at, $1) \
          WHERE id = $2 AND principal = $3 AND mime_type = $4 AND size = $5 AND state = 'ready'",
@@ -1228,7 +1254,8 @@ impl LocalArtifactStore {
     ) -> Result<(), ArtifactError> {
         match &self.database {
             ArtifactDatabase::Sqlite(pool) => {
-                let mut transaction = pool.begin().await.map_err(storage_error)?;
+                let mut connection = pool.acquire_write().await.map_err(storage_error)?;
+                let mut transaction = connection.begin().await.map_err(storage_error)?;
                 sqlx::query(
                     "INSERT INTO artifacts \
              (id, principal, mime_type, size, backend_key, state, expires_at, created_at, \
@@ -1248,6 +1275,7 @@ impl LocalArtifactStore {
                     .await
                     .map_err(storage_error)?;
                 transaction.commit().await.map_err(storage_error)?;
+                connection.finish().await.map_err(storage_error)?;
             }
             ArtifactDatabase::Postgres(pool) => {
                 let mut transaction = pool.begin().await.map_err(storage_error)?;
@@ -1283,13 +1311,17 @@ impl LocalArtifactStore {
         let principal_key = principal.continuation_key();
         let state: Option<String> = match &self.database {
             ArtifactDatabase::Sqlite(pool) => {
-                sqlx::query_scalar(
+                let mut connection = pool.acquire_write().await.map_err(storage_error)?;
+                let state = sqlx::query_scalar(
                     "UPDATE artifacts SET expires_at=0 WHERE id=? AND principal=? RETURNING state",
                 )
                 .bind(id.as_str())
                 .bind(&principal_key)
-                .fetch_optional(pool)
+                .fetch_optional(&mut *connection)
                 .await
+                .map_err(storage_error)?;
+                connection.finish().await.map_err(storage_error)?;
+                Ok(state)
             }
             ArtifactDatabase::Postgres(pool) => sqlx::query_scalar(
                 "UPDATE artifacts SET expires_at=0 WHERE id=$1 AND principal=$2 RETURNING state",
@@ -1315,14 +1347,16 @@ impl LocalArtifactStore {
                 self.remove_object(id.as_str()).await?;
                 match &self.database {
                     ArtifactDatabase::Sqlite(pool) => {
+                        let mut connection = pool.acquire_write().await.map_err(storage_error)?;
                         sqlx::query(
                             "DELETE FROM artifacts WHERE id=? AND principal=? AND state='staging'",
                         )
                         .bind(id.as_str())
                         .bind(&principal_key)
-                        .execute(pool)
+                        .execute(&mut *connection)
                         .await
                         .map_err(storage_error)?;
+                        connection.finish().await.map_err(storage_error)?;
                     }
                     ArtifactDatabase::Postgres(pool) => {
                         sqlx::query("DELETE FROM artifacts WHERE id=$1 AND principal=$2 AND state='staging'").bind(id.as_str()).bind(&principal_key).execute(pool).await.map_err(storage_error)?;
@@ -1365,7 +1399,8 @@ impl LocalArtifactStore {
                 let ids: Vec<_> = ids.into_iter().cloned().collect();
                 Self::complete_guarded(async move {
         let _guards = guards;
-        let mut transaction = pool.begin().await.map_err(storage_error)?;
+        let mut connection = pool.acquire_write().await.map_err(storage_error)?;
+        let mut transaction = connection.begin().await.map_err(storage_error)?;
         for id in &ids {
             let rows_affected = sqlx::query(
                 "UPDATE artifacts SET expires_at = MAX(expires_at, ?) WHERE id = ? AND principal = ? AND state = 'ready' AND expires_at > ?",
@@ -1383,6 +1418,7 @@ impl LocalArtifactStore {
             }
         }
         transaction.commit().await.map_err(storage_error)?;
+        connection.finish().await.map_err(storage_error)?;
         Ok(())
         }).await?;
             }

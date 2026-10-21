@@ -31,6 +31,7 @@ impl ProviderStore for SqliteProviderStore {
         if !is_valid_provider_auth_mode(&input.auth_mode) {
             anyhow::bail!("unsupported provider auth_mode: {}", input.auth_mode);
         }
+        let mut connection = self.pool.acquire_write().await?;
         sqlx::query(
     "INSERT INTO providers (id, name, vendor, protocol, base_url, preset_key, channel, models_source, static_models, api_key, adapter_credentials, vendor_options, auth_mode, use_proxy) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
@@ -48,8 +49,9 @@ impl ProviderStore for SqliteProviderStore {
             .bind(&input.vendor_options)
             .bind(&input.auth_mode)
             .bind(input.use_proxy)
-            .execute(&self.pool)
+            .execute(&mut *connection)
             .await?;
+        connection.finish().await?;
         self.get(&id)
             .await?
             .context("provider missing after create")
@@ -109,6 +111,7 @@ impl ProviderStore for SqliteProviderStore {
         let use_proxy = input.use_proxy.unwrap_or(current.use_proxy);
         let is_enabled = input.is_enabled.unwrap_or(current.is_enabled);
 
+        let mut connection = self.pool.acquire_write().await?;
         sqlx::query(
     "UPDATE providers SET name=?, vendor=?, protocol=?, base_url=?, preset_key=?, channel=?, models_source=?, static_models=?, api_key=?, adapter_credentials=?, vendor_options=?, auth_mode=?, use_proxy=?, is_enabled=?, updated_at=datetime('now'), revision=revision+1, credential_status = CASE WHEN ? THEN 'ok' ELSE credential_status END, credential_invalid_at = CASE WHEN ? THEN NULL ELSE credential_invalid_at END WHERE id=?",
             )
@@ -129,13 +132,15 @@ impl ProviderStore for SqliteProviderStore {
             .bind(reset_credential_status)
             .bind(reset_credential_status)
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *connection)
             .await?;
+        connection.finish().await?;
         self.get(id).await?.context("provider missing after update")
     }
 
     async fn delete(&self, id: &str) -> anyhow::Result<()> {
-        let mut tx = self.pool.begin().await?;
+        let mut connection = self.pool.acquire_write().await?;
+        let mut tx = connection.begin().await?;
 
         sqlx::query(
             "DELETE FROM model_backends
@@ -160,6 +165,7 @@ impl ProviderStore for SqliteProviderStore {
             .await?;
 
         tx.commit().await?;
+        connection.finish().await?;
         Ok(())
     }
 
@@ -190,6 +196,7 @@ impl ProviderStore for SqliteProviderStore {
         result: ProviderTestResult,
     ) -> anyhow::Result<()> {
         // ADR-0073：手动测试成功是恢复路径——上游接受了当前凭据，清除失效。
+        let mut connection = self.pool.acquire_write().await?;
         sqlx::query(
     "UPDATE providers SET last_test_success = ?, last_test_at = datetime('now'), revision = revision + 1, credential_status = CASE WHEN ? THEN 'ok' ELSE credential_status END, credential_invalid_at = CASE WHEN ? THEN NULL ELSE credential_invalid_at END WHERE id = ?",
             )
@@ -197,8 +204,9 @@ impl ProviderStore for SqliteProviderStore {
             .bind(result.success)
             .bind(result.success)
             .bind(provider_id)
-            .execute(&self.pool)
+            .execute(&mut *connection)
             .await?;
+        connection.finish().await?;
         Ok(())
     }
 
@@ -211,9 +219,11 @@ impl ProviderStore for SqliteProviderStore {
         id: &str,
         keys: &[String],
     ) -> anyhow::Result<()> {
-        let mut tx = self.pool.begin().await?;
+        let keys_json = serde_json::to_string(keys)?;
+        let mut connection = self.pool.acquire_write().await?;
+        let mut tx = connection.begin().await?;
         // Acquire the SQLite writer lock before reading the suspension.
-        sqlx::query("DELETE FROM provider_allowance_guards WHERE provider_id = ? AND allowance_key NOT IN (SELECT value FROM json_each(?))").bind(id).bind(serde_json::to_string(keys)?).execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM provider_allowance_guards WHERE provider_id = ? AND allowance_key NOT IN (SELECT value FROM json_each(?))").bind(id).bind(keys_json).execute(&mut *tx).await?;
         let provider = sqlx::query_scalar::<_, String>("SELECT id FROM providers WHERE id = ?")
             .bind(id)
             .fetch_optional(&mut *tx)
@@ -227,6 +237,7 @@ impl ProviderStore for SqliteProviderStore {
         sqlx::query("UPDATE provider_allowance_suspensions SET earliest_reset_at = CASE WHEN EXISTS (SELECT value FROM json_each(triggered_keys) WHERE value NOT IN (SELECT allowance_key FROM provider_allowance_guards WHERE provider_id = ?)) THEN NULL ELSE earliest_reset_at END, triggered_keys = (SELECT json_group_array(value) FROM json_each(triggered_keys) WHERE value IN (SELECT allowance_key FROM provider_allowance_guards WHERE provider_id = ?)) WHERE provider_id = ?").bind(id).bind(id).bind(id).execute(&mut *tx).await?;
         sqlx::query("UPDATE provider_allowance_suspensions SET suspended = FALSE, suspended_at = NULL, earliest_reset_at = NULL WHERE provider_id = ? AND json_array_length(triggered_keys) = 0").bind(id).execute(&mut *tx).await?;
         tx.commit().await?;
+        connection.finish().await?;
         Ok(())
     }
 
@@ -237,6 +248,9 @@ impl ProviderStore for SqliteProviderStore {
         state: &crate::db::models::AllowanceSuspensionState,
         expected_guarded_keys: &[String],
     ) -> anyhow::Result<bool> {
+        let triggered_keys_json = serde_json::to_string(&state.triggered_keys)?;
+        let guarded_keys_json = serde_json::to_string(expected_guarded_keys)?;
+        let mut connection = self.pool.acquire_write().await?;
         let result = sqlx::query(
             "INSERT INTO provider_allowance_suspensions (provider_id, suspended, suspended_at, triggered_keys, earliest_reset_at, evidence_completed_at)
              SELECT ?, ?, ?, ?, ?, ? FROM providers WHERE id = ? AND revision = ?
@@ -248,9 +262,10 @@ impl ProviderStore for SqliteProviderStore {
              suspended_at = CASE WHEN provider_allowance_suspensions.suspended AND excluded.suspended THEN provider_allowance_suspensions.suspended_at ELSE excluded.suspended_at END,
              triggered_keys = excluded.triggered_keys, earliest_reset_at = excluded.earliest_reset_at, evidence_completed_at = excluded.evidence_completed_at
              WHERE excluded.evidence_completed_at > provider_allowance_suspensions.evidence_completed_at")
-            .bind(id).bind(state.suspended).bind(&state.suspended_at).bind(serde_json::to_string(&state.triggered_keys)?).bind(state.earliest_reset_at).bind(state.evidence_completed_at)
+            .bind(id).bind(state.suspended).bind(&state.suspended_at).bind(triggered_keys_json).bind(state.earliest_reset_at).bind(state.evidence_completed_at)
             .bind(id).bind(expected.provider_revision).bind(expected.oauth_status_version).bind(expected.oauth_status_version).bind(expected.oauth_status_version.unwrap_or(0))
-            .bind(serde_json::to_string(expected_guarded_keys)?).bind(serde_json::to_string(expected_guarded_keys)?).execute(&self.pool).await?;
+            .bind(&guarded_keys_json).bind(&guarded_keys_json).execute(&mut *connection).await?;
+        connection.finish().await?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -292,6 +307,7 @@ impl ProviderStore for SqliteProviderStore {
     ) -> anyhow::Result<bool> {
         // 条件写：凭据代际（providers.revision + OAuth status_version）未变
         // 才把拒绝证据归到当前凭据上，否则放弃标记。
+        let mut connection = self.pool.acquire_write().await?;
         let result = sqlx::query(
             "UPDATE providers
      SET credential_status = 'invalid',
@@ -310,20 +326,23 @@ impl ProviderStore for SqliteProviderStore {
         .bind(expected.oauth_status_version)
         .bind(expected.oauth_status_version)
         .bind(expected.oauth_status_version.unwrap_or(0))
-        .execute(&self.pool)
+        .execute(&mut *connection)
         .await?;
+        connection.finish().await?;
         Ok(result.rows_affected() == 1)
     }
 
     async fn clear_credential_invalid(&self, id: &str) -> anyhow::Result<()> {
         // 仅在失效时落写：周期性的 OAuth 主动刷新不应空转 revision，
         // 否则会让在途请求锁定的凭据代际无故过期、丢弃真实 401 证据。
+        let mut connection = self.pool.acquire_write().await?;
         sqlx::query(
     "UPDATE providers SET credential_status = 'ok', credential_invalid_at = NULL, revision = revision + 1 WHERE id = ? AND credential_status = 'invalid'",
             )
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *connection)
             .await?;
+        connection.finish().await?;
         Ok(())
     }
 

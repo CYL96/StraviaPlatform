@@ -465,7 +465,7 @@ impl ObservationStore {
         interaction: &str,
     ) -> anyhow::Result<Option<String>> {
         Ok(match self {
-            Self::Sqlite(pool, _, _) => {
+            Self::Sqlite(pool, _) => {
                 sqlx::query_scalar("SELECT root_id FROM interaction_observations WHERE id=?")
                     .bind(interaction)
                     .fetch_optional(pool)
@@ -482,7 +482,7 @@ impl ObservationStore {
 
     pub(super) async fn contains_gap_run(&self, run_id: &str) -> anyhow::Result<bool> {
         Ok(match self {
-            Self::Sqlite(pool, _, _) => {
+            Self::Sqlite(pool, _) => {
                 sqlx::query_scalar(
                     "SELECT EXISTS(SELECT 1 FROM inference_run_observations WHERE id=?)",
                 )
@@ -516,7 +516,7 @@ impl ObservationStore {
         let limit = query.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT) as usize;
         let now = chrono::Utc::now().timestamp_millis();
         let (mut rows, observation_gap): (Vec<DiscoveryRow>, bool) = match self {
-            Self::Sqlite(pool, _, _) => {
+            Self::Sqlite(pool, _) => {
                 let gap: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM interaction_observations WHERE observation_gap=1 AND expires_at>?)")
                     .bind(now).fetch_one(pool).await?;
                 let mut builder = QueryBuilder::<sqlx::Sqlite>::new(DISCOVERY_SELECT);
@@ -575,7 +575,7 @@ impl ObservationStore {
         for row in rows {
             // 只读取普通发现事件的安全元数据，不读取请求正文或秘密映射。
             let payloads: Vec<Vec<u8>> = match self {
-                Self::Sqlite(pool, _, _) => sqlx::query_scalar("SELECT payload FROM observation_events WHERE interaction_id=? AND kind='credential_mappings_created' AND expires_at>? AND occurred_at<=?")
+                Self::Sqlite(pool, _) => sqlx::query_scalar("SELECT payload FROM observation_events WHERE interaction_id=? AND kind='credential_mappings_created' AND expires_at>? AND occurred_at<=?")
                     .bind(&row.interaction_id).bind(now).bind(row.discovered_at).fetch_all(pool).await?,
                 Self::Postgres(pool, _) => sqlx::query_scalar("SELECT payload FROM observation_events WHERE interaction_id=$1 AND kind='credential_mappings_created' AND expires_at>$2 AND occurred_at<=$3")
                     .bind(&row.interaction_id).bind(now).bind(row.discovered_at).fetch_all(pool).await?,
@@ -622,7 +622,7 @@ impl ObservationStore {
     ) -> anyhow::Result<RootChangesPage> {
         let window = forest_window(&query.filters)?;
         let read = match self {
-            Self::Sqlite(pool, _, _) => {
+            Self::Sqlite(pool, _) => {
                 root_changes_sqlite(pool, &query, &window, false, self.debug_trace_index()).await?
             }
             Self::Postgres(pool, _) => {
@@ -734,7 +734,7 @@ impl ObservationStore {
         };
         let result = async {
             match self {
-                Self::Sqlite(p, _, _) => {
+                Self::Sqlite(p, _) => {
                     root_changes_sqlite(p, &query, &window, true, self.debug_trace_index()).await
                 }
                 Self::Postgres(p, _) => {
@@ -821,7 +821,7 @@ impl ObservationStore {
             }],
         };
         let read = match self {
-            Self::Sqlite(p, _, _) => {
+            Self::Sqlite(p, _) => {
                 root_changes_sqlite(p, &query, &window, false, self.debug_trace_index()).await?
             }
             Self::Postgres(p, _) => {
@@ -987,7 +987,7 @@ impl ObservationStore {
             ObservationQueryError::InvalidEventPage
         );
         let exists = match self {
-            Self::Sqlite(pool, _, _) => interaction_sqlite(pool, id).await?.is_some(),
+            Self::Sqlite(pool, _) => interaction_sqlite(pool, id).await?.is_some(),
             Self::Postgres(pool, _) => interaction_postgres(pool, id).await?.is_some(),
         };
         if !exists {
@@ -1011,7 +1011,7 @@ impl ObservationStore {
         let limit = query.limit.unwrap_or(200) as usize;
         let forward = query.after_sequence.is_some();
         let mut events = match self {
-            Self::Sqlite(pool, _, _) => {
+            Self::Sqlite(pool, _) => {
                 let mut sql = QueryBuilder::<sqlx::Sqlite>::new(
                     "SELECT sequence,occurred_at,interaction_id,run_id,rejection_id,kind,payload FROM observation_events WHERE interaction_id=",
                 );
@@ -1077,7 +1077,7 @@ impl ObservationStore {
         through: i64,
     ) -> anyhow::Result<Option<BundleInteractionRecords>> {
         let root_id: Option<String> = match self {
-            Self::Sqlite(pool, _, _) => {
+            Self::Sqlite(pool, _) => {
                 sqlx::query_scalar("SELECT root_id FROM interaction_observations WHERE id=?")
                     .bind(id)
                     .fetch_optional(pool)
@@ -1095,7 +1095,7 @@ impl ObservationStore {
         };
         // 准入只决定截止水位前有哪些 Run；生命周期、用量和正文解释由导出模块拥有。
         let runs: Vec<(String, bool)> = match self {
-            Self::Sqlite(pool, _, _) => sqlx::query_as(
+            Self::Sqlite(pool, _) => sqlx::query_as(
                 "SELECT r.id,r.debug_enabled FROM inference_run_observations r WHERE r.interaction_id=? AND EXISTS (SELECT 1 FROM observation_events e WHERE e.run_id=r.id AND e.kind='run_admitted' AND e.sequence<=?) ORDER BY r.started_at,r.id",
             )
             .bind(id)
@@ -1111,7 +1111,7 @@ impl ObservationStore {
             .await?,
         };
         let events = match self {
-            Self::Sqlite(pool, _, _) => map_sqlite_events(
+            Self::Sqlite(pool, _) => map_sqlite_events(
                 sqlx::query("SELECT sequence,occurred_at,interaction_id,run_id,rejection_id,kind,payload FROM observation_events WHERE interaction_id=? AND sequence<=? ORDER BY sequence")
                     .bind(id).bind(through).fetch_all(pool).await?,
             )?,
@@ -1141,7 +1141,7 @@ impl ObservationStore {
         through: i64,
     ) -> anyhow::Result<Option<BundleRejectionRecords>> {
         let row: Option<(String, bool)> = match self {
-            Self::Sqlite(pool, _, _) => {
+            Self::Sqlite(pool, _) => {
                 sqlx::query_as(
                     "SELECT id,debug_enabled FROM rejected_request_observations WHERE id=?",
                 )
@@ -1180,9 +1180,7 @@ impl ObservationStore {
         let snapshot_sequence = self.max_sequence().await?;
         let limit = q.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT) as i64;
         let (total, mut rows) = match self {
-            Self::Sqlite(p, _, _) => {
-                rejections_sqlite(p, &q, start, end, bounded_end, limit).await?
-            }
+            Self::Sqlite(p, _) => rejections_sqlite(p, &q, start, end, bounded_end, limit).await?,
             Self::Postgres(p, _) => {
                 rejections_postgres(p, &q, start, end, bounded_end, limit).await?
             }
@@ -1207,7 +1205,7 @@ impl ObservationStore {
     }
     pub async fn get_rejection(&self, id: &str) -> anyhow::Result<Option<RejectionDetail>> {
         let row = match self {
-            Self::Sqlite(p, _, _) => rejection_sqlite(p, id).await?,
+            Self::Sqlite(p, _) => rejection_sqlite(p, id).await?,
             Self::Postgres(p, _) => rejection_postgres(p, id).await?,
         };
         let Some(mut row) = row else { return Ok(None) };
@@ -1230,7 +1228,7 @@ impl ObservationStore {
 
     async fn runs(&self, id: &str) -> anyhow::Result<Vec<RunRow>> {
         match self {
-            Self::Sqlite(p, _, _) => {
+            Self::Sqlite(p, _) => {
                 let mut b = QueryBuilder::<sqlx::Sqlite>::new(RUN_SELECT);
                 b.push_bind(id)
                     .push(" GROUP BY r.id ORDER BY r.started_at,r.id");
@@ -1287,7 +1285,7 @@ impl ObservationStore {
         through: i64,
     ) -> anyhow::Result<Vec<ObservationEvent>> {
         match self {
-            Self::Sqlite(pool, _, _) => map_sqlite_events(sqlx::query("SELECT sequence,occurred_at,interaction_id,run_id,rejection_id,kind,payload FROM observation_events WHERE rejection_id=? AND sequence<=? ORDER BY sequence").bind(id).bind(through).fetch_all(pool).await?),
+            Self::Sqlite(pool, _) => map_sqlite_events(sqlx::query("SELECT sequence,occurred_at,interaction_id,run_id,rejection_id,kind,payload FROM observation_events WHERE rejection_id=? AND sequence<=? ORDER BY sequence").bind(id).bind(through).fetch_all(pool).await?),
             Self::Postgres(pool, _) => map_postgres_events(sqlx::query("SELECT sequence,occurred_at,interaction_id,run_id,rejection_id,kind,payload FROM observation_events WHERE rejection_id=$1 AND sequence<=$2 ORDER BY sequence").bind(id).bind(through).fetch_all(pool).await?),
         }
     }
@@ -1738,7 +1736,6 @@ mod tests {
             std::sync::Arc::new(super::super::manifest_index::DebugTraceIndex::empty(
                 std::path::Path::new(""),
             )),
-            std::sync::Arc::new(tokio::sync::Mutex::new(())),
         );
         let at = chrono::Utc::now().timestamp_millis();
         let metadata = crate::interaction_observation::RequestMetadata::default();
@@ -1871,7 +1868,6 @@ mod tests {
             std::sync::Arc::new(super::super::manifest_index::DebugTraceIndex::empty(
                 std::path::Path::new(""),
             )),
-            std::sync::Arc::new(tokio::sync::Mutex::new(())),
         );
         let at = 1_000i64;
         for (id, status, reason, committed) in [
@@ -2099,7 +2095,6 @@ mod tests {
             std::sync::Arc::new(super::super::manifest_index::DebugTraceIndex::empty(
                 std::path::Path::new(""),
             )),
-            std::sync::Arc::new(tokio::sync::Mutex::new(())),
         );
         let request = AiRequest::new(
             "swe-2",
@@ -2189,7 +2184,6 @@ mod tests {
             std::sync::Arc::new(super::super::manifest_index::DebugTraceIndex::empty(
                 std::path::Path::new(""),
             )),
-            std::sync::Arc::new(tokio::sync::Mutex::new(())),
         ))
         .await
     }
@@ -2206,7 +2200,6 @@ mod tests {
             std::sync::Arc::new(super::super::manifest_index::DebugTraceIndex::empty(
                 std::path::Path::new(""),
             )),
-            std::sync::Arc::new(tokio::sync::Mutex::new(())),
         ))
         .await
     }
@@ -2261,7 +2254,7 @@ mod tests {
             .await?;
         // 已有数据库列的投影不能把真实交付时间替换成更晚的观测完成时间。
         let events = match store {
-            ObservationStore::Sqlite(pool, _, _) => {
+            ObservationStore::Sqlite(pool, _) => {
                 sqlx::query("UPDATE inference_run_observations SET delivery_completed_at=13916,finished_at=14000 WHERE id='known-input'")
                     .execute(pool).await?;
                 map_sqlite_events(sqlx::query("SELECT sequence,occurred_at,interaction_id,run_id,rejection_id,kind,payload FROM observation_events WHERE run_id='known-input' AND kind='target_attempt_finished'")
@@ -2573,11 +2566,7 @@ mod tests {
             .connect("sqlite::memory:")
             .await?;
         crate::migrations::migrate_sqlite(&pool, None).await?;
-        let store = ObservationStore::Sqlite(
-            pool.clone(),
-            index.clone(),
-            std::sync::Arc::new(tokio::sync::Mutex::new(())),
-        );
+        let store = ObservationStore::Sqlite(pool.clone(), index.clone());
         cleared_snapshot_scenario(&store).await?;
         batched_debug_scenario(&store).await
     }
@@ -2843,7 +2832,6 @@ mod tests {
             std::sync::Arc::new(super::super::manifest_index::DebugTraceIndex::empty(
                 std::path::Path::new(""),
             )),
-            std::sync::Arc::new(tokio::sync::Mutex::new(())),
         );
         root_changes_scenario(&store).await
     }
@@ -3104,7 +3092,6 @@ mod tests {
             std::sync::Arc::new(super::super::manifest_index::DebugTraceIndex::empty(
                 std::path::Path::new(""),
             )),
-            std::sync::Arc::new(tokio::sync::Mutex::new(())),
         );
         admit_chain_node(&store, "small", "small", None, 1).await?;
         confirm_displayed_tokens(&store, "small", 1_000, 1_000, 0, 0, 2).await?;
@@ -3176,7 +3163,6 @@ mod tests {
             std::sync::Arc::new(super::super::manifest_index::DebugTraceIndex::empty(
                 std::path::Path::new(""),
             )),
-            std::sync::Arc::new(tokio::sync::Mutex::new(())),
         );
         for index in 0..3 {
             let id = format!("root-{index}");

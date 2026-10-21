@@ -481,11 +481,8 @@ mod tests {
                     .bind(run_id).execute(&pool).await.unwrap();
             }
         }
-        let store = super::super::store::ObservationStore::Sqlite(
-            pool,
-            std::sync::Arc::clone(index),
-            std::sync::Arc::new(tokio::sync::Mutex::new(())),
-        );
+        let store =
+            super::super::store::ObservationStore::Sqlite(pool, std::sync::Arc::clone(index));
         store.mark_expired_tombstones(now).await.unwrap()
     }
 

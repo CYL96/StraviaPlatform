@@ -88,7 +88,7 @@ impl ProviderModelStore for SqliteStorage {
         provider_id: &str,
         reconciliation: ProviderModelReconciliation,
     ) -> anyhow::Result<()> {
-        let mut connection = self.pool.acquire().await?;
+        let mut connection = self.pool.acquire_write().await?;
         let mut tx = connection.begin_with("BEGIN IMMEDIATE").await?;
         if let Some(expected) = &reconciliation.expected_provider {
             let provider = sqlx::query_as::<_, crate::db::models::Provider>(
@@ -197,6 +197,7 @@ impl ProviderModelStore for SqliteStorage {
             bump_config_epoch(&mut tx).await?;
         }
         tx.commit().await?;
+        connection.finish().await?;
         Ok(())
     }
 
@@ -205,7 +206,7 @@ impl ProviderModelStore for SqliteStorage {
         input: NewProviderModelRecord,
         change_record: Option<ModelChangeRecord>,
     ) -> anyhow::Result<ProviderModelMutation> {
-        let mut connection = self.pool.acquire().await?;
+        let mut connection = self.pool.acquire_write().await?;
         let mut tx = connection.begin_with("BEGIN IMMEDIATE").await?;
         let exists = sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM provider_models WHERE provider_id = ? AND model_id = ?",
@@ -216,6 +217,8 @@ impl ProviderModelStore for SqliteStorage {
         .await?
             > 0;
         if exists {
+            tx.rollback().await?;
+            connection.finish().await?;
             return Ok(ProviderModelMutation::Conflict);
         }
         let provider_id = input.provider_id.clone();
@@ -229,6 +232,7 @@ impl ProviderModelStore for SqliteStorage {
             .await?
             .context("created Provider Model not found")?;
         tx.commit().await?;
+        connection.finish().await?;
         Ok(ProviderModelMutation::Applied(Box::new(record)))
     }
 
@@ -240,7 +244,7 @@ impl ProviderModelStore for SqliteStorage {
         snapshot_state: SnapshotState,
         expected_revision: i64,
     ) -> anyhow::Result<ProviderModelMutation> {
-        let mut connection = self.pool.acquire().await?;
+        let mut connection = self.pool.acquire_write().await?;
         let mut tx = connection.begin_with("BEGIN").await?;
         let result = update_record_metadata(
             &mut tx,
@@ -253,6 +257,8 @@ impl ProviderModelStore for SqliteStorage {
         .await?;
         if !result {
             let exists = model_exists(&mut tx, provider_id, model_id).await?;
+            tx.rollback().await?;
+            connection.finish().await?;
             return Ok(if exists {
                 ProviderModelMutation::Conflict
             } else {
@@ -265,6 +271,7 @@ impl ProviderModelStore for SqliteStorage {
             .await?
             .context("updated Provider Model not found")?;
         tx.commit().await?;
+        connection.finish().await?;
         Ok(ProviderModelMutation::Applied(Box::new(record)))
     }
 
@@ -276,7 +283,7 @@ impl ProviderModelStore for SqliteStorage {
         validate_map: &crate::provider_models::ReimportThinkingMapValidator<'_>,
         before_commit: &(dyn Fn() -> anyhow::Result<()> + Send + Sync),
     ) -> anyhow::Result<ProviderModelReimport> {
-        let mut connection = self.pool.acquire().await?;
+        let mut connection = self.pool.acquire_write().await?;
         let mut tx = connection.begin_with("BEGIN IMMEDIATE").await?;
         let snapshot_state = SnapshotState::Imported {
             source: SourceStamp::ProviderCatalog {
@@ -293,7 +300,10 @@ impl ProviderModelStore for SqliteStorage {
         )
         .await?;
         if !updated {
-            return Ok(if model_exists(&mut tx, provider_id, model_id).await? {
+            let exists = model_exists(&mut tx, provider_id, model_id).await?;
+            tx.rollback().await?;
+            connection.finish().await?;
+            return Ok(if exists {
                 ProviderModelReimport::Conflict
             } else {
                 ProviderModelReimport::NotFound
@@ -316,6 +326,7 @@ impl ProviderModelStore for SqliteStorage {
         let active_routes = SqliteRouteStore::load_routes(&mut tx, true).await?;
         before_commit()?;
         tx.commit().await?;
+        connection.finish().await?;
         Ok(ProviderModelReimport::Applied {
             model: Box::new(model),
             active_routes,
@@ -330,16 +341,22 @@ impl ProviderModelStore for SqliteStorage {
         expected_revision: i64,
         change_record: Option<ModelChangeRecord>,
     ) -> anyhow::Result<ProviderModelMutation> {
-        let mut connection = self.pool.acquire().await?;
+        let mut connection = self.pool.acquire_write().await?;
         let mut tx = connection.begin_with("BEGIN IMMEDIATE").await?;
         if let Some(record) = get_record(&mut tx, provider_id, model_id).await? {
             if record.revision != expected_revision {
+                tx.rollback().await?;
+                connection.finish().await?;
                 return Ok(ProviderModelMutation::Conflict);
             }
             if record.selection_policy == policy {
+                tx.rollback().await?;
+                connection.finish().await?;
                 return Ok(ProviderModelMutation::Applied(Box::new(record)));
             }
         } else {
+            tx.rollback().await?;
+            connection.finish().await?;
             return Ok(ProviderModelMutation::NotFound);
         }
         let result = sqlx::query(
@@ -354,13 +371,14 @@ impl ProviderModelStore for SqliteStorage {
         .execute(&mut *tx)
         .await?;
         if result.rows_affected() == 0 {
-            return Ok(
-                if get_record(&mut tx, provider_id, model_id).await?.is_some() {
-                    ProviderModelMutation::Conflict
-                } else {
-                    ProviderModelMutation::NotFound
-                },
-            );
+            let exists = get_record(&mut tx, provider_id, model_id).await?.is_some();
+            tx.rollback().await?;
+            connection.finish().await?;
+            return Ok(if exists {
+                ProviderModelMutation::Conflict
+            } else {
+                ProviderModelMutation::NotFound
+            });
         }
         // Selection policy gates whether the resolved model may serve traffic;
         // publish the change atomically with the write it accompanies.
@@ -372,6 +390,7 @@ impl ProviderModelStore for SqliteStorage {
             .await?
             .context("updated Provider Model not found")?;
         tx.commit().await?;
+        connection.finish().await?;
         Ok(ProviderModelMutation::Applied(Box::new(record)))
     }
 
@@ -384,12 +403,13 @@ impl ProviderModelStore for SqliteStorage {
         provider_id: &str,
         enabled: bool,
     ) -> anyhow::Result<ProviderModelSyncState> {
-        let mut connection = self.pool.acquire().await?;
+        let mut connection = self.pool.acquire_write().await?;
         let mut tx = connection.begin_with("BEGIN IMMEDIATE").await?;
         sqlx::query("INSERT INTO provider_model_sync_state (provider_id, automatic_sync) VALUES (?, ?) ON CONFLICT(provider_id) DO UPDATE SET automatic_sync = excluded.automatic_sync")
             .bind(provider_id).bind(enabled).execute(&mut *tx).await?;
         let state = load_sync_state(&mut tx, provider_id).await?;
         tx.commit().await?;
+        connection.finish().await?;
         Ok(state)
     }
 
@@ -399,7 +419,7 @@ impl ProviderModelStore for SqliteStorage {
         summary: ProviderModelSyncSummary,
         mut record: ModelChangeRecord,
     ) -> anyhow::Result<()> {
-        let mut connection = self.pool.acquire().await?;
+        let mut connection = self.pool.acquire_write().await?;
         let mut tx = connection.begin_with("BEGIN IMMEDIATE").await?;
         if sqlx::query_scalar::<_, String>("SELECT id FROM providers WHERE id = ?")
             .bind(provider_id)
@@ -428,6 +448,7 @@ impl ProviderModelStore for SqliteStorage {
             insert_change(&mut tx, &record).await?;
         }
         tx.commit().await?;
+        connection.finish().await?;
         Ok(())
     }
 
@@ -492,15 +513,17 @@ impl ProviderModelStore for SqliteStorage {
     }
 
     async fn prune_changes(&self, before: &str) -> anyhow::Result<()> {
+        let mut connection = self.pool.acquire_write().await?;
         sqlx::query("DELETE FROM model_changes WHERE checked_at < ?")
             .bind(before)
-            .execute(&self.pool)
+            .execute(&mut *connection)
             .await?;
+        connection.finish().await?;
         Ok(())
     }
 
     async fn delete_manual(&self, provider_id: &str, model_id: &str) -> anyhow::Result<bool> {
-        let mut connection = self.pool.acquire().await?;
+        let mut connection = self.pool.acquire_write().await?;
         let mut tx = connection.begin_with("BEGIN IMMEDIATE").await?;
         let result = sqlx::query(
     "DELETE FROM provider_models WHERE provider_id = ? AND model_id = ? AND source_kind = 'manual'",
@@ -516,6 +539,7 @@ impl ProviderModelStore for SqliteStorage {
             bump_config_epoch(&mut tx).await?;
         }
         tx.commit().await?;
+        connection.finish().await?;
         Ok(deleted)
     }
 }

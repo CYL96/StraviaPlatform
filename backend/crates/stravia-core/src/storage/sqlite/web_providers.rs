@@ -36,6 +36,7 @@ impl WebProviderStore for SqliteWebProviderStore {
 
     async fn create(&self, input: CreateWebProvider) -> anyhow::Result<WebProvider> {
         let id = stravia_runtime_contract::identifier::new_id();
+        let mut connection = self.pool.acquire_write().await?;
         sqlx::query(
             "INSERT INTO web_providers (id, name, kind, api_key, use_proxy, local_engines)
      VALUES (?, ?, ?, ?, ?, ?)",
@@ -46,8 +47,9 @@ impl WebProviderStore for SqliteWebProviderStore {
         .bind(input.api_key)
         .bind(input.use_proxy)
         .bind(input.local_engines.map(Json))
-        .execute(&self.pool)
+        .execute(&mut *connection)
         .await?;
+        connection.finish().await?;
         self.get(&id)
             .await?
             .context("Web Provider missing after create")
@@ -68,6 +70,7 @@ impl WebProviderStore for SqliteWebProviderStore {
             Some(value) => value.map(Json),
             None => current.local_engines,
         };
+        let mut connection = self.pool.acquire_write().await?;
         sqlx::query(
             "UPDATE web_providers
      SET name = ?, api_key = ?, use_proxy = ?, local_engines = ?, updated_at = datetime('now')
@@ -78,15 +81,17 @@ impl WebProviderStore for SqliteWebProviderStore {
         .bind(use_proxy)
         .bind(local_engines)
         .bind(id)
-        .execute(&self.pool)
+        .execute(&mut *connection)
         .await?;
+        connection.finish().await?;
         self.get(id)
             .await?
             .context("Web Provider missing after update")
     }
 
     async fn delete(&self, id: &str) -> anyhow::Result<()> {
-        let mut tx = self.pool.begin().await?;
+        let mut connection = self.pool.acquire_write().await?;
+        let mut tx = connection.begin().await?;
         sqlx::query("DELETE FROM web_providers WHERE id = ?")
             .bind(id)
             .execute(&mut *tx)
@@ -127,6 +132,7 @@ impl WebProviderStore for SqliteWebProviderStore {
             .await?;
         }
         tx.commit().await?;
+        connection.finish().await?;
         Ok(())
     }
 
@@ -155,14 +161,16 @@ impl WebProviderStore for SqliteWebProviderStore {
         provider_id: &str,
         result: ProviderTestResult,
     ) -> anyhow::Result<()> {
+        let mut connection = self.pool.acquire_write().await?;
         sqlx::query(
     "UPDATE web_providers SET last_test_success = ?, last_test_at = ?, updated_at = datetime('now') WHERE id = ?",
             )
             .bind(result.success)
             .bind(result.tested_at)
             .bind(provider_id)
-            .execute(&self.pool)
+            .execute(&mut *connection)
             .await?;
+        connection.finish().await?;
         Ok(())
     }
 
@@ -224,31 +232,32 @@ impl WebProviderStore for SqliteWebProviderStore {
     }
 
     async fn save_settings(&self, settings: &WebAccessSettings) -> anyhow::Result<()> {
-        let mut conn = self.pool.acquire().await?;
-        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+        let values = [
+            (
+                SEARCH_IDS_KEY,
+                serde_json::to_string(&settings.search_provider_ids)?,
+            ),
+            (
+                FETCH_IDS_KEY,
+                serde_json::to_string(&settings.fetch_provider_ids)?,
+            ),
+        ];
+        let mut connection = self.pool.acquire_write().await?;
+        let mut tx = connection.begin_with("BEGIN IMMEDIATE").await?;
         let result: anyhow::Result<()> = async {
             let providers = sqlx::query_as::<_, WebProvider>(
                 "SELECT id, name, kind, api_key, use_proxy, local_engines, last_test_success, last_test_at, created_at, updated_at FROM web_providers",
             )
-            .fetch_all(&mut *conn)
+            .fetch_all(&mut *tx)
             .await?;
             validate_web_access_provider_lists(&providers, settings)?;
-            for (key, value) in [
-                (
-                    SEARCH_IDS_KEY,
-                    serde_json::to_string(&settings.search_provider_ids)?,
-                ),
-                (
-                    FETCH_IDS_KEY,
-                    serde_json::to_string(&settings.fetch_provider_ids)?,
-                ),
-            ] {
+            for (key, value) in values {
                 sqlx::query(
                     "INSERT INTO settings (name, value) VALUES (?, ?) ON CONFLICT(name) DO UPDATE SET value = excluded.value, updated_at = datetime('now')",
                 )
                 .bind(key)
                 .bind(value)
-                .execute(&mut *conn)
+                .execute(&mut *tx)
                 .await?;
             }
             Ok(())
@@ -256,11 +265,12 @@ impl WebProviderStore for SqliteWebProviderStore {
         .await;
         match result {
             Ok(()) => {
-                sqlx::query("COMMIT").execute(&mut *conn).await?;
+                tx.commit().await?;
+                connection.finish().await?;
                 Ok(())
             }
             Err(error) => {
-                if let Err(rollback_error) = sqlx::query("ROLLBACK").execute(&mut *conn).await {
+                if let Err(rollback_error) = tx.rollback().await {
                     tracing::debug!(%rollback_error, "transaction rollback failed");
                 }
                 Err(error)

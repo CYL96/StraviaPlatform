@@ -220,7 +220,7 @@ impl RouteStore for SqliteRouteStore {
             .as_ref()
             .map(|id| id.as_str().to_owned())
             .unwrap_or_else(stravia_runtime_contract::identifier::new_id);
-        let mut connection = self.pool.acquire().await?;
+        let mut connection = self.pool.acquire_write().await?;
         let mut tx = connection.begin_with("BEGIN IMMEDIATE").await?;
         let conflict = sqlx::query_scalar::<_, String>(
             "SELECT id FROM models WHERE model_id = ? AND id != ? LIMIT 1",
@@ -326,17 +326,19 @@ impl RouteStore for SqliteRouteStore {
         }
 
         tx.commit().await?;
-        drop(connection);
+        connection.finish().await?;
         self.get(route.model_id.as_str().trim())
             .await?
             .context("Route missing after put")
     }
 
     async fn delete(&self, route_id: &str) -> anyhow::Result<()> {
+        let mut connection = self.pool.acquire_write().await?;
         sqlx::query("DELETE FROM models WHERE model_id = ?")
             .bind(route_id)
-            .execute(&self.pool)
+            .execute(&mut *connection)
             .await?;
+        connection.finish().await?;
         Ok(())
     }
 }

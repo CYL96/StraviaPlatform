@@ -63,9 +63,13 @@ impl Store {
         let now = chrono::Utc::now().timestamp_millis();
         let expires = expires_after(now, ttl);
         let payload = serde_json::to_string(record).map_err(storage)?;
+        let state_payloads = states
+            .iter()
+            .map(|state| serde_json::to_string(&state.payload).map_err(storage))
+            .collect::<Result<Vec<_>, _>>()?;
         macro_rules! insert {
             ($pool:expr, $begin:literal) => {{
-                let mut connection = $pool.acquire().await.map_err(storage)?;
+                let mut connection = $pool.acquire_write().await.map_err(storage)?;
                 let mut tx = connection.begin_with($begin).await.map_err(storage)?;
                 extend_source!(tx, &principal, record.source_generation_id.as_deref(), now, expires);
                 for predecessor in &record.source_record_ids {
@@ -80,13 +84,13 @@ impl Store {
                     sqlx::query("INSERT INTO native_compaction_sources (record_id, source_id) VALUES ($1, $2)")
                         .bind(&record.id).bind(predecessor).execute(&mut *tx).await.map_err(storage)?;
                 }
-                for state in states {
-                    let state_payload = serde_json::to_string(&state.payload).map_err(storage)?;
+                for (state, state_payload) in states.iter().zip(&state_payloads) {
                     sqlx::query("INSERT INTO native_compaction_states (record_id, principal, native_identity, fingerprint, state_payload) VALUES ($1, $2, $3, $4, $5)")
                         .bind(&record.id).bind(&principal).bind(&state.identity).bind(&state.fingerprint).bind(state_payload)
                         .execute(&mut *tx).await.map_err(storage)?;
                 }
                 tx.commit().await.map_err(storage)?;
+                connection.finish().await.map_err(storage)?;
                 Ok(())
             }};
         }
@@ -178,7 +182,7 @@ impl Store {
         macro_rules! extend {
             ($pool:expr, $begin:literal) => {{
                 // 先取得 SQLite 写锁，避免交付确认与立即回传的快照升级竞争。
-                let mut connection = $pool.acquire().await.map_err(storage)?;
+                let mut connection = $pool.acquire_write().await.map_err(storage)?;
                 let mut tx = connection.begin_with($begin).await.map_err(storage)?;
                 let mut queue = ids.to_vec();
                 let mut visited = HashSet::new();
@@ -199,6 +203,7 @@ impl Store {
                     queue.extend(record.source_record_ids);
                 }
                 tx.commit().await.map_err(storage)?;
+                connection.finish().await.map_err(storage)?;
                 Ok(())
             }};
         }
@@ -212,7 +217,7 @@ impl Store {
         let now = chrono::Utc::now().timestamp_millis();
         macro_rules! cleanup {
             ($pool:expr, $begin:literal) => {{
-                let mut connection = $pool.acquire().await.map_err(storage)?;
+                let mut connection = $pool.acquire_write().await.map_err(storage)?;
                 let mut tx = connection.begin_with($begin).await.map_err(storage)?;
                 // 先删除到期边，再删记录；仍存活的后继阻止来源被回收。
                 sqlx::query("DELETE FROM native_compaction_sources WHERE record_id IN (SELECT id FROM native_compactions WHERE expires_at <= $1)")
@@ -220,6 +225,7 @@ impl Store {
                 sqlx::query("DELETE FROM native_compactions WHERE expires_at <= $1 AND NOT EXISTS (SELECT 1 FROM native_compaction_sources s WHERE s.source_id = native_compactions.id)")
                     .bind(now).execute(&mut *tx).await.map_err(storage)?;
                 tx.commit().await.map_err(storage)?;
+                connection.finish().await.map_err(storage)?;
                 Ok(())
             }};
         }

@@ -94,7 +94,10 @@ impl SqlMappingStore {
         };
         match self {
             Self::Sqlite(pool) => {
-                let mut connection = pool.acquire().await.map_err(|error| self.storage(error))?;
+                let mut connection = pool
+                    .acquire_write()
+                    .await
+                    .map_err(|error| self.storage(error))?;
                 let mut transaction = connection
                     .begin_with("BEGIN IMMEDIATE")
                     .await
@@ -134,6 +137,10 @@ impl SqlMappingStore {
                 }
                 transaction
                     .commit()
+                    .await
+                    .map_err(|error| self.storage(error))?;
+                connection
+                    .finish()
                     .await
                     .map_err(|error| self.storage(error))?;
             }
@@ -231,7 +238,10 @@ impl MappingStore for SqlMappingStore {
         // Secrets can be arbitrarily long (e.g. private keys), so do not B-tree index them.
         match self {
             Self::Sqlite(pool) => {
-                let mut connection = pool.acquire().await.map_err(|error| self.storage(error))?;
+                let mut connection = pool
+                    .acquire_write()
+                    .await
+                    .map_err(|error| self.storage(error))?;
                 let mut transaction = connection
                     .begin_with("BEGIN IMMEDIATE")
                     .await
@@ -271,6 +281,10 @@ impl MappingStore for SqlMappingStore {
                 }
                 transaction
                     .commit()
+                    .await
+                    .map_err(|error| self.storage(error))?;
+                connection
+                    .finish()
                     .await
                     .map_err(|error| self.storage(error))?;
             }
@@ -344,12 +358,21 @@ impl MappingStore for SqlMappingStore {
     async fn cleanup_expired(&self) -> Result<u64, RedactionError> {
         match self {
             Self::Sqlite(pool) => {
-                sqlx::query("DELETE FROM reversible_redaction_mappings WHERE expires_at <= ?")
-                    .bind(now())
-                    .execute(pool)
+                let mut connection = pool
+                    .acquire_write()
                     .await
-                    .map(|result| result.rows_affected())
-                    .map_err(|error| self.storage(error))
+                    .map_err(|error| self.storage(error))?;
+                let result =
+                    sqlx::query("DELETE FROM reversible_redaction_mappings WHERE expires_at <= ?")
+                        .bind(now())
+                        .execute(&mut *connection)
+                        .await
+                        .map_err(|error| self.storage(error))?;
+                connection
+                    .finish()
+                    .await
+                    .map_err(|error| self.storage(error))?;
+                Ok(result.rows_affected())
             }
             Self::Postgres(pool) => {
                 sqlx::query("DELETE FROM reversible_redaction_mappings WHERE expires_at <= $1")

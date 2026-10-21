@@ -168,7 +168,6 @@ impl InteractionObservation {
         retention_days: u32,
         persistent: bool,
         generation_chains: crate::generation_chain::GenerationChain,
-        sqlite_write_gate: Option<Arc<tokio::sync::Mutex<()>>>,
     ) -> Self {
         let performance_sqlite_pool = sqlite.clone();
         let performance_postgres_pool = postgres.clone();
@@ -193,13 +192,8 @@ impl InteractionObservation {
                 }
             },
         );
-        let store = ObservationStore::new(
-            sqlite,
-            postgres,
-            Arc::clone(&debug_trace_index),
-            sqlite_write_gate,
-        )
-        .expect("Gateway provides exactly one observation SQL backend");
+        let store = ObservationStore::new(sqlite, postgres, Arc::clone(&debug_trace_index))
+            .expect("Gateway provides exactly one observation SQL backend");
         if store.recover_after_restart().await.is_err() {
             tracing::warn!("observation restart recovery unavailable");
         }
@@ -2122,7 +2116,6 @@ mod snapshot_tests {
             1,
             persistent,
             crate::generation_chain::test_chain().await,
-            Some(Arc::new(tokio::sync::Mutex::new(()))),
         )
         .await
     }
@@ -3868,7 +3861,6 @@ mod snapshot_tests {
         let store = store::ObservationStore::Sqlite(
             pool.clone(),
             Arc::new(manifest_index::DebugTraceIndex::load(directory.path())?),
-            Arc::new(tokio::sync::Mutex::new(())),
         );
         assert!(
             store
@@ -4015,7 +4007,6 @@ mod snapshot_tests {
         let store = store::ObservationStore::Sqlite(
             pool.clone(),
             Arc::new(manifest_index::DebugTraceIndex::load(directory.path())?),
-            Arc::new(tokio::sync::Mutex::new(())),
         );
         let first = store
             .credential_discoveries(CredentialDiscoveryQuery {
