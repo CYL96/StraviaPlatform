@@ -524,13 +524,23 @@ impl SendEligibility {
             {
                 return Err(rejected());
             }
-            if self.requires_image
-                && !(supports("image_input")
-                    || modalities.is_some_and(|modalities| {
-                        stravia_media::platform::supports_image(&modalities.input)
-                    }))
-            {
-                return Err(rejected());
+            if self.requires_image {
+                let supports_image =
+                    if self.capability == stravia_vendor_sdk::Capability::MediaImage {
+                        metadata
+                            .and_then(|metadata| metadata.modalities.as_ref())
+                            .is_some_and(|modalities| {
+                                stravia_media::platform::supports_image(&modalities.input)
+                            })
+                    } else {
+                        supports("image_input")
+                            || modalities.is_some_and(|modalities| {
+                                stravia_media::platform::supports_image(&modalities.input)
+                            })
+                    };
+                if !supports_image {
+                    return Err(rejected());
+                }
             }
         }
         Ok(destination)
