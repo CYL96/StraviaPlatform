@@ -288,7 +288,6 @@ fn fallback_session_id(provider: &ProviderSnapshot) -> String {
         .operation_metadata
         .get("transport_affinity")
         .and_then(Value::as_str)
-        .map(str::trim)
         .filter(|value| !value.is_empty())
     else {
         return uuid::Uuid::new_v4().to_string();
@@ -303,13 +302,18 @@ fn parent_session_id(provider: &ProviderSnapshot) -> Option<String> {
         .operation_metadata
         .get("parent_transport_affinity")
         .and_then(Value::as_str)
-        .map(str::trim)
         .filter(|affinity| !affinity.is_empty())
         .map(native_session_id)
 }
 
 fn native_session_id(affinity: &str) -> String {
-    let digest = Sha256::digest(format!("{VENDOR_ID}:{affinity}").as_bytes());
+    // Preserve the published namespace and bytes; changing it would rename
+    // existing sessions. In particular, whitespace belongs to the identity.
+    let mut hash = Sha256::new();
+    hash.update(VENDOR_ID.as_bytes());
+    hash.update(b":");
+    hash.update(affinity.as_bytes());
+    let digest = hash.finalize();
     let bytes: [u8; 16] = digest[..16].try_into().expect("digest has 16 bytes");
     uuid::Builder::from_random_bytes(bytes)
         .into_uuid()
@@ -543,6 +547,49 @@ mod tests {
         assert_ne!(
             fallback_session_id(&provider),
             fallback_session_id(&provider)
+        );
+    }
+
+    #[test]
+    fn session_hash_preserves_full_utf8_and_legacy_vectors() {
+        assert_eq!(
+            native_session_id("principal-target-scope"),
+            "a107661d-a7a9-43db-809b-2dc9dcd37ada"
+        );
+        let source = " 空白\0\r\n会话😀 ";
+        assert_eq!(
+            native_session_id(source),
+            "0a00c8c6-848d-463f-94f9-b8c3e6ce1a14"
+        );
+        let mut provider = ProviderSnapshot {
+            provider_id: VENDOR_ID.into(),
+            channel: CHANNEL.into(),
+            base_url: DEFAULT_BASE_URL.into(),
+            protocol: "anthropic-messages".into(),
+            options: Default::default(),
+            credentials: Default::default(),
+            model: Some("claude-sonnet-4-5".into()),
+            model_metadata: None,
+            client_headers: vec![],
+            operation_metadata: Default::default(),
+        };
+        for input in [source, " ", "\0", "会话😀", "会话😁"] {
+            provider
+                .operation_metadata
+                .insert("transport_affinity".into(), input.into());
+            provider
+                .operation_metadata
+                .insert("parent_transport_affinity".into(), input.into());
+            let session = fallback_session_id(&provider);
+            assert_eq!(session, native_session_id(input));
+            assert_eq!(session, fallback_session_id(&provider.clone()));
+            assert_eq!(Some(session), parent_session_id(&provider));
+        }
+        assert_ne!(native_session_id(source), native_session_id(source.trim()));
+        let prefix = "会话😀".repeat(4096);
+        assert_ne!(
+            native_session_id(&format!("{prefix}a")),
+            native_session_id(&format!("{prefix}b"))
         );
     }
 }

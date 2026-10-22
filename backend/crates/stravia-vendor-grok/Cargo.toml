@@ -23,6 +23,7 @@ chrono = { workspace = true, features = ["clock", "std"] }
 semver = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true, features = ["arbitrary_precision"] }
+sha2 = { workspace = true }
 url = { workspace = true }
 urlencoding = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }

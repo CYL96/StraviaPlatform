@@ -27,7 +27,21 @@ fn serialize_agent_request_id<S: serde::Serializer>(
     id: &uuid::Uuid,
     serializer: S,
 ) -> Result<S::Ok, S::Error> {
-    serializer.collect_str(&format_args!("agent-{id}"))
+    // CLI 1.3.5 computeRequestID's fallback when native operation metadata
+    // is absent is request-type/UUID, not the community proxy's agent-UUID.
+    serializer.collect_str(&format_args!("agent/{id}"))
+}
+
+// CLI 1.3.5 codeassistclient.getSessionID hashes the complete source bytes
+// with FNV-1a64 and formats the result as a signed decimal int64.
+fn native_session_id(source: &str) -> String {
+    let hash = source
+        .as_bytes()
+        .iter()
+        .fold(0xcbf29ce484222325u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+        });
+    (hash as i64).to_string()
 }
 
 pub(crate) fn infer(
@@ -199,7 +213,7 @@ pub(crate) fn infer(
     if let Some(session) = common::session_affinity(&provider) {
         body.as_object_mut()
             .expect("request was validated")
-            .insert("sessionId".into(), json!(session));
+            .insert("sessionId".into(), json!(native_session_id(session)));
     }
     let project = client::project(host, &provider)?;
     let envelope = InferenceEnvelope {
@@ -809,6 +823,39 @@ impl EventFraming {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_identity_matches_cli_135_representation() {
+        assert_eq!(native_session_id(""), "-3750763034362895579");
+        assert_eq!(
+            native_session_id(" principal/目标/会话 "),
+            "-2713670015314466186"
+        );
+        assert_eq!(
+            native_session_id("principal/目标/会话"),
+            "-7112187058504807916"
+        );
+        assert_eq!(native_session_id(&"a".repeat(64)), "-2665998720392315931");
+        assert_eq!(
+            native_session_id(&format!("{}尾", "a".repeat(64))),
+            "7809677453811392938"
+        );
+        let request = json!({});
+        let id = uuid::Uuid::parse_str("00112233-4455-4677-8899-aabbccddeeff").unwrap();
+        let envelope = serde_json::to_value(InferenceEnvelope {
+            project: "synthetic-project",
+            model: "synthetic-model",
+            request: &request,
+            user_agent: "antigravity",
+            request_type: "agent",
+            request_id: id,
+        })
+        .unwrap();
+        assert_eq!(
+            envelope["requestId"],
+            "agent/00112233-4455-4677-8899-aabbccddeeff"
+        );
+    }
 
     #[test]
     fn thinking_projection_accepts_cli_enum_and_rejects_invalid_explicit_controls() {

@@ -313,7 +313,7 @@ fn infer(
         })?;
     let mut state = read_state(host)?;
     let now_ms = Utc::now().timestamp_millis();
-    let session_id = ensure_session(api_key, now_ms, &mut state);
+    let session_id = inference_session_id(&provider, api_key, now_ms, &mut state);
     ensure_initialized(host, &provider, api_key, now_ms, &mut state)?;
     write_state(host, &state)?;
 
@@ -583,6 +583,31 @@ fn static_discovery(provider: &ProviderSnapshot) -> Result<Option<DiscoverRespon
         models: models.into_values().collect(),
         next_cursor: None,
     }))
+}
+
+fn native_session_id(affinity: &str) -> String {
+    // The official threadId validator is z.uuid(); newSession uses randomUUID().
+    // Hash the complete trusted host scope, never credentials or client headers.
+    let mut hash = Sha256::new();
+    hash.update(b"stravia:command-code:session:v1\0");
+    hash.update(affinity.as_bytes());
+    let digest = hash.finalize();
+    let mut bytes = [0; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    uuid::Uuid::from_bytes(bytes).to_string()
+}
+
+fn inference_session_id(
+    provider: &ProviderSnapshot,
+    api_key: &str,
+    now_ms: i64,
+    state: &mut PrivateState,
+) -> String {
+    common::session_affinity(provider)
+        .map(native_session_id)
+        .unwrap_or_else(|| ensure_session(api_key, now_ms, state))
 }
 
 fn ensure_session(api_key: &str, now_ms: i64, state: &mut PrivateState) -> String {
@@ -973,3 +998,85 @@ impl VendorGuest for CommandCodeVendor {
 
 #[cfg(target_arch = "wasm32")]
 stravia_vendor_sdk::export_vendor!(CommandCodeVendor);
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+
+    fn provider(affinity: Option<&str>) -> ProviderSnapshot {
+        ProviderSnapshot {
+            provider_id: VENDOR_ID.into(),
+            channel: CHANNEL_ID.into(),
+            base_url: "http://127.0.0.1:18080".into(),
+            protocol: "command-code".into(),
+            options: BTreeMap::from([("session_id".into(), json!("injected"))]),
+            credentials: BTreeMap::from([("apiKey".into(), json!("synthetic-key"))]),
+            model: Some("synthetic-model".into()),
+            model_metadata: None,
+            client_headers: vec![("x-session-id".into(), "injected".into())],
+            operation_metadata: affinity
+                .map(|value| BTreeMap::from([("session_affinity".into(), json!(value))]))
+                .unwrap_or_default(),
+        }
+    }
+
+    #[test]
+    fn wire_identity_uses_trusted_scope_without_mutating_device_or_ttl_state() {
+        let provider = provider(Some(" 会话🚀\0A "));
+        let mut state = PrivateState {
+            session_id: Some("cached-session".into()),
+            session_expires_at_ms: Some(100),
+            fingerprint: Some(generate_fingerprint("synthetic-key")),
+            next_init_at_ms: Some(200),
+        };
+        let before = serde_json::to_value(&state).unwrap();
+        let id = inference_session_id(&provider, "synthetic-key", 1000, &mut state);
+        assert_eq!(id, "f8d698ea-6c97-4aeb-881f-5a46638ee08d");
+        assert_eq!(before, serde_json::to_value(&state).unwrap());
+        let headers = inference_headers("synthetic-key", true, &id);
+        let second = inference_headers("synthetic-key", true, &id);
+        assert!(headers.contains(&("x-session-id".into(), id.clone())));
+        assert!(headers.contains(&("authorization".into(), "Bearer synthetic-key".into())));
+        let trace = |values: &Vec<(String, String)>| {
+            values
+                .iter()
+                .find(|(name, _)| name == "traceparent")
+                .unwrap()
+                .1
+                .clone()
+        };
+        assert_ne!(trace(&headers), trace(&second));
+        let mut body = json!({"config": {}, "params": {"messages": []}});
+        apply_device_envelope(&mut body, &id).unwrap();
+        assert_eq!(body["threadId"], id);
+        assert_ne!(id, native_session_id("会话🚀\0A"));
+        assert_ne!(id, native_session_id(" 会话🚀\0a "));
+        assert_ne!(id, native_session_id(" 会话🚀"));
+        let long = "会".repeat(4096);
+        assert_ne!(
+            native_session_id(&long),
+            native_session_id(&format!("{long}尾"))
+        );
+    }
+
+    #[test]
+    fn fixed_vector_and_unscoped_session_keep_existing_ttl_lifecycle() {
+        assert_eq!(
+            native_session_id(&"0123456789abcdef".repeat(4)),
+            "29776a7f-1e39-483f-b0be-28beeb2d9f3a"
+        );
+        let provider = provider(None);
+        let mut state = PrivateState::default();
+        let first = inference_session_id(&provider, "synthetic-key", 0, &mut state);
+        assert_eq!(
+            first,
+            inference_session_id(&provider, "synthetic-key", 1, &mut state)
+        );
+        let expiry = state.session_expires_at_ms.unwrap();
+        assert_ne!(
+            first,
+            inference_session_id(&provider, "synthetic-key", expiry, &mut state)
+        );
+        assert_eq!(uuid::Uuid::parse_str(&first).unwrap().get_version_num(), 4);
+    }
+}

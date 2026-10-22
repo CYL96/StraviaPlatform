@@ -785,6 +785,9 @@ async fn oauth_and_inference_enforce_native_wire_at_real_http_boundary() {
     assert_eq!(values["refresh_token"], "test-refresh");
     assert_eq!(values["project_id"], "test-project");
     provider.credentials = values;
+    provider
+        .operation_metadata
+        .insert("session_affinity".into(), json!(" principal/目标/会话 "));
     let endpoint = GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA;
     let request = ProtocolTransform::global().bind(endpoint,endpoint).unwrap().decode_request(json!({
         "contents":[{"role":"user","parts":[{"text":"Run read","future":"strip"}],"foreign":"strip"}],
@@ -855,6 +858,10 @@ async fn oauth_and_inference_enforce_native_wire_at_real_http_boundary() {
         let body: Value = serde_json::from_slice(body).unwrap();
         assert_eq!(body["project"], "test-project");
         assert_eq!(body["model"], "account-model");
+        assert_eq!(body["request"]["sessionId"], "-2713670015314466186");
+        let request_id = body["requestId"].as_str().unwrap();
+        let native_id = uuid::Uuid::parse_str(request_id.strip_prefix("agent/").unwrap()).unwrap();
+        assert_eq!(native_id.get_version_num(), 4);
         assert!(body["request"].get("cachedContent").is_none());
         assert!(body["request"]["generationConfig"].get("seed").is_none());
         for pointer in [

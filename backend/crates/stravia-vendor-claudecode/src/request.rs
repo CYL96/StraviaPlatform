@@ -215,6 +215,10 @@ pub(crate) fn inference_headers(
         ("content-type".into(), "application/json".into()),
         ("user-agent".into(), cli_user_agent(client_version)),
         ("x-claude-code-session-id".into(), session_id.into()),
+        (
+            "x-client-request-id".into(),
+            uuid::Uuid::new_v4().to_string(),
+        ),
         ("x-stainless-arch".into(), STAINLESS_ARCH.into()),
         ("x-stainless-lang".into(), "js".into()),
         ("x-stainless-os".into(), STAINLESS_OS.into()),

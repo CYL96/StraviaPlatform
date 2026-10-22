@@ -411,6 +411,66 @@ async fn builtin_api_credentials_preserve_existing_connection_field_names() -> a
 }
 
 #[tokio::test]
+async fn openrouter_session_identity_is_host_owned_and_not_sent_to_other_profiles()
+-> anyhow::Result<()> {
+    for vendor in ["openrouter", "custom"] {
+        let (base_url, server) = local_upstream(1, |_| {
+            MockResponse::json(json!({
+                "id":"chat-session","object":"chat.completion","model":"upstream-model",
+                "choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],
+                "usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}
+            }))
+        }).await?;
+        let (_directory, gateway) = gateway().await?;
+        let (route, token) = provider_route_and_key(
+            &gateway,
+            vendor,
+            ProviderSourceInput::Custom {
+                vendor: vendor.into(),
+                channel: "default".into(),
+                protocol: Some("openai-compatible".into()),
+                base_url,
+                models_source: None,
+                static_models: None,
+            },
+            "upstream-model",
+            ProviderCredentialInput::ApiKey {
+                value: "synthetic-key".into(),
+            },
+            Default::default(),
+            json!({"id":"upstream-model","name":"upstream-model"}),
+        )
+        .await?;
+        let (status, response) = chat_with_headers(
+            gateway,
+            &token,
+            json!({"model":route,"messages":[{"role":"user","content":"hello"}],
+                "session_id":"forged-body-session","request_id":"forged-request"}),
+            &[("x-session-id".into(), "forged-header-session".into())],
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK, "{vendor}: {response}");
+        let requests = server.await??;
+        let session = requests[0].headers.get("x-session-id");
+        if vendor == "openrouter" {
+            let session = session.expect("host session");
+            assert_eq!(session.len(), 64);
+            assert!(
+                session
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            );
+        } else {
+            assert!(session.is_none());
+        }
+        let body: Value = serde_json::from_slice(&requests[0].body)?;
+        assert!(body.get("session_id").is_none());
+        assert!(body.get("request_id").is_none());
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn custom_compatible_connection_can_call_an_explicit_local_upstream_without_credentials()
 -> anyhow::Result<()> {
     let (base_url, server) = local_upstream(1, |_| MockResponse::json(json!({

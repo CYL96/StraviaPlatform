@@ -28,6 +28,10 @@ fn provider() -> ProviderSnapshot {
         client_headers: vec![
             ("authorization".into(), "Bearer attacker".into()),
             ("X-KiloCode-OrganizationId".into(), "attacker-org".into()),
+            ("X-KiloCode-TaskId".into(), "attacker-task".into()),
+            ("X-KiloCode-Parent-TaskId".into(), "attacker-parent".into()),
+            ("X-KiloCode-ProjectId".into(), "attacker-project".into()),
+            ("X-KiloCode-MachineId".into(), "attacker-machine".into()),
         ],
         operation_metadata: BTreeMap::new(),
     }
@@ -61,6 +65,41 @@ fn only_credentials_supply_auth_and_org_never_comes_from_headers() {
     );
     p.credentials.insert("expiresAtUnixMs".into(), json!(0));
     assert!(matches!(key(&p).unwrap_err().kind, ErrorKind::Auth));
+}
+
+#[test]
+fn optional_client_task_identity_is_not_fabricated_or_forwarded() {
+    let mut p = provider();
+    p.operation_metadata
+        .insert("session_affinity".into(), json!("trusted-root"));
+    p.operation_metadata
+        .insert("transport_affinity".into(), json!("trusted-session"));
+    let outbound = headers(&p).unwrap();
+    for name in [
+        "X-KiloCode-TaskId",
+        "X-KiloCode-Parent-TaskId",
+        "X-KiloCode-ProjectId",
+        "X-KiloCode-MachineId",
+        "x-request-id",
+    ] {
+        assert!(
+            !outbound
+                .iter()
+                .any(|(key, _)| key.eq_ignore_ascii_case(name))
+        );
+    }
+    let mut request = controlled_request();
+    request.parameters.session.request_id = Some("unscoped-client-request".into());
+    let (_, body) = request::prepare(&p, request).unwrap();
+    for name in [
+        "session_id",
+        "request_id",
+        "task_id",
+        "conversation",
+        "previous_response_id",
+    ] {
+        assert!(body.get(name).is_none(), "{name}");
+    }
 }
 #[test]
 fn catalog_preserves_ids_and_metadata_and_skips_image_generators() {

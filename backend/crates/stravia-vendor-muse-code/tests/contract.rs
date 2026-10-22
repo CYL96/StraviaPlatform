@@ -699,8 +699,12 @@ async fn meta_projection_omits_foreign_controls_and_keeps_supported_native_value
     let mut p = provider("subscription", true);
     p.operation_metadata
         .insert("transport_affinity".into(), json!("scoped-session"));
+    p.operation_metadata
+        .insert("session_affinity".into(), json!("scoped-root"));
     p.client_headers
         .push(("session_id".into(), "injected-session".into()));
+    p.client_headers
+        .push(("x-request-id".into(), "injected-request".into()));
     run(
         &runtime,
         &plugin,
@@ -742,6 +746,8 @@ async fn meta_projection_omits_foreign_controls_and_keeps_supported_native_value
         "verbosity",
         "client_metadata",
         "conversation",
+        "session_id",
+        "request_id",
         "arbitrary_control",
     ] {
         assert!(body.get(name).is_none(), "unexpected upstream field {name}");

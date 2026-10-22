@@ -280,10 +280,7 @@ impl Gateway {
             .build()?;
         // 供应商操作的共享可续期 deadline 管理整个操作；reqwest 总超时
         // 不随流式活动续期，会截断仍持续输出的长响应。
-        let vendor_http_client = reqwest::Client::builder()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()?;
+        let vendor_http_client = vendor_http_client_builder().no_proxy().build()?;
         let vendor_websocket_client = reqwest::Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
@@ -972,7 +969,7 @@ impl Gateway {
             return Ok(cached.client.clone());
         }
 
-        let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
+        let mut builder = vendor_http_client_builder();
         if force_http1 {
             builder = builder.http1_only();
         }
@@ -989,6 +986,29 @@ impl Gateway {
         });
         Ok(client)
     }
+}
+
+/// 供应商 HTTP/2 连接探活间隔与应答超时。
+///
+/// 经 CONNECT 代理时，本机到代理的 TCP 始终存活，代理另一侧的链路静默失效后
+/// 没有任何 TCP 级信号；复用该连接的请求只能等到首 Token 超时，重试与换账号
+/// 又复用同一条连接。HTTP/2 PING 由源站端到端应答，是唯一能识别这种死连接的手段。
+/// 只在有活动流时探活；空闲连接由连接池的空闲超时回收。
+const VENDOR_H2_KEEP_ALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+const VENDOR_H2_KEEP_ALIVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+fn vendor_http_client_builder() -> reqwest::ClientBuilder {
+    vendor_http_client_builder_with(VENDOR_H2_KEEP_ALIVE_INTERVAL, VENDOR_H2_KEEP_ALIVE_TIMEOUT)
+}
+
+fn vendor_http_client_builder_with(
+    keep_alive_interval: std::time::Duration,
+    keep_alive_timeout: std::time::Duration,
+) -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .http2_keep_alive_interval(keep_alive_interval)
+        .http2_keep_alive_timeout(keep_alive_timeout)
 }
 
 enum EffectiveVendorProxy {
@@ -1035,6 +1055,40 @@ fn to_sql_backend_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn vendor_http2_request_on_silently_dead_connection_fails_instead_of_hanging()
+    -> anyhow::Result<()> {
+        // 服务端接受连接后既不读也不写，等价于代理另一侧链路静默失效：
+        // 本机 TCP 仍然存活，只有 HTTP/2 PING 无应答能暴露它。
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let url = format!("http://{}/", listener.local_addr()?);
+        let server = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+        let client = vendor_http_client_builder_with(
+            std::time::Duration::from_millis(100),
+            std::time::Duration::from_millis(100),
+        )
+        .http2_prior_knowledge()
+        .no_proxy()
+        .build()?;
+
+        let outcome =
+            tokio::time::timeout(std::time::Duration::from_secs(5), client.get(&url).send()).await;
+        server.abort();
+
+        let result =
+            outcome.expect("keep-alive must close the dead connection before the test deadline");
+        assert!(
+            result.is_err(),
+            "a dead connection cannot produce a response"
+        );
+        Ok(())
+    }
 
     #[tokio::test]
     async fn direct_and_explicit_vendor_clients_ignore_ambient_proxy() -> anyhow::Result<()> {

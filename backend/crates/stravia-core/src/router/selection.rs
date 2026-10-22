@@ -125,6 +125,14 @@ impl RouteSelector {
             self.policy_state.clone(),
         );
         policy.retain(|target| eligible.contains(&selected_target_key(target)));
+        // 计划耗尽只指计划与 Route 的可用 Target 无交集；冷却、凭据失效等健康过滤
+        // 造成的空集是 Target 暂不可用，不能报成输入模态不被支持。
+        let plan_overlaps_route = media_plan.is_none_or(|plan| {
+            route.targets.iter().any(|target| {
+                let key = target_key(target.provider_id().as_str(), target.model().as_str());
+                target.enabled && eligible.contains(&key) && plan.target_keys.contains(&key)
+            })
+        });
         if let Some(plan) = media_plan {
             policy.retain(|target| plan.target_keys.contains(&selected_target_key(target)));
         }
@@ -134,7 +142,7 @@ impl RouteSelector {
                 .await
                 .map_err(SelectionError::SchedulingEvidence)?;
             return Err(match error {
-                SelectionError::NoEligibleTarget if media_plan.is_some() => {
+                SelectionError::NoEligibleTarget if !plan_overlaps_route => {
                     SelectionError::MediaPlanExhausted
                 }
                 error => error,
@@ -1504,6 +1512,76 @@ mod tests {
         .err()
         .expect("plan without candidates");
         assert!(matches!(error, SelectionError::MediaPlanExhausted));
+    }
+
+    #[tokio::test]
+    async fn cooling_plan_targets_are_not_reported_as_media_plan_exhaustion() {
+        let fixture = fixture(memory(), no_continuation());
+        let mut first_target = target("first", 10);
+        first_target.target_retry_budget = 0;
+        let mut second_target = target("second", 0);
+        second_target.target_retry_budget = 0;
+        let route = route(vec![first_target, second_target]);
+        let plan = MediaRoutingPlan {
+            mode: MediaRoutingMode::Native,
+            target_keys: vec!["first:model".into(), "second:model".into()],
+            source_artifact_ids: Vec::new(),
+        };
+        register_targets(&fixture.storage, &route).await;
+        let principal = principal();
+        let request = request();
+        let estimate = estimate_uncached_input_tokens(&request);
+        let parent = crate::router::GenerationParentTarget::Unresolved;
+
+        let mut policy = fixture
+            .selector
+            .select(
+                &principal,
+                &route,
+                &request,
+                Some(&plan),
+                None,
+                estimate,
+                &CooldownAttempts::default(),
+                &parent,
+            )
+            .await
+            .expect("both plan targets are healthy");
+        for _ in 0..2 {
+            let failed = policy.next_healthy().expect("plan target");
+            assert_eq!(
+                policy.record_failure(
+                    &failed,
+                    AttemptFailureSignal {
+                        kind: AiErrorKind::Timeout,
+                        client_output_committed: false,
+                        retry_after: None,
+                        now_ms: fixture.policy_state.now_ms(),
+                        jitter_sample: 0.5,
+                    },
+                ),
+                AttemptFailureDisposition::TryNextTarget
+            );
+        }
+        drop(policy);
+
+        // 计划内 Target 全部冷却是健康问题，不是输入模态不被支持；新请求不继承冷却例外。
+        let error = fixture
+            .selector
+            .select(
+                &principal,
+                &route,
+                &request,
+                Some(&plan),
+                None,
+                estimate,
+                &CooldownAttempts::default(),
+                &parent,
+            )
+            .await
+            .err()
+            .expect("every plan target is cooling");
+        assert!(matches!(error, SelectionError::NoEligibleTarget));
     }
 
     #[tokio::test]

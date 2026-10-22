@@ -275,27 +275,35 @@ async fn required_choice_with_complete_tools_does_not_trigger_native_400() {
 
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires task build:vendors:all"]
-async fn separate_component_stores_reuse_the_persisted_session() {
+async fn separate_component_stores_derive_session_without_private_state() {
     let (runtime, plugin) = load_plugin().await;
     let recorded = Arc::new(Recorded::default());
     let mut provider = provider("big-pickle");
     provider.operation_metadata.insert(
         "session_affinity".into(),
-        Value::String("0123456789abcdef".repeat(4)),
+        Value::String("主体/Target/链路\0\r\n🙂".into()),
     );
-    for _ in 0..2 {
-        infer_once(
-            &runtime,
-            &plugin,
-            provider.clone(),
-            request("big-pickle"),
-            &recorded,
-        )
-        .await
-        .expect("inference succeeds");
+    provider.client_headers = vec![
+        ("x-opencode-session".into(), "injected-session".into()),
+        ("x-opencode-request".into(), "injected-request".into()),
+    ];
+    *recorded.private_state.lock() = Some(b"obsolete state must not be read".to_vec());
+    for index in 0..3 {
+        if index == 2 {
+            provider.operation_metadata.insert(
+                "session_affinity".into(),
+                json!("主体/other-Target/链路\0\r\n🙂"),
+            );
+        }
+        let mut input = request("big-pickle");
+        input.parameters.session.id = Some("client-session".into());
+        input.parameters.session.request_id = Some("client-request".into());
+        infer_once(&runtime, &plugin, provider.clone(), input, &recorded)
+            .await
+            .expect("inference succeeds");
     }
     let requests = recorded.requests.lock();
-    assert_eq!(requests.len(), 2);
+    assert_eq!(requests.len(), 3);
     let header = |index: usize, name: &str| {
         requests[index]
             .headers
@@ -306,11 +314,35 @@ async fn separate_component_stores_reuse_the_persisted_session() {
     };
     assert_eq!(
         header(0, "x-opencode-session"),
+        "ses_2d6e2675e3a3B8feCq4rWYOa0e"
+    );
+    assert_eq!(
+        header(0, "x-opencode-session"),
         header(1, "x-opencode-session")
+    );
+    assert_ne!(
+        header(0, "x-opencode-session"),
+        header(2, "x-opencode-session")
     );
     assert_ne!(
         header(0, "x-opencode-request"),
         header(1, "x-opencode-request")
+    );
+    for index in 0..3 {
+        assert!(header(index, "x-opencode-request").starts_with("msg_"));
+        let body: Value = serde_json::from_slice(&requests[index].body).unwrap();
+        for name in [
+            "session_id",
+            "request_id",
+            "conversation",
+            "previous_response_id",
+        ] {
+            assert!(body.get(name).is_none(), "{name}");
+        }
+    }
+    assert_eq!(
+        recorded.private_state.lock().as_deref(),
+        Some(b"obsolete state must not be read".as_slice())
     );
 }
 

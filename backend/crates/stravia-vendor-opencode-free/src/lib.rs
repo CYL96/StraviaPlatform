@@ -1,7 +1,7 @@
 //! OpenCode Zen 免费层专属 Vendor 插件。
 //!
 //! 免费层使用私有客户端门控；本插件按已抓包并实调的官方版本构造 UA、
-//! 时间编码的 ses/msg 身份、stream 与工具声明，tool_choice 归一为 auto。
+//! 确定性 ses 身份、新建时间编码 msg、stream 与工具声明，tool_choice 归一为 auto。
 //! 缺失的 bash/read 只补声明并追加不可调用禁令，不提供工具执行器，不覆盖
 //! 客户端同名工具。成功实调不代表全部模型或未来门控都可用；原生拒绝照常返回。
 //! 依据与实测：docs/research/opencode-free-models.md §3.4。
@@ -174,7 +174,7 @@ fn execute_inference(
     let mut encoded = common::encode_inference_request(PROTOCOL, request)?;
     project_body(&mut encoded.body);
     let mut headers = Vec::new();
-    native_identity::apply(host, provider, &mut headers)?;
+    native_identity::apply(provider, &mut headers)?;
     set_header(&mut headers, "content-type", "application/json".into());
     apply_auth(provider, &mut headers);
     let url = common::endpoint_url(&provider.base_url, &encoded.path)?;
@@ -197,7 +197,7 @@ fn execute_inference(
 fn discover(host: &GuestHost, provider: &ProviderSnapshot) -> Result<OperationOutput, PluginError> {
     let url = format!("{}/models", provider.base_url.trim_end_matches('/'));
     let mut headers = vec![("accept".to_owned(), "application/json".to_owned())];
-    native_identity::apply(host, provider, &mut headers)?;
+    native_identity::apply(provider, &mut headers)?;
     apply_auth(provider, &mut headers);
     let response = host.http_start(HttpRequest {
         method: "GET".to_owned(),

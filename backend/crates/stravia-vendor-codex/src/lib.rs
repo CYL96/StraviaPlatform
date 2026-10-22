@@ -239,7 +239,7 @@ fn infer(
         }
     }
     request.parameters.store = Some(false);
-    let mut session = codex::NativeSession::new(&provider, &request.parameters.session);
+    let mut session = codex::NativeSession::new(&provider);
     session.resolve_identity(host, &provider)?;
 
     let protocol = OPEN_RESPONSES_2026_04_24;
@@ -294,7 +294,11 @@ fn infer(
         &provider,
         &body,
         &session,
-        codex::BodyOperation::Http,
+        if operation == Operation::Compact {
+            codex::BodyOperation::Compact
+        } else {
+            codex::BodyOperation::Http
+        },
         &mut headers,
     )?;
     host.emit_started()?;
@@ -305,9 +309,6 @@ fn infer(
         body: serde_json::to_vec(&body)
             .map_err(|_| invalid("Codex request could not be encoded"))?,
     })?;
-    if operation == Operation::Infer && (200..300).contains(&response.status()?) {
-        session.capture_turn_state(host, &provider, &response.headers()?)?;
-    }
     match operation {
         Operation::Infer => {
             // Codex 流式请求的成功响应按 SSE 解码，不依赖上游是否返回 Content-Type。
@@ -390,7 +391,6 @@ fn prepare_responses_body(
             .operation_metadata
             .get("transport_affinity")
             .and_then(Value::as_str)
-            .map(str::trim)
             .filter(|value| !value.is_empty())
     {
         object.insert(

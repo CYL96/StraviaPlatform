@@ -578,6 +578,78 @@ async fn declared_future_native_effort_survives_claude_code_normalization() {
 
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires task build:vendors:all"]
+async fn scoped_ids_survive_reload_without_reusing_http_request_ids() {
+    let services = Arc::new(MockServices {
+        routes: vec![(UPSTREAM, 200, "text/event-stream", SSE_TOOL_USE.into())],
+        ..MockServices::default()
+    });
+    let source = " 空白\0\r\n会话😀 ";
+    for _ in 0..2 {
+        let (runtime, plugin) = load_plugin().await;
+        let mut provider = signed_in();
+        provider
+            .operation_metadata
+            .insert("transport_affinity".into(), source.into());
+        provider
+            .operation_metadata
+            .insert("parent_transport_affinity".into(), source.into());
+        provider.client_headers = vec![
+            ("x-client-request-id".into(), "injected-request".into()),
+            ("x-claude-code-session-id".into(), "injected-session".into()),
+        ];
+        let mut request = anthropic_client_request(json!({
+            "model": "claude-sonnet-4-5", "max_tokens": 1024,
+            "metadata": {"user_id": "{\"session_id\":\"injected-session\"}"},
+            "messages": [{"role": "user", "content": "Read a."}]
+        }));
+        request.parameters.session.id = Some("injected-session".into());
+        request.parameters.session.request_id = Some("injected-request".into());
+        run(
+            &runtime,
+            &plugin,
+            &services,
+            OperationInput::Infer { provider, request },
+        )
+        .await
+        .expect("inference succeeds after reload");
+    }
+    let requests = services.requests.lock();
+    assert_eq!(requests.len(), 2);
+    let mut http_ids = Vec::new();
+    for sent in requests.iter() {
+        let header = |name: &str| {
+            sent.headers
+                .iter()
+                .find(|(candidate, _)| candidate == name)
+                .unwrap()
+                .1
+                .as_str()
+        };
+        assert_eq!(
+            header("x-claude-code-session-id"),
+            "0a00c8c6-848d-463f-94f9-b8c3e6ce1a14"
+        );
+        let http_id = header("x-client-request-id");
+        assert_eq!(uuid::Uuid::parse_str(http_id).unwrap().get_version_num(), 4);
+        assert_ne!(http_id, header("x-claude-code-session-id"));
+        http_ids.push(http_id);
+        let body: Value = serde_json::from_slice(&sent.body).unwrap();
+        let identity: Value =
+            serde_json::from_str(body["metadata"]["user_id"].as_str().unwrap()).unwrap();
+        assert_eq!(identity["session_id"], header("x-claude-code-session-id"));
+        assert_eq!(identity["parent_session_id"], identity["session_id"]);
+        assert_eq!(identity["device_id"], DEVICE_ID);
+        assert_eq!(identity["account_uuid"], ACCOUNT_UUID);
+    }
+    assert_ne!(http_ids[0], http_ids[1]);
+    assert!(
+        services.private_state.lock().is_none(),
+        "identity projection does not rewrite authentication state"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires task build:vendors:all"]
 async fn inference_is_sent_in_claude_code_shape_and_tool_names_round_trip() {
     let (runtime, plugin) = load_plugin().await;
     let services = Arc::new(MockServices {

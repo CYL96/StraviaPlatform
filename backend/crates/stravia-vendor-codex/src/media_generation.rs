@@ -83,7 +83,7 @@ pub(super) fn generate(
         "include":[]
     });
     codex::prepare_operation_body(&mut body, codex::BodyOperation::Image)?;
-    let mut session = codex::NativeSession::new(provider, &Default::default());
+    let mut session = codex::NativeSession::new(provider);
     session.resolve_identity(host, provider)?;
     session.apply_body(&mut body);
     let mut headers = vec![

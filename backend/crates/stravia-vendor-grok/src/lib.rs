@@ -9,6 +9,7 @@ use base64::Engine as _;
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use stravia_runtime_contract::protocol::ids::OPEN_RESPONSES_2026_04_24;
 use stravia_runtime_contract::protocol::ir::AiRequest;
 use stravia_vendor_common::{common, thinking};
@@ -346,14 +347,30 @@ fn apply_session_headers(
 ) {
     // Session identity is host-derived. Downstream session/agent/turn headers
     // and arbitrary provider options cannot become native routing authority.
-    let session = common::session_affinity(provider).unwrap_or_default();
+    if let Some(affinity) = common::session_affinity(provider) {
+        let session = native_session_id(affinity);
+        headers.push(("x-grok-conv-id".into(), session.clone()));
+        headers.push(("x-grok-session-id".into(), session));
+    }
     headers.extend([
-        ("x-grok-conv-id".into(), session.to_owned()),
-        ("x-grok-session-id".into(), session.to_owned()),
         ("x-grok-req-id".into(), uuid::Uuid::new_v4().to_string()),
         ("x-grok-model-override".into(), model.to_owned()),
         ("x-grok-agent-id".into(), String::new()),
     ]);
+}
+
+fn native_session_id(affinity: &str) -> String {
+    // Official session_setup uses UUIDv7. This deterministic projection preserves
+    // its representation, not its wall-clock ordering; no host ID is a timestamp.
+    let mut hash = Sha256::new();
+    hash.update(b"stravia:xai-grok:session:v1\0");
+    hash.update(affinity.as_bytes());
+    let digest = hash.finalize();
+    let mut bytes = [0; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x70;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    uuid::Uuid::from_bytes(bytes).to_string()
 }
 
 fn apply_auth_headers(
@@ -958,6 +975,25 @@ mod tests {
     }
 
     #[test]
+    fn native_session_projection_hashes_complete_utf8_with_v7_shape() {
+        assert_eq!(
+            native_session_id(&"0123456789abcdef".repeat(4)),
+            "4a1b97b7-3852-7fe0-886b-5a1da6313fb0"
+        );
+        let id = native_session_id(" 会话🚀\0A ");
+        assert_eq!(id, "bdf8ba07-b0a8-782c-b691-76903d9e8d90");
+        assert_eq!(uuid::Uuid::parse_str(&id).unwrap().get_version_num(), 7);
+        assert_ne!(id, native_session_id("会话🚀\0A"));
+        assert_ne!(id, native_session_id(" 会话🚀\0a "));
+        assert_ne!(id, native_session_id(" 会话🚀"));
+        let long = "会".repeat(4096);
+        assert_ne!(
+            native_session_id(&long),
+            native_session_id(&format!("{long}尾"))
+        );
+    }
+
+    #[test]
     fn native_session_headers_use_host_affinity_not_client_identity() {
         let affinity = "0123456789abcdef".repeat(4);
         let provider = ProviderSnapshot {
@@ -977,8 +1013,8 @@ mod tests {
         apply_session_headers(&provider, "grok", &mut first);
         apply_session_headers(&provider, "grok", &mut second);
         for name in ["x-grok-conv-id", "x-grok-session-id"] {
-            assert!(first.contains(&(name.into(), affinity.clone())));
-            assert!(second.contains(&(name.into(), affinity.clone())));
+            assert!(first.contains(&(name.into(), native_session_id(&affinity))));
+            assert!(second.contains(&(name.into(), native_session_id(&affinity))));
         }
         let request_id = |headers: &Vec<(String, String)>| {
             headers
@@ -989,7 +1025,22 @@ mod tests {
                 .clone()
         };
         assert_ne!(request_id(&first), request_id(&second));
+        assert_eq!(
+            uuid::Uuid::parse_str(&request_id(&first))
+                .unwrap()
+                .get_version_num(),
+            4
+        );
         assert!(first.iter().all(|(_, value)| value != "injected"));
+        let mut unscoped = provider;
+        unscoped.operation_metadata.clear();
+        let mut headers = Vec::new();
+        apply_session_headers(&unscoped, "grok", &mut headers);
+        assert!(
+            headers
+                .iter()
+                .all(|(name, _)| { name != "x-grok-conv-id" && name != "x-grok-session-id" })
+        );
     }
 
     #[test]

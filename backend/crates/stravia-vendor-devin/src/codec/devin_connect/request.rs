@@ -155,29 +155,29 @@ pub struct SessionShape {
 /// Raw request session/cache/correlation ids and prompt contents are not
 /// identities. Without scoped affinity each request receives fresh native ids.
 /// Persisted production state, not this pure identity function, owns steps.
-pub fn session_shape(session_token: &str, transport_affinity: Option<&str>) -> SessionShape {
-    let mut hasher = Sha256::new();
-    hasher.update(b"devin-session-root");
-    hasher.update((session_token.len() as u64).to_be_bytes());
-    hasher.update(session_token.as_bytes());
-    if let Some(affinity) = transport_affinity.filter(|value| !value.trim().is_empty()) {
-        hasher.update(affinity.as_bytes());
-    } else {
-        hasher.update(Uuid::new_v4().as_bytes());
-    }
-    let root: [u8; 32] = hasher.finalize().into();
-    let trajectory_id = uuid_from_seed(&root, 0);
+/// Credentials do not participate: refreshing a token must not rename a
+/// host-scoped session. Separate namespaces preserve the two wire meanings.
+pub fn session_shape(transport_affinity: Option<&str>) -> SessionShape {
+    let (trajectory_id, cascade_id) =
+        if let Some(source) = transport_affinity.filter(|value| !value.is_empty()) {
+            (
+                uuid_from_source(b"stravia:devin:trajectory:v1\0", source),
+                uuid_from_source(b"stravia:devin:cascade:v1\0", source),
+            )
+        } else {
+            (Uuid::new_v4().to_string(), Uuid::new_v4().to_string())
+        };
     SessionShape {
-        cascade_id: uuid_from_seed(&root, 1),
+        cascade_id,
         step_index: 0,
         trajectory_id,
     }
 }
 
-fn uuid_from_seed(root: &[u8; 32], salt: u32) -> String {
+fn uuid_from_source(namespace: &[u8], source: &str) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(root);
-    hasher.update(salt.to_be_bytes());
+    hasher.update(namespace);
+    hasher.update(source.as_bytes());
     let digest = hasher.finalize();
     let mut bytes = [0u8; 16];
     bytes.copy_from_slice(&digest[..16]);
@@ -539,12 +539,12 @@ fn client_metadata(session_token: &str, displays: bool, platform: DevinClientPla
 }
 
 /// ClientMetadata #31: 366 bytes rendered as 732 lowercase hex chars. The
-/// real CLI derives a stable machine fingerprint from MAC addresses
-/// (`windsurf-api-client/fingerprint.rs`) and the server tracks it per
-/// account (`has_fingerprint_set`); the wire itself only checks shape. We
-/// derive a deterministic per-credential id instead of a fresh random one —
-/// the same token always presents the same device, matching the CLI's
-/// stable-device semantics and the reference's opt-in stable-device mode.
+/// existing codec derives a deterministic per-credential value instead of
+/// reading host device identifiers. The official 3000.11.3 binary contains
+/// `windsurf-api-client/src/fingerprint.rs` and `has_fingerprint_set`, but
+/// those strings alone do not prove its generation algorithm, validation,
+/// or server acceptance. This synthetic value is not an official machine
+/// fingerprint implementation; keep its existing mapping unchanged.
 fn device_fingerprint(session_token: &str) -> String {
     // Counter-mode expand: block_i = SHA256(token || "devin-clientmeta" || i).
     // 12 blocks × 32 bytes covers 366.
@@ -1673,7 +1673,7 @@ mod tests {
     }
 
     fn shape(_req: &AiRequest) -> SessionShape {
-        session_shape("tok", None)
+        session_shape(None)
     }
 
     #[test]
@@ -3106,8 +3106,102 @@ mod tests {
     }
 
     #[test]
+    fn encoded_session_ids_preserve_complete_scoped_utf8_and_message_lifecycle() {
+        let req = AiRequest::new("m", vec![text_item(Role::User, "hi")]);
+        let source = " principal/目标/会话 ";
+        let shape = session_shape(Some(source));
+        assert_eq!(shape.trajectory_id, "550f6c5d-7cef-401a-b1fc-b10e2baf7625");
+        assert_eq!(shape.cascade_id, "d3042aec-4029-458c-ba34-e931615046b1");
+        let first = encode_test_chat_request(&req, "tok", &shape, Some("synthetic-jwt")).unwrap();
+        let second = encode_test_chat_request(&req, "tok", &shape, Some("synthetic-jwt")).unwrap();
+        let first_fields = parse_fields(&first).unwrap();
+        let second_fields = parse_fields(&second).unwrap();
+        let field = |number| {
+            first_fields
+                .iter()
+                .find(|field| field.number == number)
+                .unwrap()
+        };
+        assert_eq!(field(16).bytes, shape.cascade_id.as_bytes());
+        assert_eq!(field(26).bytes, b"synthetic-jwt");
+        let refreshed = encode_test_chat_request(
+            &req,
+            "refreshed-token",
+            &session_shape(Some(source)),
+            Some("synthetic-jwt"),
+        )
+        .unwrap();
+        let refreshed_fields = parse_fields(&refreshed).unwrap();
+        assert_eq!(
+            refreshed_fields
+                .iter()
+                .find(|field| field.number == 16)
+                .unwrap()
+                .bytes,
+            field(16).bytes
+        );
+        assert_eq!(
+            refreshed_fields
+                .iter()
+                .find(|field| field.number == 15)
+                .unwrap()
+                .bytes,
+            field(15).bytes
+        );
+        let trajectory = parse_fields(field(15).bytes).unwrap();
+        assert_eq!(
+            trajectory
+                .iter()
+                .find(|field| field.number == 1)
+                .unwrap()
+                .bytes,
+            shape.trajectory_id.as_bytes()
+        );
+        let first_message = parse_fields(field(3).bytes).unwrap();
+        let second_message = parse_fields(
+            second_fields
+                .iter()
+                .find(|field| field.number == 3)
+                .unwrap()
+                .bytes,
+        )
+        .unwrap();
+        let message_id = first_message
+            .iter()
+            .find(|field| field.number == 1)
+            .unwrap()
+            .bytes;
+        let next_message_id = second_message
+            .iter()
+            .find(|field| field.number == 1)
+            .unwrap()
+            .bytes;
+        assert_ne!(message_id, next_message_id);
+        assert_eq!(
+            Uuid::parse_str(std::str::from_utf8(message_id).unwrap())
+                .unwrap()
+                .get_version_num(),
+            4
+        );
+        assert_ne!(
+            shape.cascade_id,
+            session_shape(Some(source.trim())).cascade_id
+        );
+        assert_ne!(
+            session_shape(Some(&"a".repeat(1024))).cascade_id,
+            session_shape(Some(&format!("{}尾", "a".repeat(1024)))).cascade_id
+        );
+        let whitespace = session_shape(Some("  "));
+        assert_eq!(
+            whitespace.cascade_id,
+            "22aa0fa8-af4b-4016-97ad-5c693e95ff40"
+        );
+        assert_eq!(whitespace.cascade_id, session_shape(Some("  ")).cascade_id);
+    }
+
+    #[test]
     fn session_shape_derives_stable_trajectory_and_steps() {
-        let first = session_shape("tok", Some("principal-a/target-a/session"));
+        let first = session_shape(Some("principal-a/target-a/session"));
         // First GetChatMessage on a trajectory omits step_index on the wire.
         assert_eq!(first.step_index, 0);
         assert!(Uuid::parse_str(&first.trajectory_id).is_ok());
@@ -3115,22 +3209,22 @@ mod tests {
         assert_ne!(first.trajectory_id, first.cascade_id);
         // Ids are deterministic from the start — AssignModel binds its jwt to
         // the cascade id before the chat request exists.
-        let second = session_shape("tok", Some("principal-a/target-a/session"));
+        let second = session_shape(Some("principal-a/target-a/session"));
         assert_eq!(second.cascade_id, first.cascade_id);
         assert_eq!(second.trajectory_id, first.trajectory_id);
         assert_eq!(second.step_index, 0);
-        for (token, affinity) in [
-            ("tok", Some("principal-b/target-a/session")),
-            ("tok", Some("principal-a/target-b/session")),
-            ("tok2", Some("principal-a/target-a/session")),
-            ("tok", None),
-            ("tok", Some("")),
+        for affinity in [
+            Some("principal-b/target-a/session"),
+            Some("principal-a/target-b/session"),
+            Some("principal-a/target-a/other-session"),
+            None,
+            Some(""),
         ] {
-            assert_ne!(session_shape(token, affinity).cascade_id, first.cascade_id);
+            assert_ne!(session_shape(affinity).cascade_id, first.cascade_id);
         }
         assert_ne!(
-            session_shape("tok", None).cascade_id,
-            session_shape("tok", None).cascade_id
+            session_shape(None).cascade_id,
+            session_shape(None).cascade_id
         );
     }
 

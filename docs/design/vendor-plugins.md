@@ -61,6 +61,59 @@ Claude Code 的 SDK 标记与 `claude-cli/2.1.300 (external, sdk-cli)` User-Agen
 
 已安装的独立插件须重新构建并导入才能更新身份；仅升级宿主不会替换旧组件。Claude Code 的已声明 `client_version` 覆盖仍优先于默认值；OpenCode 不再提供任意 `userAgent` 覆盖，旧未知选项不会进入出站请求。历史协议研究及密码学向量保留原始核对版本，不因更新身份而重标来源；离线组件与请求边界验证不能证明真实账号的版本门控、模型可用性或订阅资格。
 
+### 会话与请求 ID
+
+以下为 2026-10-22 对上述固定客户端版本的核对，不自动升级客户端身份。本仓库有 10 个 Vendor 包，没有 WorkBuddy；不套用其 root、UUIDv7 或 baggage profile。普通 API、CLI 推理、compact、认证、发现和额度分别保留自己的请求 profile，不按字段名称推定生命周期。
+
+可信来源只有 SDK `ProviderSnapshot.operation_metadata` 中由宿主生产的作用域键：
+
+- `session_affinity`：Principal + Target + 本地 Generation Chain／Agent Run 根；同一链路各轮、内部调用与压缩共享。
+- `transport_affinity`：Principal + Target + 会话 fingerprint；没有会话时回退本地链路根或 Model Turn。parent、fork、context 使用各自宿主 scoped affinity。
+- 客户端 headers、canonical request/session/turn 标签和 Provider options 不得覆盖这些身份。SDK 没有独立可信操作／消息 ID 时保留原生新建生命周期，不拿 session/root 冒充 request/message。trace/span、真实 ACP connection ID 与认证凭据不参与转换。
+
+| 插件及核对版本 | 字段、表示与生命周期 | 官方证据及适用范围 |
+| --- | --- | --- |
+| base / OpenRouter API `1.0.0` | 仅 OpenRouter 的 `x-session-id` 为完整源稳定派生的 64 位小写 hex；无源省略。其他普通 API 不新增 CLI 会话头。 | [官方 OpenAPI](https://openrouter.ai/openapi.json) 仅要求 session string 最多 256 字符，无 UUID 限制；[官方 sticky routing 说明](https://openrouter.ai/blog/tutorials/prompt-caching-sticky-routing/)要求会话内稳定。Chat／Responses 的 routing 语义不外推到其他端点；body `session_id` 优先于 header，因此不允许客户端扩展覆盖宿主值。 |
+| Codex `0.162.1` | session/thread/parent/fork 为小写带横线的 UUIDv7 位格式，session=thread。Responses HTTP／WS 的 `x-client-request-id=thread-id`，并非每次 HTTP 新建。turn 每模型操作新建真实 UUIDv7，无可信 parent/root turn 则省略。兼容 window 为 `thread:0`，context-window 使用独立宿主作用域。 | 固定 commit [`092d3acd`](https://github.com/openai/codex/tree/092d3acd6bec3e3a14bdc7e7a2810ab628ab759d)：[ThreadId](https://github.com/openai/codex/blob/092d3acd6bec3e3a14bdc7e7a2810ab628ab759d/codex-rs/protocol/src/thread_id.rs) 默认 `now_v7`，parser 只要求 `Uuid::parse_str`；[HTTP](https://github.com/openai/codex/blob/092d3acd6bec3e3a14bdc7e7a2810ab628ab759d/codex-rs/codex-api/src/endpoint/responses.rs#L76-L90) 与 [WS](https://github.com/openai/codex/blob/092d3acd6bec3e3a14bdc7e7a2810ab628ab759d/codex-rs/core/src/client.rs#L1300-L1321) 确认 request/thread 关系。本插件保留的 `0.134.0` [Compact profile](https://github.com/openai/codex/blob/a75c443fdb64db48c3cf4bdb247c7ee52c0144c9/codex-rs/core/src/client.rs#L498-L525) 不发该请求头，不冒称已迁移新版 remote compact。Search／hosted image 实际走 Responses，不推广到独立 Images API。 |
+| Claude Code `2.1.300` / SDK `0.128.0` | session/parent 为 UUIDv4 位格式；session header 与 `metadata.user_id.session_id` 同值。每次推理 HTTP 新建独立 UUIDv4 `x-client-request-id`；无 scope 新建 session。已有 device 64 hex、account 原值不变。 | [官方 Linux native 包](https://registry.npmjs.org/@anthropic-ai/claude-code-linux-x64/-/claude-code-linux-x64-2.1.300.tgz) embedded JS 与 [固定 SDK](https://registry.npmjs.org/@anthropic-ai/sdk/-/sdk-0.128.0.tgz)。CLI session regex 接受大小写且不强制版本；默认新建用 `crypto.randomUUID`。HTTP ID 的 first-party 推理 gate 不外推到 models/usage；输入 Messages 不强加 CLI 本地 `msg_id`，响应 message/request ID 原样保留。 |
+| Grok CLI `1.0.52` | `x-grok-conv-id` 与 `x-grok-session-id` 同一 UUIDv7 位格式；缺 scope 省略。`x-grok-req-id` 每调用独立新建 UUIDv4。 | [官方 1.0.52 发行物](https://x.ai/cli/grok-1.0.52-linux-x86_64.gz)确认版本及头名；UUIDv7 默认工厂与 UUIDv4 RequestId 来自[固定公开源码](https://github.com/xai-org/grok-build/tree/9684fa3cdbf2995e30ea8b9b637f1db008f144fc)，该源码实际为 **1.0.10**，不能冒称已证明 1.0.52 全部生成算法。其 compact/recap 等路径允许带标签 ID，不能推定服务端所有接口强制裸 UUID。当前 stable 指针为 1.0.67，本次未升级固定身份。 |
+| Command Code `1.82.1` | trusted session 映射 UUIDv4 位格式，`x-session-id=body.threadId`。无 scope 保留既有 UUIDv4／TTL 新建生命周期；独立 telemetry `sess_`、trace/span 与 fingerprint 不变。 | [官方 npm 产物](https://registry.npmjs.org/command-code/-/command-code-1.82.1.tgz) `newSession` 使用 `randomUUID`，`toWireThreadId` 使用 `z.uuid()` 校验；此为客户端校验，不是服务端接受证明。telemetry session 不是 thread。 |
+| Devin `3000.11.3` | trajectory/cascade 按两个既有不同语义映射为 UUIDv4 位格式，不再以 token 参与派生。每次编码 message 仍新建 UUIDv4；step 推进、AssignModel 的 cascade/JWT 绑定不变。 | [官方 manifest](https://static.devin.ai/cli/3000.11.3/manifest.json)及[固定发行物](https://static.devin.ai/cli/3000.11.3/devin-3000.11.3-x86_64-unknown-linux.tar.gz)摘要匹配，但 stripped 二进制不足恢复精确字段生成／validator。**v4 只是保留既有 codec 形态，官方字段版本尚未证实**；不把第三方 3000.10.x 编码证据重标为官方 3000.11.3 契约。 |
+| Antigravity CLI `1.3.5` | `sessionId` 为完整 UTF-8 的 FNV-1a64 按 signed int64 输出十进制，无 scope 省略。文本与图片 `requestId` 每调用新建 `agent/UUIDv4`，使用无原生操作上下文的官方 fallback。 | [官方 Linux 发行物](https://github.com/google-antigravity/antigravity-cli/releases/download/1.3.5/agy_cli_linux_x64.tar.gz)反汇编确认 `getSessionID`、`computeRequestID`；前者调用 `FormatInt`，后者 fallback 使用 `%v/%v` 与 `NewRandom`。上层输入结构的字段准确名称／恢复作用域尚未完全恢复，不伪造原生 conversation 树，也不声称服务端强制此算法。 |
+| OpenCode Zen Free `1.18.25` | 稳定 session 为 `ses_` + 12 lowerhex + 14 base62；无 scope 仍按真实时间新建。`x-opencode-request` 为独立新建 `msg_`，不是 session 或 HTTP UUID。删除原 256 项持久映射。 | 固定源码 [`cb7d8b2f`](https://github.com/anomalyco/opencode/tree/cb7d8b2f5e44876ef98b661dc10590c915af3a9f)：[默认算法](https://github.com/anomalyco/opencode/blob/cb7d8b2f5e44876ef98b661dc10590c915af3a9f/packages/schema/src/identifier.ts)为 time/counter/random，客户端 session/message 类型只检查 `ses`／`msg` 前缀；[请求头](https://github.com/anomalyco/opencode/blob/cb7d8b2f5e44876ef98b661dc10590c915af3a9f/packages/opencode/src/session/llm/request.ts#L190-L194)取 `input.sessionID`／`input.user.id`。SDK 无可信独立 message 源，保留每插件操作新建，不从 session/root 伪造用户消息关联。公开 Zen handler 无时间解码证据，不能替代当前私有网关校验。 |
+| Kilo CLI `7.8.15` / Gateway | 不强加 session/root/message/request。没有对应原生上下文时不添加可选 task/parent/project/machine 字段；组织授权字段不变。 | [固定源码 `56aead64`](https://github.com/Kilo-Org/kilocode/tree/56aead6452eb5837b9800b05d1fa7989f50ccbe0) 的 Gateway factory 无 task ID 也可构造请求；不能从 CLI 可选遥测推定所有 Gateway API 必填。 |
+| Muse Code / Model API `1.0.0` | 不添加无证据的客户端 session/request。响应/message ID 与 `previous_response_id` 保留上游值；显式 `prompt_cache_key`、`safety_identifier` 不是会话源。 | 官方 [CreateResponse](https://dev.meta.ai/docs/api-reference/responses/schemas#create-response) 与 [Responses 兼容文档](https://dev.meta.ai/docs/protocols/responses#openai-compatibility)没有强制客户端会话／HTTP ID；未给独立客户端发行版本，不伪造版本号。 |
+
+#### 固定映射契约
+
+源字符串以**完整原文 UTF-8**进入散列：不 trim、截断、改大小写、Unicode 归一化或 hex decode。缺失、空串、类型错误均视为无可信源，按上表省略或原生新建；仅含空白的非空字符串仍是不同身份。控制字符只参与散列，不原样进入 header。没有内存／持久化 source→ID 映射表。
+
+除已发布的 Claude 冒号 namespace 与官方 FNV 算法外，下表 `\0` 都是**真实 NUL 字节 `0x00`**，不是两个字符。UUID 映射取 `SHA256(namespace || source.UTF8)[0..16]`，`bytes[6]=(bytes[6]&0x0f)|(version<<4)`、`bytes[8]=(bytes[8]&0x3f)|0x80`，使用 RFC UUID 网络字节序、小写带横线表示，不采用混合端序。算法属于稳定身份契约，不能随版本更换。
+
+| 字段 | 固定 namespace／算法 | 源 `user-run-a` 的参考输出 |
+| --- | --- | --- |
+| OpenRouter session | `stravia-openrouter-session-v1\0`；全部 SHA256 输出为 64 lowerhex | `39e55f82ef4ff56ea4e8dd4439d2d71d2b657085d36a77cb65419d0ddac211fc` |
+| Codex session/thread/parent/fork | `openai-codex\0`；UUIDv7 位格式 | `62b0511e-90cd-7ce2-a863-774b8cc15be1` |
+| Codex context window | `openai-codex:context-window\0`；UUIDv7 位格式 | 与对应独立 context 源绑定，不复用 thread 源 |
+| Claude session/parent | 保留既有 `claude-code:`；UUIDv4 位格式 | `0bc95508-ec2f-4603-95db-de73350b2a28` |
+| Grok conversation/session | `stravia:xai-grok:session:v1\0`；UUIDv7 位格式 | `ea3a3e91-202f-7c6a-a14a-40f17619ecee` |
+| Command session/thread | `stravia:command-code:session:v1\0`；UUIDv4 位格式 | `e779caf0-834a-4e90-8ae8-d66a0269bb3f` |
+| Devin trajectory | `stravia:devin:trajectory:v1\0`；UUIDv4 位格式 | `b2ff88c8-446c-4a64-bf89-230532a0c9d4` |
+| Devin cascade | `stravia:devin:cascade:v1\0`；UUIDv4 位格式 | `fcde4a4a-da9f-4a77-9e56-c8b5bec23dad` |
+| OpenCode session | `stravia/opencode-free/session\0`；digest[0..6] 为 12 hex，digest[6..20] 逐字节 `%62`，字母表 `0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz` | `ses_7625576406f7WczdWZpXXOdKpd` |
+| Antigravity session | FNV-1a64 初值 `0xcbf29ce484222325`、乘数 `0x100000001b3`，逐 UTF-8 byte xor/multiply、64-bit wrap，转 signed int64 十进制 | `8470453353509564100` |
+
+Devin 的两个固定 namespace 区分原有两种独立身份，不是字段级随机盐。session/thread 本来同义的字段使用同一内容；父身份与此前父会话使用同一映射。没有设备、路径、时钟、随机数或认证凭据参与已有宿主 ID 的转换。已有安装／device 身份和 Devin step、Command 初始化等必要持久状态不属于 source→ID 映射，继续按各自生命周期保存。
+
+**明确限制与首次切换：**
+
+- 给摘要设置 v7 位仅是 **UUIDv7 位格式**，不是带真实创建时间的 UUIDv7 生成，也不是官方提供的确定性算法。Codex/Grok 不具真实时间排序语义；OpenCode 稳定 `ses_` 的前 12 hex 不再是创建时间，不能用于原生时间解码／排序。其独立 `msg_` 与无亲和 `ses_` 的真实时间新建路径不变。FNV-1a64 是非加密 64 位散列，存在理论碰撞风险。
+- Codex SDK 没有可信原生 window ordinal，`:0` 只保持既有 transport-scoped 窗口生命周期和官方表示形态，**不承诺重建官方压缩序号／窗口轮换**。缺少可信 turn 源时不能用 canonical 标签跨独立操作命中 turn-state；新模型操作新建 turn。旧 Compact profile 与新版 remote compact 的协议差异未在本次扩大迁移。
+- base/OpenRouter、Codex、Grok、Command、Devin、Antigravity、OpenCode 的已有上游身份会首次切换，缓存亲和／原生身份重新建立；Devin 新 trajectory 按既有规则从首步开始并重新绑定 assignment。Claude 正常宿主 hex 输入保持原 digest，原先被 trim 的异常输入恢复区分。宿主会话、Run、模型操作、HTTP 尝试的生命周期不变，不迁移历史或修改 schema；认证凭据、已保存 device 与权限不变。
+- 独立插件必须重新构建并导入；base 随宿主更新。公开源码与静态发行物证明默认构造／客户端校验，**不证明私有服务端接受任意确定性值**。Devin 精确字段算法、Grok 1.0.52 完整生成算法、Antigravity 原生 session 上层来源仍有上表证据缺口；既有 Command/Devin 合成设备指纹保持不变，不冒称复刻官方硬件指纹。
+
+本地验证加载实际构建的 10 个 Wasm，经 loopback HTTP/TCP 捕获请求，覆盖参考向量、同源重载与独立进程稳定、root/session 隔离、Unicode/CRLF/NUL、空串／错误类型／缺失源、客户端注入与请求头／body 关联；独立 request/message 仍按各自 profile 新建。响应由本地接收器合成，不访问真实上游，不代表账号资格、订阅门控或服务端格式接受证明。
+
 ### 参数清单的核对证据与边界
 
 |接入|核对依据|实际覆盖与限制|
@@ -79,9 +132,9 @@ Claude Code 的 SDK 标记与 `claude-cli/2.1.300 (external, sdk-cli)` User-Agen
 
 默认 Base URL 使用当前[官方文档](https://opencode.ai/v2/docs/console/models/)的 `https://opencode.ai/inference/v1`。2026-10-15 的修复后 Wasm 实调在该入口对 `big-pickle` 返回 HTTP 200，并完成准确文本探测；旧 `/zen/v1` 请求仍收到 403。此前失败请求只改入口也仍被拒，说明不能把入口迁移当作 UA、会话 ID 和工具 schema 修复的替代。重新构建并导入插件后，手动固定旧 Base URL 的已有连接还须改为当前地址；插件不静默重写自定义地址。
 
-免费请求使用已核验的官方完整 UA、原生时间编码的 `ses_`／`msg_`、流式 wire 和 `tool_choice: auto`。只有缺失的 `bash`／`read` 才补兼容声明，输入字段采用官方工具形态，不能再使用空 `properties`；客户端同名工具与已有指令保持原值，仅对补出的名字追加不可调用指令。这里没有工具执行器，不伪造工具结果；系统指令是模型约束，不是强制执行隔离。目标原生不支持的 tool-choice 模式不能保证原语义。
+免费请求使用已核验的官方完整 UA、固定原生 `ses_` 表示与独立时间编码的 `msg_`、流式 wire 和 `tool_choice: auto`。只有缺失的 `bash`／`read` 才补兼容声明，输入字段采用官方工具形态，不能再使用空 `properties`；客户端同名工具与已有指令保持原值，仅对补出的名字追加不可调用指令。这里没有工具执行器，不伪造工具结果；系统指令是模型约束，不是强制执行隔离。目标原生不支持的 tool-choice 模式不能保证原语义。
 
-宿主的主体／Target／链路作用域亲和键只用于查找原生 session，不截断为伪时间前缀。插件私有状态保存至多 256 个映射，命中不写盘，满时淘汰最早创建的一项；无亲和键的操作生成新身份且不读写该缓存。宿主的私有状态接口没有原子读改写，并发首次未命中可能覆盖缓存项、随后重建 session；这是尽力复用的路由亲和缓存，不承载对话历史或授权，每次仍发送完整消息。
+宿主的主体／Target／链路作用域亲和键按上方「会话与请求 ID」契约确定性编码为原生 `ses_` 表示，不读写私有映射表；完整源参与散列，不只截取源前缀。稳定表示不含真实创建时间；独立 `msg_` 与无亲和 `ses_` 仍按官方时间／随机新建。升级后旧缓存映射不再读取，原生 session 首次切换；不迁移历史或改写存储 schema，每次仍发送完整消息。
 
 `/models` 可读不代表推理获准；[官方维护者仍限定免费层在 OpenCode 内使用](https://github.com/anomalyco/opencode/issues/49621#issuecomment-5723383322)。本次成功不构成第三方接入承诺，模型、配额与门控仍可能变化。插件保留原生拒绝，不轮换 IP、不盲重试、不改用其他模型或另一个 Agent 后端。来源和受控对照见[研究记录](../research/opencode-free-models.md#343-本仓库回归修复2026-10-15官方-cli-捕获与真实-wasm)。
 
@@ -487,7 +540,7 @@ Provider 描述符通过 `config_groups` 声明分组，每项包含稳定的 `i
   - `parallel_tool_calls` 反向编码为请求字段 #11 的 `disable_parallel_tool_calls`；`tool_choice: auto` 与合法具名工具分别编码 #12 的 option/tool name，`none`、`required` 与其它无支持选择省略。不能据此承诺强制或禁止工具调用，也不把被省略的选择改写成提示词。
   - Effort 由模型 selector 消费，不是额外 wire thinking 字段。presence/frequency penalties、`response_format`、非 Effort thinking control，以及候选数、logit bias、top-logprobs 数量、prediction、verbosity、background、max-tool-calls、truncation、结构化输出、外来缓存/压缩等未确认原生字段省略；协议原始扩展不能绕过白名单。具体字段布局与投影见 [Devin 私有编码器](../../backend/crates/stravia-vendor-devin/src/codec/devin_connect/request.rs) 和 [准备入口](../../backend/crates/stravia-vendor-devin/src/codec/devin_connect/mod.rs)，遵循 [ADR-0006](../adr/0006-own-protocol-conversion-behind-canonical-stages.md)。
   - 受保护思考写入 prompt #12：`devin-thinking-v1:` wrapper 先解包，signature type 写入 #18；其它非空载荷（包括其它上游的 Responses `encrypted_content`）作为不透明签名先试一次，被拒后由宿主按 ADR-0080 剥离外来载荷。redacted 状态使用原生载体；没有受保护载荷的 summary/content 仅按可读助手正文投影，原始历史不改写，不制造签名。
-  - 原生 trajectory/cascade 只由会话 token 与宿主主体+Target 作用域的 `transport_affinity` 派生；缺失作用域时每次请求生成新身份。canonical session 可参与宿主的作用域身份计算，但客户端原始 session/cache/correlation ID 与 prompt 内容不能直接决定复用。实际 step index 由插件持久状态推进，AssignModel 的 JWT 与同一 cascade 绑定，不从客户端伪造；新行为需重新构建并导入 Devin Wasm。
+  - 原生 trajectory/cascade 只由宿主主体+Target 作用域的完整 `transport_affinity` 按上方固定 namespace 派生，不再依赖会话 token；正常刷新不会重命名同一宿主会话。缺失作用域时每次请求生成新身份。canonical session 可参与宿主的作用域身份计算，但客户端原始 session/cache/correlation ID 与 prompt 内容不能直接决定复用。实际 step index 由插件持久状态推进，AssignModel 的 JWT 与同一 cascade 绑定，不从客户端伪造；首次切换新 trajectory，需重新构建并导入 Devin Wasm。官方 3000.11.3 的精确 ID 版本仍未证实，不把既有 v4 codec 形态当作官方服务端要求。
   - 消息、媒体、工具定义、工具调用及关联结果和原生压缩状态，目标能表达时保留，不能表达时默认省略；请求、响应、stream delta 与 continuation 历史均适用，不因语义损失整体拒绝。统一原生工具与 Custom／Namespace 工具不会因此伪装成 Devin 工具。同步执行省略不支持的 background 控制，不承诺异步任务；其他供应商同样遵循默认省略政策。该规则不绕过源协议内容解析、安全、凭据或网络校验。
 - Devin 仅在上游模型标识首次出现或变化时生成对应 metadata 事件；重复标识不跳过同帧用量或其他内容。宿主不依赖这一去重来接收长 metadata 前导流，也不统一合并不同协议的 metadata、用量、思考签名或其他增量。
 - WebSocket 失败通过强类型传输事实跨越 WIT 边界，不直接授权重试。只有未提交结果且既有 Route 策略允许同 Target 重试时，宿主才将下一次尝试设为 HTTP-only，并去除仅当前 WebSocket 可用的续接状态，以完整历史重放；下一次客户端请求恢复自动传输选择。
@@ -495,8 +548,8 @@ Provider 描述符通过 `config_groups` 声明分组，每项包含稳定的 `i
 - `ws-request.continuation-id` 只用于依赖连接本地状态的续接。宿主在池锁内匹配精确身份和 response tip、独占取出 socket，再检查其可用性；找不到时返回 `continuation-unavailable`，不新建握手、不发送增量请求。Executor 直接使用已保留的完整 Effective Model Request，不消耗上游恢复预算或增加 Target 失败计数。
 - 插件消费成功的 `completed` 终态后，通过 `ws-connection.close(Some(upstream response ID))` 归还连接；宿主不解析供应商 JSON 来猜测身份。`close(None)` 清除旧 tip；取消、中途断流、非法帧或未知终态直接销毁连接。`store=false` 的旧 ID 不得发送到新连接、其他分支占用的连接或 tip 已前移的连接。
 - 插件以 `continuation-not-found` 和 `protected-reasoning-rejected` 报告已确认的续接丢失或受保护推理拒绝，不将普通上游错误归入这些事实。宿主只在输出前执行完整历史恢复，不向客户端暴露未经脱敏的上游错误文本。续接丢失在恢复预算允许时恢复一次。受保护推理首次不因协议、模型或来源不同提前剥离；被拒后只移除外来与来源不明的载荷并重放一次，本上游载荷始终保留，无可剥离载荷时原样返回错误。该恢复不消耗 Target 恢复预算，也不计入连续失败；重放重新获得完整的 Target 首 token 窗口，总 deadline 不变。重放未再被判为推理拒绝时（包括被首 token 超时等取消，避免后续 Target 重试再次首发同一外来载荷），宿主按“当前签发作用域 × 来源签发作用域”记忆拒绝，来源不明的载荷按摘要记忆；命中进程内记忆时首发剥离，见 [ADR-0080](../adr/0080-try-protected-reasoning-once-and-block-only-foreign-origins.md)。宿主每次派发从实际请求重算 `operation_metadata.protected_reasoning_untrusted`：仅含外来或来源不明受保护载荷时设置 JSON `true`，否则省略。Devin 只在该声明为 `true` 且尚无模型输出时将 Connect `invalid_argument` 分类为推理拒绝；拒绝 trailer 前的模型标识与用量帧不算输出，判定与宿主首个输出提交规则一致；可解包的私有 replay 封装解包，其余非空载荷作为不透明签名先试一次。插件 codec 与内置 codec 一样自行决定可读思考的表示：原生载体能承载无签名明文时原生编码，否则降级为助手正文；宿主不再替插件把思考改写成文本。
-- Codex 通过宿主的 `transport_affinity` 派生稳定的 session/thread/window 身份。宿主优先对 canonical session fingerprint 按 Principal 与 Target 加作用域，再回退本地 Generation root 或当前 Model Turn；同一客户端会话跨独立链路根时仍可复用，原始别名、每次请求的 correlation ID 与 prompt cache key 不直接充当传输身份。无作用域亲和键时插件每次生成新身份。一个插件本地 `NativeSession` 同时投影 HTTP body 的 `client_metadata`、HTTP headers 与 WebSocket 握手；canonical 的 turn、parent-turn、root-turn 与 request correlation 各归其原生位置，缺失 turn/request ID 生成新值，不混作 session key；installation ID 与 turn-state 来自插件私有状态，不来自客户端。turn metadata 仅保留明确支持的官方成员，未知自定义键丢弃；自报身份不能覆盖宿主作用域身份。省略的默认服务级别与上游补全的 `default` 生成相同路由提示。认证、账号、URL、插件与凭据作用域仍参与连接隔离。私有 Codex endpoint 不等于公共 Responses API：从[官方请求结构](https://github.com/openai/codex/blob/main/codex-rs/codex-api/src/common.rs)正向投影，省略不支持的采样、输出上限、`metadata` 与 `prompt_cache_retention`，保留已支持的 `prompt_cache_key` 与 `parallel_tool_calls`。HTTP 不发送 WS-only `previous_response_id`／`generate`：若宿主已准备增量续接，插件在发出 Started 或网络请求前报告 `continuation-unavailable`，让宿主按既有机制恢复完整历史，不消耗恢复预算、不增加 Target 失败计数，不能删 ID 后仍发增量历史。WS 保留官方允许的续接、generate、stream 与 service tier。这些目标投影不改写 canonical 历史。只有实际发送了续接 ID、尚无模型响应事件，且收到 HTTP 状态语义为 400、`invalid_request_error`、无 code 的明确 ``Invalid `previous_response_id`.`` 错误时，才把该 Codex 错误归类为 `continuation-not-found`；普通 400 与已开始响应后的错误不回放。
-- 推理与压缩操作的 `operation_metadata.session_affinity` 是宿主下发的上游会话亲和键：只由本地链路根（Generation Chain 根节点或 Agent Run 根 Turn）按主体与 Target 派生为 64 位 hex，同一链路各轮与压缩共享同一值，不采用客户端自报的 session 标头或 `prompt_cache_key`；无链路的操作不下发。`base` 仅为 OpenRouter Profile 将该值投影为其[官方 `x-session-id`](https://openrouter.ai/docs/guides/best-practices/prompt-caching)，不再向所有兼容 API 广播同一自定义会话头。专属插件按官方工具的固定字段投影，例如 OpenCode Zen 的 `x-opencode-session` 与 WorkBuddy 的 `X-Conversation-ID`；不合并任意客户端 headers，缺失宿主身份时不从原始别名自行猜测。
+- Codex 通过宿主的 `transport_affinity` 按上方契约派生稳定的 UUIDv7 位格式 session/thread 身份，兼容 window 为 `thread:0`，不声称恢复官方压缩序号。宿主优先对 canonical session fingerprint 按 Principal 与 Target 加作用域，再回退本地 Generation root 或当前 Model Turn；同一客户端会话跨独立链路根时仍可复用，原始别名、每次请求的 correlation ID 与 prompt cache key 不直接充当传输身份。无作用域亲和键时插件每次生成新身份。一个插件本地 `NativeSession` 同时投影 HTTP body 的 `client_metadata`、HTTP headers 与 WebSocket 握手；canonical request/turn/parent-turn/root-turn 不作为可信宿主身份，turn 每新操作新建真实 UUIDv7，无可信父/root turn 时省略。Responses 的 `x-client-request-id` 取 thread，旧 Compact profile 不发该头；installation ID 保持既有私有状态生命周期。SDK 无可信同 turn 源，独立操作不认领旧 turn-state；删除已无法读取的 turn-state 持久缓存及捕获写入，不用客户端 turn 标签恢复路由。turn metadata 仅保留明确支持的官方成员，未知自定义键丢弃；自报身份不能覆盖宿主作用域身份。省略的默认服务级别与上游补全的 `default` 生成相同路由提示。认证、账号、URL、插件与凭据作用域仍参与连接隔离。私有 Codex endpoint 不等于公共 Responses API：从[官方请求结构](https://github.com/openai/codex/blob/main/codex-rs/codex-api/src/common.rs)正向投影，省略不支持的采样、输出上限、`metadata` 与 `prompt_cache_retention`，保留已支持的 `prompt_cache_key` 与 `parallel_tool_calls`。HTTP 不发送 WS-only `previous_response_id`／`generate`：若宿主已准备增量续接，插件在发出 Started 或网络请求前报告 `continuation-unavailable`，让宿主按既有机制恢复完整历史，不消耗恢复预算、不增加 Target 失败计数，不能删 ID 后仍发增量历史。WS 保留官方允许的续接、generate、stream 与 service tier。这些目标投影不改写 canonical 历史。只有实际发送了续接 ID、尚无模型响应事件，且收到 HTTP 状态语义为 400、`invalid_request_error`、无 code 的明确 ``Invalid `previous_response_id`.`` 错误时，才把该 Codex 错误归类为 `continuation-not-found`；普通 400 与已开始响应后的错误不回放。
+- 推理与压缩操作的 `operation_metadata.session_affinity` 是宿主下发的上游会话亲和键：只由本地链路根（Generation Chain 根节点或 Agent Run 根 Turn）按主体与 Target 派生为 64 位 hex，同一链路各轮与压缩共享同一值，不采用客户端自报的 session 标头或 `prompt_cache_key`；无链路的操作不下发。`base` 仅为 OpenRouter Profile 将完整源按固定 SHA256 契约投影为其[官方 `x-session-id`](https://openrouter.ai/docs/guides/best-practices/prompt-caching)，不向所有兼容 API 广播同一自定义会话头。专属插件按上方逐字段契约投影，例如 OpenCode Zen 的 `x-opencode-session` 与 Grok 的 `x-grok-session-id`；不合并任意客户端 headers，缺失宿主身份时不从原始别名自行猜测。
 - 同一次 Model Turn 的完整历史恢复、认证刷新及随后重放持续复用最初的组件、操作租约与数据代际，不能在恢复循环中重新取得管理器当前版本。真实 HTTP 401 可在未提交且预算允许时进入一次认证恢复；403 不触发刷新。插件声明的辅助认证刷新也由宿主调度，不要求伪造持久化 OAuth 记录。
 - OAuth 回放与原生压缩的账户身份采用宿主持久化的稳定认证连接标识，而不是 access token、refresh token 或到期时间。正常刷新保持身份，重新登录创建新身份；非 OAuth 凭据变更仍改变其指纹。Target、供应商、channel、协议、模型、代理、地址与选项边界保持不变。
 - 具体职责取舍见 [ADR-0071](../adr/0071-orchestrate-vendors-through-host-network-capabilities.md)，网络授权采用下述元数据声明与白名单原则。

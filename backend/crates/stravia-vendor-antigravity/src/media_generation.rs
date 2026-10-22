@@ -37,7 +37,7 @@ pub(crate) fn generate(
     let project = client::project(host, provider)?;
     let envelope = json!({
         "project":project, "model":model, "request":body,
-        "requestType":"agent", "requestId":format!("agent-{}", uuid::Uuid::new_v4()),
+        "requestType":"agent", "requestId":format!("agent/{}", uuid::Uuid::new_v4()),
         "userAgent":"antigravity"
     });
     let body = serde_json::to_vec(&envelope)

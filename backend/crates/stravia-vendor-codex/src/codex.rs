@@ -2,9 +2,10 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use stravia_runtime_contract::protocol::{
     ids::OPEN_RESPONSES_2026_04_24,
-    ir::{AiResponse, ServerToolUsage, SessionParameters, Usage},
+    ir::{AiResponse, ServerToolUsage, Usage},
 };
 use stravia_vendor_sdk::{
     GuestHost, ProviderSnapshot, SearchRequest, SearchResponse, SearchSource, WsMessage, WsRequest,
@@ -24,42 +25,28 @@ const ORIGINATOR: &str = "codex_cli_rs";
 /// One identity projection shared by the HTTP body, HTTP headers and WS handshake.
 /// Only the host-scoped affinity may select a reusable native session.
 pub(super) struct NativeSession {
-    request_id: String,
     metadata: Value,
     headers: Vec<(String, String)>,
 }
 
 impl NativeSession {
-    pub(super) fn new(provider: &ProviderSnapshot, session: &SessionParameters) -> Self {
-        let seed = uuid::Uuid::new_v4().to_string();
-        let affinity = clean_id(
-            provider
-                .operation_metadata
-                .get("transport_affinity")
-                .and_then(Value::as_str),
-        )
-        .unwrap_or(&seed);
-        let session_id = format!("session-{affinity}");
-        let thread_id = format!("thread-{affinity}");
-        let window_id = format!("window-{affinity}");
-        let turn_id = clean_id(session.turn_id.as_deref())
-            .map(str::to_owned)
-            .unwrap_or_else(|| format!("turn-{seed}"));
-        let request_id = clean_id(session.request_id.as_deref())
-            .map(str::to_owned)
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    pub(super) fn new(provider: &ProviderSnapshot) -> Self {
+        let thread_id = scoped_affinity(provider, "transport_affinity")
+            .map(|affinity| native_uuid("openai-codex", affinity))
+            .unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
+        let session_id = thread_id.clone();
+        // The SDK has no trusted native window ordinal. Keep the existing
+        // transport-scoped lifecycle; do not invent a compaction counter.
+        let window_id = format!("{thread_id}:0");
+        // Canonical client turn/request labels are not host-scoped operation
+        // identities. A newly constructed native turn remains independent.
+        let turn_id = uuid::Uuid::now_v7().to_string();
         let mut metadata = json!({
             "session_id": session_id,
             "thread_id": thread_id,
             "x-codex-window-id": window_id,
             "turn_id": turn_id,
         });
-        if let Some(parent_turn) = clean_id(session.parent_turn_id.as_deref()) {
-            metadata["parent_turn_id"] = parent_turn.into();
-        }
-        if let Some(root_turn) = clean_id(session.root_turn_id.as_deref()) {
-            metadata["root_turn_id"] = root_turn.into();
-        }
         for (affinity_key, metadata_key) in [
             (
                 "parent_thread_transport_affinity",
@@ -70,28 +57,13 @@ impl NativeSession {
                 "forked_from_thread_id",
             ),
         ] {
-            if let Some(affinity) = clean_id(
-                provider
-                    .operation_metadata
-                    .get(affinity_key)
-                    .and_then(Value::as_str),
-            ) {
-                metadata[metadata_key] = format!("thread-{affinity}").into();
+            if let Some(affinity) = scoped_affinity(provider, affinity_key) {
+                metadata[metadata_key] = native_uuid("openai-codex", affinity).into();
             }
         }
-        if let Some(affinity) = clean_id(
-            provider
-                .operation_metadata
-                .get("context_window_transport_affinity")
-                .and_then(Value::as_str),
-        ) {
-            use sha2::{Digest, Sha256};
-            let digest = Sha256::digest(affinity.as_bytes());
-            let bytes: [u8; 16] = digest[..16].try_into().expect("digest has 16 bytes");
-            metadata["context_window_id"] = uuid::Builder::from_random_bytes(bytes)
-                .into_uuid()
-                .to_string()
-                .into();
+        if let Some(affinity) = scoped_affinity(provider, "context_window_transport_affinity") {
+            metadata["context_window_id"] =
+                native_uuid("openai-codex:context-window", affinity).into();
         }
         let mut headers = vec![
             ("session-id".into(), session_id),
@@ -105,13 +77,7 @@ impl NativeSession {
             headers.push(("x-codex-parent-thread-id".into(), parent_thread.into()));
         }
         let mut turn_metadata = serde_json::Map::new();
-        for name in [
-            "session_id",
-            "thread_id",
-            "turn_id",
-            "parent_turn_id",
-            "root_turn_id",
-        ] {
+        for name in ["session_id", "thread_id", "turn_id"] {
             if let Some(value) = metadata.get(name) {
                 turn_metadata.insert(name.into(), value.clone());
             }
@@ -133,11 +99,7 @@ impl NativeSession {
         let turn_metadata = Value::Object(turn_metadata).to_string();
         headers.push(("x-codex-turn-metadata".into(), turn_metadata.clone()));
         metadata["x-codex-turn-metadata"] = turn_metadata.into();
-        Self {
-            request_id,
-            metadata,
-            headers,
-        }
+        Self { metadata, headers }
     }
 
     pub(super) fn apply_body(&self, body: &mut Value) {
@@ -157,12 +119,6 @@ impl NativeSession {
             return Err(invalid("Codex native installation identity is invalid"));
         }
         let installation = identity.installation_id.clone();
-        let turn = self.turn_key();
-        if let Some((_, state)) = identity.turns.iter().find(|(key, _)| key == &turn) {
-            self.headers
-                .push(("x-codex-turn-state".into(), state.clone()));
-            self.metadata["x-codex-turn-state"] = state.clone().into();
-        }
         if created {
             write_identities(host, &mut root, identities)?;
         }
@@ -185,67 +141,42 @@ impl NativeSession {
         self.metadata["x-codex-turn-metadata"] = turn_metadata.into();
         Ok(())
     }
+}
 
-    fn turn_key(&self) -> String {
-        format!(
-            "{}:{}",
-            self.metadata["session_id"], self.metadata["turn_id"]
-        )
-    }
+fn scoped_affinity<'a>(provider: &'a ProviderSnapshot, key: &str) -> Option<&'a str> {
+    provider
+        .operation_metadata
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+}
 
-    pub(super) fn capture_turn_state(
-        &self,
-        host: &GuestHost,
-        provider: &ProviderSnapshot,
-        headers: &[(String, String)],
-    ) -> Result<(), stravia_vendor_sdk::PluginError> {
-        let Some(state) = headers
-            .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case("x-codex-turn-state"))
-            .and_then(|(_, value)| clean_id(Some(value)))
-        else {
-            return Ok(());
-        };
-        let (mut root, mut identities) = read_identities(host)?;
-        let Some(identity) = identities.get_mut(&credential_key(provider)?) else {
-            return Err(invalid("Codex native installation identity is missing"));
-        };
-        let turn = self.turn_key();
-        if !identity.capture(turn, state) {
-            return Ok(());
-        }
-        write_identities(host, &mut root, identities)
-    }
+/// UUIDv7 bit representation only: hash-derived bits are not a wall clock and
+/// do not preserve official UUIDv7 creation-time ordering.
+fn native_uuid(namespace: &str, affinity: &str) -> String {
+    let mut hash = Sha256::new();
+    hash.update(namespace.as_bytes());
+    hash.update([0]);
+    hash.update(affinity.as_bytes());
+    let digest = hash.finalize();
+    let mut bytes: [u8; 16] = digest[..16].try_into().expect("digest has 16 bytes");
+    bytes[6] = (bytes[6] & 0x0f) | 0x70;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    uuid::Uuid::from_bytes(bytes).to_string()
 }
 
 #[derive(Serialize, Deserialize)]
 // https://github.com/openai/codex/blob/main/codex-rs/core/src/installation_id.rs
-// https://github.com/openai/codex/blob/main/codex-rs/core/src/client.rs
-// 官方安装 UUID 持久化；turn-state 只复用本 turn 首个上游响应头。
+// 官方安装 UUID 持久化；新操作没有可信的旧 turn 可复用。
 struct NativeIdentity {
     installation_id: String,
-    #[serde(default)]
-    turns: std::collections::VecDeque<(String, String)>,
 }
 
 impl NativeIdentity {
     fn new() -> Self {
         Self {
             installation_id: uuid::Uuid::new_v4().to_string(),
-            turns: Default::default(),
         }
-    }
-
-    fn capture(&mut self, turn: String, state: &str) -> bool {
-        // 官方 OnceLock 保留同一 turn 的首个响应值，不让后续响应切换路由。
-        if self.turns.iter().any(|(key, _)| key == &turn) {
-            return false;
-        }
-        if self.turns.len() >= 256 {
-            self.turns.pop_front();
-        }
-        self.turns.push_back((turn, state.into()));
-        true
     }
 }
 
@@ -300,12 +231,6 @@ fn write_identities(
         &serde_json::to_vec(root)
             .map_err(|_| invalid("Codex native identity state could not be encoded"))?,
     )
-}
-
-fn clean_id(value: Option<&str>) -> Option<&str> {
-    value
-        .map(str::trim)
-        .filter(|value| !value.is_empty() && !value.contains(['\r', '\n']))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -541,15 +466,16 @@ pub(super) fn append_runtime_headers(
         }
         set_header(headers, name, value.clone());
     }
-    let request_id = if websocket {
-        // 官方 WS 握手以 thread 关联连接，不使用每次 HTTP 请求的 correlation ID。
-        session.metadata["thread_id"]
-            .as_str()
-            .expect("native thread ID")
-    } else {
-        &session.request_id
-    };
-    set_header(headers, "x-client-request-id", request_id.to_owned());
+    // rust-v0.162.1 binds this header to the thread on both Responses HTTP
+    // (codex-api/endpoint/responses.rs) and WS (core/client.rs).
+    let request_id = session.metadata["thread_id"]
+        .as_str()
+        .expect("native thread ID");
+    // The retained rust-v0.134.0 unary compact profile has session/thread
+    // headers but no x-client-request-id.
+    if operation != BodyOperation::Compact {
+        set_header(headers, "x-client-request-id", request_id.to_owned());
+    }
     set_header(headers, "x-codex-routing-hint", routing_hint(body)?);
     Ok(())
 }
@@ -745,7 +671,7 @@ pub(super) fn search(
         "include": ["reasoning.encrypted_content", "web_search_call.action.sources"]
     });
     prepare_operation_body(&mut body, BodyOperation::Search)?;
-    let mut session = NativeSession::new(provider, &SessionParameters::default());
+    let mut session = NativeSession::new(provider);
     session.resolve_identity(host, provider)?;
     session.apply_body(&mut body);
     let mut headers = vec![
@@ -768,7 +694,6 @@ pub(super) fn search(
             .map_err(|_| invalid("Codex Search request could not be encoded"))?,
     })?;
     ensure_success(&response, "Codex Search")?;
-    session.capture_turn_state(host, provider, &response.headers()?)?;
     let bytes = stravia_vendor_sdk::read_http_body(&response, MAX_RESPONSE_BYTES)?;
     let response = parse_responses_body(&bytes)?;
     let report_id = provider
@@ -1063,48 +988,6 @@ mod tests {
     use std::collections::BTreeMap;
 
     #[test]
-    fn installation_identity_persists_and_turn_state_stays_with_its_turn_and_credential() {
-        let mut identities = Identities::new();
-        let first_key = credential_key(&provider()).unwrap();
-        let identity = identities
-            .entry(first_key.clone())
-            .or_insert_with(NativeIdentity::new);
-        let installation = identity.installation_id.clone();
-        assert_eq!(
-            uuid::Uuid::parse_str(&installation)
-                .unwrap()
-                .get_version_num(),
-            4
-        );
-        assert!(identity.capture("session-a:turn-a".into(), "first-state"));
-        assert!(!identity.capture("session-a:turn-a".into(), "replacement"));
-        assert!(identity.capture("session-a:turn-b".into(), "next-turn"));
-        let mut restored: Identities =
-            serde_json::from_slice(&serde_json::to_vec(&identities).unwrap()).unwrap();
-        let identity = restored.get_mut(&first_key).unwrap();
-        assert_eq!(identity.installation_id, installation);
-        assert_eq!(
-            identity.turns[0],
-            ("session-a:turn-a".into(), "first-state".into())
-        );
-        assert_eq!(
-            identity.turns[1],
-            ("session-a:turn-b".into(), "next-turn".into())
-        );
-        let mut other = provider();
-        other
-            .credentials
-            .insert("access_token".into(), "other-token".into());
-        let other_key = credential_key(&other).unwrap();
-        assert_ne!(first_key, other_key);
-        let other_identity = restored
-            .entry(other_key)
-            .or_insert_with(NativeIdentity::new);
-        assert_ne!(other_identity.installation_id, installation);
-        assert!(other_identity.turns.is_empty());
-    }
-
-    #[test]
     fn canonical_native_choice_selects_search_but_not_unsupported_execution() {
         use stravia_runtime_contract::protocol::ir::{
             AiItem, AiRequest, MessageContent, NativeTool, NativeToolKind, Role, ToolChoice,
@@ -1251,19 +1134,12 @@ mod tests {
             "context_window_transport_affinity".into(),
             "scoped-window".into(),
         );
-        let canonical = SessionParameters {
-            parent_id: Some("raw-parent".into()),
-            forked_from_id: Some("raw-fork".into()),
-            context_window_id: Some("raw-window".into()),
-            root_turn_id: Some("canonical-root-turn".into()),
-            ..Default::default()
-        };
-        let child = NativeSession::new(&provider, &canonical);
+        let child = NativeSession::new(&provider);
         let mut earlier_parent = provider.clone();
         earlier_parent
             .operation_metadata
             .insert("transport_affinity".into(), "scoped-parent".into());
-        let parent = NativeSession::new(&earlier_parent, &Default::default());
+        let parent = NativeSession::new(&earlier_parent);
         assert_eq!(
             child.metadata["x-codex-parent-thread-id"],
             parent.metadata["thread_id"]
@@ -1272,8 +1148,11 @@ mod tests {
             serde_json::from_str(child.metadata["x-codex-turn-metadata"].as_str().unwrap())
                 .unwrap();
         assert_eq!(turn["parent_thread_id"], parent.metadata["thread_id"]);
-        assert_eq!(turn["forked_from_thread_id"], "thread-scoped-fork");
-        assert_eq!(turn["root_turn_id"], "canonical-root-turn");
+        assert_eq!(
+            turn["forked_from_thread_id"],
+            native_uuid("openai-codex", "scoped-fork")
+        );
+        assert!(turn.get("root_turn_id").is_none());
         assert!(uuid::Uuid::parse_str(turn["context_window_id"].as_str().unwrap()).is_ok());
         assert!(child.metadata.get("forked_from_thread_id").is_none());
         assert!(child.metadata.get("context_window_id").is_none());
@@ -1281,7 +1160,7 @@ mod tests {
             "parent_thread_transport_affinity".into(),
             "other-principal-target-parent".into(),
         );
-        let other = NativeSession::new(&provider, &canonical);
+        let other = NativeSession::new(&provider);
         assert_ne!(
             other.metadata["x-codex-parent-thread-id"],
             child.metadata["x-codex-parent-thread-id"]
@@ -1289,15 +1168,9 @@ mod tests {
     }
 
     #[test]
-    fn canonical_native_identity_is_shared_and_scoped_not_raw_client_identity() {
+    fn native_identity_is_shared_and_scoped_not_raw_client_identity() {
         let provider = provider();
-        let canonical = SessionParameters {
-            id: Some("raw-affinity".into()),
-            request_id: Some("request-correlation".into()),
-            turn_id: Some("canonical-turn".into()),
-            ..Default::default()
-        };
-        let session = NativeSession::new(&provider, &canonical);
+        let session = NativeSession::new(&provider);
         let mut body = json!({"model":"gpt-6-astra", "client_metadata":{"session_id":"spoofed"}});
         session.apply_body(&mut body);
         let mut headers = vec![
@@ -1325,9 +1198,16 @@ mod tests {
                 Some(headers[header].as_str())
             );
         }
-        assert_eq!(headers["session-id"], "session-principal-target-scope");
-        assert_eq!(headers["thread-id"], "thread-principal-target-scope");
-        assert_eq!(headers["x-client-request-id"], "request-correlation");
+        assert_eq!(
+            headers["session-id"],
+            "cc39dd30-b6dd-72f8-b778-d6c48c3af5fa"
+        );
+        assert_eq!(headers["thread-id"], headers["session-id"]);
+        assert_eq!(headers["x-client-request-id"], headers["thread-id"]);
+        assert_eq!(
+            headers["x-codex-window-id"],
+            format!("{}:0", headers["thread-id"])
+        );
         assert!(!headers.contains_key("x-codex-beta-features"));
         assert!(!headers.contains_key("x-codex-turn-state"));
         assert!(!headers.contains_key("x-openai-subagent"));
@@ -1338,32 +1218,107 @@ mod tests {
         let turn: Value = serde_json::from_str(&headers["x-codex-turn-metadata"]).unwrap();
         assert_eq!(turn["thread_id"], body["client_metadata"]["thread_id"]);
         assert_eq!(turn["session_id"], body["client_metadata"]["session_id"]);
-        assert_eq!(turn["turn_id"], "canonical-turn");
+        assert_ne!(turn["turn_id"], "canonical-turn");
+        assert_eq!(
+            uuid::Uuid::parse_str(turn["turn_id"].as_str().unwrap())
+                .unwrap()
+                .get_version_num(),
+            7
+        );
         assert!(turn.get("custom_hint").is_none());
         assert!(body["client_metadata"].get("custom_hint").is_none());
     }
 
     #[test]
-    fn scoped_sessions_are_stable_but_request_ids_and_turns_are_distinct() {
+    fn scoped_identity_preserves_full_utf8_and_independent_turns_at_wire_boundary() {
         let mut provider = provider();
-        let first = NativeSession::new(&provider, &SessionParameters::default());
-        let second = NativeSession::new(&provider, &SessionParameters::default());
-        assert_eq!(first.metadata["session_id"], second.metadata["session_id"]);
-        assert_eq!(first.metadata["thread_id"], second.metadata["thread_id"]);
-        assert_ne!(first.request_id, second.request_id);
-        assert_ne!(first.metadata["turn_id"], second.metadata["turn_id"]);
+        let source = " 空白\0\r\n会话😀 ";
+        provider
+            .operation_metadata
+            .insert("transport_affinity".into(), source.into());
+        provider
+            .operation_metadata
+            .insert("context_window_transport_affinity".into(), source.into());
+        let first = NativeSession::new(&provider);
+        let reloaded = NativeSession::new(&provider.clone());
+        assert_eq!(
+            first.metadata["thread_id"],
+            "5d42eca3-00ce-7fd9-879a-2f189010d915"
+        );
+        assert_eq!(first.metadata["thread_id"], reloaded.metadata["thread_id"]);
+        assert_ne!(first.metadata["turn_id"], reloaded.metadata["turn_id"]);
+        let turn: Value =
+            serde_json::from_str(first.metadata["x-codex-turn-metadata"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(
+            turn["context_window_id"],
+            "8d48e1ac-0b84-75f1-b2c8-f17313c5b686"
+        );
+        assert!(turn.get("parent_turn_id").is_none());
+        assert!(turn.get("root_turn_id").is_none());
+        for operation in [
+            BodyOperation::Http,
+            BodyOperation::WebSocket,
+            BodyOperation::Compact,
+            BodyOperation::Search,
+            BodyOperation::Image,
+        ] {
+            let mut body = json!({"model":"gpt-6-astra"});
+            first.apply_body(&mut body);
+            let mut headers = provider.client_headers.clone();
+            append_runtime_headers(&provider, &body, &first, operation, &mut headers).unwrap();
+            let headers: BTreeMap<_, _> = headers.into_iter().collect();
+            assert_eq!(headers["thread-id"], "5d42eca3-00ce-7fd9-879a-2f189010d915");
+            if operation == BodyOperation::Compact {
+                assert!(!headers.contains_key("x-client-request-id"));
+            } else {
+                assert_eq!(headers["x-client-request-id"], headers["thread-id"]);
+            }
+            assert!(
+                headers
+                    .values()
+                    .all(|value| !value.contains(['\0', '\r', '\n']))
+            );
+        }
+        for other in [source.trim(), "空白\0\r\n会话😀", " ", "会话😀", "会话😁"] {
+            provider
+                .operation_metadata
+                .insert("transport_affinity".into(), other.into());
+            assert_ne!(
+                NativeSession::new(&provider).metadata["thread_id"],
+                first.metadata["thread_id"]
+            );
+        }
+        let prefix = "会话😀".repeat(4096);
         assert_ne!(
-            first.request_id,
-            first.metadata["thread_id"].as_str().unwrap()
+            native_uuid("openai-codex", &format!("{prefix}a")),
+            native_uuid("openai-codex", &format!("{prefix}b"))
         );
         provider
             .operation_metadata
+            .insert("transport_affinity".into(), "".into());
+        assert_ne!(
+            NativeSession::new(&provider).metadata["thread_id"],
+            NativeSession::new(&provider).metadata["thread_id"]
+        );
+    }
+
+    #[test]
+    fn scoped_sessions_are_stable_but_native_turns_are_distinct() {
+        let mut provider = provider();
+        let first = NativeSession::new(&provider);
+        let second = NativeSession::new(&provider);
+        assert_eq!(first.metadata["session_id"], second.metadata["session_id"]);
+        assert_eq!(first.metadata["thread_id"], second.metadata["thread_id"]);
+        assert_ne!(first.metadata["turn_id"], second.metadata["turn_id"]);
+        provider
+            .operation_metadata
             .insert("transport_affinity".into(), "other-principal-target".into());
-        let other = NativeSession::new(&provider, &SessionParameters::default());
+        let other = NativeSession::new(&provider);
         assert_ne!(first.metadata["session_id"], other.metadata["session_id"]);
         provider.operation_metadata.remove("transport_affinity");
-        let isolated = NativeSession::new(&provider, &SessionParameters::default());
-        let another = NativeSession::new(&provider, &SessionParameters::default());
+        let isolated = NativeSession::new(&provider);
+        let another = NativeSession::new(&provider);
         assert_ne!(
             isolated.metadata["session_id"],
             another.metadata["session_id"]

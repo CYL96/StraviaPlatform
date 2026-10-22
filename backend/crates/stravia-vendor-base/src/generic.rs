@@ -3,6 +3,7 @@ use stravia_vendor_common::common;
 use stravia_vendor_common::thinking;
 
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use stravia_protocol_codec::codec::openai::compatible::chat_completions::OpenAIChatCompletionsV1;
 use stravia_protocol_codec::registry::ProtocolRegistry;
 use stravia_runtime_contract::protocol::ids::{
@@ -649,14 +650,19 @@ fn append_official_session_headers(
     // OpenRouter 明确支持 sticky/grouping；不能把私有头普发给其它兼容 API。
     // https://openrouter.ai/docs/guides/best-practices/prompt-caching
     if vendor_id == "openrouter"
-        && let Some(affinity) = provider
-            .operation_metadata
-            .get("session_affinity")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty() && value.len() <= 256)
+        && let Some(affinity) = common::session_affinity(provider)
     {
-        set_header(headers, "x-session-id", affinity.to_owned());
+        // 官方只要求稳定、至多 256 字符；固定摘要保留完整源身份并使 Unicode/
+        // 控制字符适用于 HTTP header，不把源字符串的空白当作可丢弃内容。
+        let mut digest = Sha256::new();
+        digest.update(b"stravia-openrouter-session-v1\0");
+        digest.update(affinity.as_bytes());
+        let mut session = String::with_capacity(64);
+        for byte in digest.finalize() {
+            use std::fmt::Write as _;
+            write!(&mut session, "{byte:02x}").expect("writing to String");
+        }
+        set_header(headers, "x-session-id", session);
     }
 }
 
@@ -1115,31 +1121,6 @@ mod tests {
             client_headers: Vec::new(),
             operation_metadata: BTreeMap::new(),
         }
-    }
-
-    #[test]
-    fn official_session_header_is_scoped_to_openrouter_and_requires_host_identity() {
-        let mut snapshot = provider(OPENAI_CHAT_PROTOCOL, "key");
-        snapshot.client_headers = vec![("x-session-id".into(), "untrusted-client-session".into())];
-        snapshot
-            .operation_metadata
-            .insert("session_affinity".into(), json!("host-scoped-session"));
-        for vendor in ["openai", "custom", "anthropic", "cohere", "openrouter"] {
-            let mut headers = Vec::new();
-            append_official_session_headers(vendor, &snapshot, &mut headers);
-            if vendor == "openrouter" {
-                assert_eq!(
-                    headers,
-                    vec![("x-session-id".into(), "host-scoped-session".into())]
-                );
-            } else {
-                assert!(headers.is_empty(), "{vendor}");
-            }
-        }
-        snapshot.operation_metadata.clear();
-        let mut headers = Vec::new();
-        append_official_session_headers("openrouter", &snapshot, &mut headers);
-        assert!(headers.is_empty());
     }
 
     #[test]

@@ -268,7 +268,6 @@ fn infer(
 
     let mut state = read_state(host)?;
     let shape = state.advance_session(session_shape(
-        token,
         provider
             .operation_metadata
             .get("transport_affinity")
@@ -799,43 +798,30 @@ mod session_tests {
     fn persisted_state_preserves_native_steps_across_restart_and_principal_boundaries() {
         let affinity = Some("principal-a/target-a/session");
         let mut state = PrivateState::default();
-        let first = state.advance_session(session_shape("credential", affinity));
+        let first = state.advance_session(session_shape(affinity));
         assert_eq!(first.step_index, 0);
         assert_eq!(wire_step(&first), None);
         // These are the same serde bytes written/read by production private state.
         let bytes = serde_json::to_vec(&state).unwrap();
         let mut restored: PrivateState = serde_json::from_slice(&bytes).unwrap();
-        let second = restored.advance_session(session_shape("credential", affinity));
+        let second = restored.advance_session(session_shape(affinity));
         assert_eq!(second.step_index, 2);
         assert_eq!(wire_step(&second), Some(2));
         assert_eq!(second.cascade_id, first.cascade_id);
         let bytes = serde_json::to_vec(&restored).unwrap();
         let mut restored: PrivateState = serde_json::from_slice(&bytes).unwrap();
-        let third = restored.advance_session(session_shape("credential", affinity));
+        let third = restored.advance_session(session_shape(affinity));
         assert_eq!(third.step_index, 3);
         assert_eq!(wire_step(&third), Some(3));
         assert_eq!(third.trajectory_id, first.trajectory_id);
         assert_eq!(
             restored
-                .advance_session(session_shape(
-                    "credential",
-                    Some("principal-b/target-a/session")
-                ))
+                .advance_session(session_shape(Some("principal-b/target-a/session")))
                 .step_index,
             0
         );
-        assert_eq!(
-            restored
-                .advance_session(session_shape("credential", None))
-                .step_index,
-            0
-        );
-        assert_eq!(
-            restored
-                .advance_session(session_shape("credential", None))
-                .step_index,
-            0
-        );
+        assert_eq!(restored.advance_session(session_shape(None)).step_index, 0);
+        assert_eq!(restored.advance_session(session_shape(None)).step_index, 0);
     }
 
     fn wire_step(shape: &SessionShape) -> Option<u64> {
@@ -865,20 +851,20 @@ mod session_tests {
             let affinity = format!("scoped/{index}");
             assert_eq!(
                 state
-                    .advance_session(session_shape("credential", Some(&affinity)))
+                    .advance_session(session_shape(Some(&affinity)))
                     .step_index,
                 0
             );
         }
-        let resumed = state.advance_session(session_shape("credential", Some("scoped/0")));
+        let resumed = state.advance_session(session_shape(Some("scoped/0")));
         assert_eq!(resumed.step_index, 2);
         assert_eq!(state.next_steps.len(), 256);
-        let fresh = state.advance_session(session_shape("credential", Some("scoped/new")));
+        let fresh = state.advance_session(session_shape(Some("scoped/new")));
         assert_eq!(fresh.step_index, 0);
         assert_eq!(state.next_steps.len(), 1);
         assert_eq!(
             state
-                .advance_session(session_shape("credential", Some("scoped/new")))
+                .advance_session(session_shape(Some("scoped/new")))
                 .step_index,
             2
         );

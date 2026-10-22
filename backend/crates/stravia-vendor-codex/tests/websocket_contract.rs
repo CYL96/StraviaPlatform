@@ -240,11 +240,42 @@ async fn http_case(case: &'static str) {
             request.extend_from_slice(&buffer[..count]);
         }
         let body: serde_json::Value = serde_json::from_slice(&request[header_end..]).unwrap();
+        let header = |expected: &str| {
+            headers.lines().find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case(expected).then(|| value.trim())
+            })
+        };
+        let thread = header("thread-id").expect("thread header");
+        assert_eq!(thread, "5d42eca3-00ce-7fd9-879a-2f189010d915");
+        assert_eq!(header("session-id"), Some(thread));
+        assert_eq!(
+            header("x-codex-window-id"),
+            Some(format!("{thread}:0").as_str())
+        );
         if case.starts_with("compact") {
             assert!(headers.starts_with("POST /responses/compact "));
             assert!(body.get("stream").is_none());
+            assert!(header("x-client-request-id").is_none());
         } else {
             assert_eq!(body["stream"], true);
+            assert_eq!(header("x-client-request-id"), Some(thread));
+            assert_eq!(body["client_metadata"]["thread_id"], thread);
+            let turn: Value = serde_json::from_str(
+                body["client_metadata"]["x-codex-turn-metadata"]
+                    .as_str()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                uuid::Uuid::parse_str(turn["turn_id"].as_str().unwrap())
+                    .unwrap()
+                    .get_version_num(),
+                7
+            );
+            assert_ne!(turn["turn_id"], "injected-turn");
+            assert!(turn.get("parent_turn_id").is_none());
+            assert!(turn.get("root_turn_id").is_none());
         }
         if case == "logprobs"
             && body["include"].as_array().is_some_and(|include| {
@@ -347,6 +378,9 @@ async fn http_case(case: &'static str) {
     provider
         .operation_metadata
         .insert("transport_preference".into(), "http-only".into());
+    provider
+        .operation_metadata
+        .insert("transport_affinity".into(), " 空白\0\r\n会话😀 ".into());
     let scope = OperationScope::new(
         services.clone(),
         CancellationToken::new(),
@@ -363,6 +397,11 @@ async fn http_case(case: &'static str) {
             }))
             .unwrap();
     }
+    inference.parameters.session.id = Some("injected-session".into());
+    inference.parameters.session.request_id = Some("injected-request\r\ninvalid".into());
+    inference.parameters.session.turn_id = Some("injected-turn".into());
+    inference.parameters.session.parent_turn_id = Some("injected-parent".into());
+    inference.parameters.session.root_turn_id = Some("injected-root".into());
     let input = if case.starts_with("compact") {
         OperationInput::Compact {
             provider,
@@ -909,6 +948,14 @@ async fn affinity_and_account_headers_follow_actual_codex_frames() {
         assert_eq!(sent[index]["prompt_cache_key"], "canonical-final-smoke");
         assert_eq!(sent[index]["parallel_tool_calls"], false);
         assert_eq!(closed[index].as_deref(), Some(*response_id));
+        let thread = &connections[index].headers["thread-id"];
+        assert_eq!(uuid::Uuid::parse_str(thread).unwrap().get_version_num(), 7);
+        assert_eq!(connections[index].headers["session-id"], *thread);
+        assert_eq!(connections[index].headers["x-client-request-id"], *thread);
+        assert_eq!(
+            connections[index].headers["x-codex-window-id"],
+            format!("{thread}:0")
+        );
         for (header, metadata) in [
             ("session-id", "session_id"),
             ("thread-id", "thread_id"),

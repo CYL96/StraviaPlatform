@@ -1308,7 +1308,7 @@ mod tests {
         let body = encode_get_chat_message_request_with_platform(
             &request,
             "test-token",
-            &session_shape("test-token", None),
+            &session_shape(None),
             None,
             DevinClientPlatform::Linux,
         )
@@ -1451,7 +1451,7 @@ mod tests {
         let body = super::super::request::encode_get_chat_message_request_with_platform(
             &request,
             "test-token",
-            &super::super::request::session_shape("test-token", None),
+            &super::super::request::session_shape(None),
             None,
             super::super::request::DevinClientPlatform::Linux,
         )
