@@ -51,12 +51,18 @@ impl AdminService {
         self.gw.vendor_plugins.descriptor(provider_id)
     }
 
-    /// Effective provider profiles reported by installed and loadable Vendor Components.
-    /// Dedicated packages replace the fallback profile as a whole.
+    /// 完整有效描述符及实际来源，供已有连接读取配置；不应用选择器的目录替代规则。
     pub async fn list_vendor_metadata(
         &self,
-    ) -> anyhow::Result<Vec<stravia_vendor_sdk::ProviderDescriptor>> {
-        Ok(self.gw.vendor_plugins.descriptors())
+    ) -> anyhow::Result<Vec<crate::plugin::ProviderMetadata>> {
+        Ok(self.gw.vendor_plugins.provider_metadata(false))
+    }
+
+    /// 新建连接的可选入口；外部仅替代 base 的同目录、同 channel 卡片。
+    pub async fn list_selectable_vendor_metadata(
+        &self,
+    ) -> anyhow::Result<Vec<crate::plugin::ProviderMetadata>> {
+        Ok(self.gw.vendor_plugins.provider_metadata(true))
     }
 
     /// Runtime inventory: loaded Vendor Components plus the protocol codec

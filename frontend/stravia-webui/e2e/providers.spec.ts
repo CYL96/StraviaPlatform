@@ -1,6 +1,6 @@
 import { expect, test } from '@playwright/test'
 
-import type { ProviderDescriptor } from '../src/lib/types'
+import type { ProviderMetadata } from '../src/lib/types'
 import { prepareApp } from './prepare-app'
 
 test.beforeEach(async ({ page }) => {
@@ -104,8 +104,8 @@ test('service cards filter sign-in methods and use local logos before remote fal
   await page.goto('/providers')
   await page.getByRole('button', { name: /添加.*供应商/ }).click()
   const grid = page.locator('[data-provider-grid]')
-  const openAi = grid.getByRole('button', { name: /^OpenAI API 密钥$/ })
-  const compatible = grid.getByRole('button', { name: /^OpenAI Compatible API 密钥$/ })
+  const openAi = grid.getByRole('button', { name: /^OpenAI API 密钥 / })
+  const compatible = grid.getByRole('button', { name: /^OpenAI Compatible API 密钥 / })
   await expect(openAi.locator('img')).toHaveAttribute('src', /^data:image\/svg\+xml,/)
   await expect
     .poll(() => openAi.locator('img').evaluate((img: HTMLImageElement) => img.naturalWidth))
@@ -273,14 +273,14 @@ test('provider editor selects a service before validating its configuration', as
   await expect(refreshButton).toBeVisible()
   await refreshButton.click()
   await expect(page.getByRole('button', { name: /^OpenAI Compatible / })).toBeVisible()
-  await expect(page.getByRole('button', { name: /^OpenAI API key$/ })).toBeVisible()
+  await expect(page.getByRole('button', { name: /^OpenAI API key / })).toBeVisible()
   await expect(page.getByRole('button', { name: /OpenAI.*Codex.*OAuth account/ })).toBeVisible()
 
   await searchInput.fill('OpenAI')
-  await expect(page.getByRole('button', { name: /^OpenAI API key$/ })).toBeVisible()
+  await expect(page.getByRole('button', { name: /^OpenAI API key / })).toBeVisible()
   await expect(page.getByRole('button', { name: /OpenAI.*Codex.*OAuth account/ })).toBeVisible()
   await expect(page.getByRole('tab', { name: 'Choose provider' })).toHaveAttribute('aria-selected', 'true')
-  const openAiOption = page.getByRole('button', { name: /^OpenAI API key$/ })
+  const openAiOption = page.getByRole('button', { name: /^OpenAI API key / })
   const codexOption = page.getByRole('button', { name: /OpenAI.*Codex.*OAuth account/ })
   await openAiOption.focus()
   await openAiOption.press('ArrowRight')
@@ -463,12 +463,13 @@ test('Provider configuration follows plugin field visibility conditions', async 
     created_at: '2026-01-01T00:00:00Z',
     updated_at: '2026-01-01T00:00:00Z',
   }
-  await page.route('**/api/v1/vendors', async (route) => {
+  await page.route('**/api/v1/vendors*', async (route) => {
     await route.fulfill({
       json: {
         data: [
           {
             provider_id: provider.vendor,
+            plugin: { id: provider.vendor, name: 'Conditional fixture plugin' },
             catalog_id: null,
             display_name: 'Conditional fixture',
             description: 'Exercises conditional configuration fields.',
@@ -1421,6 +1422,7 @@ test('completed OAuth satisfies session credential fields and submits the provid
   } as const
   const descriptor = {
     provider_id: 'devin',
+    plugin: { id: 'devin', name: 'Devin' },
     catalog_id: 'devin',
     display_name: 'Devin',
     description: 'Local OAuth form regression fixture.',
@@ -1468,13 +1470,13 @@ test('completed OAuth satisfies session credential fields and submits the provid
       field_origins: [],
     },
     data_compat: { config_fields_format: 1, private_state_format: 1, credentials_format: 1, model_metadata_format: 1 },
-  } satisfies ProviderDescriptor
+  } satisfies ProviderMetadata
   const fixtureSecret = 'fixture-only-devin-session-token'
   let oauthReady = false
   let initBody: Record<string, unknown> | undefined
   let createBody: Record<string, unknown> | undefined
 
-  await page.route('**/api/v1/vendors', (route) => route.fulfill({ json: { data: [descriptor] } }))
+  await page.route('**/api/v1/vendors*', (route) => route.fulfill({ json: { data: [descriptor] } }))
   await page.route('**/api/v1/providers/configuration-preview', async (route) => {
     const input = route.request().postDataJSON() as { base_url: string; credentials: Record<string, unknown> }
     expect(input.credentials).toEqual({})

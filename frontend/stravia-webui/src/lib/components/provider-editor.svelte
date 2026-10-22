@@ -16,8 +16,11 @@ import {
   buildProviderOptions,
   defaultProviderName,
   optionDescription,
+  optionDirectoryId,
   optionLabel,
+  optionPluginSource,
   providerNameAfterOptionChange,
+  providerOptionMatches,
   type ProviderOption,
 } from '#lib/provider-options.js'
 
@@ -57,25 +60,15 @@ let oauthAuthorization = $state<{
 
 const queryClient = useQueryClient()
 const providerDescriptorsQuery = createQuery(() => ({
-  queryKey: ['provider-descriptors'],
-  queryFn: admin.providers.descriptors,
+  queryKey: ['provider-descriptors', 'selectable'],
+  queryFn: admin.providers.choices,
 }))
 const options = $derived(buildProviderOptions(providerDescriptorsQuery.data ?? []))
 const selectedOption = $derived(options.find((option) => option.key === selectedOptionKey))
-const configFields = $derived(selectedOption?.descriptor.config_fields ?? [])
+const configFields = $derived(selectedOption?.metadata.config_fields ?? [])
 const supportsConfigValidation = $derived(selectedOption?.channel.capabilities.includes('config_validation') ?? false)
 const oauthProvider = $derived(Boolean(selectedOption?.channel.auth))
-const providerOptions = $derived.by(() => {
-  const query = search.trim().toLocaleLowerCase(localeState.current)
-  return options.filter((option) => {
-    if (!query) return true
-
-    const auth = option.channel.auth ? 'oauth account 账号' : 'api key'
-    const text = `${option.descriptor.provider_id} ${option.descriptor.catalog_id ?? ''} ${optionLabel(option, localeState.current)} ${option.channel.id} ${resolvePluginText(option.channel.name, localeState.current)} ${optionDescription(option, localeState.current)} ${auth}`
-
-    return text.toLocaleLowerCase(localeState.current).includes(query)
-  })
-})
+const providerOptions = $derived(options.filter((option) => providerOptionMatches(option, search, localeState.current)))
 
 function writeProvider(submission: ProviderConnectionSubmission): Promise<Provider> {
   const { target } = submission
@@ -105,7 +98,7 @@ function writeProvider(submission: ProviderConnectionSubmission): Promise<Provid
 const draft = new ProviderConnectionDraft({
   target: () =>
     selectedOption
-      ? { kind: 'create', descriptor: selectedOption.descriptor, channel: selectedOption.channel }
+      ? { kind: 'create', descriptor: selectedOption.metadata, channel: selectedOption.channel }
       : undefined,
   api: admin.providers,
   writer: { write: writeProvider },
@@ -162,7 +155,7 @@ function handleOpenChange(nextOpen: boolean): void {
 async function chooseOption(option: ProviderOption): Promise<void> {
   const name = providerNameAfterOptionChange(draft.fields.name, selectedOption, option)
   const values: Record<string, unknown> = {}
-  for (const field of option.descriptor.config_fields) {
+  for (const field of option.metadata.config_fields) {
     if (!field.secret && field.default_json != null) values[field.key] = field.default_json
     else if (!field.secret && field.required && field.kind.type === 'bool') values[field.key] = false
   }
@@ -232,6 +225,14 @@ function saveProvider(): void {
     }
   }} />
 
+{#snippet providerOptionSource(option: ProviderOption)}
+  <p
+    class="mt-auto flex w-full min-w-0 flex-wrap items-baseline gap-x-2 gap-y-0.5 text-xs leading-relaxed text-muted-foreground">
+    <span class="font-technical break-all">{optionDirectoryId(option)}</span>
+    <span class="min-w-0 break-words">{optionPluginSource(option, localeState.current)}</span>
+  </p>
+{/snippet}
+
 {#snippet providerOptionCard(option: ProviderOption)}
   <button
     type="button"
@@ -244,9 +245,10 @@ function saveProvider(): void {
     onclick={() => void chooseOption(option)}>
     <div class="flex w-full items-start gap-3">
       <ProviderMark
-        icon={option.descriptor.catalog_id ?? option.descriptor.provider_id}
+        icon={optionDirectoryId(option)}
         name={optionLabel(option, localeState.current)}
-        logo={option.descriptor.catalog_id ?? option.descriptor.provider_id} />
+        svg={option.metadata.icon_svg}
+        logo={optionDirectoryId(option)} />
       <div class="min-w-0 flex-1">
         <p class="line-clamp-2 text-pretty font-medium leading-snug">{optionLabel(option, localeState.current)}</p>
         <p class="mt-1 line-clamp-2 text-xs leading-relaxed text-muted-foreground">
@@ -254,6 +256,7 @@ function saveProvider(): void {
         </p>
       </div>
     </div>
+    {@render providerOptionSource(option)}
   </button>
 {/snippet}
 
@@ -360,6 +363,7 @@ function saveProvider(): void {
           saveProvider()
         }}>
         <div class="route-overlay-body">
+          <div class="mb-6">{@render providerOptionSource(selectedOption)}</div>
           <Field.Group class="grid gap-6 sm:grid-cols-2">
             <Field.Field size="name" class="sm:col-span-2">
               <Field.Label for="provider-name">{m.common_connection_name()}</Field.Label>
@@ -413,7 +417,7 @@ function saveProvider(): void {
             {/if}
             <ProviderConfigFields
               fields={configFields}
-              configGroups={selectedOption.descriptor.config_groups}
+              configGroups={selectedOption.metadata.config_groups}
               protocol={draft.fields.protocol || selectedOption.channel.protocol || ''}
               bind:values={draft.fields.values}
               satisfiedSecretFields={oauthSessionSecretFields}
@@ -427,7 +431,7 @@ function saveProvider(): void {
             <ProviderOAuthAuthorization
               class="mt-6"
               bind:this={oauthAuthorization}
-              vendorId={selectedOption.descriptor.provider_id}
+              vendorId={selectedOption.metadata.provider_id}
               channel={selectedOption.channel.id}
               flow={selectedOption.channel.auth!.flow}
               configuration={draft.oauthConfiguration}

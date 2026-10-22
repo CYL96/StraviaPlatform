@@ -3282,6 +3282,92 @@ async fn dedicated_profile_wholly_replaces_base_and_never_falls_back_when_its_ar
     Ok(())
 }
 
+async fn only_deepseek_card(
+    gateway: &Gateway,
+) -> anyhow::Result<stravia_core::plugin::ProviderMetadata> {
+    let mut cards: Vec<_> = gateway
+        .admin()
+        .list_selectable_vendor_metadata()
+        .await?
+        .into_iter()
+        .filter(|card| card.descriptor.provider_id == "deepseek")
+        .collect();
+    anyhow::ensure!(
+        cards.len() == 1,
+        "expected exactly one deepseek card, got {}",
+        cards.len()
+    );
+    Ok(cards.remove(0))
+}
+
+#[tokio::test]
+async fn management_metadata_names_the_loaded_plugin_and_returns_to_base_without_touching_connections()
+-> anyhow::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let gateway = Gateway::new(GatewayConfig {
+        data_dir: directory.path().to_owned(),
+        ..GatewayConfig::default()
+    })
+    .await?;
+    let saved = create_provider(
+        &gateway,
+        "DeepSeek connection created from base",
+        "deepseek",
+        "http://127.0.0.1:1",
+        "openai-compatible",
+    )
+    .await?;
+    let base_card = only_deepseek_card(&gateway).await?;
+    assert_eq!(base_card.plugin.id, "base");
+    assert_eq!(base_card.plugin.name, "Stravia Base Providers");
+    assert_eq!(
+        base_card.descriptor,
+        gateway.admin().vendor_metadata("deepseek")?
+    );
+
+    install_fixture(&gateway, "capability-dedicated-deepseek.wasm", false).await?;
+    let dedicated_card = only_deepseek_card(&gateway).await?;
+    assert_eq!(dedicated_card.plugin.id, "deepseek");
+    assert_eq!(
+        dedicated_card.plugin.name,
+        "Capability Contract (dedicated-deepseek)"
+    );
+    assert_eq!(dedicated_card.descriptor.provider_id, "deepseek");
+    assert_eq!(
+        dedicated_card.descriptor.catalog_id.as_deref(),
+        Some("deepseek")
+    );
+    assert_eq!(
+        dedicated_card
+            .descriptor
+            .channels
+            .iter()
+            .map(|channel| channel.id.as_str())
+            .collect::<Vec<_>>(),
+        ["dedicated"],
+        "a channel that no base channel matches keeps its own card and name"
+    );
+    assert_eq!(
+        dedicated_card.descriptor,
+        gateway.admin().vendor_metadata("deepseek")?,
+        "runtime resolution reports the raw dedicated profile"
+    );
+
+    gateway.admin().uninstall_vendor_plugin("deepseek").await?;
+    let restored_card = only_deepseek_card(&gateway).await?;
+    assert_eq!(restored_card, base_card);
+    assert_eq!(
+        restored_card.descriptor,
+        gateway.admin().vendor_metadata("deepseek")?
+    );
+
+    let retained = gateway.admin().get_provider(&saved.id).await?;
+    assert_eq!(retained.vendor.as_deref(), Some("deepseek"));
+    assert_eq!(retained.channel.as_deref(), Some("default"));
+    assert_eq!(retained.protocol, "openai-compatible");
+    Ok(())
+}
+
 #[tokio::test]
 async fn manually_installed_codex_component_reuses_one_connection_for_search_and_image()
 -> anyhow::Result<()> {
@@ -3293,6 +3379,7 @@ async fn manually_installed_codex_component_reuses_one_connection_for_search_and
         .list_vendor_metadata()
         .await?
         .into_iter()
+        .map(|card| card.descriptor)
         .find(|descriptor| descriptor.provider_id == "openai-codex")
         .expect("manually installed OpenAI Codex provider profile");
     let codex = descriptor

@@ -1,44 +1,86 @@
 import * as m from '#lib/paraglide/messages.js'
 import type { Locale } from '#lib/localization.svelte.js'
 import { resolvePluginText } from '#lib/plugin-text.js'
-import type { ProviderDescriptor, VendorChannelDescriptor } from '#lib/types.js'
+import type { ProviderMetadata, VendorChannelDescriptor } from '#lib/types.js'
 
+/**
+ * One selectable card: a provider profile channel as supplied by one plugin.
+ * `metadata.provider_id` stays the execution identity; the card key also carries
+ * the plugin so profiles from different plugins never collapse into one option.
+ */
 export interface ProviderOption {
   key: string
-  descriptor: ProviderDescriptor
+  metadata: ProviderMetadata
   channel: VendorChannelDescriptor
 }
 
-export function buildProviderOptions(descriptors: ProviderDescriptor[]): ProviderOption[] {
-  const options = descriptors.flatMap((descriptor) =>
-    descriptor.channels.map((channel) => ({ key: `${descriptor.provider_id}/${channel.id}`, descriptor, channel })),
+export function buildProviderOptions(entries: ProviderMetadata[]): ProviderOption[] {
+  const options = entries.flatMap((metadata) =>
+    metadata.channels.map((channel) => ({
+      key: `${metadata.plugin.id}/${metadata.provider_id}/${channel.id}`,
+      metadata,
+      channel,
+    })),
   )
   // The generic Custom profile covers any endpoint; pin it ahead of the branded vendors.
   return options.toSorted(
-    (left, right) =>
-      Number(right.descriptor.provider_id === 'custom') - Number(left.descriptor.provider_id === 'custom'),
+    (left, right) => Number(right.metadata.provider_id === 'custom') - Number(left.metadata.provider_id === 'custom'),
   )
 }
 
 export function optionLabel(option: ProviderOption, locale: Locale): string {
-  return option.descriptor.provider_id === 'custom'
+  return option.metadata.provider_id === 'custom'
     ? m.provider_options_custom({}, { locale })
-    : option.descriptor.display_name
+    : option.metadata.display_name
+}
+
+/** Directory identity shown on cards and used for the logo; never used to dispatch. */
+export function optionDirectoryId(option: ProviderOption): string {
+  return option.metadata.catalog_id ?? option.metadata.provider_id
+}
+
+export function optionPluginSource(option: ProviderOption, locale: Locale): string {
+  const { name, id } = option.metadata.plugin
+  return m.provider_options_plugin_source({ name, id }, { locale })
+}
+
+function optionAuthKind(option: ProviderOption, locale: Locale): string {
+  return option.channel.auth
+    ? m.common_oauth_account({}, { locale })
+    : option.metadata.config_fields.some((field) => field.secret && field.key === 'setup_token')
+      ? m.provider_options_setup_token({}, { locale })
+      : m.provider_options_api_key({}, { locale })
 }
 
 export function optionDescription(option: ProviderOption, locale: Locale): string {
-  const auth = option.channel.auth
-    ? m.common_oauth_account({}, { locale })
-    : option.descriptor.config_fields.some((field) => field.secret && field.key === 'setup_token')
-      ? m.provider_options_setup_token({}, { locale })
-      : m.provider_options_api_key({}, { locale })
+  const auth = optionAuthKind(option, locale)
   return option.channel.id === 'default' ? auth : `${resolvePluginText(option.channel.name, locale)} · ${auth}`
 }
 
+/** Search covers the displayed text plus the real provider id, directory id, and source plugin. */
+export function providerOptionMatches(option: ProviderOption, query: string, locale: Locale): boolean {
+  const needle = query.trim().toLocaleLowerCase(locale)
+  if (!needle) return true
+
+  const text = [
+    option.metadata.provider_id,
+    option.metadata.catalog_id ?? '',
+    option.metadata.plugin.name,
+    option.metadata.plugin.id,
+    optionLabel(option, locale),
+    option.channel.id,
+    resolvePluginText(option.channel.name, locale),
+    optionDescription(option, locale),
+    option.channel.auth ? 'oauth account 账号' : 'api key',
+  ].join(' ')
+
+  return text.toLocaleLowerCase(locale).includes(needle)
+}
+
 export function defaultProviderName(option: ProviderOption): string {
-  return option.descriptor.channels.length > 1
-    ? `${option.descriptor.display_name} ${resolvePluginText(option.channel.name, 'en-US')}`
-    : option.descriptor.display_name
+  return option.metadata.channels.length > 1
+    ? `${option.metadata.display_name} ${resolvePluginText(option.channel.name, 'en-US')}`
+    : option.metadata.display_name
 }
 
 export function providerNameAfterOptionChange(

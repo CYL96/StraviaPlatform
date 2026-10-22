@@ -169,8 +169,22 @@ pub(super) async fn list_loaded_extensions(State(gw): State<Gateway>) -> impl In
     }
 }
 
-pub(super) async fn list_vendor_metadata(State(gw): State<Gateway>) -> impl IntoResponse {
-    match gw.admin().list_vendor_metadata().await {
+#[derive(Default, Deserialize)]
+pub(super) struct VendorMetadataQuery {
+    #[serde(default)]
+    selectable: bool,
+}
+
+pub(super) async fn list_vendor_metadata(
+    State(gw): State<Gateway>,
+    Query(query): Query<VendorMetadataQuery>,
+) -> impl IntoResponse {
+    let result = if query.selectable {
+        gw.admin().list_selectable_vendor_metadata().await
+    } else {
+        gw.admin().list_vendor_metadata().await
+    };
+    match result {
         Ok(vendors) => Json(serde_json::json!({ "data": vendors })).into_response(),
         Err(e) => err(e),
     }

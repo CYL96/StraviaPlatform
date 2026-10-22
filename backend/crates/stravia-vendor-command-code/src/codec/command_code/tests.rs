@@ -542,6 +542,25 @@ fn private_projection_preserves_tool_calls_without_inventing_arguments() {
 }
 
 #[test]
+fn off_effort_uses_the_native_cli_value() {
+    use stravia_runtime_contract::thinking::{TargetThinkingControl, ThinkingLevel};
+
+    let mut request = AiRequest::new("deepseek/deepseek-v4.1-flash", Vec::new());
+    request.reasoning.level = Some(ThinkingLevel::Off);
+    let body = CommandCodeGenerateV1
+        .encode_request(request.clone())
+        .unwrap();
+    assert_eq!(body["params"]["reasoning_effort"], "off");
+
+    request.reasoning.level = Some(ThinkingLevel::High);
+    request.reasoning.target_control = Some(TargetThinkingControl::Effort {
+        value: "none".into(),
+    });
+    let body = CommandCodeGenerateV1.encode_request(request).unwrap();
+    assert_eq!(body["params"]["reasoning_effort"], "off");
+}
+
+#[test]
 fn private_thinking_control_only_encodes_effort() {
     use stravia_runtime_contract::thinking::TargetThinkingControl;
     let mut request = AiRequest::new("model", Vec::new());

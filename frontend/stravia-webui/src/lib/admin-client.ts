@@ -65,7 +65,7 @@ import type {
   UpdateRoute,
   UpdateProvider,
   UpdateWebProvider,
-  ProviderDescriptor,
+  ProviderMetadata,
   ProviderConfigurationPreview,
   ProviderConfigurationPreviewInput,
   WebAccessSettings,
@@ -182,7 +182,8 @@ export const admin = {
     get: (id: string) => request<ModelChangeRecord>('GET', `/model-changes/${encodeURIComponent(id)}`),
   },
   providers: {
-    descriptors: () => request<ProviderDescriptor[]>('GET', '/vendors'),
+    descriptors: () => request<ProviderMetadata[]>('GET', '/vendors'),
+    choices: () => request<ProviderMetadata[]>('GET', '/vendors?selectable=true'),
     list: () => request<Provider[]>('GET', '/providers'),
     create: (input: CreateProvider) => request<Provider>('POST', '/providers', input),
     previewConfiguration: (input: ProviderConfigurationPreviewInput) =>

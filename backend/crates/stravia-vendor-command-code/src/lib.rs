@@ -1,5 +1,6 @@
 mod allowance;
 mod codec;
+mod discovery;
 mod messages {
     include!(concat!(env!("OUT_DIR"), "/messages.rs"));
 }
@@ -13,20 +14,23 @@ use sha2::{Digest, Sha256};
 use stravia_protocol_codec::accumulator::StreamResponseAccumulator;
 use stravia_protocol_codec::transform::TextWireStreamParser;
 use stravia_runtime_contract::protocol::ir::{AiErrorKind, AiRequest, AiStreamDelta};
-use stravia_vendor_common::{common, thinking};
+use stravia_vendor_common::common;
 #[cfg(target_arch = "wasm32")]
 use stravia_vendor_sdk::VendorGuest;
 use stravia_vendor_sdk::{
     CANONICAL_FORMAT_VERSION, Capability, ChannelDescriptor, ConfigField, ConfigFieldKind,
-    ConfigGroup, ConfigValidationResponse, DataCompatibility, DiscoverResponse, DiscoveredModel,
-    ErrorKind, GuestHost, MODELS_SOURCE_CATALOG, NetworkDeclaration, Operation, OperationInput,
-    OperationOutput, OriginDeclaration, PluginError, ProviderDescriptor, ProviderSnapshot,
-    ValidationIssue, VendorDescriptor, VendorKind, read_http_body,
+    ConfigGroup, ConfigValidationResponse, DataCompatibility, ErrorKind, GuestHost,
+    NetworkDeclaration, Operation, OperationInput, OperationOutput, OriginDeclaration, PluginError,
+    ProviderDescriptor, ProviderSnapshot, ValidationIssue, VendorDescriptor, VendorKind,
+    read_http_body,
 };
 
 use crate::codec::{CommandCodeGenerateV1, CommandCodeStreamParser, DEFAULT_WORKING_DIR};
 
 const VENDOR_ID: &str = "command-code";
+/// Directory identity shared with the catalog and Base naming; the package and
+/// execution identity stay `command-code`.
+const CATALOG_ID: &str = "commandcode";
 const CHANNEL_ID: &str = "default";
 const PROTOCOL_VERSION: &str = "1.82.1";
 const DEFAULT_BASE_URL: &str = "https://api.commandcode.ai";
@@ -102,9 +106,9 @@ pub fn descriptor() -> VendorDescriptor {
         kind: VendorKind::Dedicated,
         providers: vec![ProviderDescriptor {
             provider_id: VENDOR_ID.into(),
-            catalog_id: Some(VENDOR_ID.into()),
+            catalog_id: Some(CATALOG_ID.into()),
             icon_svg: Some(include_str!("assets/command-code.svg").into()),
-            display_name: "Command Code".into(),
+            display_name: "CommandCode".into(),
             description: Some(
                 "Command Code CLI-compatible inference, model discovery, and allowance".into(),
             ),
@@ -217,7 +221,7 @@ pub fn execute(
             infer(host, provider, request)
         }
         (Operation::Discover, OperationInput::Discover { provider, .. }) => {
-            discover(host, &provider).map(OperationOutput::Discover)
+            discovery::execute(host, &provider).map(OperationOutput::Discover)
         }
         (Operation::Allowance, OperationInput::Allowance { provider, .. }) => {
             allowance::execute(host, &provider).map(OperationOutput::Allowance)
@@ -432,157 +436,6 @@ fn model_error(message: impl Into<String>) -> PluginError {
         ErrorKind::upstream(Some(AiErrorKind::ServerError), None),
         message,
     )
-}
-
-fn discover(
-    host: &GuestHost,
-    provider: &ProviderSnapshot,
-) -> Result<DiscoverResponse, PluginError> {
-    if let Some(response) = static_discovery(provider)? {
-        return Ok(response);
-    }
-    let key = api_key(provider)?;
-    let url = provider
-        .operation_metadata
-        .get("models_source")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|source| !source.is_empty() && *source != MODELS_SOURCE_CATALOG)
-        .map(str::to_string)
-        .unwrap_or_else(|| format!("{}/provider/v1/models", base_url(provider)));
-    let response = host.http_start(stravia_vendor_sdk::wit::types::HttpRequest {
-        method: "GET".into(),
-        url,
-        headers: identity_headers(key),
-        body: Vec::new(),
-    })?;
-    let status = response.status()?;
-    if !(200..300).contains(&status) {
-        return Err(http_error(
-            &response,
-            status,
-            "Command Code model discovery",
-        ));
-    }
-    let bytes = read_http_body(&response, MAX_BODY)?;
-    let value: Value = serde_json::from_slice(&bytes).map_err(|err| {
-        error(
-            ErrorKind::Invalid,
-            format!("invalid Command Code model catalog: {err}"),
-        )
-    })?;
-    let mut models = BTreeMap::new();
-    for item in value
-        .get("data")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        let Some(id) = item
-            .get("id")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|id| !id.is_empty())
-            .map(str::to_string)
-        else {
-            continue;
-        };
-        let display_name = item
-            .get("name")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|name| !name.is_empty())
-            .unwrap_or(&id)
-            .to_string();
-        let family = item
-            .get("family")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|family| !family.is_empty())
-            .map(str::to_string);
-        let selector = item
-            .get("selector")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|selector| !selector.is_empty())
-            .map(str::to_string)
-            .or_else(|| Some(id.clone()));
-        let capabilities = item
-            .get("capabilities")
-            .and_then(Value::as_array)
-            .map(|values| {
-                values
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default();
-        let metadata = item
-            .as_object()
-            .map(stravia_vendor_common::thinking::source_metadata)
-            .unwrap_or_default();
-        models.insert(
-            id.clone(),
-            DiscoveredModel {
-                id,
-                display_name,
-                family,
-                selector,
-                capabilities,
-                metadata,
-            },
-        );
-    }
-    if models.is_empty() {
-        return Err(error(
-            ErrorKind::Invalid,
-            "Command Code model discovery returned no model ids",
-        ));
-    }
-    Ok(DiscoverResponse {
-        models: models.into_values().collect(),
-        next_cursor: None,
-    })
-}
-
-fn static_discovery(provider: &ProviderSnapshot) -> Result<Option<DiscoverResponse>, PluginError> {
-    let Some(static_models) = provider.operation_metadata.get("static_models") else {
-        return Ok(None);
-    };
-    let values = static_models.as_array().ok_or_else(|| {
-        error(
-            ErrorKind::Invalid,
-            "operation_metadata.static_models must be a JSON array",
-        )
-    })?;
-    let mut models = BTreeMap::new();
-    for (index, value) in values.iter().enumerate() {
-        let id = value.as_str().ok_or_else(|| {
-            error(
-                ErrorKind::Invalid,
-                format!("operation_metadata.static_models[{index}] must be a string"),
-            )
-        })?;
-        let id = id.trim();
-        if id.is_empty() {
-            continue;
-        }
-        let mut model = DiscoveredModel {
-            id: id.to_owned(),
-            display_name: id.to_owned(),
-            family: None,
-            selector: None,
-            capabilities: Vec::new(),
-            metadata: BTreeMap::new(),
-        };
-        thinking::decorate_discovered_model(VENDOR_ID, &mut model);
-        models.entry(id.to_owned()).or_insert(model);
-    }
-    Ok(Some(DiscoverResponse {
-        models: models.into_values().collect(),
-        next_cursor: None,
-    }))
 }
 
 fn native_session_id(affinity: &str) -> String {

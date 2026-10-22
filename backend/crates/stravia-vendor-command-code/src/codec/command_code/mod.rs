@@ -101,12 +101,13 @@ impl CommandCodeGenerateV1 {
         insert_optional(&mut params, "temperature", request.generation.temperature);
         match request.reasoning.target_control {
             Some(stravia_runtime_contract::thinking::TargetThinkingControl::Effort { value }) => {
+                let value = if value == "none" { "off".into() } else { value };
                 params.insert("reasoning_effort".into(), Value::String(value));
             }
             None => {
                 if let Some(effort) = request.reasoning.level.map(|level| {
                     if level == stravia_runtime_contract::thinking::ThinkingLevel::Off {
-                        "none"
+                        "off"
                     } else {
                         level.as_str()
                     }

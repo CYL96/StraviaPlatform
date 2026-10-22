@@ -1,6 +1,6 @@
 import type { Page } from '@playwright/test'
 import type { UpdateStatus } from '../src/lib/product-update'
-import type { ProviderDescriptor } from '../src/lib/types'
+import type { ProviderMetadata } from '../src/lib/types'
 
 const codexManualInput = {
   type: 'callback_url',
@@ -9,9 +9,12 @@ const codexManualInput = {
   secret: false,
 } as const
 
+const basePlugin = { id: 'base', name: 'Stravia Base Providers' }
+
 const providerDescriptors = [
   {
     provider_id: 'openai',
+    plugin: basePlugin,
     catalog_id: 'openai',
     display_name: 'OpenAI',
     description: 'OpenAI API connections.',
@@ -44,6 +47,7 @@ const providerDescriptors = [
   },
   {
     provider_id: 'openai-codex',
+    plugin: { id: 'openai-codex', name: 'OpenAI Codex' },
     catalog_id: 'openai',
     display_name: 'OpenAI Codex',
     description: 'Codex OAuth account connections.',
@@ -103,6 +107,7 @@ const providerDescriptors = [
   },
   {
     provider_id: 'anthropic',
+    plugin: basePlugin,
     catalog_id: 'anthropic',
     display_name: 'Anthropic',
     description: 'Anthropic API connections.',
@@ -138,6 +143,7 @@ const providerDescriptors = [
   },
   {
     provider_id: 'openai-compatible',
+    plugin: basePlugin,
     catalog_id: null,
     display_name: 'OpenAI Compatible',
     description: 'Bring your own OpenAI-compatible endpoint.',
@@ -168,7 +174,7 @@ const providerDescriptors = [
     network: { base_url_field: null, extra_origins: [], field_origins: [] },
     data_compat: { config_fields_format: 1, private_state_format: 1, credentials_format: 1, model_metadata_format: 1 },
   },
-] satisfies ProviderDescriptor[]
+] satisfies ProviderMetadata[]
 
 const settingValues: Record<string, string> = {
   artifact_settings: JSON.stringify({

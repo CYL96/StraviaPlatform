@@ -933,7 +933,8 @@ async fn fresh_inventory_is_exactly_base_and_persists_no_wasm_artifact() -> anyh
             );
         }
     }
-    let profiles = gateway.admin().list_vendor_metadata().await?;
+    let metadata = gateway.admin().list_vendor_metadata().await?;
+    let profiles: Vec<_> = metadata.iter().map(|card| &card.descriptor).collect();
     for provider_id in ["command-code", "devin", "openai-codex", "xai-grok"] {
         assert!(
             profiles
@@ -955,7 +956,8 @@ async fn manually_installed_dedicated_packages_keep_complete_profiles() -> anyho
         assert_eq!(installed.status, "ready");
     }
 
-    let profiles = gateway.admin().list_vendor_metadata().await?;
+    let metadata = gateway.admin().list_vendor_metadata().await?;
+    let profiles: Vec<_> = metadata.iter().map(|card| &card.descriptor).collect();
     let profile = |provider_id: &str| {
         profiles
             .iter()
@@ -978,7 +980,7 @@ async fn manually_installed_dedicated_packages_keep_complete_profiles() -> anyho
     for (provider_id, catalog_id, channel_id) in [
         ("openai-codex", "openai", "codex"),
         ("xai-grok", "xai", "grok"),
-        ("command-code", "command-code", "default"),
+        ("command-code", "commandcode", "default"),
         ("devin", "devin", "devin"),
     ] {
         let dedicated = profile(provider_id);
@@ -1012,6 +1014,144 @@ async fn manually_installed_dedicated_packages_keep_complete_profiles() -> anyho
         "the manually installed dedicated packages must keep every previously public capability observable"
     );
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn management_metadata_reports_each_cards_loaded_plugin_and_keeps_runtime_identity()
+-> anyhow::Result<()> {
+    let (catalog_url, catalog_server) = local_upstream(6, |request| {
+        if request.path.ends_with("/version.json") {
+            MockResponse::json(json!({"revision":"picker-cards","generated_at":"2026-10-22"}))
+        } else if request.path.ends_with("/providers.json") {
+            MockResponse::json(json!({
+                "commandcode":{
+                    "id":"commandcode","name":"CommandCode","npm":"@ai-sdk/openai-compatible",
+                    "api":"https://api.commandcode.ai/provider/v1"
+                },
+                "openai":{
+                    "id":"openai","name":"OpenAI","npm":"@ai-sdk/openai",
+                    "api":"https://api.openai.com/v1"
+                },
+                "xai":{
+                    "id":"xai","name":"xAI","npm":"@ai-sdk/xai",
+                    "api":"https://api.x.ai/v1"
+                }
+            }))
+        } else if request.path.ends_with("/models.json") {
+            MockResponse::json(json!({"openai/test":{"id":"openai/test","name":"Catalog model"}}))
+        } else {
+            panic!("unexpected catalog request {}", request.path);
+        }
+    })
+    .await?;
+    let directory = tempfile::tempdir()?;
+    let gateway = Gateway::new(GatewayConfig {
+        data_dir: directory.path().to_path_buf(),
+        catalog_base_url: Some(catalog_url),
+        ..Default::default()
+    })
+    .await?;
+    gateway.catalog_sync.refresh().await?;
+    catalog_server.await??;
+    let base_command = gateway.admin().vendor_metadata("commandcode")?;
+    for vendor_id in ["command-code", "openai-codex", "xai-grok"] {
+        install_distributed_vendor_plugin(&gateway, vendor_id).await?;
+    }
+    let plugins = gateway.admin().list_vendor_plugins().await?;
+    let cards = gateway.admin().list_selectable_vendor_metadata().await?;
+    assert!(
+        cards
+            .iter()
+            .all(|card| card.descriptor.provider_id != "commandcode"),
+        "the external card replaces the matching base choice"
+    );
+    let metadata = gateway.admin().list_vendor_metadata().await?;
+    let retained_base = metadata
+        .iter()
+        .find(|card| card.descriptor.provider_id == "commandcode")
+        .expect("saved base connections still need their complete configuration descriptor");
+    assert_eq!(retained_base.plugin.id, "base");
+    assert_eq!(retained_base.descriptor, base_command);
+
+    let provider_ids = cards
+        .iter()
+        .map(|card| card.descriptor.provider_id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        provider_ids.len(),
+        cards.len(),
+        "no base card may duplicate an external one"
+    );
+    for card in &cards {
+        let plugin = plugins
+            .iter()
+            .find(|plugin| plugin.vendor_id == card.plugin.id)
+            .unwrap_or_else(|| panic!("card {} names an uninstalled plugin", card.plugin.id));
+        assert_eq!(plugin.status, "ready");
+        assert_eq!(plugin.name, card.plugin.name);
+    }
+
+    let card = |provider_id: &str| {
+        cards
+            .iter()
+            .find(|card| card.descriptor.provider_id == provider_id)
+            .unwrap_or_else(|| panic!("missing provider card {provider_id}"))
+    };
+    let command_code = card("command-code");
+    assert_eq!(command_code.plugin.id, "command-code");
+    assert_eq!(command_code.plugin.name, "Command Code");
+    assert_eq!(
+        command_code.descriptor.catalog_id.as_deref(),
+        Some("commandcode")
+    );
+    assert_eq!(command_code.descriptor.display_name, "CommandCode");
+
+    let openai = card("openai");
+    assert_eq!(openai.plugin.id, "base");
+    assert_eq!(openai.plugin.name, "Stravia Base Providers");
+    let codex = card("openai-codex");
+    assert_eq!(codex.plugin.id, "openai-codex");
+    assert_eq!(codex.descriptor.catalog_id.as_deref(), Some("openai"));
+    assert_eq!(codex.descriptor.display_name, "OpenAI Codex");
+    let xai = card("xai");
+    assert_eq!(xai.plugin.id, "base");
+    let grok = card("xai-grok");
+    assert_eq!(grok.plugin.id, "xai-grok");
+    assert_eq!(grok.descriptor.display_name, "xAI Grok");
+
+    // API-key and OAuth entries of one directory identity are different
+    // channels, so neither replaces the other.
+    for (api, dedicated, api_channel, dedicated_channel) in [
+        (openai, codex, "default", "codex"),
+        (xai, grok, "default", "grok"),
+    ] {
+        assert_eq!(api.descriptor.catalog_id, dedicated.descriptor.catalog_id);
+        assert!(
+            api.descriptor
+                .channels
+                .iter()
+                .any(|channel| channel.id == api_channel)
+        );
+        assert_eq!(
+            dedicated
+                .descriptor
+                .channels
+                .iter()
+                .map(|channel| channel.id.as_str())
+                .collect::<Vec<_>>(),
+            [dedicated_channel]
+        );
+    }
+
+    // The overlay is management-only: runtime profiles stay the raw ones.
+    for provider_id in ["command-code", "openai", "openai-codex", "xai", "xai-grok"] {
+        assert_eq!(
+            card(provider_id).descriptor,
+            gateway.admin().vendor_metadata(provider_id)?,
+            "runtime profile {provider_id} must not carry the picker overlay"
+        );
+    }
     Ok(())
 }
 
@@ -2372,10 +2512,33 @@ async fn deepseek_builtin_applies_thinking_and_tool_history_on_the_real_wire() -
 }
 
 #[tokio::test]
-async fn command_code_legacy_catalog_marker_still_discovers_from_the_connection_origin()
+async fn command_code_discovery_returns_subscription_models_with_native_efforts()
 -> anyhow::Result<()> {
-    let (base_url, server) = local_upstream(1, |_| {
-        MockResponse::json(json!({"data":[{"id":"command-local-model"}]}))
+    let (base_url, server) = local_upstream(3, |request| {
+        MockResponse::json(match request.path.as_str() {
+            "/alpha/whoami" => json!({"org":{"id":"org-local"}}),
+            "/alpha/billing/subscriptions?orgId=org-local" => {
+                json!({"success":true,"data":{"planId":"individual-go","status":"active"}})
+            }
+            "/provider/v1/models?view=client" => json!({"schemaVersion":1,"data":[
+                {
+                    "id":"deepseek/deepseek-v4.1-flash",
+                    "name":"DeepSeek V4.1 Flash (latest)",
+                    "category":"opensource",
+                    "minimumPlan":"individual-go",
+                    "context_length":1000000,
+                    "inputModalities":["text","image"],
+                    "reasoningEfforts":["off","low","high","max"]
+                },
+                {"id":"claude-sonnet-5-5","category":"opensource","minimumPlan":"individual-goat"},
+                {"id":"claude-opus-5-5","category":"premium","minimumPlan":"individual-provider"}
+            ]}),
+            _ => json!({"data":[
+                {"id":"deepseek/deepseek-v4.1-flash"},
+                {"id":"claude-sonnet-5-5"},
+                {"id":"claude-opus-5-5"}
+            ]}),
+        })
     })
     .await?;
     let (_directory, gateway) = gateway().await?;
@@ -2399,17 +2562,35 @@ async fn command_code_legacy_catalog_marker_still_discovers_from_the_connection_
             use_proxy: false,
         })
         .await?;
-    assert_eq!(provider.models_source.as_deref(), Some("catalog"));
+    gateway.admin().sync_provider_models(&provider.id).await?;
+    let models = gateway.admin().list_provider_models(&provider.id).await?;
     assert_eq!(
-        gateway.admin().get_provider_models(&provider.id).await?,
-        ["command-local-model"]
+        models
+            .models
+            .iter()
+            .map(|model| model.id.as_str())
+            .collect::<Vec<_>>(),
+        ["deepseek/deepseek-v4.1-flash"]
     );
-    let requests = server.await??;
-    assert_eq!(requests[0].path, "/provider/v1/models");
+    let model = gateway
+        .admin()
+        .get_provider_model(&provider.id, "deepseek/deepseek-v4.1-flash")
+        .await?;
     assert_eq!(
-        requests[0].headers.get("authorization").map(String::as_str),
-        Some("Bearer local-command-key")
+        serde_json::to_value(&model.metadata.reasoning_efforts)?,
+        json!(["none", "low", "high", "max"])
     );
+    assert_eq!(
+        model.metadata.limit.and_then(|limit| limit.context),
+        Some(1000000)
+    );
+    let modalities = model
+        .metadata
+        .modalities
+        .expect("declared model modalities");
+    assert_eq!(modalities.input, ["text", "image"]);
+    assert_eq!(modalities.output, ["text"]);
+    server.await??;
     Ok(())
 }
 
