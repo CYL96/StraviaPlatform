@@ -215,30 +215,78 @@ test('narrow screens coarsen a long custom range without truncating or horizonta
   ).toBe(false)
 })
 
-test('token breakdown keeps net input without adding cache subsets back', async ({ page }) => {
-  await prepareApp(page)
-  await stubStats(page)
-  await page.route('**/api/v1/stats/overview**', async (route) => {
-    await route.fulfill({
-      json: {
-        data: {
-          total_requests: 1,
-          total_input_tokens: 20,
-          total_output_tokens: 20,
-          total_cache_read_tokens: 80,
-          total_cache_write_tokens: 10,
-          total_reasoning_tokens: null,
-          avg_duration_ms: 1000,
-          avg_first_token_ms: 500,
-          avg_output_tps: 20,
-          error_count: 0,
+for (const scenario of [
+  {
+    name: 'includes net input, output, and both cache categories',
+    input: 20,
+    output: 20,
+    read: 80,
+    write: 10,
+    total: '130',
+    shares: [
+      ['Input Tokens', '15.38%'],
+      ['Output Tokens', '15.38%'],
+      ['Cache read tokens', '61.54%'],
+      ['Cache write tokens', '7.69%'],
+    ],
+  },
+  {
+    name: 'renders cache-only usage without inventing unreported input or output',
+    input: null,
+    output: null,
+    read: 80,
+    write: 10,
+    total: '90',
+    shares: [
+      ['Cache read tokens', '88.89%'],
+      ['Cache write tokens', '11.11%'],
+    ],
+  },
+  {
+    name: 'keeps reported zero categories distinct from unreported categories',
+    input: 0,
+    output: null,
+    read: 80,
+    write: 0,
+    total: '80',
+    shares: [
+      ['Input Tokens', '0%'],
+      ['Cache read tokens', '100%'],
+      ['Cache write tokens', '0%'],
+    ],
+  },
+] as const) {
+  test(`token breakdown ${scenario.name}`, async ({ page }) => {
+    await prepareApp(page)
+    await stubStats(page)
+    await page.route('**/api/v1/stats/overview**', async (route) => {
+      await route.fulfill({
+        json: {
+          data: {
+            total_requests: 1,
+            total_input_tokens: scenario.input,
+            total_output_tokens: scenario.output,
+            total_cache_read_tokens: scenario.read,
+            total_cache_write_tokens: scenario.write,
+            total_reasoning_tokens: null,
+            avg_duration_ms: 1000,
+            avg_first_token_ms: 500,
+            avg_output_tps: 20,
+            error_count: 0,
+          },
         },
-      },
+      })
     })
+    await page.goto('/stats')
+    const breakdown = page.getByRole('region', { name: 'Token breakdown', exact: true })
+    await expect(breakdown).toBeVisible()
+    await expect(breakdown.getByText(scenario.total, { exact: true })).toBeVisible()
+    const legend = breakdown.getByRole('listitem')
+    await expect(legend).toHaveCount(scenario.shares.length)
+    for (const [label, share] of scenario.shares) {
+      const category = legend.filter({ has: page.getByText(label, { exact: true }) })
+      await expect(category.getByText(label, { exact: true })).toBeVisible()
+      await expect(category.getByText(share, { exact: true })).toBeVisible()
+    }
   })
-  await page.goto('/stats')
-  const breakdown = page.getByRole('region', { name: 'Token breakdown', exact: true })
-  await expect(breakdown).toBeVisible()
-  await expect(breakdown.getByText('40', { exact: true })).toBeVisible()
-  await expect(breakdown.getByRole('listitem')).toHaveCount(2)
-})
+}

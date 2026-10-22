@@ -294,10 +294,11 @@ impl SqlCustomRuleStore {
     ) -> Result<CustomRule, CustomRuleError> {
         let input = input.validated()?;
         let spec = serde_json::to_string(&input.spec).map_err(|_| CustomRuleError::Storage)?;
-        let row: Option<Row> = match &self.backend {
-            Backend::Sqlite(pool) => {
-                let mut connection = pool.acquire_write().await.map_err(storage)?;
-                let row = sqlx::query_as(concat!(
+        let row: Option<Row> =
+            match &self.backend {
+                Backend::Sqlite(pool) => {
+                    let mut connection = pool.acquire_write().await.map_err(storage)?;
+                    let row = sqlx::query_as(concat!(
                     "UPDATE credential_custom_rules SET name = ?, description = ?, enabled = ?, \
                          spec = ?, updated_at = ? WHERE id = ? RETURNING ",
                     columns!()
@@ -311,11 +312,10 @@ impl SqlCustomRuleStore {
                 .fetch_optional(&mut *connection)
                 .await
                 .map_err(storage)?;
-                connection.finish().await.map_err(storage)?;
-                Ok(row)
-            }
-            Backend::Postgres(pool) => {
-                sqlx::query_as(concat!(
+                    connection.finish().await.map_err(storage)?;
+                    Ok(row)
+                }
+                Backend::Postgres(pool) => sqlx::query_as(concat!(
                     "UPDATE credential_custom_rules SET name = $1, description = $2, enabled = $3, \
                      spec = $4, updated_at = $5 WHERE id = $6 RETURNING ",
                     columns!()
@@ -327,10 +327,9 @@ impl SqlCustomRuleStore {
                 .bind(now())
                 .bind(id)
                 .fetch_optional(pool)
-                .await
+                .await,
             }
-        }
-        .map_err(storage)?;
+            .map_err(storage)?;
         row.ok_or(CustomRuleError::NotFound)?.into_rule()
     }
 

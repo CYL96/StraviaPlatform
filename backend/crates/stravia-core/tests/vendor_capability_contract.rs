@@ -3680,10 +3680,6 @@ async fn manually_installed_codex_component_reuses_one_connection_for_search_and
         );
         assert_eq!(turn["turn_id"], request.body["client_metadata"]["turn_id"]);
         assert_ne!(turn["turn_id"], "spoofed-turn");
-        assert_ne!(
-            request.headers["x-client-request-id"],
-            request.headers["thread-id"]
-        );
         assert!(!request.headers.contains_key("session_id"));
         assert!(!request.headers.contains_key("x-session-id"));
         assert!(!request.headers.contains_key("idempotency-key"));
@@ -3713,23 +3709,15 @@ async fn manually_installed_codex_component_reuses_one_connection_for_search_and
             Some("native-turn-state")
         );
     }
-    assert_eq!(
-        requests[0].headers["x-client-request-id"],
-        "independent-request-correlation"
-    );
-    assert_eq!(
-        requests[5].headers["x-client-request-id"],
-        "other-request-correlation"
-    );
     for header in ["session-id", "thread-id", "x-codex-window-id"] {
+        assert_eq!(
+            requests[0].headers[header], requests[1].headers[header],
+            "HTTP continuation retains the same principal-scoped session"
+        );
         assert_ne!(requests[0].headers[header], requests[5].headers[header]);
     }
     for (index, request) in requests.iter().enumerate() {
         for earlier in &requests[..index] {
-            assert_ne!(
-                request.headers["x-client-request-id"],
-                earlier.headers["x-client-request-id"]
-            );
             assert_ne!(
                 request.body["client_metadata"]["turn_id"],
                 earlier.body["client_metadata"]["turn_id"]
@@ -4093,10 +4081,15 @@ async fn manually_installed_codex_component_continues_client_tool_results_on_one
         handshakes[0]["authorization"],
         "Bearer controlled-codex-continuation-token"
     );
+    assert!(!handshakes[0].contains_key("x-codex-turn-metadata"));
+    assert!(!handshakes[0].contains_key("x-codex-turn-state"));
     for (turn, (socket, frame)) in frames.iter().enumerate() {
         assert_eq!(*socket, 0);
         assert_eq!(frame["type"], "response.create");
         let metadata = &frame["client_metadata"];
+        for (header, key) in [("session-id", "session_id"), ("thread-id", "thread_id")] {
+            assert_eq!(metadata[key], handshakes[0][header].to_str()?);
+        }
         let context: Value = serde_json::from_str(
             metadata["x-codex-turn-metadata"]
                 .as_str()
