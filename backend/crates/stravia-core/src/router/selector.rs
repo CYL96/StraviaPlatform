@@ -51,6 +51,12 @@ pub struct AttemptFailureSignal {
     pub jitter_sample: f64,
 }
 
+#[derive(Clone, Copy)]
+enum RetryAfterPolicy {
+    Wait(Duration),
+    Cooldown(Duration),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ConversationIdentity {
     GenerationParent(String),
@@ -238,6 +244,7 @@ impl RoutePolicyStateInner {
         retry_budget: i32,
         cooldown_ms: i64,
         now_ms: u64,
+        retry_after: Option<RetryAfterPolicy>,
     ) -> Option<u32> {
         let current = self.targets.get(target_key);
         if current.map_or(0, |runtime| runtime.epoch) != epoch {
@@ -246,14 +253,25 @@ impl RoutePolicyStateInner {
         let consecutive_failures = current
             .map_or(0, |runtime| runtime.consecutive_failures)
             .saturating_add(1);
+        let cooldown_ms = match retry_after {
+            Some(RetryAfterPolicy::Cooldown(delay)) => delay.as_millis() as u64,
+            _ => cooldown_ms.max(0) as u64,
+        };
         let should_cool = cooldown_ms > 0
-            && (consecutive_failures > retry_budget.max(0) as u32
+            && (matches!(retry_after, Some(RetryAfterPolicy::Cooldown(_)))
+                || consecutive_failures > retry_budget.max(0) as u32
                 || current.is_some_and(|runtime| runtime.probe_epoch == Some(epoch)));
         let next = TargetRuntime {
             consecutive_failures,
-            retry_after_until: current.map_or(0, |runtime| runtime.retry_after_until),
+            retry_after_until: match retry_after {
+                Some(RetryAfterPolicy::Wait(delay)) => current
+                    .map_or(0, |runtime| runtime.retry_after_until)
+                    .max(now_ms.saturating_add(delay.as_millis().min(u64::MAX as u128) as u64)),
+                Some(RetryAfterPolicy::Cooldown(_)) => now_ms.saturating_add(cooldown_ms),
+                None => current.map_or(0, |runtime| runtime.retry_after_until),
+            },
             cooldown_until: if should_cool {
-                now_ms.saturating_add(cooldown_ms as u64)
+                now_ms.saturating_add(cooldown_ms)
             } else {
                 0
             },
@@ -392,29 +410,26 @@ impl RoutePolicyState {
     ) -> Option<u32> {
         let now_ms = self.now_ms();
         let mut inner = self.inner.lock();
-        inner.record_failure(target_key, epoch, retry_budget, cooldown_ms, now_ms)
+        inner.record_failure(target_key, epoch, retry_budget, cooldown_ms, now_ms, None)
     }
 
     pub(crate) fn record_failure_with_retry_after(
         &self,
-        target_key: &str,
+        target: &SelectedTarget,
         epoch: u64,
-        retry_budget: i32,
-        cooldown_ms: i64,
         retry_after: Option<Duration>,
     ) {
+        let target_key = selected_target_key(target);
         let now_ms = self.now_ms();
         let mut inner = self.inner.lock();
-        if inner
-            .record_failure(target_key, epoch, retry_budget, cooldown_ms, now_ms)
-            .is_some()
-            && let Some(delay) = retry_after
-            && let Some(runtime) = inner.targets.get_mut(target_key)
-        {
-            runtime.retry_after_until = runtime
-                .retry_after_until
-                .max(now_ms.saturating_add(delay.as_millis().min(u64::MAX as u128) as u64));
-        }
+        inner.record_failure(
+            &target_key,
+            epoch,
+            target.target_retry_budget,
+            target.target_cooldown_ms,
+            now_ms,
+            retry_after_policy(target, retry_after),
+        );
     }
 
     /// Provider 内部恢复会吞掉原失败，只有仍可继续时在这里计数。
@@ -435,7 +450,14 @@ impl RoutePolicyState {
         {
             return false;
         }
-        inner.record_failure(target_key, epoch, retry_budget, cooldown_ms, self.now_ms());
+        inner.record_failure(
+            target_key,
+            epoch,
+            retry_budget,
+            cooldown_ms,
+            self.now_ms(),
+            None,
+        );
         true
     }
 
@@ -897,6 +919,11 @@ impl RouteAttemptPolicy {
             self.skip_current();
             return AttemptFailureDisposition::Stop;
         }
+        let retry_after = retry_after_policy(target, retry_after);
+        let retry_after_wait = match retry_after {
+            Some(RetryAfterPolicy::Wait(delay)) => Some(delay),
+            _ => None,
+        };
         let key = selected_target_key(target);
         // Never trust a stale signal timestamp over the evidence clock or the
         // state's own clock — the floor keeps cooldown writes monotonic.
@@ -907,15 +934,8 @@ impl RouteAttemptPolicy {
             target.target_retry_budget,
             target.target_cooldown_ms,
             now_ms,
+            retry_after,
         );
-        if failures.is_some()
-            && let Some(delay) = retry_after
-            && let Some(runtime) = self.state.inner.lock().targets.get_mut(&key)
-        {
-            runtime.retry_after_until = runtime
-                .retry_after_until
-                .max(now_ms.saturating_add(delay.as_millis().min(u64::MAX as u128) as u64));
-        }
         // 调用方只传入上游失败；除已提交输出和请求级错误外，任何上游错误都换 Target。
         if client_output_committed {
             self.skip_current();
@@ -923,19 +943,17 @@ impl RouteAttemptPolicy {
         }
         if !self.current_probe
             && !self.current_exception
-            && transient_failure(&kind)
+            && !matches!(retry_after, Some(RetryAfterPolicy::Cooldown(_)))
+            && (transient_failure(&kind)
+                || kind == AiErrorKind::QuotaExceeded && retry_after_wait.is_some())
             && let Some(failures) = failures
             && failures <= target.target_retry_budget.max(0) as u32
-            && (retry_after.is_some() || self.retry_current())
+            && (retry_after_wait.is_some() || self.retry_current())
         {
             let cap_ms = 500_u64
                 .saturating_mul(1_u64 << (failures - 1).min(4))
                 .min(8_000);
-            let delay = if kind == AiErrorKind::RateLimitError {
-                retry_after.unwrap_or_else(|| jitter(cap_ms, jitter_sample))
-            } else {
-                jitter(cap_ms, jitter_sample)
-            };
+            let delay = retry_after_wait.unwrap_or_else(|| jitter(cap_ms, jitter_sample));
             return AttemptFailureDisposition::RetrySame { delay };
         }
         self.skip_current();
@@ -1115,6 +1133,23 @@ fn transient_failure(kind: &AiErrorKind) -> bool {
 
 fn jitter(cap_ms: u64, sample: f64) -> Duration {
     Duration::from_secs_f64((cap_ms as f64 / 1_000.0) * sample.clamp(0.0, 1.0))
+}
+
+fn retry_after_policy(
+    target: &SelectedTarget,
+    retry_after: Option<Duration>,
+) -> Option<RetryAfterPolicy> {
+    retry_after.map(|delay| {
+        if target.first_token_timeout_ms > 0
+            && delay > Duration::from_millis(target.first_token_timeout_ms as u64)
+        {
+            RetryAfterPolicy::Cooldown(delay.min(Duration::from_millis(
+                target.target_cooldown_ms.max(0) as u64,
+            )))
+        } else {
+            RetryAfterPolicy::Wait(delay)
+        }
+    })
 }
 
 fn release_reservation(reservations: &mut HashMap<String, u64>, key: &str, amount: u64) {
@@ -1755,6 +1790,136 @@ mod tests {
             ),
             AttemptFailureDisposition::TryNextTarget
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_after_waits_within_first_token_window_and_otherwise_cools() {
+        for streamed in [false, true] {
+            for (first_token_ms, cooldown_ms, retry_after, wait_ms, cooling, kind) in [
+                (
+                    60_000,
+                    1_000,
+                    Duration::from_secs(3),
+                    3_000,
+                    false,
+                    AiErrorKind::RateLimitError,
+                ),
+                (
+                    60_000,
+                    1_000,
+                    Duration::from_secs(3),
+                    3_000,
+                    false,
+                    AiErrorKind::ServiceUnavailable,
+                ),
+                (
+                    60_000,
+                    120_000,
+                    Duration::from_secs(60),
+                    60_000,
+                    false,
+                    AiErrorKind::QuotaExceeded,
+                ),
+                (
+                    60_000,
+                    120_000,
+                    Duration::from_secs(61),
+                    61_000,
+                    true,
+                    AiErrorKind::QuotaExceeded,
+                ),
+                (
+                    60_000,
+                    120_000,
+                    Duration::from_secs(7095),
+                    120_000,
+                    true,
+                    AiErrorKind::RateLimitError,
+                ),
+                (
+                    60_000,
+                    0,
+                    Duration::from_secs(7095),
+                    0,
+                    true,
+                    AiErrorKind::RateLimitError,
+                ),
+                (
+                    0,
+                    1_000,
+                    Duration::from_secs(70),
+                    70_000,
+                    false,
+                    AiErrorKind::RateLimitError,
+                ),
+                (
+                    60_000,
+                    120_000,
+                    Duration::MAX,
+                    120_000,
+                    true,
+                    AiErrorKind::RateLimitError,
+                ),
+            ] {
+                let state = RoutePolicyState::default();
+                let mut configured = target("limited", 0);
+                configured.first_token_timeout_ms = first_token_ms;
+                configured.target_cooldown_ms = cooldown_ms;
+                let targets = [configured];
+                let mut policy = policy_at(&state, &targets, 0);
+                let limited = policy.next_healthy().expect("initial Target");
+                if streamed {
+                    state.record_failure_with_retry_after(
+                        &limited,
+                        policy.current_epoch(),
+                        Some(retry_after),
+                    );
+                } else {
+                    assert_eq!(
+                        policy.record_failure(
+                            &limited,
+                            AttemptFailureSignal {
+                                retry_after: Some(retry_after),
+                                ..failure_at(kind, 0)
+                            },
+                        ),
+                        if cooling {
+                            AttemptFailureDisposition::TryNextTarget
+                        } else {
+                            AttemptFailureDisposition::RetrySame {
+                                delay: Duration::from_millis(wait_ms),
+                            }
+                        },
+                    );
+                }
+                drop(policy);
+                if cooling && wait_ms > 0 {
+                    let status = state.target_status("limited:model");
+                    assert_eq!(status.state, TargetRuntimeState::CoolingDown);
+                    assert_eq!(status.cooldown_remaining_ms, Some(wait_ms));
+                }
+
+                if wait_ms > 0 {
+                    tokio::time::advance(Duration::from_millis(wait_ms - 1)).await;
+                    let mut waiting = policy_at(&state, &targets, wait_ms - 1);
+                    waiting.retain_eligible(&HashSet::new());
+                    assert!(waiting.is_empty(), "must respect the effective wait");
+                    assert!(
+                        policy_at(&state, &targets, wait_ms - 1)
+                            .next_healthy()
+                            .is_none()
+                    );
+                    tokio::time::advance(Duration::from_millis(1)).await;
+                }
+                let mut recovered = policy_at(&state, &targets, wait_ms);
+                recovered.retain_eligible(&HashSet::new());
+                assert_eq!(
+                    next_provider(&mut recovered).as_deref(),
+                    Some("limited"),
+                    "streamed={streamed}, cooldown_ms={cooldown_ms}, retry_after={retry_after:?}",
+                );
+            }
+        }
     }
 
     #[test]

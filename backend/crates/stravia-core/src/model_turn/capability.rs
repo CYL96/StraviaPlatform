@@ -549,8 +549,8 @@ impl Gateway {
                         last_error = Some(failure);
                         match disposition {
                             AttemptFailureDisposition::RetrySame { delay } => {
-                                // Preserve the upstream error when its required wait
-                                // cannot fit; failover must not retry this Target early.
+                                // Retry-After 在首 Token 窗口内时完整等待；
+                                // 总 deadline 放不下时保留上游错误并切换 Target。
                                 if retry_after.is_some() && delay >= context.deadline.remaining() {
                                     policy.skip_current();
                                     break;
