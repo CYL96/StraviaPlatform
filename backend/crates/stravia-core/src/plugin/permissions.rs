@@ -2,12 +2,87 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
 use stravia_vendor_sdk::{
-    Capability, MODELS_SOURCE_CATALOG, OriginDeclaration, ProviderDescriptor,
+    Capability, MODELS_SOURCE_CATALOG, OriginDeclaration, OriginHost, ProviderDescriptor,
 };
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum NetworkOrigin {
+    Exact(String),
+    HostRegex {
+        scheme: String,
+        port: u16,
+        regex: String,
+    },
+}
+
+impl std::fmt::Display for NetworkOrigin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Exact(origin) => f.write_str(origin),
+            Self::HostRegex {
+                scheme,
+                port,
+                regex,
+            } => {
+                write!(
+                    f,
+                    "{scheme} host regex /{regex}/ (full host match, port {port})"
+                )
+            }
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct NetworkPolicy(std::sync::Arc<CompiledNetworkPolicy>);
+
+#[derive(Default)]
+struct CompiledNetworkPolicy {
+    exact: BTreeSet<String>,
+    regex: Vec<(String, u16, regex::Regex)>,
+}
+
+impl NetworkPolicy {
+    pub(crate) fn compile(
+        origins: impl IntoIterator<Item = NetworkOrigin>,
+    ) -> anyhow::Result<Self> {
+        let mut policy = CompiledNetworkPolicy::default();
+        for origin in origins {
+            match origin {
+                NetworkOrigin::Exact(origin) => {
+                    policy.exact.insert(origin);
+                }
+                NetworkOrigin::HostRegex {
+                    scheme,
+                    port,
+                    regex,
+                } => {
+                    // 先验证原始语法，避免不平衡括号借外层分组逃逸完整 host 边界。
+                    // 无效声明使整个快照失败，不能静默丢弃权限后继续执行。
+                    regex::Regex::new(&regex)?;
+                    let regex = regex::Regex::new(&format!(r"\A(?:{regex})\z"))?;
+                    policy.regex.push((scheme, port, regex));
+                }
+            }
+        }
+        Ok(Self(std::sync::Arc::new(policy)))
+    }
+
+    pub(crate) fn allows(&self, url: &url::Url) -> bool {
+        self.0.exact.contains(&url.origin().ascii_serialization())
+            || url.host_str().is_some_and(|host| {
+                self.0.regex.iter().any(|(scheme, port, regex)| {
+                    url.scheme() == scheme
+                        && url.port_or_known_default() == Some(*port)
+                        && regex.is_match(host)
+                })
+            })
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NetworkGrant {
-    pub(crate) origin: String,
+    pub(crate) origin: NetworkOrigin,
     pub(crate) configuration_field: Option<String>,
     pub(crate) connection_scoped: bool,
 }
@@ -99,16 +174,36 @@ fn configured_string<'a>(
         .filter(|value| !value.is_empty())
 }
 
-fn declared_origin(declaration: &OriginDeclaration) -> anyhow::Result<String> {
+fn declared_origin(declaration: &OriginDeclaration) -> anyhow::Result<NetworkOrigin> {
+    anyhow::ensure!(
+        matches!(declaration.scheme.as_str(), "http" | "https" | "ws" | "wss"),
+        "network permission requires an HTTP or WebSocket scheme"
+    );
+    let host = match &declaration.host {
+        OriginHost::Exact(host) => host,
+        OriginHost::Regex { regex } => {
+            return Ok(NetworkOrigin::HostRegex {
+                scheme: declaration.scheme.clone(),
+                port: declaration.port.unwrap_or_else(|| {
+                    if matches!(declaration.scheme.as_str(), "https" | "wss") {
+                        443
+                    } else {
+                        80
+                    }
+                }),
+                regex: regex.clone(),
+            });
+        }
+    };
     let mut url = url::Url::parse(&format!("{}://localhost", declaration.scheme))?;
-    url.set_host(Some(&declaration.host))
+    url.set_host(Some(host))
         .map_err(|_| anyhow::anyhow!("invalid declared network origin host"))?;
     url.set_port(declaration.port)
         .map_err(|_| anyhow::anyhow!("invalid declared network origin port"))?;
     exact_origin(url.as_str())
 }
 
-fn exact_origin(value: &str) -> anyhow::Result<String> {
+fn exact_origin(value: &str) -> anyhow::Result<NetworkOrigin> {
     let url = url::Url::parse(value.trim())?;
     anyhow::ensure!(
         matches!(url.scheme(), "http" | "https" | "ws" | "wss")
@@ -118,5 +213,83 @@ fn exact_origin(value: &str) -> anyhow::Result<String> {
             && !url.host_str().is_some_and(|host| host.contains('*')),
         "network permission requires an exact HTTP or WebSocket origin without credentials"
     );
-    Ok(url.origin().ascii_serialization())
+    Ok(NetworkOrigin::Exact(url.origin().ascii_serialization()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn regex_policy(pattern: &str, port: Option<u16>) -> NetworkPolicy {
+        NetworkPolicy::compile([declared_origin(&OriginDeclaration {
+            scheme: "https".into(),
+            host: OriginHost::Regex {
+                regex: pattern.into(),
+            },
+            port,
+        })
+        .unwrap()])
+        .unwrap()
+    }
+
+    #[test]
+    fn regex_matches_only_full_canonical_host_with_declared_scheme_and_effective_port() {
+        let policy = regex_policy(r"cdn[0-9]+\.example\.com", None);
+        assert!(policy.allows(&url::Url::parse("https://CDN12.EXAMPLE.COM/image.png").unwrap()));
+        assert!(policy.allows(&url::Url::parse("https://cdn12.example.com:443/").unwrap()));
+        for value in [
+            "https://evilcdn12.example.com/",
+            "https://cdn12.example.com.evil.test/",
+            "https://evil.test/cdn12.example.com",
+            "http://cdn12.example.com/",
+            "wss://cdn12.example.com/",
+            "https://cdn12.example.com:8443/",
+        ] {
+            assert!(!policy.allows(&url::Url::parse(value).unwrap()), "{value}");
+        }
+        let alternate = regex_policy(r"cdn[0-9]+\.example\.com", Some(8443));
+        assert!(alternate.allows(&url::Url::parse("https://cdn1.example.com:8443/").unwrap()));
+        assert!(!alternate.allows(&url::Url::parse("https://cdn1.example.com/").unwrap()));
+    }
+
+    #[test]
+    fn malformed_regex_rejects_the_entire_permission_snapshot() {
+        let mut rules = vec![
+            declared_origin(&OriginDeclaration {
+                scheme: "https".into(),
+                host: OriginHost::Regex { regex: "[".into() },
+                port: None,
+            })
+            .unwrap(),
+        ];
+        rules.push(exact_origin("https://saved.example.com/path").unwrap());
+        assert!(NetworkPolicy::compile(rules).is_err());
+    }
+
+    #[test]
+    fn malformed_regex_cannot_escape_host_wrapper() {
+        let rule = NetworkOrigin::HostRegex {
+            scheme: "https".into(),
+            port: 443,
+            regex: r"x)\z|(?:.*".into(),
+        };
+        assert!(NetworkPolicy::compile([rule]).is_err());
+    }
+
+    #[test]
+    fn administrator_saved_values_remain_exact_origins() {
+        let policy =
+            NetworkPolicy::compile([exact_origin("https://SAVED.example.com:443/path").unwrap()])
+                .unwrap();
+        assert!(policy.allows(&url::Url::parse("https://saved.example.com/other").unwrap()));
+        for value in [
+            "https://sub.saved.example.com/",
+            "http://saved.example.com/",
+            "https://saved.example.com:8443/",
+        ] {
+            assert!(!policy.allows(&url::Url::parse(value).unwrap()));
+        }
+        assert!(exact_origin("https://*.example.com").is_err());
+        assert!(exact_origin("https://user:pass@example.com").is_err());
+    }
 }

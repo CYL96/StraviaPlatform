@@ -8297,6 +8297,7 @@ name = "stravia-vendor-sdk"
 version = "0.5.2"
 dependencies = [
  "base64 0.23.1",
+ "regex",
  "semver",
  "serde",
  "serde_json",

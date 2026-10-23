@@ -1,4 +1,3 @@
-use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -26,6 +25,7 @@ use tracing::Instrument as _;
 use crate::interaction_observation::{RunEvent, RunObserver};
 
 use super::lifecycle::VendorOperation;
+use super::permissions::NetworkPolicy;
 
 mod http;
 mod websocket;
@@ -235,7 +235,7 @@ impl Drop for VendorWebSocketPool {
 pub(crate) struct VendorNetwork {
     http: Client,
     websocket: Client,
-    origins: Arc<BTreeSet<String>>,
+    origins: NetworkPolicy,
     operation: Arc<VendorOperation>,
     cancellation: CancellationToken,
     protocol: String,
@@ -264,7 +264,7 @@ impl VendorNetwork {
     pub(crate) fn new(
         http: Client,
         websocket: Client,
-        origins: BTreeSet<String>,
+        origins: NetworkPolicy,
         operation: Arc<VendorOperation>,
         cancellation: CancellationToken,
         mut protocol: String,
@@ -277,7 +277,7 @@ impl VendorNetwork {
         Self {
             http,
             websocket,
-            origins: Arc::new(origins),
+            origins,
             operation,
             cancellation,
             protocol,
@@ -375,7 +375,7 @@ impl VendorNetwork {
                 "upstream URL has an unauthorized scheme or user information",
             ));
         }
-        if !self.origins.contains(&url.origin().ascii_serialization()) {
+        if !self.origins.allows(&url) {
             return Err(invalid(
                 "upstream origin is not authorized for this operation",
             ));

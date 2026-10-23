@@ -1172,7 +1172,7 @@ pub(crate) fn declared_permissions(
                 .into_iter()
                 .filter(|grant| static_origins.insert(grant.origin.clone()))
                 .map(|grant| PluginNetworkPermission {
-                    origin: grant.origin,
+                    origin: grant.origin.to_string(),
                     provider_id: None,
                     configuration_field: grant.configuration_field,
                     added: false,
@@ -1204,7 +1204,7 @@ pub(crate) fn declared_permissions(
             .into_iter()
             .filter(|grant| grant.connection_scoped)
             .map(|grant| PluginNetworkPermission {
-                origin: grant.origin,
+                origin: grant.origin.to_string(),
                 provider_id: Some(provider.id.clone()),
                 configuration_field: grant.configuration_field,
                 added: false,

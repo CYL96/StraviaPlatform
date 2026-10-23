@@ -7,7 +7,6 @@
 //! Catalog synchronization never receives provider credentials, private state,
 //! WebSockets, or model events.
 
-use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -24,6 +23,7 @@ use tokio::sync::Mutex;
 use super::lifecycle::VendorOperation;
 use super::manager::VendorPlugins;
 use super::network::VendorNetwork;
+use super::permissions::{NetworkOrigin, NetworkPolicy};
 use crate::provider_catalog::{
     CatalogError, CatalogModelList, CatalogModelSource, CatalogProviderScope,
     CatalogRefreshSummary, ProviderCatalog,
@@ -220,11 +220,12 @@ impl VendorCatalogSync {
         let (plugin, operation, _epoch) = self.plugins.acquire_package("base")?;
         let cancellation = CancellationToken::new();
         let deadline = Deadline::fixed(Instant::now() + SYNC_DEADLINE);
-        let origins = self
-            .catalog_base_url
-            .iter()
-            .cloned()
-            .collect::<BTreeSet<_>>();
+        let origins = NetworkPolicy::compile(
+            self.catalog_base_url
+                .iter()
+                .cloned()
+                .map(NetworkOrigin::Exact),
+        )?;
         let network = VendorNetwork::new(
             self.http.clone(),
             self.websocket.clone(),

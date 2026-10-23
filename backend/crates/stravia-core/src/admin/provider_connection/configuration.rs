@@ -283,7 +283,7 @@ pub(super) fn resolved_permissions(
             grants
                 .into_iter()
                 .map(|grant| ProviderNetworkPermission {
-                    origin: grant.origin,
+                    origin: grant.origin.to_string(),
                     configuration_field: grant.configuration_field,
                     connection_scoped: grant.connection_scoped,
                 })

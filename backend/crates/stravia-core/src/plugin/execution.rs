@@ -25,7 +25,7 @@ use crate::provider_models::ProviderModelRecord;
 
 use super::lifecycle::{VendorOperation, VendorPublicationFence};
 use super::network::VendorNetwork;
-use super::permissions::resolve_permissions;
+use super::permissions::{NetworkPolicy, resolve_permissions};
 use super::store::{PluginStorageError, PluginStore};
 
 #[derive(Debug, Clone)]
@@ -144,7 +144,7 @@ pub(crate) struct VendorSessionScope {
     pub(crate) data_epoch: i64,
     pub(crate) provider: ProviderSnapshot,
     pub(crate) private_state: Arc<Mutex<Option<Vec<u8>>>>,
-    origins: BTreeSet<String>,
+    origins: NetworkPolicy,
 }
 
 #[derive(Clone)]
@@ -157,7 +157,7 @@ pub(crate) struct PreparedVendorExecution {
     provider: ProviderSnapshot,
     oauth_connection_id: Option<String>,
     use_proxy: bool,
-    origins: BTreeSet<String>,
+    origins: NetworkPolicy,
     kind: Operation,
     /// ADR-0073：连接快照锁定的凭据代际，供上游凭据拒绝的条件写比对。
     credential_version: ProviderCredentialVersion,
@@ -244,17 +244,18 @@ impl Gateway {
             selected_channel(descriptor, &provider.channel)?,
             &provider.protocol,
         );
-        let origins = resolve_permissions(
-            descriptor,
-            Some(&provider.base_url),
-            None,
-            None,
-            &provider.options,
-            &provider.credentials,
-        )?
-        .into_iter()
-        .map(|grant| grant.origin)
-        .collect();
+        let origins = NetworkPolicy::compile(
+            resolve_permissions(
+                descriptor,
+                Some(&provider.base_url),
+                None,
+                None,
+                &provider.options,
+                &provider.credentials,
+            )?
+            .into_iter()
+            .map(|grant| grant.origin),
+        )?;
         drop(operation);
         Ok(VendorSessionScope {
             vendor_id: vendor_id.to_owned(),
@@ -884,7 +885,7 @@ impl Gateway {
         provider_id: Option<String>,
         session_state: Option<Arc<Mutex<Option<Vec<u8>>>>>,
         use_proxy: bool,
-        origins: BTreeSet<String>,
+        origins: NetworkPolicy,
         provider: ProviderSnapshot,
         request: VendorRequest,
         context: &VendorCallContext,
@@ -1020,7 +1021,7 @@ fn provider_snapshot(
     kind: Operation,
     discovery_source: Option<&str>,
     context: &VendorCallContext,
-) -> anyhow::Result<(ProviderSnapshot, bool, BTreeSet<String>)> {
+) -> anyhow::Result<(ProviderSnapshot, bool, NetworkPolicy)> {
     let use_proxy = connection.provider.use_proxy;
     let options = json_object(&connection.provider.vendor_options, "provider options")?;
     let saved_credentials = connection_credentials(&connection.provider)?;
@@ -1042,17 +1043,18 @@ fn provider_snapshot(
     }
     anyhow::ensure!(!base_url.trim().is_empty(), "provider base URL is missing");
     // OAuth/Guest 返回值不能成为新的目的地址授权来源。
-    let origins = resolve_permissions(
-        descriptor,
-        Some(&base_url),
-        discovery_source,
-        connection.provider.static_models.as_deref(),
-        &options,
-        &saved_credentials,
-    )?
-    .into_iter()
-    .map(|grant| grant.origin)
-    .collect();
+    let origins = NetworkPolicy::compile(
+        resolve_permissions(
+            descriptor,
+            Some(&base_url),
+            discovery_source,
+            connection.provider.static_models.as_deref(),
+            &options,
+            &saved_credentials,
+        )?
+        .into_iter()
+        .map(|grant| grant.origin),
+    )?;
     let mut credentials = saved_credentials;
     if let Some(oauth) = connection.oauth.as_ref() {
         extend_oauth_credentials(&mut credentials, oauth)?;

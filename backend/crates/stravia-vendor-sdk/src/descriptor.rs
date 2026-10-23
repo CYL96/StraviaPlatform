@@ -441,13 +441,36 @@ pub struct ConfigGroup {
     pub label: LocalizedText,
 }
 
-/// One exact additional origin the plugin is allowed to reach. No wildcards:
-/// host/port must be concrete.
+/// 固定声明的主机范围。精确主机保留 JSON 字符串形式，不支持通配符；
+/// 正则使用 `{"regex":"..."}`，只匹配规范化后的完整主机，不匹配 URL 或路径。
+///
+/// Host 将正则包装为 `\A(?:PATTERN)\z`，在操作快照中编译并冻结；
+/// 正则不会放宽声明的 scheme 和有效端口，运行时数据不能扩展权限。
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(untagged, deny_unknown_fields)]
+pub enum OriginHost {
+    Exact(String),
+    Regex { regex: String },
+}
+
+impl From<String> for OriginHost {
+    fn from(host: String) -> Self {
+        Self::Exact(host)
+    }
+}
+
+impl From<&str> for OriginHost {
+    fn from(host: &str) -> Self {
+        Self::Exact(host.into())
+    }
+}
+
+/// One additional origin scope the plugin is allowed to reach.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct OriginDeclaration {
     /// `http`, `https`, `ws`, or `wss`.
     pub scheme: String,
-    pub host: String,
+    pub host: OriginHost,
     /// `None` = scheme default port.
     pub port: Option<u16>,
 }
@@ -462,7 +485,8 @@ pub struct NetworkDeclaration {
     /// have to re-declare a field for it.
     #[serde(default)]
     pub base_url_field: Option<String>,
-    /// Exact extra origins (e.g. a fixed auth endpoint).
+    /// 固定的额外来源范围（如精确认证端点或正则 CDN 主机），在安装时声明，
+    /// 不接受 guest 输出、私有状态或上游响应追加权限。
     #[serde(default)]
     pub extra_origins: Vec<OriginDeclaration>,
     /// Config field keys whose *saved values* the host resolves into exact
@@ -830,8 +854,20 @@ impl ProviderDescriptor {
             if !matches!(origin.scheme.as_str(), "http" | "https" | "ws" | "wss") {
                 return Err(DescriptorError::BadOriginScheme(origin.scheme.clone()));
             }
-            if origin.host.is_empty() || origin.host.contains('*') {
-                return Err(DescriptorError::BadOriginHost(origin.host.clone()));
+            match &origin.host {
+                OriginHost::Exact(host) => {
+                    if host.is_empty() || host.contains('*') {
+                        return Err(DescriptorError::BadOriginHost(host.clone()));
+                    }
+                }
+                OriginHost::Regex { regex } => {
+                    // 先拒绝借外层括号才能闭合的表达式，再验证与 Host 相同的包装。
+                    if regex::Regex::new(regex).is_err()
+                        || regex::Regex::new(&format!(r"\A(?:{regex})\z")).is_err()
+                    {
+                        return Err(DescriptorError::BadOriginHostRegex(regex.clone()));
+                    }
+                }
             }
         }
         for field in &self.config_fields {
@@ -988,6 +1024,8 @@ pub enum DescriptorError {
     BadOriginScheme(String),
     #[error("origin host `{0}` is empty or contains a wildcard")]
     BadOriginHost(String),
+    #[error("origin host regex `{0}` is invalid for full-host matching")]
+    BadOriginHostRegex(String),
     #[error("enum field `{0}` declares no options")]
     EmptyEnum(String),
     #[error("enum field `{0}` declares a duplicate option value")]
@@ -999,6 +1037,102 @@ pub enum DescriptorError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exact_origin_hosts_preserve_string_wire_format_and_validation() {
+        let json = serde_json::json!({
+            "scheme": "https",
+            "host": "api.example.com",
+            "port": null
+        });
+        let declaration: crate::OriginDeclaration = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(
+            declaration.host,
+            crate::OriginHost::Exact("api.example.com".into())
+        );
+        assert_eq!(serde_json::to_value(&declaration).unwrap(), json);
+        let mut profile = provider("alpha");
+        profile.network.extra_origins.push(declaration);
+        assert_eq!(profile.validate(), Ok(()));
+        for host in ["", "*", "*.example.com"] {
+            profile.network.extra_origins[0].host = host.into();
+            assert_eq!(
+                profile.validate(),
+                Err(DescriptorError::BadOriginHost(host.into()))
+            );
+        }
+    }
+
+    #[test]
+    fn regex_origin_hosts_round_trip_and_validate_full_host_pattern() {
+        let json = serde_json::json!({
+            "scheme": "https",
+            "host": {"regex": r"cdn-[0-9]+\.example\.com|images\.example\.com"},
+            "port": 8443
+        });
+        let declaration: OriginDeclaration = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(
+            declaration.host,
+            OriginHost::Regex {
+                regex: r"cdn-[0-9]+\.example\.com|images\.example\.com".into()
+            }
+        );
+        assert_eq!(serde_json::to_value(&declaration).unwrap(), json);
+        let mut profile = provider("alpha");
+        profile.network.extra_origins.push(declaration);
+        assert_eq!(profile.validate(), Ok(()));
+        // 同时拒绝吞掉包装结尾的注释，以及借包装括号闭合并逃出锚点的表达式。
+        for pattern in ["[", "(?=cdn)", r"(?x)#", r"x)\z|(?:.*"] {
+            profile.network.extra_origins[0].host = OriginHost::Regex {
+                regex: pattern.into(),
+            };
+            assert_eq!(
+                profile.validate(),
+                Err(DescriptorError::BadOriginHostRegex(pattern.into()))
+            );
+        }
+        profile.network.extra_origins[0].host = OriginHost::Regex {
+            regex: r"cdn\.example\.com".into(),
+        };
+        profile.network.extra_origins[0].scheme = "file".into();
+        assert_eq!(
+            profile.validate(),
+            Err(DescriptorError::BadOriginScheme("file".into()))
+        );
+    }
+
+    #[test]
+    fn origin_host_rejects_wrong_ambiguous_and_unknown_shapes() {
+        for host in [
+            serde_json::Value::Null,
+            serde_json::json!(42),
+            serde_json::json!(true),
+            serde_json::json!([]),
+            serde_json::json!([".*"]),
+            serde_json::json!({}),
+            serde_json::json!({"exact": "api.example.com"}),
+            serde_json::json!({"regex": null}),
+            serde_json::json!({"regex": 42}),
+            serde_json::json!({"regex": ".*", "exact": "api.example.com"}),
+            serde_json::json!({"regex": ".*", "unknown": true}),
+        ] {
+            let json = serde_json::json!({
+                "scheme": "https",
+                "host": host,
+                "port": null
+            });
+            assert!(
+                serde_json::from_value::<OriginDeclaration>(json.clone()).is_err(),
+                "{json}"
+            );
+        }
+        assert!(
+            serde_json::from_str::<OriginDeclaration>(
+                r#"{"scheme":"https","host":{"regex":"safe","regex":".*"},"port":null}"#
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn authorization_code_without_listener_requires_manual_text_input() {

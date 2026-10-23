@@ -1,4 +1,3 @@
-use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -141,12 +140,138 @@ fn network(url: &str, pool: Arc<VendorWebSocketPool>) -> VendorNetwork {
     VendorNetwork::new(
         client.clone(),
         client,
-        BTreeSet::from([origin]),
+        crate::plugin::permissions::NetworkPolicy::compile([
+            crate::plugin::permissions::NetworkOrigin::Exact(origin),
+        ])
+        .unwrap(),
         operation,
         CancellationToken::new(),
         "open-responses".into(),
     )
     .with_websocket_pool(pool, "test-scope".into(), Some("response-id".into()))
+}
+
+#[tokio::test]
+async fn regex_policy_reauthorizes_http_redirect_before_sending() {
+    let destination = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let destination_url = format!("http://{}/forbidden", destination.local_addr().unwrap());
+    let reached = Arc::new(AtomicUsize::new(0));
+    let reached_by_handler = reached.clone();
+    let app = Router::new().route(
+        "/",
+        get(move || {
+            reached_by_handler.fetch_add(1, Ordering::SeqCst);
+            let destination_url = destination_url.clone();
+            async move { axum::response::Redirect::temporary(&destination_url) }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let url = format!("http://{address}/");
+    let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let mut network = network(&url, Arc::new(VendorWebSocketPool::default()));
+    network.origins = crate::plugin::permissions::NetworkPolicy::compile([
+        crate::plugin::permissions::NetworkOrigin::HostRegex {
+            scheme: "http".into(),
+            port: address.port(),
+            regex: r"127\.0\.0\.1".into(),
+        },
+    ])
+    .unwrap();
+    let response = network
+        .http_start(stravia_vendor_runtime::HttpRequest {
+            method: "GET".into(),
+            url,
+            headers: Vec::new(),
+            body: Vec::new(),
+            compression: None,
+        })
+        .unwrap();
+    let error = response
+        .status()
+        .await
+        .expect_err("redirect port is outside frozen policy");
+    assert!(matches!(error.kind, stravia_vendor_sdk::ErrorKind::Trapped));
+    assert_eq!(reached.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        destination.into_std().unwrap().accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock,
+    );
+    task.abort();
+}
+
+#[tokio::test]
+async fn regex_policy_reauthorizes_websocket_redirect_before_handshake() {
+    let destination = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let destination_url = format!("ws://{}/forbidden", destination.local_addr().unwrap());
+    let reached = Arc::new(AtomicUsize::new(0));
+    let reached_by_handler = reached.clone();
+    let app = Router::new().route(
+        "/",
+        get(move || {
+            reached_by_handler.fetch_add(1, Ordering::SeqCst);
+            let destination_url = destination_url.clone();
+            async move { axum::response::Redirect::temporary(&destination_url) }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let url = format!("ws://{address}/");
+    let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let mut network = network(&url, Arc::new(VendorWebSocketPool::default()));
+    network.origins = crate::plugin::permissions::NetworkPolicy::compile([
+        crate::plugin::permissions::NetworkOrigin::HostRegex {
+            scheme: "ws".into(),
+            port: address.port(),
+            regex: r"127\.0\.0\.1".into(),
+        },
+    ])
+    .unwrap();
+    let error = network
+        .ws_connect(WsRequest {
+            url,
+            headers: Vec::new(),
+            protocols: Vec::new(),
+            continuation_id: None,
+            reuse_max_age_millis: None,
+            compression: None,
+        })
+        .await
+        .err()
+        .expect("redirect port is outside frozen policy");
+    assert!(matches!(error.kind, stravia_vendor_sdk::ErrorKind::Trapped));
+    assert_eq!(reached.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        destination.into_std().unwrap().accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock,
+    );
+    task.abort();
+}
+
+#[tokio::test]
+async fn regex_policy_rejects_previously_authorized_pooled_websocket() {
+    let server = test_server().await;
+    let pool = Arc::new(VendorWebSocketPool::default());
+    let original = network(&server.url, pool.clone());
+    round_trip_and_park(&original, &server.url, "tip").await;
+    assert_eq!(pool.idle.lock().len(), 1);
+    let requested = reqwest::Url::parse(&server.url).unwrap();
+    let mut current = network(&server.url, pool.clone());
+    current.origins = crate::plugin::permissions::NetworkPolicy::compile([
+        crate::plugin::permissions::NetworkOrigin::HostRegex {
+            scheme: "ws".into(),
+            port: requested.port_or_known_default().unwrap(),
+            regex: "localhost".into(),
+        },
+    ])
+    .unwrap();
+    let error = require_tip(&current, &server.url, "tip", Vec::new())
+        .await
+        .err()
+        .expect("unauthorized pooled destination must not be reused");
+    assert!(matches!(error.kind, stravia_vendor_sdk::ErrorKind::Trapped));
+    assert_eq!(pool.idle.lock().len(), 1);
+    assert_eq!(server.connections.load(Ordering::SeqCst), 1);
 }
 
 async fn checkout(network: &VendorNetwork, url: &str) -> Arc<dyn HostWebSocket> {

@@ -706,7 +706,7 @@ fn config_groups(fields: &[ConfigField]) -> Vec<ConfigGroup> {
 fn origin(scheme: &str, host: &str) -> OriginDeclaration {
     OriginDeclaration {
         scheme: scheme.to_owned(),
-        host: host.to_owned(),
+        host: host.to_owned().into(),
         port: None,
     }
 }

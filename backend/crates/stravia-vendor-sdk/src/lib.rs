@@ -45,7 +45,7 @@ pub use descriptor::{
     Capability, ChannelDescriptor, ConfigField, ConfigFieldKind, ConfigGroup, DataCompatibility,
     DefaultModelsSource, EnumOption, FieldCondition, LocalizedText, MAX_PROVIDER_ICON_BYTES,
     MODEL_CAPABILITY_THINKING_TOGGLE, MODELS_SOURCE_CATALOG, NetworkDeclaration, OriginDeclaration,
-    ProviderDescriptor, VendorDescriptor, VendorKind,
+    OriginHost, ProviderDescriptor, VendorDescriptor, VendorKind,
 };
 pub use envelope::{
     CANONICAL_FORMAT_VERSION, CanonicalEnvelope, decode_payload, encode_payload,

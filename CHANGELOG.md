@@ -4,6 +4,7 @@
 
 ### Added
 
+- Added fixed host-regex declarations for plugin network origins alongside existing exact hosts. The SDK validates patterns; the host compiles full-host matches once per frozen operation policy and still requires the declared scheme and effective port. Invalid patterns reject the policy, redirects and pooled WebSockets remain checked, and runtime responses or private state cannot add permissions. Update the host before importing plugins that use regex declarations; no WIT or database change is required.
 - Added plugin-declared HTTP request compression and streaming response decompression for gzip, deflate, Brotli, and Zstandard, plus host-negotiated WebSocket permessage-deflate with disabled/preferred/required policies, bounded inflation, and compression-aware socket reuse. Claude Code declares its accepted response encodings; Codex requests preferred WS compression without replaying an unsuccessful negotiation.
 - Added a source-built Linux Server flake with embedded production WebUI and base Wasm vendor, locked offline build dependencies, and a `services.stravia` NixOS module. The service owns deployment flags and persistent directory permissions while the application retains its writable database/cache configuration and existing setup flow. Chromium remains optional; the existing devenv workflow is unchanged.
 

@@ -16,6 +16,7 @@ serde = { workspace = true }
 serde_json = { workspace = true, features = ["arbitrary_precision"] }
 base64 = { workspace = true }
 semver = { workspace = true }
+regex = { workspace = true }
 thiserror = { workspace = true }
 wit-bindgen = { workspace = true }
 
