@@ -1505,7 +1505,7 @@ async fn web_access_admin_routes_persist_masked_providers_and_atomic_priority() 
     Ok(())
 }
 
-// 内置-only vendor(command-code)必须能通过标准 catalog 流程创建;
+// 安装的专属 Vendor 必须能通过标准 catalog 流程创建；
 // 目录解析失败要返回结构化错误码,而不是 200 + 裸错误串。
 #[tokio::test]
 async fn provider_create_accepts_builtin_vendors_and_codes_catalog_mismatches() -> anyhow::Result<()>
@@ -1540,8 +1540,7 @@ async fn provider_create_accepts_builtin_vendors_and_codes_catalog_mismatches() 
     assert_eq!(channel["base_url"], "https://api.commandcode.ai");
     let fingerprint = channel["fingerprint"].as_str().expect("fingerprint");
 
-    // 模型清单来自 `/provider/v1/models`(HTTP 发现),用本地 mock 提供
-    // 真实 API 的 OpenAI 兼容格式,避免 E2E 触达生产服务。
+    // 发现必须同时验证账号订阅与客户端目录；所有端点均由本地夹具提供。
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let mock_models = axum::routing::get(|| async {
@@ -1553,6 +1552,7 @@ async fn provider_create_accepts_builtin_vendors_and_codes_catalog_mismatches() 
                     "object": "model",
                     "owned_by": "command-code",
                     "name": "DeepSeek V4 Pro (latest)",
+                    "minimumPlan": "individual-pro",
                     "context_length": 1000000
                 },
                 {
@@ -1560,6 +1560,7 @@ async fn provider_create_accepts_builtin_vendors_and_codes_catalog_mismatches() 
                     "object": "model",
                     "owned_by": "command-code",
                     "name": "Claude Fable 5",
+                    "minimumPlan": "individual-pro",
                     "context_length": 1000000
                 },
                 {
@@ -1567,6 +1568,7 @@ async fn provider_create_accepts_builtin_vendors_and_codes_catalog_mismatches() 
                     "object": "model",
                     "owned_by": "command-code",
                     "name": "CCC Private 1",
+                    "minimumPlan": "individual-pro",
                     "context_length": 64000
                 }
             ]
@@ -1575,7 +1577,23 @@ async fn provider_create_accepts_builtin_vendors_and_codes_catalog_mismatches() 
     let server = tokio::spawn(async move {
         axum::serve(
             listener,
-            axum::Router::new().route("/provider/v1/models", mock_models),
+            axum::Router::new()
+                .route("/provider/v1/models", mock_models)
+                .route(
+                    "/alpha/whoami",
+                    axum::routing::get(|| async {
+                        axum::Json(serde_json::json!({"org": {"id": "test-org"}}))
+                    }),
+                )
+                .route(
+                    "/alpha/billing/subscriptions",
+                    axum::routing::get(|| async {
+                        axum::Json(serde_json::json!({
+                            "success": true,
+                            "data": {"planId": "individual-pro", "status": "active"}
+                        }))
+                    }),
+                ),
         )
         .await
     });
@@ -1609,7 +1627,6 @@ async fn provider_create_accepts_builtin_vendors_and_codes_catalog_mismatches() 
     let created_json: serde_json::Value = serde_json::from_slice(&created_body)?;
     assert_eq!(created_json["data"]["vendor"], "command-code");
     assert_eq!(created_json["data"]["protocol"], "command-code");
-    assert_eq!(created_json["data"]["preset_key"], "command-code");
     assert_eq!(
         created_json["data"]["base_url"],
         format!("http://{address}")

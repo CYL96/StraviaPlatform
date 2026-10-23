@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## [0.5.3] - 2026-10-23
+
+### Verification
+
+- Manual signed-update smoke checks were not run on Windows x86_64/ARM64 or Linux x86_64/ARM64 because this release environment has no four-platform device matrix. Automated release checks do not replace verification of native installation and relaunch behavior.
+
 ### Added
 
 - Added fixed host-regex declarations for plugin network origins alongside existing exact hosts. The SDK validates patterns; the host compiles full-host matches once per frozen operation policy and still requires the declared scheme and effective port. Invalid patterns reject the policy, redirects and pooled WebSockets remain checked, and runtime responses or private state cannot add permissions. Update the host before importing plugins that use regex declarations; no WIT or database change is required.
@@ -10,6 +16,7 @@
 
 ### Fixed
 
+- Corrected release-blocking Clippy diagnostics in regex-origin port defaults and updated the Server catalog regression fixture to supply Command Code subscription evidence, removing an obsolete incidental catalog-key assertion without changing production identity or entitlement rules.
 - Image Routes now schedule both text-to-image and image-to-image Targets without reference images, but exclude Targets without registered image input when references are present. Eligibility is rechecked before sending; priority, traffic/latency scheduling, retries, and failover remain shared with text Routes.
 - Explicit upstream Retry-After delays within the Target's First Token Timeout now wait in Stravia before retrying, without being shortened by the cooldown setting; quota errors with an explicit short recovery delay can also retry within the existing budget. Longer delays immediately cool the Target for the lesser of its configured cooldown and Retry-After, then fail over without retaining a longer hidden retry gate. Restarting the updated server clears legacy process-local retry gates without a manual database reset; saved allowance suspensions, invalid credentials, and disabled selections remain protected. Cancellation, request deadlines, retry budgets, and committed-output protections remain in force.
 - Provider selection cards now show their catalog identifier and source plugin, with source-aware search and provenance retained during connection setup. Core lets external plugins replace matching base catalog/channel choices while preserving independent external plugins and distinct API/OAuth channels; the complete metadata view remains available for editing saved connections. Replacing cards use the base catalog name; Command Code aligns with `CommandCode` / `commandcode` without changing its `command-code` execution identity or saved connections. Rebuild and re-import the standalone Command Code plugin to update its catalog metadata.

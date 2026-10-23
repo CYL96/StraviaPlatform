@@ -184,7 +184,7 @@ fn declared_origin(declaration: &OriginDeclaration) -> anyhow::Result<NetworkOri
         OriginHost::Regex { regex } => {
             return Ok(NetworkOrigin::HostRegex {
                 scheme: declaration.scheme.clone(),
-                port: declaration.port.unwrap_or_else(|| {
+                port: declaration.port.unwrap_or({
                     if matches!(declaration.scheme.as_str(), "https" | "wss") {
                         443
                     } else {
