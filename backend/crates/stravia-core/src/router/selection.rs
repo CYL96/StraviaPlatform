@@ -87,7 +87,7 @@ impl RouteSelector {
         cooldown: &CooldownAttempts,
         parent_target: &crate::router::GenerationParentTarget,
     ) -> Result<RouteAttemptPolicy, SelectionError> {
-        let eligible = self.output_eligible_targets(route).await?;
+        let eligible = self.modality_eligible_targets(route, false).await?;
         let conversation = conversation_identity(request);
         let conversation_affinity_target = match (&conversation, parent_target) {
             (
@@ -166,10 +166,13 @@ impl RouteSelector {
         principal: &Principal,
         route: &RouteConfig,
         estimated_input_tokens: u64,
+        requires_image: bool,
         observer: Option<&RunObserver>,
         cooldown: &CooldownAttempts,
     ) -> Result<RouteAttemptPolicy, SelectionError> {
-        let eligible = self.output_eligible_targets(route).await?;
+        let eligible = self
+            .modality_eligible_targets(route, requires_image)
+            .await?;
         let snapshot = self
             .scheduling_snapshot(&route.targets, observer)
             .await
@@ -201,9 +204,10 @@ impl RouteSelector {
         Ok(policy)
     }
 
-    async fn output_eligible_targets(
+    async fn modality_eligible_targets(
         &self,
         route: &RouteConfig,
+        requires_image: bool,
     ) -> Result<std::collections::HashSet<String>, SelectionError> {
         let modality = route
             .output_modality
@@ -216,7 +220,17 @@ impl RouteSelector {
                 .find(target.provider_id().as_str(), target.model().as_str())
                 .await
                 .map_err(SelectionError::SchedulingEvidence)?;
-            if model.is_some_and(|model| model.metadata.supports_route_output_modality(modality)) {
+            if model.is_some_and(|model| {
+                model.metadata.supports_route_output_modality(modality)
+                    && (!requires_image
+                        || model
+                            .metadata
+                            .modalities
+                            .as_ref()
+                            .is_some_and(|modalities| {
+                                stravia_media::platform::supports_image(&modalities.input)
+                            }))
+            }) {
                 eligible.insert(target_key(
                     target.provider_id().as_str(),
                     target.model().as_str(),
@@ -1090,6 +1104,7 @@ mod tests {
                     &principal(),
                     &route,
                     12_345,
+                    false,
                     None,
                     &CooldownAttempts::default(),
                 )

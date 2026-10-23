@@ -34,13 +34,21 @@ Core 统一管理已保存 OAuth 连接的刷新，不由各管理入口或 Vend
 | `stravia-vendor-base` | `base` / `fallback` | 除下列专属 Profile 外的全部现有供应商；`openai`、`xai`、`anthropic` 仅保留普通 API channel。 |
 | `stravia-vendor-codex` | `openai-codex` / `dedicated` | `provider_id = openai-codex`、`catalog_id = openai`、channel `codex`。 |
 | `stravia-vendor-grok` | `xai-grok` / `dedicated` | `provider_id = xai-grok`、`catalog_id = xai`、channel `grok`。 |
-| `stravia-vendor-command-code` | `command-code` / `dedicated` | `provider_id = command-code`、`catalog_id = command-code`、channel `default`。 |
+| `stravia-vendor-command-code` | `command-code` / `dedicated` | `provider_id = command-code`、`catalog_id = commandcode`、channel `default`；目录名称为 `CommandCode`。 |
 | `stravia-vendor-devin` | `devin` / `dedicated` | `provider_id = devin`、`catalog_id = devin`、channel `devin`。 |
 | `stravia-vendor-claudecode` | `claude-code` / `dedicated` | `provider_id = claude-code`、`catalog_id = anthropic`、channel `oauth`。 |
 | `stravia-vendor-antigravity` | `antigravity` / `dedicated` | `provider_id = antigravity`、无目录映射、channel `oauth`；模型与额度来自登录账号。 |
 | `stravia-vendor-opencode-free` | `opencode-free` / `dedicated` | `provider_id = opencode-free`、`catalog_id = opencode`、channel `default`。 |
 | `stravia-vendor-muse-code` | `muse-code` / `dedicated` | `provider_id = muse-code`、`catalog_id = meta`、channel `subscription`。 |
 | `stravia-vendor-kilo` | `kilo` / `dedicated` | `provider_id = kilo`、`catalog_id = kilo`、channel `default`。 |
+
+### 供应商选择器与来源
+
+管理接口 `GET /api/v1/vendors` 返回完整有效的 Provider 元数据，供已有连接读取配置；新建连接使用 `GET /api/v1/vendors?selectable=true` 获取应用替代规则后的候选列表，两者不共用查询缓存。原描述符字段保持扁平布局，新增 `plugin: { id, name }`，由宿主从实际加载的软件包身份及名称生成。卡片与连接配置步骤显示目录标识、来源插件名称和插件 ID；搜索同时覆盖展示名称、目录标识、执行身份及插件来源。
+
+Core 以「目录身份 + channel ID」处理选择器中的替代关系：目录身份优先使用 `catalog_id`，未声明时使用 `provider_id`。外部插件声明同一入口时，仅隐藏 `base` 对应 channel 的卡片，并沿用该 base Profile 的展示名称；未匹配的 base channel 继续可选。不同外部插件即使声明相同目录入口也各自保留，不能互相覆盖；不同 channel 的 API 与 Codex／OAuth 接入不合并。卸载外部插件后，原 base 入口重新可选。相同执行身份的已安装包接管及 retired Profile 隐藏规则保持不变。
+
+上述替代仅作用于新建连接的选择列表，不改变运行时描述符、执行解析或已保存连接。WebUI 始终使用所选 Profile 的 `provider_id` 和 channel 创建连接，不能拿目录 ID 分发。例如 Command Code 展示 `CommandCode`／`commandcode`，来源为 `Command Code (command-code)`，执行身份仍为 `command-code`。升级宿主后还须重新构建并导入独立插件，才能更新旧组件自带的目录标识；不迁移连接 UUID、凭据、Route 或历史。
 
 ### 客户端身份版本
 
@@ -127,6 +135,17 @@ Devin 的两个固定 namespace 区分原有两种独立身份，不是字段级
 |其他插件|各自既有固定官方协议／工具源码、模型目录与 OMP 实现|通过实际 Wasm 合同验证投影与流式解析，不把离线 fixture 当作账号资格证明。Muse Code 账号授权与 Kilo OAuth 仍需要对应账号。|
 
 上述 CLI 捕获均使用合成凭据、隔离配置与 loopback 接收器，返回受控错误，不执行模型工具，不产生官方服务调用。它们证明工具构造出的参数形态，不证明上游接受任意字段取值；授权的真实调用另行验证成功终态。真实 Codex HTTP 对同一可用模型的 `stream:false` 返回 400／`stream must be set to true`，改为 `stream:true` 后返回 200 并完成。插件因此对非 compact 操作固定使用官方流式 wire；客户端可继续选择非流式响应，由宿主汇总结果，canonical 的交付选择不被改写。compact 保持其官方非流式契约。
+
+### Command Code 模型发现
+
+模型获取、订阅筛选与规格解析全部属于 `stravia-vendor-command-code`，Core 和 WebUI 只消费统一的 `DiscoveredModel`，不维护 Command Code 的套餐或字段分支。
+
+- 插件在连接 origin 下读取 `/alpha/whoami`，以返回的 `org.id` 查询 `/alpha/billing/subscriptions?orgId=...`，再读取 `/provider/v1/models?view=client`。客户端目录是全量目录，不是账号已获授权的模型列表；裸 `/provider/v1/models` 不提供完整的模型能力与订阅要求。目录与订阅规则依据[官方 CLI 1.87.1 发行物](https://unpkg.com/command-code@1.87.1/dist/cli.mjs)，不改变上表中的推理客户端身份版本。
+- 只有 `active`、`trialing`、`past_due` 状态提供当前订阅身份。插件按官方套餐顺序与每行的 `minimumPlan` 筛选，排除隐藏模型；未提供 `minimumPlan` 时使用官方 `opensource`／`premium` 分类规则，显式 `null` 不授予订阅访问。这里只列出订阅权益，不因充值或赠送余额解锁额外付费模型。无有效订阅、未知套餐、订阅查询失败或筛选后没有模型时明确报错，不退回全量目录或发布一个空库存。
+- 插件将 `context_length` 和 `inputModalities` 转为统一上下文与模态规格，将 `reasoningEfforts` 转为 `reasoning_efforts`。目录的 `off` 在统一规格中表示为 `none`，供 Core 生成规范的 `off` 档映射；私有 codec 发送时再还原为 CLI 原生的 `reasoning_effort: "off"`。显式无 effort 声明保持为空列表，缺失声明保持未知，不硬编码具体型号的档位。
+- `static_models` 只能进一步缩小当前订阅允许的目录集合，不能添加未知或更高套餐的型号，也不绕过账号查询。显式 `models_source` 仍指定目录地址，但响应必须包含客户端目录所需的订阅要求；插件不把仅含 ID 的列表当作订阅权限证明。
+
+升级后重新构建并导入独立插件，再同步模型。来源托管的规格按既有同步规则更新；管理员已编辑的规格仍需显式 re-import，不自动覆盖，也不删除已有 Route 或 Target。
 
 ### OpenCode Zen Free 准入限制
 

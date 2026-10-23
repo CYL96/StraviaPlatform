@@ -27,5 +27,6 @@ pub(crate) use lifecycle::VendorPublicationFence;
 pub use store::PluginStore;
 pub use types::{
     ConfirmPluginUpdate, PluginBindingImpact, PluginDataDiscard, PluginNetworkPermission,
-    PluginPreview, PluginProvider, PluginSource, PluginSummary,
+    PluginPreview, PluginProvider, PluginSource, PluginSummary, ProviderMetadata,
+    ProviderPluginSource,
 };

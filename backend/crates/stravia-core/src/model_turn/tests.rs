@@ -263,6 +263,19 @@ async fn retry_after_outside_shared_window_preserves_upstream_error() {
 #[tokio::test]
 async fn retry_after_within_window_respects_delay() {
     let (_dir, gateway, key, calls) = retry_window_fixture("retry-window-delay", false, 1).await;
+    let provider = gateway
+        .admin()
+        .get_model("retry-window-delay")
+        .await
+        .unwrap()
+        .targets[0]
+        .provider_id()
+        .to_string();
+    let mut configured = thinking_target(&provider, &[], 20);
+    configured.first_token_timeout_ms = Some(2_000);
+    configured.target_retry_budget = Some(5);
+    configured.target_cooldown_ms = Some(100);
+    set_thinking_targets(&gateway, "retry-window-delay", vec![configured]).await;
     let turn = gateway
         .model_turn
         .execute(

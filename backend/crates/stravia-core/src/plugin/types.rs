@@ -22,6 +22,25 @@ pub struct PluginProvider {
     pub name: String,
 }
 
+/// The installed Vendor Component that supplied a provider profile. Read from
+/// the loaded component manifest, never from the profile itself.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ProviderPluginSource {
+    pub id: String,
+    pub name: String,
+}
+
+/// Management view of one provider profile. The JSON is the SDK
+/// profile's fields followed by `plugin`; `descriptor.provider_id` remains the
+/// execution identity, while `display_name` may be canonicalized for the
+/// picker (see `plugin::manager::provider_metadata`).
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ProviderMetadata {
+    #[serde(flatten)]
+    pub descriptor: stravia_vendor_sdk::ProviderDescriptor,
+    pub plugin: ProviderPluginSource,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct PluginNetworkPermission {
     pub origin: String,

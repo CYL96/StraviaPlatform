@@ -1100,6 +1100,7 @@
   "provider_editor_update_service_list": "Reload providers",
   "provider_options_api_key": "API key",
   "provider_options_custom": "Custom",
+  "provider_options_plugin_source": "Plugin: {name} ({id})",
   "provider_options_setup_token": "Setup token",
   "provider_model_catalog_clear_selected_model": "Clear selected model",
   "provider_model_catalog_clear_filters": "Clear filters",

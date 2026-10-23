@@ -1040,7 +1040,7 @@ Route 缓存发布与发送准入有原子先后顺序：资格读取期间发�
 
 SQLite/PostgreSQL `0014_remove_shared_rpm_pools` 删除已保存的池额度与目的地关联，不把池额度复制成独立限额；原池成员恢复不限，原本独立设置的目的地 RPM 与等待／队列参数保留。升级前备份数据库；需要限制原成员时，在对应模型服务的模型清单重新设置 RPM。
 
-本地发送等待耗尽为 `target_rpm_exceeded`（429，可确定恢复时间时附 `Retry-After`）；队列满为 `target_rpm_queue_full`（503，不伪造恢复时间）。`target_rpm_busy` 是发送前额度竞争变化的内部重新选路信号；取消与 deadline 分别保留 `cancelled`／`deadline_exceeded`。明确上游 `Retry-After` 仍是硬门禁，不能缩短重发；已有保留原上游错误的分支不改成普通等待超时。冷却额外尝试及请求错误隔离见 [ADR-0034](../adr/0034-layer-route-target-selection.md)。
+本地发送等待耗尽为 `target_rpm_exceeded`（429，可确定恢复时间时附 `Retry-After`）；队列满为 `target_rpm_queue_full`（503，不伪造恢复时间）。`target_rpm_busy` 是发送前额度竞争变化的内部重新选路信号；取消与 deadline 分别保留 `cancelled`／`deadline_exceeded`。明确上游 `Retry-After` 按 §12.8 区分内部完整等待和有界冷却；短等待不能截短后提前重发，长等待的共享门禁随有效冷却到期。已有保留原上游错误的分支不改成普通等待超时。冷却额外尝试及请求错误隔离见 [ADR-0034](../adr/0034-layer-route-target-selection.md)。
 
 ---
 
@@ -1459,13 +1459,17 @@ tests/stream/
 
 ### 12.8 Router 故障策略
 
-429 的显式 `Retry-After` 只在所需等待小于当前请求剩余 deadline 窗口时进行同 Target 重试；等待大于或等于剩余窗口时，推理和独立能力执行均跳过该 Target 并尝试其余合格目标。没有备用时立即返回原上游错误，不以等待耗尽后的 `deadline_exceeded` 覆盖它，也不缩短等待后提前重打限流目标。跳过等待仍只计入本次上游失败，不额外触发冷却或重复扣除 Target Retry Budget。
+显式 `Retry-After` 不大于 Target First Token Timeout 时，推理和独立能力执行在 Stravia 内部完整等待后重发同 Target，不提前向客户端返回该次限流；等待不按 `target_cooldown_ms` 截短。First Token Timeout 为 0 时关闭此时长上限。同 Target 重试仍受共享失败预算、半开／冷却额外尝试的单次限制、Client Output Commit、取消和总 deadline 约束。等待大于或等于当前请求剩余 deadline 时，跳过该 Target 并尝试其余合格目标；没有备用时立即返回原上游错误，不以等待耗尽后的 `deadline_exceeded` 覆盖它，也不截短等待后提前重发。
 
-`RouteAttemptPolicy` 统一 Target 分层选择、同 Target full-jitter 重试、QuotaExceeded 换 Target、First Token Timeout 与进程内 Target Cooldown。普通状态下，每个 `provider_id:model` 只有一份共享连续失败计数：同 Target 内部重试与跨请求终态上游失败都递增，完整成功清零。Target Retry Budget 为 N 表示第 N+1 次连续失败才触发冷却；缺省 5，即第 6 次失败后冷却 120 秒。瞬时失败是否在同 Target 重试仍由错误分类决定；QuotaExceeded 与 Authentication / Authorization、InvalidRequest、Unknown 等非瞬时上游错误计数并直接换 Target，不在同 Target 重试。ContextLength、ContentFiltered 与明确的请求级证据仍终止请求，不因计数改成同 Target 重试。用户取消、消费者断开以及本地准备、Hook、存储错误不计数。Client Output Commit 后仍禁止换 Target，只终止当前请求；Commit 本身不计数也不单独触发冷却，其后的真实上游失败仍计数。冷却为 0 时仅关闭冷却调度门禁；共享失败仍计数，达到阈值后仍按错误分类更换或停止 Target，完整成功仍清零。
+显式 `Retry-After` 大于已启用的 Target First Token Timeout 时，立即进入 `min(target_cooldown_ms, Retry-After)` 的共享冷却并切换其他合格 Target，不在当前请求里等待，也不要求先耗尽 Target Retry Budget。共享 Retry-After 门禁采用同一个有效冷却截止时间，不能在冷却到期后继续阻塞到原始 Retry-After。冷却为 0 时不建立共享等待，但本次请求仍跳过该 Target。每次上游失败只累计一次，不重复扣除预算。
 
-冷却结束进入半开，只在满足现有路由条件并实际选中时原子领取一个探测名额；探测期间其他请求跳过该 Target。半开只有一次上游尝试，同时关闭同 Target 预算重试与 ProviderCall 内部重试和回退；完整成功清零并恢复正常，任何上游探测失败（含已发出上游请求后的超时）立即重新冷却。用户取消、消费者断开和本地准备失败只释放探测名额，不伪造成功或失败。
+`RouteAttemptPolicy` 统一 Target 分层选择、同 Target full-jitter 重试、QuotaExceeded 换 Target、First Token Timeout 与进程内 Target Cooldown。普通状态下，每个 `provider_id:model` 只有一份共享连续失败计数：同 Target 内部重试与跨请求终态上游失败都递增，完整成功清零。除上述显式长 Retry-After 外，Target Retry Budget 为 N 表示第 N+1 次连续失败才触发冷却；缺省 5，即第 6 次失败后冷却 120 秒。瞬时失败是否在同 Target 重试仍由错误分类决定；QuotaExceeded 带有首 Token 时限内的显式 Retry-After 时可完整等待后重试，否则与 Authentication / Authorization、InvalidRequest、Unknown 等非瞬时上游错误一样计数并直接换 Target。ContextLength、ContentFiltered 与明确的请求级证据仍终止请求，不因计数改成同 Target 重试。用户取消、消费者断开以及本地准备、Hook、存储错误不计数。Client Output Commit 后仍禁止换 Target，只终止当前请求；Commit 本身不计数也不单独触发冷却，其后的真实上游失败仍计数。冷却为 0 时仅关闭冷却调度门禁；共享失败仍计数，达到阈值后仍按错误分类更换或停止 Target，完整成功仍清零。
+
+冷却结束进入半开，只在满足现有路由条件并实际选中时原子领取一个探测名额；探测期间其他请求跳过该 Target。半开只有一次上游尝试，同时关闭同 Target 预算重试与 ProviderCall 内部重试和回退；完整成功清零并恢复正常，任何上游探测失败（含已发出上游请求后的超时）立即重新冷却，显式长 Retry-After 仍使用上述有界时长。用户取消、消费者断开和本地准备失败只释放探测名额，不伪造成功或失败。
 
 计数与恢复状态由共享 `RoutePolicyState` 按 `provider_id:model` 管理；世代标识防止旧请求结果覆盖新的冷却或探测。冷却不取消已经开始执行的请求，但后续选择、重试以及异步准备后的准入会重新检查资格。不存在独立的固定 3 次失败 / 30 秒健康恢复规则，也不执行后台主动探测。
+
+连续失败数、冷却和 Retry-After 门禁仅保存在当前进程内，不写入数据库，也不从历史 Observation 重建。升级并重启后，旧版遗留的长 Retry-After 门禁自然清除，其他资格有效的 Target 可重新参与调度，无需手工清库或修改暂停标记。Provider 禁用、Credential Invalid、模型选择策略和额度暂停是持久化限制，仍按原规则生效；升级不会强制解封额度耗尽或凭据失效的 Provider。
 
 管理面通过已鉴权的 `GET /api/v1/models/{route_id}/target-statuses` 读取 `{data: [...]}`；`route_id` 是客户端 Model ID。每项包含 `target_id`、`provider_id`、`model`、`state`（`available` / `cooling_down` / `half_open` / `probing`）和 `cooldown_remaining_ms`（仅冷却期间为剩余毫秒，其余为 `null`）。没有失败记录的 `available` 仅表示允许调度，不代表主动健康检测成功。WebUI 使用独立查询在页面可见时每 2 秒刷新，不覆盖编辑草稿；读取失败停止周期刷新并提供重试，未知状态不显示为健康。
 

@@ -352,6 +352,12 @@ export interface ProviderDescriptor {
   data_compat: VendorDataCompatibility
 }
 
+/** Management DTO for a descriptor actually supplied by an installed plugin. */
+export interface ProviderMetadata extends ProviderDescriptor {
+  /** Loaded vendor package identity resolved by the host; profile self-reporting is ignored. */
+  plugin: { id: string; name: string }
+}
+
 export interface ProviderConfigurationPreviewInput {
   /** Saved connection UUID when reviewing an existing connection. */
   provider_id?: string

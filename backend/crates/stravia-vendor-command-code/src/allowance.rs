@@ -81,7 +81,7 @@ pub(crate) fn execute(
     Ok(parsed)
 }
 
-fn commandcode_request(
+pub(super) fn commandcode_request(
     base_url: &str,
     credential: &str,
     path: &str,

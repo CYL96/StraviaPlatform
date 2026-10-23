@@ -218,6 +218,8 @@ impl Gateway {
         self.validate_vendor_route_capability(route, capability)
             .await?;
 
+        let requires_image =
+            matches!(&request, VendorRequest::MediaImage(request) if !request.references.is_empty());
         let estimated_input_tokens = estimated_input_tokens(&request);
         let mut capability_observation =
             CapabilityObservation::new(context.observer.clone(), route, estimated_input_tokens);
@@ -247,6 +249,7 @@ impl Gateway {
                         principal,
                         current_route,
                         estimated_input_tokens,
+                        requires_image,
                         context.observer.as_ref(),
                         &context.root_request.cooldown,
                     )
@@ -429,7 +432,7 @@ impl Gateway {
                             single_attempt: policy.current_is_probe(),
                             capability,
                             requires_video: false,
-                            requires_image: false,
+                            requires_image,
                         }),
                     });
                     attempt_context.model_turn_id = Some(capability_observation.id.clone());
@@ -549,8 +552,8 @@ impl Gateway {
                         last_error = Some(failure);
                         match disposition {
                             AttemptFailureDisposition::RetrySame { delay } => {
-                                // Preserve the upstream error when its required wait
-                                // cannot fit; failover must not retry this Target early.
+                                // Retry-After 在首 Token 窗口内时完整等待；
+                                // 总 deadline 放不下时保留上游错误并切换 Target。
                                 if retry_after.is_some() && delay >= context.deadline.remaining() {
                                     policy.skip_current();
                                     break;

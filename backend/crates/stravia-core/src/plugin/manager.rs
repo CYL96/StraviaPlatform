@@ -324,6 +324,59 @@ impl VendorPlugins {
         descriptors
     }
 
+    /// 元数据来源与选择器规则来自同一安装快照；完整视图保留旧连接的配置入口。
+    pub(crate) fn provider_metadata(&self, selectable_only: bool) -> Vec<ProviderMetadata> {
+        let entries = self.entries.read();
+        let installed: BTreeSet<&str> = entries.keys().map(String::as_str).collect();
+        let mut base = None;
+        let mut retired = BTreeSet::new();
+        let mut external = Vec::new();
+        for (package_id, entry) in entries.iter() {
+            let Some(loaded) = &entry.loaded else {
+                continue;
+            };
+            let descriptor = loaded.descriptor();
+            let package = ProfilePackage {
+                source: ProviderPluginSource {
+                    id: package_id.clone(),
+                    name: descriptor.display_name.clone(),
+                },
+                profiles: descriptor.providers.clone(),
+            };
+            if package_id == "base" {
+                retired.clone_from(&entry.retired_profiles);
+                base = Some(package);
+            } else {
+                external.push(package);
+            }
+        }
+        if selectable_only {
+            provider_metadata(base, external, &installed, &retired)
+        } else {
+            let mut cards = Vec::new();
+            for package in base.into_iter().chain(external) {
+                for profile in package.profiles {
+                    if package.source.id == "base"
+                        && (installed.contains(profile.provider_id.as_str())
+                            || retired.contains(&profile.provider_id))
+                    {
+                        continue;
+                    }
+                    cards.push(ProviderMetadata {
+                        descriptor: profile,
+                        plugin: package.source.clone(),
+                    });
+                }
+            }
+            cards.sort_by(|left, right| {
+                left.descriptor
+                    .provider_id
+                    .cmp(&right.descriptor.provider_id)
+            });
+            cards
+        }
+    }
+
     fn resolution_fingerprint(&self, scope_ids: &BTreeSet<String>) -> anyhow::Result<Vec<u8>> {
         let entries = self.entries.read();
         let mut digest = Sha256::new();
@@ -1058,6 +1111,116 @@ fn resolved_entry<'a>(entries: &'a HashMap<String, Entry>, provider_id: &str) ->
     entries.get(provider_id).or_else(|| entries.get("base"))
 }
 
+/// One loaded component's provider profiles with its manifest-derived source.
+struct ProfilePackage {
+    source: ProviderPluginSource,
+    profiles: Vec<ProviderDescriptor>,
+}
+
+/// Directory identity shared by cards that present the same upstream service:
+/// `catalog_id` when declared, otherwise the profile's own `provider_id`.
+fn directory_id(profile: &ProviderDescriptor) -> &str {
+    profile
+        .catalog_id
+        .as_deref()
+        .filter(|id| !id.is_empty())
+        .unwrap_or(&profile.provider_id)
+}
+
+/// Picker cards over loaded components; never used for execution resolution.
+///
+/// - Every external profile is kept as its own card (tagged with its package),
+///   even when several packages share a directory identity and channel.
+/// - An external channel replaces the base channel with the same directory
+///   identity and `channel.id`; only that base channel is removed, a base card
+///   with no channel left disappears, and base channels without a matching
+///   external one (for example API versus Codex/OAuth) stay.
+/// - A replacing external card takes the matched base profile's `display_name`
+///   so same-service cards read alike and are told apart by `plugin`. Cards
+///   that match no base channel keep their own name.
+/// - A base profile whose `provider_id` is an installed package id, or that the
+///   catalog retired, is not offered (same as `descriptors`). Retired profiles
+///   do not lend their name.
+///
+/// `installed` lists every installed package id, loadable or not.
+fn provider_metadata(
+    base: Option<ProfilePackage>,
+    external: Vec<ProfilePackage>,
+    installed: &BTreeSet<&str>,
+    retired: &BTreeSet<String>,
+) -> Vec<ProviderMetadata> {
+    let (base_source, base_profiles) = match base {
+        Some(package) => (
+            Some(package.source),
+            package
+                .profiles
+                .into_iter()
+                .filter(|profile| !retired.contains(&profile.provider_id))
+                .collect::<Vec<_>>(),
+        ),
+        None => (None, Vec::new()),
+    };
+
+    let mut cards = Vec::new();
+    let mut claimed: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for package in external {
+        for mut profile in package.profiles {
+            let identity = directory_id(&profile).to_owned();
+            let canonical_name = base_profiles
+                .iter()
+                .find(|candidate| {
+                    directory_id(candidate) == identity
+                        && candidate.channels.iter().any(|base_channel| {
+                            profile
+                                .channels
+                                .iter()
+                                .any(|channel| channel.id == base_channel.id)
+                        })
+                })
+                .map(|candidate| candidate.display_name.clone());
+            if let Some(name) = canonical_name {
+                profile.display_name = name;
+            }
+            claimed
+                .entry(identity)
+                .or_default()
+                .extend(profile.channels.iter().map(|channel| channel.id.clone()));
+            cards.push(ProviderMetadata {
+                descriptor: profile,
+                plugin: package.source.clone(),
+            });
+        }
+    }
+
+    if let Some(source) = base_source {
+        for mut profile in base_profiles {
+            if installed.contains(profile.provider_id.as_str()) {
+                continue;
+            }
+            if let Some(taken) = claimed.get(directory_id(&profile)) {
+                profile
+                    .channels
+                    .retain(|channel| !taken.contains(&channel.id));
+                if profile.channels.is_empty() {
+                    continue;
+                }
+            }
+            cards.push(ProviderMetadata {
+                descriptor: profile,
+                plugin: source.clone(),
+            });
+        }
+    }
+
+    cards.sort_by(|left, right| {
+        left.descriptor
+            .provider_id
+            .cmp(&right.descriptor.provider_id)
+            .then_with(|| left.plugin.id.cmp(&right.plugin.id))
+    });
+    cards
+}
+
 fn provider_view(provider: &Provider) -> PluginProvider {
     PluginProvider {
         id: provider.id.clone(),
@@ -1321,4 +1484,370 @@ async fn binding_impacts(
         }
     }
     Ok(impacts)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn profile(
+        provider_id: &str,
+        catalog_id: Option<&str>,
+        display_name: &str,
+        channels: &[&str],
+    ) -> ProviderDescriptor {
+        serde_json::from_value(json!({
+            "provider_id": provider_id,
+            "catalog_id": catalog_id,
+            "display_name": display_name,
+            "description": null,
+            "channels": channels.iter().map(|id| json!({
+                "id": id,
+                "name": {"en-US": id},
+                "description": null,
+                "auth": null,
+                "protocol": "openai-compatible",
+                "default_base_url": null,
+                "capabilities": ["infer"]
+            })).collect::<Vec<_>>(),
+            "capabilities": ["infer"],
+            "config_groups": [],
+            "config_fields": [],
+            "network": {"base_url_field": null, "extra_origins": [], "field_origins": []},
+            "data_compat": {
+                "config_fields_format": 1,
+                "private_state_format": 1,
+                "credentials_format": 1,
+                "model_metadata_format": 1
+            }
+        }))
+        .expect("test profile")
+    }
+
+    fn package(id: &str, name: &str, profiles: Vec<ProviderDescriptor>) -> ProfilePackage {
+        ProfilePackage {
+            source: ProviderPluginSource {
+                id: id.into(),
+                name: name.into(),
+            },
+            profiles,
+        }
+    }
+
+    fn base_openai() -> ProfilePackage {
+        package(
+            "base",
+            "Stravia Base Providers",
+            vec![profile("openai", Some("openai"), "OpenAI", &["default"])],
+        )
+    }
+
+    /// `(plugin id, provider_id, display_name, channel ids)` per card.
+    type CardView<'a> = (&'a str, &'a str, &'a str, Vec<&'a str>);
+
+    fn view(cards: &[ProviderMetadata]) -> Vec<CardView<'_>> {
+        cards
+            .iter()
+            .map(|card| {
+                (
+                    card.plugin.id.as_str(),
+                    card.descriptor.provider_id.as_str(),
+                    card.descriptor.display_name.as_str(),
+                    card.descriptor
+                        .channels
+                        .iter()
+                        .map(|channel| channel.id.as_str())
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+
+    fn merge(
+        base: Option<ProfilePackage>,
+        external: Vec<ProfilePackage>,
+        installed: &[&str],
+        retired: &[&str],
+    ) -> Vec<ProviderMetadata> {
+        let installed: BTreeSet<&str> = installed.iter().copied().collect();
+        let retired: BTreeSet<String> = retired.iter().map(|id| (*id).to_owned()).collect();
+        provider_metadata(base, external, &installed, &retired)
+    }
+
+    #[test]
+    fn external_replaces_the_base_card_for_the_same_directory_channel_and_takes_its_name() {
+        let external = package(
+            "acme-openai",
+            "Acme OpenAI",
+            vec![profile(
+                "acme-openai",
+                Some("openai"),
+                "Acme Gateway",
+                &["default"],
+            )],
+        );
+        let cards = merge(
+            Some(base_openai()),
+            vec![external],
+            &["base", "acme-openai"],
+            &[],
+        );
+        assert_eq!(
+            view(&cards),
+            [("acme-openai", "acme-openai", "OpenAI", vec!["default"])]
+        );
+        assert_eq!(cards[0].plugin.name, "Acme OpenAI");
+        assert_eq!(cards[0].descriptor.catalog_id.as_deref(), Some("openai"));
+    }
+
+    #[test]
+    fn two_external_plugins_with_the_same_directory_channel_are_both_kept() {
+        let first = package(
+            "first",
+            "First",
+            vec![profile(
+                "first",
+                Some("openai"),
+                "First OpenAI",
+                &["default"],
+            )],
+        );
+        let second = package(
+            "second",
+            "Second",
+            vec![profile(
+                "second",
+                Some("openai"),
+                "Second OpenAI",
+                &["default"],
+            )],
+        );
+        let cards = merge(
+            Some(base_openai()),
+            vec![second, first],
+            &["base", "first", "second"],
+            &[],
+        );
+        assert_eq!(
+            view(&cards),
+            [
+                ("first", "first", "OpenAI", vec!["default"]),
+                ("second", "second", "OpenAI", vec!["default"]),
+            ]
+        );
+        assert_eq!(cards[0].plugin.name, "First");
+        assert_eq!(cards[1].plugin.name, "Second");
+    }
+
+    #[test]
+    fn api_and_codex_channels_of_one_directory_identity_stay_separate() {
+        let codex = package(
+            "openai-codex",
+            "OpenAI Codex",
+            vec![profile(
+                "openai-codex",
+                Some("openai"),
+                "OpenAI Codex",
+                &["codex"],
+            )],
+        );
+        let cards = merge(
+            Some(base_openai()),
+            vec![codex],
+            &["base", "openai-codex"],
+            &[],
+        );
+        assert_eq!(
+            view(&cards),
+            [
+                ("base", "openai", "OpenAI", vec!["default"]),
+                (
+                    "openai-codex",
+                    "openai-codex",
+                    "OpenAI Codex",
+                    vec!["codex"]
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn only_the_replaced_channel_leaves_a_multi_channel_base_card() {
+        let base = package(
+            "base",
+            "Stravia Base Providers",
+            vec![profile(
+                "acme",
+                Some("acme"),
+                "Acme",
+                &["default", "oauth", "enterprise"],
+            )],
+        );
+        let external = package(
+            "acme-oauth",
+            "Acme OAuth",
+            vec![profile(
+                "acme-oauth",
+                Some("acme"),
+                "Acme Login",
+                &["oauth"],
+            )],
+        );
+        let cards = merge(Some(base), vec![external], &["base", "acme-oauth"], &[]);
+        assert_eq!(
+            view(&cards),
+            [
+                ("base", "acme", "Acme", vec!["default", "enterprise"]),
+                ("acme-oauth", "acme-oauth", "Acme", vec!["oauth"]),
+            ]
+        );
+    }
+
+    #[test]
+    fn missing_catalog_id_falls_back_to_provider_id_on_both_sides() {
+        let base = package(
+            "base",
+            "Base",
+            vec![
+                profile("plain", None, "Plain", &["default"]),
+                profile("branded", Some("shared"), "Branded", &["default"]),
+            ],
+        );
+        let by_provider_id = package(
+            "plain-ext",
+            "Plain Ext",
+            vec![profile(
+                "plain-ext",
+                Some("plain"),
+                "Plain Ext",
+                &["default"],
+            )],
+        );
+        // No catalog_id: its identity is `shared`, the same as `branded`'s
+        // catalog_id, so it replaces that card.
+        let into_catalog_id = package(
+            "shared",
+            "Shared",
+            vec![profile("shared", None, "Shared", &["default"])],
+        );
+        let cards = merge(
+            Some(base),
+            vec![by_provider_id, into_catalog_id],
+            &["base", "plain-ext", "shared"],
+            &[],
+        );
+        assert_eq!(
+            view(&cards),
+            [
+                ("plain-ext", "plain-ext", "Plain", vec!["default"]),
+                ("shared", "shared", "Branded", vec!["default"]),
+            ]
+        );
+    }
+
+    #[test]
+    fn installed_package_id_takes_over_the_base_profile_even_when_unloaded() {
+        let base = || {
+            package(
+                "base",
+                "Base",
+                vec![
+                    profile("deepseek", Some("deepseek"), "DeepSeek", &["default"]),
+                    profile("groq", Some("groq"), "Groq", &["default"]),
+                ],
+            )
+        };
+        // `deepseek` is installed but contributes no loaded package.
+        let cards = merge(Some(base()), Vec::new(), &["base", "deepseek"], &[]);
+        assert_eq!(view(&cards), [("base", "groq", "Groq", vec!["default"])]);
+
+        // A loaded dedicated package whose channel does not match still takes
+        // over the whole base profile and keeps its own name.
+        let dedicated = package(
+            "deepseek",
+            "Dedicated DeepSeek",
+            vec![profile(
+                "deepseek",
+                Some("deepseek"),
+                "Dedicated Search",
+                &["dedicated"],
+            )],
+        );
+        let cards = merge(Some(base()), vec![dedicated], &["base", "deepseek"], &[]);
+        assert_eq!(
+            view(&cards),
+            [
+                (
+                    "deepseek",
+                    "deepseek",
+                    "Dedicated Search",
+                    vec!["dedicated"]
+                ),
+                ("base", "groq", "Groq", vec!["default"]),
+            ]
+        );
+    }
+
+    #[test]
+    fn retired_base_profiles_are_hidden_and_do_not_lend_their_name() {
+        let base = package(
+            "base",
+            "Base",
+            vec![
+                profile("old", Some("old"), "Old Name", &["default"]),
+                profile("fresh", Some("fresh"), "Fresh", &["default"]),
+            ],
+        );
+        let external = package(
+            "old-ext",
+            "Old Ext",
+            vec![profile("old-ext", Some("old"), "Old Ext", &["default"])],
+        );
+        let cards = merge(Some(base), vec![external], &["base", "old-ext"], &["old"]);
+        assert_eq!(
+            view(&cards),
+            [
+                ("base", "fresh", "Fresh", vec!["default"]),
+                ("old-ext", "old-ext", "Old Ext", vec!["default"]),
+            ]
+        );
+    }
+
+    #[test]
+    fn removing_the_external_restores_the_untouched_base_card() {
+        let external = package(
+            "acme-openai",
+            "Acme OpenAI",
+            vec![profile(
+                "acme-openai",
+                Some("openai"),
+                "Acme Gateway",
+                &["default"],
+            )],
+        );
+        let replaced = merge(
+            Some(base_openai()),
+            vec![external],
+            &["base", "acme-openai"],
+            &[],
+        );
+        assert!(
+            replaced
+                .iter()
+                .all(|card| card.descriptor.provider_id != "openai")
+        );
+
+        let restored = merge(Some(base_openai()), Vec::new(), &["base"], &[]);
+        assert_eq!(
+            restored,
+            [ProviderMetadata {
+                descriptor: base_openai().profiles.remove(0),
+                plugin: ProviderPluginSource {
+                    id: "base".into(),
+                    name: "Stravia Base Providers".into(),
+                },
+            }]
+        );
+    }
 }

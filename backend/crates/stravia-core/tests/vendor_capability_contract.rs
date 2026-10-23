@@ -1350,6 +1350,171 @@ async fn external_search_switches_only_retryable_started_failures() -> anyhow::R
 }
 
 #[tokio::test]
+async fn image_route_filters_reference_inputs_before_priority_and_failover() -> anyhow::Result<()> {
+    let harness = TestHarness::new().await?;
+    install_fixture(&harness.gateway, "capability-pure-image.wasm", false).await?;
+    let text_upstream = LocalUpstream::start().await?;
+    let image_upstream = LocalUpstream::start().await?;
+    let text_provider = create_provider(
+        &harness.gateway,
+        "Text-to-image Provider",
+        "fixture.capability-image",
+        &text_upstream.url,
+        "fixture-image",
+    )
+    .await?;
+    let image_provider = create_provider(
+        &harness.gateway,
+        "Image-to-image Provider",
+        "fixture.capability-image",
+        &image_upstream.url,
+        "fixture-image",
+    )
+    .await?;
+    for (provider, model, inputs) in [
+        (&text_provider, "text-to-image", json!(["text"])),
+        (&image_provider, "image-to-image", json!(["text", "image"])),
+    ] {
+        harness
+            .gateway
+            .admin()
+            .create_manual_provider_model(
+                &provider.id,
+                model,
+                CreateManualProviderModel {
+                    metadata: json!({
+                        "id": model,
+                        "capabilities": ["media_image"],
+                        "modalities": {"input": inputs, "output": ["image"]}
+                    }),
+                    template_id: None,
+                },
+            )
+            .await?;
+    }
+    let route = create_route(
+        &harness.gateway,
+        "mixed-image-inputs",
+        vec![
+            (&text_provider, "text-to-image", 20),
+            (&image_provider, "image-to-image", 10),
+        ],
+        0,
+        stravia_core::db::models::RouteOutputModality::Image,
+    )
+    .await?;
+    configure_image_generation(&harness.gateway, &route.model_id).await?;
+    let client = harness.connect().await;
+
+    text_upstream
+        .push_json("/image", StatusCode::OK, image_response())
+        .await;
+    let generated = call_generate(
+        &client,
+        json!({"type":"image","input":{"prompt":"generate without a reference","reference_images":[]}}),
+    )
+    .await;
+    assert_ne!(generated.is_error, Some(true), "{generated:?}");
+    assert_eq!(text_upstream.call_count("/image").await, 1);
+    assert_eq!(image_upstream.call_count("/image").await, 0);
+    let reference = generated.structured_content.expect("generated Artifact")["path"]
+        .as_str()
+        .expect("Artifact Reference")
+        .to_owned();
+
+    // 无参考图时两类均可执行，优先级和失败切换不因输入能力另设顺序。
+    text_upstream
+        .push_json(
+            "/image",
+            StatusCode::BAD_GATEWAY,
+            json!({"error":"overloaded"}),
+        )
+        .await;
+    image_upstream
+        .push_json("/image", StatusCode::OK, image_response())
+        .await;
+    let fallback = call_generate(
+        &client,
+        json!({"type":"image","input":{"prompt":"generate through the fallback"}}),
+    )
+    .await;
+    assert_ne!(fallback.is_error, Some(true), "{fallback:?}");
+    assert_eq!(text_upstream.call_count("/image").await, 2);
+    assert_eq!(image_upstream.call_count("/image").await, 1);
+
+    text_upstream
+        .push_json("/image", StatusCode::OK, image_response())
+        .await;
+    image_upstream
+        .push_json("/image", StatusCode::OK, image_response())
+        .await;
+    let edited = call_generate(
+        &client,
+        json!({"type":"image","input":{"prompt":"edit the reference","reference_images":[reference]}}),
+    )
+    .await;
+    assert_ne!(edited.is_error, Some(true), "{edited:?}");
+    assert_eq!(
+        text_upstream.call_count("/image").await,
+        2,
+        "reference images must exclude text-only input before selecting the higher-priority Target"
+    );
+    assert_eq!(image_upstream.call_count("/image").await, 2);
+    let requests = image_upstream.requests().await;
+    assert_eq!(requests[1].body["references"][0]["media_type"], "image/png");
+
+    let text_only_route = create_route(
+        &harness.gateway,
+        "text-to-image-only",
+        vec![(&text_provider, "text-to-image", 0)],
+        0,
+        stravia_core::db::models::RouteOutputModality::Image,
+    )
+    .await?;
+    configure_image_generation(&harness.gateway, &text_only_route.model_id).await?;
+    let rejected = call_generate(
+        &client,
+        json!({"type":"image","input":{"prompt":"cannot edit","reference_images":[reference]}}),
+    )
+    .await;
+    assert_eq!(rejected.is_error, Some(true), "{rejected:?}");
+    assert_eq!(text_upstream.call_count("/image").await, 2);
+
+    // 保存后的规格漂移立即生效，旧附件标志不能代替实际图片输入登记。
+    let detail = harness
+        .gateway
+        .admin()
+        .get_provider_model(&image_provider.id, "image-to-image")
+        .await?;
+    harness
+        .gateway
+        .admin()
+        .update_provider_model(
+            &image_provider.id,
+            "image-to-image",
+            stravia_core::provider_models::UpdateProviderModel {
+                revision: detail.revision,
+                metadata: json!({
+                    "attachment": true,
+                    "capabilities": ["media_image", "image_input"],
+                    "modalities": {"input": ["text"], "output": ["image"]}
+                }),
+            },
+        )
+        .await?;
+    configure_image_generation(&harness.gateway, &route.model_id).await?;
+    let drifted = call_generate(
+        &client,
+        json!({"type":"image","input":{"prompt":"cannot edit after input drift","reference_images":[reference]}}),
+    )
+    .await;
+    assert_eq!(drifted.is_error, Some(true), "{drifted:?}");
+    assert_eq!(text_upstream.call_count("/image").await, 2);
+    assert_eq!(image_upstream.call_count("/image").await, 2);
+    Ok(())
+}
+
+#[tokio::test]
 async fn pure_image_vendor_stores_real_owned_png_and_cannot_chat() -> anyhow::Result<()> {
     let harness = TestHarness::new().await?;
     install_fixture(&harness.gateway, "capability-pure-image.wasm", false).await?;
@@ -3282,6 +3447,92 @@ async fn dedicated_profile_wholly_replaces_base_and_never_falls_back_when_its_ar
     Ok(())
 }
 
+async fn only_deepseek_card(
+    gateway: &Gateway,
+) -> anyhow::Result<stravia_core::plugin::ProviderMetadata> {
+    let mut cards: Vec<_> = gateway
+        .admin()
+        .list_selectable_vendor_metadata()
+        .await?
+        .into_iter()
+        .filter(|card| card.descriptor.provider_id == "deepseek")
+        .collect();
+    anyhow::ensure!(
+        cards.len() == 1,
+        "expected exactly one deepseek card, got {}",
+        cards.len()
+    );
+    Ok(cards.remove(0))
+}
+
+#[tokio::test]
+async fn management_metadata_names_the_loaded_plugin_and_returns_to_base_without_touching_connections()
+-> anyhow::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let gateway = Gateway::new(GatewayConfig {
+        data_dir: directory.path().to_owned(),
+        ..GatewayConfig::default()
+    })
+    .await?;
+    let saved = create_provider(
+        &gateway,
+        "DeepSeek connection created from base",
+        "deepseek",
+        "http://127.0.0.1:1",
+        "openai-compatible",
+    )
+    .await?;
+    let base_card = only_deepseek_card(&gateway).await?;
+    assert_eq!(base_card.plugin.id, "base");
+    assert_eq!(base_card.plugin.name, "Stravia Base Providers");
+    assert_eq!(
+        base_card.descriptor,
+        gateway.admin().vendor_metadata("deepseek")?
+    );
+
+    install_fixture(&gateway, "capability-dedicated-deepseek.wasm", false).await?;
+    let dedicated_card = only_deepseek_card(&gateway).await?;
+    assert_eq!(dedicated_card.plugin.id, "deepseek");
+    assert_eq!(
+        dedicated_card.plugin.name,
+        "Capability Contract (dedicated-deepseek)"
+    );
+    assert_eq!(dedicated_card.descriptor.provider_id, "deepseek");
+    assert_eq!(
+        dedicated_card.descriptor.catalog_id.as_deref(),
+        Some("deepseek")
+    );
+    assert_eq!(
+        dedicated_card
+            .descriptor
+            .channels
+            .iter()
+            .map(|channel| channel.id.as_str())
+            .collect::<Vec<_>>(),
+        ["dedicated"],
+        "a channel that no base channel matches keeps its own card and name"
+    );
+    assert_eq!(
+        dedicated_card.descriptor,
+        gateway.admin().vendor_metadata("deepseek")?,
+        "runtime resolution reports the raw dedicated profile"
+    );
+
+    gateway.admin().uninstall_vendor_plugin("deepseek").await?;
+    let restored_card = only_deepseek_card(&gateway).await?;
+    assert_eq!(restored_card, base_card);
+    assert_eq!(
+        restored_card.descriptor,
+        gateway.admin().vendor_metadata("deepseek")?
+    );
+
+    let retained = gateway.admin().get_provider(&saved.id).await?;
+    assert_eq!(retained.vendor.as_deref(), Some("deepseek"));
+    assert_eq!(retained.channel.as_deref(), Some("default"));
+    assert_eq!(retained.protocol, "openai-compatible");
+    Ok(())
+}
+
 #[tokio::test]
 async fn manually_installed_codex_component_reuses_one_connection_for_search_and_image()
 -> anyhow::Result<()> {
@@ -3293,6 +3544,7 @@ async fn manually_installed_codex_component_reuses_one_connection_for_search_and
         .list_vendor_metadata()
         .await?
         .into_iter()
+        .map(|card| card.descriptor)
         .find(|descriptor| descriptor.provider_id == "openai-codex")
         .expect("manually installed OpenAI Codex provider profile");
     let codex = descriptor
@@ -3353,7 +3605,7 @@ async fn manually_installed_codex_component_reuses_one_connection_for_search_and
                     "id": "gpt-5.4",
                     "name": "GPT-5.4",
                     "capabilities": ["infer", "search", "media_image"],
-                    "modalities": {"input": ["text"], "output": ["text", "image"]},
+                    "modalities": {"input": ["text", "image"], "output": ["text", "image"]},
                     "limit": {"context": 272000, "output": 128000},
                     "cost": {"input": 2.5, "output": 15.0}
                 }),

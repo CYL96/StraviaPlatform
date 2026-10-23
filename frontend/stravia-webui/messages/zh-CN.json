@@ -1094,6 +1094,7 @@
   "provider_editor_update_service_list": "重新加载供应商",
   "provider_options_api_key": "API 密钥",
   "provider_options_custom": "自定义",
+  "provider_options_plugin_source": "插件：{name}（{id}）",
   "provider_options_setup_token": "设置令牌",
   "provider_model_catalog_clear_selected_model": "清除已选模型",
   "provider_model_catalog_clear_filters": "清除筛选",

@@ -860,8 +860,8 @@ fn execute_inner(
                     },
                 ) {
                     AttemptFailureDisposition::RetrySame { delay } => {
-                        // An explicit upstream wait must fit in the current request
-                        // window. Never shorten it and hit the limited Target early.
+                        // Retry-After 在首 Token 窗口内时完整等待；
+                        // 总 deadline 仍是硬边界，不能将等待截短后提前重发。
                         if failure.retry_after.is_some() && delay >= input.deadline.remaining() {
                             attempts.skip_current();
                             last_error = Some(failure);
@@ -1632,13 +1632,8 @@ impl AttemptRoutePolicy {
     }
 
     fn record_failure(&self, target: &SelectedTarget, retry_after: Option<Duration>) {
-        self.state.record_failure_with_retry_after(
-            &selected_target_key(target),
-            self.epoch,
-            target.target_retry_budget,
-            target.target_cooldown_ms,
-            retry_after,
-        );
+        self.state
+            .record_failure_with_retry_after(target, self.epoch, retry_after);
     }
 }
 
@@ -2625,10 +2620,8 @@ fn record_upstream_failure(
 ) {
     if failure.is_upstream() && !request_level_failure(failure) {
         attempts.state().record_failure_with_retry_after(
-            &selected_target_key(target),
+            target,
             attempts.current_epoch(),
-            target.target_retry_budget,
-            target.target_cooldown_ms,
             failure.retry_after,
         );
     }
