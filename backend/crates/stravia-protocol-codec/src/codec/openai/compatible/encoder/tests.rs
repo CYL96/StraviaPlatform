@@ -1277,3 +1277,304 @@ fn signed_thinking_with_tool_calls_keeps_reasoning_content_and_drops_signature()
     // 有 tool_calls 时 content 可缺省，但绝不能把签名写进任何字段。
     assert!(!body.to_string().contains("opaque-sig"));
 }
+
+type ReplayMeta = Option<Box<stravia_runtime_contract::protocol::ir::AiItemMetadata>>;
+
+fn responses_replay_request(items: Vec<AiItem>) -> AiRequest {
+    let mut request = AiRequest::new("deepseek-flash", items);
+    request.meta.source_protocol =
+        Some(stravia_runtime_contract::protocol::ids::OPEN_RESPONSES_2026_04_24);
+    request
+}
+
+fn responses_filler_meta() -> ReplayMeta {
+    Some(
+        stravia_runtime_contract::protocol::ir::AiItemMetadata::boxed(
+            serde_json::json!({"reasoning_content": ""}),
+        ),
+    )
+}
+
+fn responses_replay_user(text: &str) -> AiItem {
+    AiItem {
+        role: Role::User,
+        content: MessageContent::Text(text.to_owned().into()),
+        tool_calls: None,
+        tool_call_id: None,
+        meta: None,
+    }
+}
+
+fn responses_replay_text(text: &str, meta: ReplayMeta) -> AiItem {
+    AiItem {
+        role: Role::Assistant,
+        content: MessageContent::Text(text.to_owned().into()),
+        tool_calls: None,
+        tool_call_id: None,
+        meta,
+    }
+}
+
+fn responses_replay_call(id: &str, name: &str, arguments: &str, meta: ReplayMeta) -> AiItem {
+    AiItem {
+        role: Role::Assistant,
+        content: MessageContent::Text(String::new().into()),
+        tool_calls: Some(vec![ToolCall {
+            id: id.into(),
+            name: name.to_owned(),
+            arguments: arguments.to_owned(),
+        }]),
+        tool_call_id: None,
+        meta,
+    }
+}
+
+fn responses_replay_output(id: &str, text: &str) -> AiItem {
+    AiItem {
+        role: Role::Tool,
+        content: MessageContent::Text(text.to_owned().into()),
+        tool_calls: None,
+        tool_call_id: Some(id.into()),
+        meta: None,
+    }
+}
+
+#[test]
+fn responses_reverse_order_parallel_outputs_keep_call_associations() {
+    let request = responses_replay_request(vec![
+        responses_replay_user("run both"),
+        responses_replay_text("checking", responses_filler_meta()),
+        responses_replay_call(
+            "call_read",
+            "read",
+            r#"{"path":"src/lib.rs"}"#,
+            responses_filler_meta(),
+        ),
+        responses_replay_call(
+            "call_find",
+            "find",
+            r#"{"pattern":"TODO"}"#,
+            responses_filler_meta(),
+        ),
+        responses_replay_output("call_find", "find output"),
+        responses_replay_output("call_read", "read output"),
+    ]);
+
+    let (body, _) = OpenAIEncoder
+        .encode_request(request)
+        .expect("encode responses replay");
+    let messages = body["messages"].as_array().expect("messages array");
+
+    assert_eq!(messages.len(), 4);
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|message| message["role"] == "assistant")
+            .count(),
+        1,
+        "parallel calls must share the single assistant round"
+    );
+    assert_eq!(messages[1]["role"], "assistant");
+    assert_eq!(messages[1]["content"], "checking");
+    let calls: Vec<(&str, &str, &str)> = messages[1]["tool_calls"]
+        .as_array()
+        .expect("tool calls")
+        .iter()
+        .map(|call| {
+            (
+                call["id"].as_str().expect("call id"),
+                call["function"]["name"].as_str().expect("call name"),
+                call["function"]["arguments"]
+                    .as_str()
+                    .expect("call arguments"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        calls,
+        [
+            ("call_read", "read", r#"{"path":"src/lib.rs"}"#),
+            ("call_find", "find", r#"{"pattern":"TODO"}"#),
+        ]
+    );
+
+    let outputs: Vec<(&str, &str)> = messages
+        .iter()
+        .filter(|message| message["role"] == "tool")
+        .map(|message| {
+            (
+                message["tool_call_id"].as_str().expect("output call id"),
+                message["content"].as_str().expect("output content"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        outputs,
+        [("call_find", "find output"), ("call_read", "read output"),],
+        "reverse-order outputs must stay attached to their own call ids"
+    );
+}
+
+#[test]
+fn responses_missing_thought_stays_empty_without_fabrication() {
+    for with_filler in [true, false] {
+        let meta = || {
+            if with_filler {
+                responses_filler_meta()
+            } else {
+                None
+            }
+        };
+        let request = responses_replay_request(vec![
+            responses_replay_user("no reasoning captured"),
+            responses_replay_text("answer", meta()),
+            responses_replay_call("call_read", "read", r#"{"path":"src/lib.rs"}"#, meta()),
+            responses_replay_call("call_find", "find", r#"{"pattern":"TODO"}"#, meta()),
+            responses_replay_output("call_read", "read output"),
+            responses_replay_output("call_find", "find output"),
+        ]);
+
+        let (body, _) = OpenAIEncoder
+            .encode_request(request)
+            .expect("encode responses replay");
+        let messages = body["messages"].as_array().expect("messages array");
+
+        assert_eq!(messages.len(), 4);
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message["role"] == "assistant")
+                .count(),
+            1
+        );
+        let assistant = &messages[1];
+        assert_eq!(assistant["content"], "answer");
+        assert_eq!(assistant["tool_calls"].as_array().expect("calls").len(), 2);
+
+        if with_filler {
+            assert_eq!(
+                assistant["reasoning_content"], "",
+                "explicit empty filler presence must survive"
+            );
+        } else {
+            assert!(
+                assistant.get("reasoning_content").is_none(),
+                "absent reasoning must not be fabricated: {assistant}"
+            );
+        }
+    }
+}
+
+#[test]
+fn responses_reasoning_block_and_sibling_metadata_survive_in_order_once() {
+    let mut reasoning = AiItem::reasoning(vec!["first thought".to_owned()], Vec::new(), None);
+    // The same native fragment also carries a raw copy of its block text.
+    reasoning.meta = Some(
+        stravia_runtime_contract::protocol::ir::AiItemMetadata::boxed(
+            serde_json::json!({"reasoning_content": "first thought"}),
+        ),
+    );
+    let request = responses_replay_request(vec![
+        responses_replay_user("explain"),
+        reasoning,
+        responses_replay_text(
+            "answer",
+            Some(
+                stravia_runtime_contract::protocol::ir::AiItemMetadata::boxed(
+                    serde_json::json!({"reasoning_content": "second thought"}),
+                ),
+            ),
+        ),
+    ]);
+
+    let (body, _) = OpenAIEncoder
+        .encode_request(request)
+        .expect("encode responses replay");
+    let messages = body["messages"].as_array().expect("messages array");
+
+    assert_eq!(
+        messages.len(),
+        2,
+        "reasoning and text belong to one assistant round"
+    );
+    let assistant = &messages[1];
+    assert_eq!(assistant["role"], "assistant");
+    assert_eq!(assistant["content"], "answer");
+    assert_eq!(
+        assistant["reasoning_content"], "first thought\nsecond thought",
+        "the real block replaces its same-fragment metadata copy, while the \
+         sibling fragment's reasoning is appended once in encounter order"
+    );
+}
+
+#[test]
+fn responses_legacy_graph_metadata_hard_boundary_keeps_separate_messages() {
+    let mut first = responses_replay_text("first", None);
+    first.meta = Some(Box::new(
+        stravia_runtime_contract::protocol::ir::AiItemMetadata::default(),
+    ));
+    let mut second = responses_replay_text("second", None);
+    second.meta = Some(
+        stravia_runtime_contract::protocol::ir::AiItemMetadata::boxed(serde_json::json!({"id": 7})),
+    );
+    let request =
+        responses_replay_request(vec![responses_replay_user("legacy history"), first, second]);
+
+    let (body, _) = OpenAIEncoder
+        .encode_request(request)
+        .expect("encode legacy Responses history");
+    let messages = body["messages"].as_array().expect("messages array");
+
+    assert_eq!(
+        messages.len(),
+        3,
+        "reserved legacy metadata must hard-bound coalescing"
+    );
+    assert_eq!(messages[1]["role"], "assistant");
+    assert_eq!(messages[1]["content"], "first");
+    assert!(messages[1].get("id").is_none());
+    assert_eq!(messages[2]["role"], "assistant");
+    assert_eq!(messages[2]["content"], "second");
+    assert_eq!(
+        messages[2]["id"],
+        serde_json::json!(7),
+        "legacy numeric graph id must survive verbatim"
+    );
+}
+
+#[test]
+fn chat_source_explicit_empty_and_multiple_assistant_messages_stay_distinct() {
+    let mut request = AiRequest::new(
+        "deepseek-flash",
+        vec![
+            responses_replay_user("hello"),
+            responses_replay_text("", responses_filler_meta()),
+            responses_replay_text("first answer", None),
+            responses_replay_text("second answer", None),
+        ],
+    );
+    request.meta.source_protocol =
+        Some(stravia_runtime_contract::protocol::ids::OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1);
+
+    let (body, _) = OpenAIEncoder
+        .encode_request(request)
+        .expect("encode chat request");
+    let messages = body["messages"].as_array().expect("messages array");
+
+    assert_eq!(
+        messages.len(),
+        4,
+        "Chat history must not be regrouped like Responses replay"
+    );
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|message| message["role"] == "assistant")
+            .count(),
+        3
+    );
+    assert_eq!(messages[1]["content"], "");
+    assert_eq!(messages[1]["reasoning_content"], "");
+    assert_eq!(messages[2]["content"], "first answer");
+    assert_eq!(messages[3]["content"], "second answer");
+}

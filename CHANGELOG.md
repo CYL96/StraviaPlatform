@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Fixed
+
+- Responses-to-Chat replay now reconstructs each assistant round from its reasoning, text and parallel function-call items before repairing tool history. Valid parallel calls remain together with their original result associations, without extra empty assistant messages or reasoning copied across tool-result boundaries. Fragment-local reasoning is preserved in order; opaque and malformed legacy metadata remain boundaries, and native Chat history is unchanged. Rebuild the host and affected Wasm vendors to apply the fix.
+
 ## [0.5.3] - 2026-10-23
 
 ### Verification

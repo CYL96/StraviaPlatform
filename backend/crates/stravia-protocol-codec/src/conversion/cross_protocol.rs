@@ -440,7 +440,7 @@ fn openai_encoder_injects_adjacent_tool_call_for_non_adjacent_match() {
     assert_eq!(assistant_call_id, tool_id);
 }
 #[test]
-fn openai_encoder_drops_intermediate_assistant_text_before_tool_result() {
+fn responses_round_merges_text_with_call_before_matching_output() {
     let messages = vec![
         AiItem {
             role: IrRole::Assistant,
@@ -468,12 +468,7 @@ fn openai_encoder_drops_intermediate_assistant_text_before_tool_result() {
             meta: None,
         },
     ];
-    let mut req = AiRequest::new("MiniMax-M2.7", messages);
-    req.stream = StreamConfig {
-        enabled: false,
-        include_usage: false,
-    };
-    req.meta.source_protocol = Some(OPEN_RESPONSES_2026_04_24);
+    let req = responses_request(messages, false);
 
     let (body, _) = OpenAIEncoder
         .encode_request(req)
@@ -483,14 +478,25 @@ fn openai_encoder_drops_intermediate_assistant_text_before_tool_result() {
         .and_then(|v| v.as_array())
         .expect("messages array");
 
-    // intermediate assistant text should be dropped to keep tool_result adjacent
-    assert_eq!(messages.len(), 3);
+    assert_eq!(
+        messages.len(),
+        2,
+        "same-round text and call must share one assistant message before its output"
+    );
     assert_eq!(
         messages[0].get("role").and_then(|v| v.as_str()),
         Some("assistant")
     );
     assert_eq!(
-        messages[1]
+        messages[0]["content"],
+        json!([
+            {"type": "text", "text": "plan"},
+            {"type": "text", "text": "extra text"},
+        ]),
+        "same-round text blocks must survive in original order"
+    );
+    assert_eq!(
+        messages[0]
             .get("tool_calls")
             .and_then(|v| v.as_array())
             .and_then(|arr| arr.first())
@@ -499,16 +505,31 @@ fn openai_encoder_drops_intermediate_assistant_text_before_tool_result() {
         Some("call_keep")
     );
     assert_eq!(
-        messages[2].get("role").and_then(|v| v.as_str()),
+        messages[0]
+            .get("tool_calls")
+            .and_then(|v| v.as_array())
+            .and_then(|arr| arr.first())
+            .and_then(|tc| tc.get("function"))
+            .and_then(|f| f.get("arguments"))
+            .and_then(|v| v.as_str()),
+        Some("{\"command\":\"ls -la\"}")
+    );
+    assert_eq!(
+        messages[1].get("role").and_then(|v| v.as_str()),
         Some("tool")
     );
     assert_eq!(
-        messages[2].get("tool_call_id").and_then(|v| v.as_str()),
+        messages[1].get("tool_call_id").and_then(|v| v.as_str()),
         Some("call_keep")
     );
+    assert_eq!(
+        messages[1].get("content").and_then(|v| v.as_str()),
+        Some("{\"stdout\":\"...\"}")
+    );
 }
+
 #[test]
-fn openai_encoder_remaps_duplicate_tool_call_ids() {
+fn responses_round_remaps_duplicate_call_ids_without_losing_correlation() {
     let messages = vec![
         AiItem {
             role: IrRole::Assistant,
@@ -516,7 +537,7 @@ fn openai_encoder_remaps_duplicate_tool_call_ids() {
             tool_calls: Some(vec![ToolCall {
                 id: ("call_dup".to_string()).into(),
                 name: "exec_command".to_string(),
-                arguments: "{}".to_string(),
+                arguments: "{\"step\":1}".to_string(),
             }]),
             tool_call_id: None,
             meta: None,
@@ -527,32 +548,27 @@ fn openai_encoder_remaps_duplicate_tool_call_ids() {
             tool_calls: Some(vec![ToolCall {
                 id: ("call_dup".to_string()).into(),
                 name: "exec_command".to_string(),
-                arguments: "{}".to_string(),
+                arguments: "{\"step\":2}".to_string(),
             }]),
             tool_call_id: None,
             meta: None,
         },
         AiItem {
             role: IrRole::Tool,
-            content: IrMessageContent::Text("{\"ok\":true}".to_string().into()),
+            content: IrMessageContent::Text("first result".to_string().into()),
             tool_calls: None,
             tool_call_id: Some(("call_dup".to_string()).into()),
             meta: None,
         },
         AiItem {
             role: IrRole::Tool,
-            content: IrMessageContent::Text("{\"ok\":true}".to_string().into()),
+            content: IrMessageContent::Text("second result".to_string().into()),
             tool_calls: None,
             tool_call_id: Some(("call_dup".to_string()).into()),
             meta: None,
         },
     ];
-    let mut req = AiRequest::new("MiniMax-M2.7", messages);
-    req.stream = StreamConfig {
-        enabled: false,
-        include_usage: false,
-    };
-    req.meta.source_protocol = Some(OPEN_RESPONSES_2026_04_24);
+    let req = responses_request(messages, false);
 
     let (body, _) = OpenAIEncoder
         .encode_request(req)
@@ -562,31 +578,218 @@ fn openai_encoder_remaps_duplicate_tool_call_ids() {
         .and_then(|v| v.as_array())
         .expect("messages array");
 
-    let ids: Vec<String> = messages
+    let assistants: Vec<&Value> = messages
         .iter()
-        .filter_map(|m| {
-            m.get("tool_calls")
-                .and_then(|v| v.as_array())
-                .and_then(|arr| arr.first())
-        })
-        .filter_map(|tc| tc.get("id").and_then(|v| v.as_str()).map(|s| s.to_string()))
+        .filter(|m| m.get("role").and_then(|v| v.as_str()) == Some("assistant"))
         .collect();
-    assert_eq!(ids.len(), 2);
-    assert_ne!(ids[0], ids[1]);
+    assert_eq!(
+        assistants.len(),
+        1,
+        "duplicate calls from one Responses round must stay on one assistant message"
+    );
+    let calls = assistants[0]
+        .get("tool_calls")
+        .and_then(|v| v.as_array())
+        .expect("regrouped tool calls");
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0]["function"]["arguments"], json!("{\"step\":1}"));
+    assert_eq!(calls[1]["function"]["arguments"], json!("{\"step\":2}"));
+    let mut call_ids: Vec<&str> = calls
+        .iter()
+        .filter_map(|tc| tc.get("id").and_then(|v| v.as_str()))
+        .collect();
+    assert_eq!(call_ids.len(), 2);
+    assert_ne!(call_ids[0], call_ids[1], "duplicate ids must be remapped");
 
-    let tool_ids: Vec<String> = messages
+    let tool_messages: Vec<&Value> = messages
         .iter()
         .filter(|m| m.get("role").and_then(|v| v.as_str()) == Some("tool"))
-        .filter_map(|m| {
-            m.get("tool_call_id")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-        })
         .collect();
-    assert_eq!(tool_ids.len(), 2);
-    assert!(ids.contains(&tool_ids[0]));
-    assert!(ids.contains(&tool_ids[1]));
+    assert_eq!(tool_messages.len(), 2);
+    assert_eq!(
+        tool_messages[0].get("content").and_then(|v| v.as_str()),
+        Some("first result")
+    );
+    assert_eq!(
+        tool_messages[1].get("content").and_then(|v| v.as_str()),
+        Some("second result")
+    );
+    let mut tool_ids: Vec<&str> = tool_messages
+        .iter()
+        .filter_map(|m| m.get("tool_call_id").and_then(|v| v.as_str()))
+        .collect();
+    call_ids.sort_unstable();
+    tool_ids.sort_unstable();
+    assert_eq!(
+        call_ids, tool_ids,
+        "every tool output must stay correlated with one retained call id"
+    );
 }
+
+#[test]
+fn responses_replayed_parallel_round_regroups_reasoning_text_and_calls_for_chat() {
+    let pair = ProtocolTransform::global()
+        .bind(
+            OPEN_RESPONSES_2026_04_24,
+            OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+        )
+        .expect("bind Responses replay to Chat");
+    let mut request = pair
+        .decode_request(json!({
+            "model": "deepseek-flash",
+            "stream": false,
+            "input": [
+                {"type": "message", "role": "user", "content": [
+                    {"type": "input_text", "text": "inspect the repository"}
+                ]},
+                {"type": "reasoning", "summary": [], "content": [
+                    {"type": "reasoning_text", "text": "原始思考"}
+                ]},
+                {"type": "message", "role": "assistant", "content": [
+                    {"type": "output_text", "text": "说明"}
+                ]},
+                {"type": "function_call", "call_id": "call_read",
+                 "name": "read", "arguments": "{\"path\":\"src/lib.rs\"}"},
+                {"type": "function_call", "call_id": "call_find",
+                 "name": "find", "arguments": "{\"pattern\":\"TODO\"}"},
+                {"type": "function_call_output", "call_id": "call_read",
+                 "output": "read output"},
+                {"type": "function_call_output", "call_id": "call_find",
+                 "output": "find output"},
+                {"type": "reasoning", "summary": [
+                    {"type": "summary_text", "text": "second thought"}
+                ]},
+                {"type": "message", "role": "assistant", "content": [
+                    {"type": "output_text", "text": "final answer"}
+                ]}
+            ]
+        }))
+        .expect("decode Responses replay");
+    // DeepSeek thinking adapters fill every assistant item that lacks the field.
+    for item in &mut request.items {
+        if item.role == IrRole::Assistant
+            && let Some(meta) = item.meta.as_mut()
+            && meta.object_extensions().is_some()
+            && meta.get("reasoning_content").is_none()
+        {
+            meta.insert_extension("reasoning_content", Value::String(String::new()))
+                .expect("reasoning filler is an ordinary extension");
+        }
+    }
+
+    let body = pair
+        .encode_request(request)
+        .expect("encode Chat replay")
+        .body;
+    let messages = body
+        .get("messages")
+        .and_then(|v| v.as_array())
+        .expect("messages array");
+
+    assert_eq!(
+        messages.len(),
+        5,
+        "user + one assistant round + two outputs + a following round; no ghost assistant messages"
+    );
+    let roles: Vec<&str> = messages
+        .iter()
+        .filter_map(|m| m.get("role").and_then(|v| v.as_str()))
+        .collect();
+    assert_eq!(roles, ["user", "assistant", "tool", "tool", "assistant"]);
+
+    let assistant = &messages[1];
+    assert_eq!(
+        assistant.get("content").and_then(|v| v.as_str()),
+        Some("说明")
+    );
+    assert_eq!(
+        assistant.get("reasoning_content").and_then(|v| v.as_str()),
+        Some("原始思考")
+    );
+    let calls = assistant
+        .get("tool_calls")
+        .and_then(|v| v.as_array())
+        .expect("parallel calls on the regrouped round");
+    assert_eq!(calls.len(), 2);
+    assert_eq!(
+        calls[0].get("id").and_then(|v| v.as_str()),
+        Some("call_read")
+    );
+    assert_eq!(
+        calls[0]
+            .get("function")
+            .and_then(|f| f.get("name"))
+            .and_then(|v| v.as_str()),
+        Some("read")
+    );
+    assert_eq!(
+        calls[0]
+            .get("function")
+            .and_then(|f| f.get("arguments"))
+            .and_then(|v| v.as_str()),
+        Some("{\"path\":\"src/lib.rs\"}")
+    );
+    assert_eq!(
+        calls[1].get("id").and_then(|v| v.as_str()),
+        Some("call_find")
+    );
+    assert_eq!(
+        calls[1]
+            .get("function")
+            .and_then(|f| f.get("name"))
+            .and_then(|v| v.as_str()),
+        Some("find")
+    );
+    assert_eq!(
+        calls[1]
+            .get("function")
+            .and_then(|f| f.get("arguments"))
+            .and_then(|v| v.as_str()),
+        Some("{\"pattern\":\"TODO\"}")
+    );
+
+    assert_eq!(
+        messages[2].get("tool_call_id").and_then(|v| v.as_str()),
+        Some("call_read")
+    );
+    assert_eq!(
+        messages[2].get("content").and_then(|v| v.as_str()),
+        Some("read output")
+    );
+    assert_eq!(
+        messages[3].get("tool_call_id").and_then(|v| v.as_str()),
+        Some("call_find")
+    );
+    assert_eq!(
+        messages[3].get("content").and_then(|v| v.as_str()),
+        Some("find output")
+    );
+
+    let second_round = &messages[4];
+    assert_eq!(
+        second_round.get("content").and_then(|v| v.as_str()),
+        Some("final answer")
+    );
+    assert_eq!(
+        second_round
+            .get("reasoning_content")
+            .and_then(|v| v.as_str()),
+        Some("second thought"),
+        "a new assistant round after tool output must keep its own reasoning"
+    );
+    assert!(second_round.get("tool_calls").is_none());
+
+    let reasoning: Vec<&str> = messages
+        .iter()
+        .filter_map(|m| m.get("reasoning_content").and_then(|v| v.as_str()))
+        .collect();
+    assert_eq!(
+        reasoning,
+        ["原始思考", "second thought"],
+        "each round keeps its own reasoning; no empty ghosts and no cross-round cloning"
+    );
+}
+
 #[test]
 fn anthropic_encoder_maps_required_tool_choice_to_any() {
     let messages = vec![AiItem {

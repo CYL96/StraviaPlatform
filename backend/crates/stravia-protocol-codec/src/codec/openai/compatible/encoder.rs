@@ -4,9 +4,11 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
+use stravia_runtime_contract::protocol::ids::OPEN_RESPONSES_2026_04_24;
 use stravia_runtime_contract::protocol::ir::AiRequest;
 use stravia_runtime_contract::protocol::ir::ToolCall;
 use stravia_runtime_contract::protocol::ir::request::AiItem;
+use stravia_runtime_contract::protocol::ir::request::AiItemMetadata;
 use stravia_runtime_contract::protocol::ir::request::ContentBlock;
 use stravia_runtime_contract::protocol::ir::request::MediaSource;
 use stravia_runtime_contract::protocol::ir::request::MessageContent;
@@ -22,8 +24,14 @@ impl OpenAIEncoder {
         let tools = req.tools.as_deref().unwrap_or(&[]);
         let tools_opt: Option<&[ToolSpec]> = if tools.is_empty() { None } else { Some(tools) };
 
+        let responses_ingress = req.meta.source_protocol == Some(OPEN_RESPONSES_2026_04_24);
+        let items = if responses_ingress {
+            coalesce_responses_assistant_rounds(req.items)
+        } else {
+            req.items
+        };
         let normalized_messages =
-            normalize_messages_for_openai(req.items, req.instructions, tools_opt);
+            normalize_messages_for_openai(items, req.instructions, tools_opt, responses_ingress);
         let mut messages = Vec::with_capacity(normalized_messages.len());
         for message in normalized_messages {
             if let Some(message) = encode_message(message)? {
@@ -246,10 +254,268 @@ fn tool_choice_to_value(tc: ToolChoice) -> Option<Value> {
     })
 }
 
+/// Open Responses replays one assistant round as consecutive native items:
+/// reasoning, message text/media, and one item per parallel function call.
+/// Chat completions can only carry that round as a single assistant message,
+/// so coalesce those items before normalization. Reasoning stays in blocks so
+/// the existing encoder stripping keeps signatures and encrypted payloads out
+/// of plaintext; metadata is only merged when the extension maps agree.
+fn coalesce_responses_assistant_rounds(mut messages: Vec<AiItem>) -> Vec<AiItem> {
+    // Resolve each fragment's own reasoning plaintext before grouping. Blocks
+    // stay intact for protected-payload stripping, while sibling metadata can
+    // then combine in encounter order instead of a later promotion overwriting
+    // it with only the merged block text.
+    for item in &mut messages {
+        if item.role == Role::Assistant {
+            promote_reasoning_meta(item);
+        }
+    }
+    let mut write = 0usize;
+    let mut round_open = false;
+    let mut blocks: Option<Vec<ContentBlock>> = None;
+    for read in 0..messages.len() {
+        if round_open {
+            let (kept, pending) = messages.split_at_mut(read);
+            let target = &mut kept[write - 1];
+            let incoming = &mut pending[0];
+            if can_coalesce_responses_items(target, incoming) {
+                merge_responses_item(target, incoming, &mut blocks);
+                continue;
+            }
+        }
+        if let Some(blocks) = blocks.take() {
+            messages[write - 1].content = finish_responses_blocks(blocks);
+        }
+        if write != read {
+            messages.swap(write, read);
+        }
+        round_open = is_mergeable_responses_assistant(&messages[write]);
+        write += 1;
+    }
+    if let Some(blocks) = blocks {
+        messages[write - 1].content = finish_responses_blocks(blocks);
+    }
+    messages.truncate(write);
+    messages
+}
+
+fn can_coalesce_responses_items(target: &AiItem, incoming: &AiItem) -> bool {
+    is_mergeable_responses_assistant(target)
+        && is_mergeable_responses_assistant(incoming)
+        && !metadata_extensions_conflict(target.meta.as_deref(), incoming.meta.as_deref())
+}
+
+fn is_mergeable_responses_assistant(item: &AiItem) -> bool {
+    item.role == Role::Assistant
+        && item
+            .tool_call_id
+            .as_ref()
+            .is_none_or(|id| id.trim().is_empty())
+        && item.meta.as_ref().is_none_or(|meta| {
+            meta.object_extensions().is_some_and(|extensions| {
+                // Reserved graph keys in imported metadata cannot cross the
+                // extension API; probe with an empty copy so validation never
+                // mutates the real metadata.
+                let mut probe = AiItemMetadata::default();
+                extensions
+                    .keys()
+                    .all(|key| probe.remove_extension(key).is_ok())
+            })
+        })
+        && item.item_reference().is_none()
+        && !item.is_compaction()
+        && !item.is_compaction_trigger()
+        && match &item.content {
+            MessageContent::Text(_) => true,
+            MessageContent::Blocks(blocks) => blocks.iter().all(is_responses_round_block),
+        }
+}
+
+fn is_responses_round_block(block: &ContentBlock) -> bool {
+    matches!(
+        block,
+        ContentBlock::Text { .. }
+            | ContentBlock::Image { .. }
+            | ContentBlock::Audio { .. }
+            | ContentBlock::File { .. }
+            | ContentBlock::Video { .. }
+            | ContentBlock::Document { .. }
+            | ContentBlock::Refusal { .. }
+            | ContentBlock::Thinking { .. }
+            | ContentBlock::Reasoning { .. }
+            | ContentBlock::RedactedThinking { .. }
+    )
+}
+
+/// Object extension values from different native items can coexist only when
+/// they do not disagree. `reasoning_content` is the one field with an explicit
+/// merge rule, so it is not treated as a conflict here.
+fn metadata_extensions_conflict(
+    target: Option<&AiItemMetadata>,
+    incoming: Option<&AiItemMetadata>,
+) -> bool {
+    let (Some(target), Some(incoming)) = (target, incoming) else {
+        return false;
+    };
+    let (Some(target_extensions), Some(incoming_extensions)) =
+        (target.object_extensions(), incoming.object_extensions())
+    else {
+        return true;
+    };
+    incoming_extensions.iter().any(|(key, value)| {
+        target_extensions
+            .get(key)
+            .is_some_and(|existing| existing != value && key.as_str() != "reasoning_content")
+    })
+}
+
+fn merge_responses_item(
+    target: &mut AiItem,
+    incoming: &mut AiItem,
+    blocks: &mut Option<Vec<ContentBlock>>,
+) {
+    if blocks.is_none() {
+        let target_content =
+            std::mem::replace(&mut target.content, MessageContent::Blocks(Vec::new()));
+        *blocks = Some(initial_responses_blocks(target_content));
+    }
+    let incoming_content =
+        std::mem::replace(&mut incoming.content, MessageContent::Blocks(Vec::new()));
+    append_responses_content(
+        blocks.as_mut().expect("blocks initialized above"),
+        incoming_content,
+    );
+    merge_item_metadata(&mut target.meta, incoming.meta.take());
+    if let Some(mut incoming_calls) = incoming.tool_calls.take() {
+        target
+            .tool_calls
+            .get_or_insert_with(Vec::new)
+            .append(&mut incoming_calls);
+    }
+}
+
+/// Per-item graph annotations cannot survive coalescing and are never emitted
+/// by the chat encoder; keep the first fragment's graph fields and merge the
+/// object extensions that do reach the wire.
+fn merge_item_metadata(
+    target: &mut Option<Box<AiItemMetadata>>,
+    incoming: Option<Box<AiItemMetadata>>,
+) {
+    let Some(incoming) = incoming else {
+        return;
+    };
+    if target.is_none() {
+        *target = Some(incoming);
+        return;
+    }
+    let Some(incoming_extensions) = incoming.into_object_extensions() else {
+        return;
+    };
+    let target = target.as_mut().expect("target metadata checked above");
+    for (key, value) in incoming_extensions {
+        if key == "reasoning_content" {
+            merge_reasoning_content(target, value);
+            continue;
+        }
+        if target.get(&key).is_none() {
+            target
+                .insert_extension(key, value)
+                .expect("incoming extension is not a graph field");
+        }
+    }
+}
+
+/// Actual reasoning text wins over the empty filler strict chat upstreams
+/// require. When both fragments carry text, join them in encounter order with
+/// the same newline convention as `fold_standalone_reasoning_items`; when
+/// neither does, keep the existing explicit `""` / `null` value.
+fn merge_reasoning_content(target: &mut AiItemMetadata, incoming: Value) {
+    let existing = target
+        .remove_extension("reasoning_content")
+        .expect("reasoning content is not reserved");
+    let Some(existing) = existing else {
+        target
+            .insert_extension("reasoning_content", incoming)
+            .expect("reasoning content is not reserved");
+        return;
+    };
+    let incoming_is_text = incoming.as_str().is_some_and(|text| !text.is_empty());
+    if matches!(&existing, Value::String(text) if !text.is_empty()) {
+        let Value::String(mut text) = existing else {
+            unreachable!("non-empty reasoning text checked above");
+        };
+        if incoming_is_text {
+            let Value::String(incoming_text) = incoming else {
+                unreachable!("non-empty reasoning text checked above");
+            };
+            text.push('\n');
+            text.push_str(&incoming_text);
+        }
+        target
+            .insert_extension("reasoning_content", Value::String(text))
+            .expect("reasoning content is not reserved");
+    } else {
+        let merged = if incoming_is_text { incoming } else { existing };
+        target
+            .insert_extension("reasoning_content", merged)
+            .expect("reasoning content is not reserved");
+    }
+}
+
+fn initial_responses_blocks(content: MessageContent) -> Vec<ContentBlock> {
+    match content {
+        MessageContent::Text(text) if text.is_empty() => Vec::new(),
+        MessageContent::Text(text) => vec![ContentBlock::Text {
+            text,
+            cache_control: None,
+        }],
+        MessageContent::Blocks(mut blocks) => {
+            blocks.retain(|block| !is_empty_text_block(block));
+            blocks
+        }
+    }
+}
+
+fn append_responses_content(blocks: &mut Vec<ContentBlock>, incoming: MessageContent) {
+    match incoming {
+        MessageContent::Text(text) => {
+            if !text.is_empty() {
+                blocks.push(ContentBlock::Text {
+                    text,
+                    cache_control: None,
+                });
+            }
+        }
+        MessageContent::Blocks(incoming_blocks) => blocks.extend(
+            incoming_blocks
+                .into_iter()
+                .filter(|block| !is_empty_text_block(block)),
+        ),
+    }
+}
+
+fn is_empty_text_block(block: &ContentBlock) -> bool {
+    matches!(block, ContentBlock::Text { text, .. } if text.is_empty())
+}
+
+fn finish_responses_blocks(mut blocks: Vec<ContentBlock>) -> MessageContent {
+    match blocks.len() {
+        0 => MessageContent::Text(String::new().into()),
+        1 if matches!(&blocks[0], ContentBlock::Text { .. }) => {
+            let Some(ContentBlock::Text { text, .. }) = blocks.pop() else {
+                unreachable!("single text block checked above");
+            };
+            MessageContent::Text(text)
+        }
+        _ => MessageContent::Blocks(blocks),
+    }
+}
+
 fn normalize_messages_for_openai(
     messages: Vec<AiItem>,
     system: Option<String>,
     tools: Option<&[ToolSpec]>,
+    responses_ingress: bool,
 ) -> Vec<AiItem> {
     let supplied_tool_ids = collect_supplied_tool_ids(&messages);
     let preprocessed = remap_duplicate_tool_call_ids(messages, system, &supplied_tool_ids);
@@ -270,7 +536,9 @@ fn normalize_messages_for_openai(
 
     for mut msg in preprocessed {
         if msg.role == Role::Assistant {
-            if !is_standalone_reasoning_item(&msg) {
+            // Responses fragments were already promoted before coalescing;
+            // re-promoting a merged item would drop sibling reasoning text.
+            if !responses_ingress && !is_standalone_reasoning_item(&msg) {
                 promote_reasoning_meta(&mut msg);
             }
             if let Some(tool_calls) = &mut msg.tool_calls {
@@ -327,7 +595,9 @@ fn normalize_messages_for_openai(
 
         let has_adjacent_matching_call = out
             .last()
-            .is_some_and(|prev| assistant_has_tool_call_id(prev, &final_id));
+            .is_some_and(|prev| assistant_has_tool_call_id(prev, &final_id))
+            || (responses_ingress
+                && assistant_before_contiguous_tool_results_has_call(&out, &final_id));
         if !has_adjacent_matching_call {
             let extracted_call = take_matching_tool_call_from_history(&mut out, &final_id);
             if let Some((tc, source_idx)) = extracted_call {
@@ -402,7 +672,7 @@ fn normalize_messages_for_openai(
         has_reasoning || content_has_non_whitespace_text(&msg.content)
     });
 
-    fold_standalone_reasoning_items(&mut out);
+    fold_standalone_reasoning_items(&mut out, responses_ingress);
 
     out
 }
@@ -419,13 +689,22 @@ fn normalize_messages_for_openai(
 /// messages), so it falls back to the carrier's own `content`, like every
 /// codec does when no native carrier exists. Carriers with no plaintext at
 /// all (only signatures / ciphertext / redacted data) are dropped entirely.
-fn fold_standalone_reasoning_items(out: &mut Vec<AiItem>) {
+/// For Responses ingress the item's already-resolved metadata is the complete
+/// merged reasoning text and wins over re-deriving only its block-backed part.
+fn fold_standalone_reasoning_items(out: &mut Vec<AiItem>, responses_ingress: bool) {
     for idx in (0..out.len()).rev() {
         if !is_standalone_reasoning_item(&out[idx]) {
             continue;
         }
         let mut carrier = out.remove(idx);
-        let text = standalone_reasoning_text(&mut carrier);
+        let text = if responses_ingress {
+            match take_resolved_reasoning(&mut carrier) {
+                Some(text) => text,
+                None => standalone_reasoning_text(&mut carrier),
+            }
+        } else {
+            standalone_reasoning_text(&mut carrier)
+        };
         if out.get(idx).is_some_and(|next| {
             next.role == Role::Assistant
                 && next
@@ -472,6 +751,26 @@ fn fold_standalone_reasoning_items(out: &mut Vec<AiItem>) {
             carrier.meta = None;
             out.insert(idx, carrier);
         }
+    }
+}
+
+/// Remove the already-resolved reasoning text from a Responses carrier. It is
+/// complete for every coalesced fragment, unlike block-only extraction.
+fn take_resolved_reasoning(item: &mut AiItem) -> Option<String> {
+    let meta = item.meta.as_mut()?;
+    if !meta
+        .get("reasoning_content")
+        .and_then(Value::as_str)
+        .is_some_and(|text| !text.is_empty())
+    {
+        return None;
+    }
+    match meta
+        .remove_extension("reasoning_content")
+        .expect("reasoning content is not reserved")
+    {
+        Some(Value::String(text)) if !text.is_empty() => Some(text),
+        _ => None,
     }
 }
 
@@ -648,6 +947,16 @@ fn assistant_has_tool_call_id(msg: &AiItem, tool_call_id: &str) -> bool {
             .iter()
             .any(|tc| !tc.id.trim().is_empty() && tc.id == tool_call_id)
     })
+}
+
+/// Tool results after a coalesced Responses round arrive one after another;
+/// the nearest prior assistant owns all of them even though it is no longer
+/// directly adjacent to the later results.
+fn assistant_before_contiguous_tool_results_has_call(out: &[AiItem], tool_call_id: &str) -> bool {
+    out.iter()
+        .rev()
+        .find(|message| message.role != Role::Tool)
+        .is_some_and(|message| assistant_has_tool_call_id(message, tool_call_id))
 }
 
 fn remap_duplicate_tool_call_ids(
